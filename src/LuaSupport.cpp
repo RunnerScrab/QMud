@@ -253,17 +253,70 @@ end
 if not unpack then unpack = table.unpack end
 if not loadstring then loadstring = load end
 
-if not module then
-  function module(name, ...)
-    local M = package.loaded[name] or _G[name] or {}
-    package.loaded[name] = M
-    _G[name] = M
-    local env = setmetatable(M, { __index = _G })
-    setfenv(2, env)
-    for _, f in ipairs({...}) do
-      f(env)
+if package and type(package) == "table" and type(package.seeall) ~= "function" then
+  function package.seeall(module_table)
+    local mt = getmetatable(module_table)
+    if type(mt) ~= "table" then
+      mt = {}
+      setmetatable(module_table, mt)
     end
-    return env
+    mt.__index = _G
+    return module_table
+  end
+end
+
+if not module then
+  local function find_global_module(name)
+    local current = _G
+    for part in string.gmatch(name, "[^%.]+") do
+      if type(current) ~= "table" then
+        return nil
+      end
+      current = current[part]
+      if current == nil then
+        return nil
+      end
+    end
+    return current
+  end
+
+  local function assign_global_module(name, module_table)
+    local current = _G
+    local pending = nil
+    for part in string.gmatch(name, "[^%.]+") do
+      if pending ~= nil then
+        local next_table = current[pending]
+        if type(next_table) ~= "table" then
+          next_table = {}
+          current[pending] = next_table
+        end
+        current = next_table
+      end
+      pending = part
+    end
+    if pending ~= nil then
+      current[pending] = module_table
+    end
+  end
+
+  function module(name, ...)
+    local M = package.loaded[name]
+    if type(M) ~= "table" then
+      M = find_global_module(name)
+      if type(M) ~= "table" then
+        M = {}
+      end
+    end
+    assign_global_module(name, M)
+    M._NAME = name
+    M._M = M
+    M._PACKAGE = string.match(name, "^(.*%.)[^%.]+$") or ""
+    package.loaded[name] = M
+    setfenv(2, M)
+    for _, f in ipairs({...}) do
+      f(M)
+    end
+    return M
   end
 end
 

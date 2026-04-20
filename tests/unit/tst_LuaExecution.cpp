@@ -393,13 +393,65 @@ class tst_LuaExecution : public QObject
 			QVERIFY(state);
 
 			const auto result = evaluateLuaToString(
-			    state.get(), QByteArrayLiteral("module(\"compat_mod\")\n"
+			    state.get(), QByteArrayLiteral("local tostring = tostring\n"
+			                                   "local package = package\n"
+			                                   "module(\"compat_mod\")\n"
 			                                   "value = 42\n"
 			                                   "return tostring(compat_mod.value) .. \":\" .. "
 			                                   "tostring(package.loaded.compat_mod.value) .. \":\" .. "
 			                                   "tostring(value)"));
 			QVERIFY2(result.ok, qPrintable(result.error));
 			QCOMPARE(result.value, QStringLiteral("42:42:42"));
+		}
+
+		void moduleShimSetsLegacyModuleFields()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			const auto result = evaluateLuaToString(
+			    state.get(),
+			    QByteArrayLiteral("local tostring = tostring\n"
+			                      "local package = package\n"
+			                      "module(\"compat.parent\")\n"
+			                      "return tostring(_NAME) .. \":\" .. "
+			                      "tostring(_M == package.loaded[\"compat.parent\"]) .. \":\" .. "
+			                      "tostring(_PACKAGE)"));
+			QVERIFY2(result.ok, qPrintable(result.error));
+			QCOMPARE(result.value, QStringLiteral("compat.parent:true:compat."));
+		}
+
+		void moduleShimCreatesDottedGlobalPath()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			const auto result = evaluateLuaToString(
+			    state.get(), QByteArrayLiteral("local tostring = tostring\n"
+			                                   "local package = package\n"
+			                                   "module(\"compat.path.deep\")\n"
+			                                   "value = 7\n"
+			                                   "return tostring(type(compat)) .. \":\" .. "
+			                                   "tostring(type(compat.path)) .. \":\" .. "
+			                                   "tostring(compat.path.deep.value) .. \":\" .. "
+			                                   "tostring(package.loaded[\"compat.path.deep\"] == "
+			                                   "compat.path.deep)"));
+			QVERIFY2(result.ok, qPrintable(result.error));
+			QCOMPARE(result.value, QStringLiteral("table:table:7:true"));
+		}
+
+		void moduleShimSupportsPackageSeeallOption()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			const auto result = evaluateLuaToString(
+			    state.get(), QByteArrayLiteral("local tostring = tostring\n"
+			                                   "module(\"compat.seeall\", package.seeall)\n"
+			                                   "return tostring(type(print)) .. \":\" .. "
+			                                   "tostring(getmetatable(_M).__index == _G)"));
+			QVERIFY2(result.ok, qPrintable(result.error));
+			QCOMPARE(result.value, QStringLiteral("function:true"));
 		}
 
 		void unpackAliasUsesTableUnpackBehaviour()
