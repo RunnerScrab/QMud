@@ -395,9 +395,10 @@ class tst_LuaExecution : public QObject
 			const auto result = evaluateLuaToString(
 			    state.get(), QByteArrayLiteral("local tostring = tostring\n"
 			                                   "local package = package\n"
+			                                   "local globals = _G\n"
 			                                   "module(\"compat_mod\")\n"
 			                                   "value = 42\n"
-			                                   "return tostring(compat_mod.value) .. \":\" .. "
+			                                   "return tostring(globals.compat_mod.value) .. \":\" .. "
 			                                   "tostring(package.loaded.compat_mod.value) .. \":\" .. "
 			                                   "tostring(value)"));
 			QVERIFY2(result.ok, qPrintable(result.error));
@@ -428,14 +429,16 @@ class tst_LuaExecution : public QObject
 
 			const auto result = evaluateLuaToString(
 			    state.get(), QByteArrayLiteral("local tostring = tostring\n"
+			                                   "local type = type\n"
 			                                   "local package = package\n"
+			                                   "local globals = _G\n"
 			                                   "module(\"compat.path.deep\")\n"
 			                                   "value = 7\n"
-			                                   "return tostring(type(compat)) .. \":\" .. "
-			                                   "tostring(type(compat.path)) .. \":\" .. "
-			                                   "tostring(compat.path.deep.value) .. \":\" .. "
+			                                   "return tostring(type(globals.compat)) .. \":\" .. "
+			                                   "tostring(type(globals.compat.path)) .. \":\" .. "
+			                                   "tostring(globals.compat.path.deep.value) .. \":\" .. "
 			                                   "tostring(package.loaded[\"compat.path.deep\"] == "
-			                                   "compat.path.deep)"));
+			                                   "globals.compat.path.deep)"));
 			QVERIFY2(result.ok, qPrintable(result.error));
 			QCOMPARE(result.value, QStringLiteral("table:table:7:true"));
 		}
