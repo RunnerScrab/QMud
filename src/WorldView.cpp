@@ -10000,6 +10000,7 @@ void InputTextEdit::keyPressEvent(QKeyEvent *event)
 	if (m_view && (event->key() == Qt::Key_Up || event->key() == Qt::Key_Down))
 	{
 		const int direction = (event->key() == Qt::Key_Up) ? -1 : 1;
+		bool      handled   = false;
 		if (event->modifiers() == Qt::NoModifier)
 		{
 			if (m_view->m_arrowsChangeHistory)
@@ -10009,13 +10010,19 @@ void InputTextEdit::keyPressEvent(QKeyEvent *event)
 					m_view->recallPartialHistory(direction);
 				else
 					m_view->recallHistory(direction);
+				handled = true;
 			}
-			return;
 		}
-		if (event->modifiers() == Qt::AltModifier)
+		else if (event->modifiers() == Qt::AltModifier)
 		{
 			if (m_view->m_altArrowRecallsPartial || m_view->m_arrowRecallsPartial)
+			{
 				m_view->recallPartialHistory(direction);
+				handled = true;
+			}
+		}
+		if (handled)
+		{
 			return;
 		}
 	}
