@@ -6628,6 +6628,10 @@ void WorldView::paintMiniWindows(QPainter *painter, bool underneath, const QRect
 
 	painter->save();
 	painter->setClipRect(clippedUpdateRect);
+	painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
+
+	const auto drawImageToRect = [painter](const QRect &targetRect, const QImage &image)
+	{ painter->drawImage(targetRect, image); };
 
 	if (underneath)
 	{
@@ -6685,7 +6689,7 @@ void WorldView::paintMiniWindows(QPainter *painter, bool underneath, const QRect
 			{
 				const QRect rect = positionImageRect(image.size(), clientSize, ownerSize, mode);
 				if (rect.intersects(clippedUpdateRect))
-					painter->drawImage(rect, image);
+					drawImageToRect(rect, image);
 			}
 		}
 	}
@@ -6703,7 +6707,7 @@ void WorldView::paintMiniWindows(QPainter *painter, bool underneath, const QRect
 			{
 				const QRect rect = positionImageRect(image.size(), clientSize, ownerSize, mode);
 				if (rect.intersects(clippedUpdateRect))
-					painter->drawImage(rect, image);
+					drawImageToRect(rect, image);
 			}
 		}
 	}
@@ -6748,7 +6752,7 @@ void WorldView::paintMiniWindows(QPainter *painter, bool underneath, const QRect
 			    window->position <= 3)
 			{
 				if (window->rect.intersects(clippedUpdateRect))
-					painter->drawImage(window->rect, image);
+					drawImageToRect(window->rect, image);
 			}
 			else
 			{
@@ -6756,10 +6760,7 @@ void WorldView::paintMiniWindows(QPainter *painter, bool underneath, const QRect
 				{
 					if (!window->rect.intersects(clippedUpdateRect))
 						continue;
-					const bool smooth = painter->testRenderHint(QPainter::SmoothPixmapTransform);
-					painter->setRenderHint(QPainter::SmoothPixmapTransform, false);
-					painter->drawImage(window->rect, image);
-					painter->setRenderHint(QPainter::SmoothPixmapTransform, smooth);
+					drawImageToRect(window->rect, image);
 				}
 				else
 				{
