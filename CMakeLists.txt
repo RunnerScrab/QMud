@@ -14,6 +14,8 @@ endif ()
 option(QMUD_ENABLE_LUA_SCRIPTING "Enable Lua scripting callbacks" ON)
 option(QMUD_ENABLE_TESTING "Enable QMud QtTest/CTest targets" ON)
 option(QMUD_ENABLE_GUI_TESTS "Enable GUI-focused QtTest suites" ON)
+option(QMUD_ENABLE_EXPERIMENTAL_THREADED_LUA_EXECUTOR
+        "Enable experimental worker-thread Lua executor backend (on by default)" ON)
 option(QMUD_CI_BUILD "Mark runtime display version as CI build (-ci suffix)" OFF)
 option(QMUD_RELEASE_NATIVE_OPTIMIZATIONS "Tune Release builds for the local CPU (-march=native or /arch:AVX2)" OFF)
 set(QMUD_SYSTEM_LUA_MODULES_PREFIX "" CACHE PATH
@@ -182,6 +184,7 @@ set(QMUD_SOURCES
         helpers/AliasMatchUtils.cpp
         helpers/HyperlinkActionUtils.cpp
         helpers/WorldCommandProcessorUtils.cpp
+        helpers/LuaExecutionUtils.cpp
         NameGeneration.cpp
         DoubleMetaphone.cpp
         ErrorDescriptions.cpp
@@ -211,6 +214,7 @@ set(QMUD_SOURCES
         helpers/MiniWindowUtils.cpp
         helpers/FontUtils.cpp
         BraceMatch.cpp
+        LuaExecutor.cpp
         LuaCallbackEngine.cpp
         LuaApiExport.cpp
         LuaFunctionMetadata.cpp
@@ -247,6 +251,7 @@ set(QMUD_HEADERS
         MainFrame.h
         helpers/MainFrameActionUtils.h
         helpers/MainFrameMdiUtils.h
+        helpers/LuaExecutionUtils.h
         TabActivationHistory.h
         AppController.h
         Environment.h
@@ -295,6 +300,8 @@ set(QMUD_HEADERS
         MxpDiagnostics.h
         MxpDebugWindow.h
         BraceMatch.h
+        LuaExecutor.h
+        LuaExecutorThreaded.h
         LuaCallbackEngine.h
         LuaApiExport.h
         FileExtensions.h
@@ -319,6 +326,9 @@ set(QMUD_HEADERS
 )
 
 set(QMUD_SOURCE_FILES_ABS)
+if (QMUD_ENABLE_EXPERIMENTAL_THREADED_LUA_EXECUTOR)
+    list(APPEND QMUD_SOURCES LuaExecutorThreaded.cpp)
+endif ()
 foreach (QMUD_SOURCE_FILE IN LISTS QMUD_SOURCES)
     list(APPEND QMUD_SOURCE_FILES_ABS "${QMUD_SRC_DIR}/${QMUD_SOURCE_FILE}")
 endforeach ()
@@ -378,7 +388,8 @@ if (APPLE)
     target_link_libraries(QMud PRIVATE "-framework CoreServices")
 endif ()
 target_compile_definitions(QMud PRIVATE QMUD_ENABLE_SOUND=${QMUD_ENABLE_SOUND_VALUE}
-        QMUD_ENABLE_TEXT_TO_SPEECH=${QMUD_ENABLE_TEXT_TO_SPEECH_VALUE})
+        QMUD_ENABLE_TEXT_TO_SPEECH=${QMUD_ENABLE_TEXT_TO_SPEECH_VALUE}
+        QMUD_ENABLE_EXPERIMENTAL_THREADED_LUA_EXECUTOR=$<IF:$<BOOL:${QMUD_ENABLE_EXPERIMENTAL_THREADED_LUA_EXECUTOR}>,1,0>)
 
 if (QMUD_ENABLE_LUA_SCRIPTING)
     set(QMUD_LUA_LIBRARY_FILES "")

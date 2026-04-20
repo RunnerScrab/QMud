@@ -7,6 +7,7 @@
  */
 
 #include "AppController.h"
+#include "LuaExecutor.h"
 // ReSharper disable once CppUnusedIncludeDirective
 #include "NameGeneration.h"
 // ReSharper disable once CppUnusedIncludeDirective
@@ -231,12 +232,12 @@ class tst_Dialog_PluginWizard : public QObject
 			auto *descriptionPage = qobject_cast<QWizardPage *>(dialog.page(1));
 			QVERIFY(descriptionPage);
 
-			QTextEdit *descriptionEdit = descriptionPage->findChild<QTextEdit *>();
+			auto descriptionEdit = descriptionPage->findChild<QTextEdit *>();
 			QVERIFY(descriptionEdit);
 			QCheckBox *generateHelp =
 			    findCheckBoxByText(*descriptionPage, QStringLiteral("Generate help alias"));
 			QVERIFY(generateHelp);
-			QLineEdit *helpAliasEdit = descriptionPage->findChild<QLineEdit *>();
+			auto helpAliasEdit = descriptionPage->findChild<QLineEdit *>();
 			QVERIFY(helpAliasEdit);
 
 			QVERIFY(!generateHelp->isEnabled());

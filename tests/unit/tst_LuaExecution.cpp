@@ -2,18 +2,64 @@
  * QMud Project
  * Copyright (c) 2026 Panagiotis Kalogiratos (Nodens)
  *
- * File: tst_LuaSupportCompat.cpp
- * Role: Unit coverage for Lua 5.1 compatibility helpers used by Mushclient-style plugins.
+ * File: tst_LuaExecution.cpp
+ * Role: Consolidated unit coverage for Lua execution helpers and compatibility shims.
  */
 
 #include "LuaSupport.h"
+#include "helpers/LuaExecutionUtils.h"
 
 #include <QtTest/QTest>
+
+#include <array>
+
+Q_DECLARE_METATYPE(LuaExecutorBackendMode)
 
 extern "C" int luaopen_lsqlite3(lua_State *L);
 
 namespace
 {
+	class RawLuaStateOwner final
+	{
+		public:
+			explicit RawLuaStateOwner(lua_State *state) : m_state(state)
+			{
+			}
+			~RawLuaStateOwner()
+			{
+				if (m_state)
+					lua_close(m_state);
+			}
+
+			RawLuaStateOwner(const RawLuaStateOwner &)                   = delete;
+			RawLuaStateOwner        &operator=(const RawLuaStateOwner &) = delete;
+
+			[[nodiscard]] lua_State *get() const
+			{
+				return m_state;
+			}
+
+		private:
+			lua_State *m_state{nullptr};
+	};
+
+	bool runLuaChunk(lua_State *state, const QByteArray &chunk)
+	{
+		if (!state)
+			return false;
+		if (luaL_loadbuffer(state, chunk.constData(), static_cast<size_t>(chunk.size()), "test") != LUA_OK)
+		{
+			lua_pop(state, 1);
+			return false;
+		}
+		if (lua_pcall(state, 0, 0, 0) != LUA_OK)
+		{
+			lua_pop(state, 1);
+			return false;
+		}
+		return true;
+	}
+
 	/**
 	 * @brief Executes a Lua chunk and returns the first result as UTF-8 string.
 	 */
@@ -46,7 +92,7 @@ namespace
 			return result;
 		}
 		if (luaL_loadbuffer(L, chunk.constData(), static_cast<size_t>(chunk.size()),
-		                    "tst_LuaSupportCompat") != 0)
+		                    "tst_LuaExecution_eval") != 0)
 		{
 			const char *err = lua_tostring(L, -1);
 			result.error    = QString::fromUtf8(err ? err : "unknown load error");
@@ -84,7 +130,7 @@ namespace
 			return false;
 		}
 		if (luaL_loadbuffer(L, chunk.constData(), static_cast<size_t>(chunk.size()),
-		                    "tst_LuaSupportCompat_exec") != 0)
+		                    "tst_LuaExecution_exec") != 0)
 		{
 			const char *err = lua_tostring(L, -1);
 			error           = QString::fromUtf8(err ? err : "unknown load error");
@@ -119,14 +165,214 @@ namespace
 } // namespace
 
 /**
- * @brief QTest fixture covering Lua 5.1 compatibility shims.
+ * @brief QTest fixture covering Lua execution helpers and Lua 5.1 compatibility shims.
  */
-class tst_LuaSupportCompat : public QObject
+class tst_LuaExecution : public QObject
 {
 		Q_OBJECT
 
 		// NOLINTBEGIN(readability-convert-member-functions-to-static)
 	private slots:
+		void threadedRequestRecognition_data()
+		{
+			QTest::addColumn<QByteArray>("envValue");
+			QTest::addColumn<bool>("expected");
+
+			QTest::newRow("empty") << QByteArray() << false;
+			QTest::newRow("direct") << QByteArray("direct") << false;
+			QTest::newRow("threaded lower") << QByteArray("threaded") << true;
+			QTest::newRow("threaded upper") << QByteArray("THREADED") << true;
+			QTest::newRow("worker mixed") << QByteArray("WoRkEr") << true;
+			QTest::newRow("trimmed threaded") << QByteArray("  threaded  ") << true;
+			QTest::newRow("unknown") << QByteArray("custom") << false;
+		}
+
+		void threadedRequestRecognition()
+		{
+			QFETCH(QByteArray, envValue);
+			QFETCH(bool, expected);
+			QCOMPARE(qmudIsThreadedLuaExecutorRequested(envValue), expected);
+		}
+
+		void resolveModeRespectsAvailability()
+		{
+			QCOMPARE(qmudResolveLuaExecutorBackendMode("threaded", true), LuaExecutorBackendMode::Threaded);
+			QCOMPARE(qmudResolveLuaExecutorBackendMode("worker", true), LuaExecutorBackendMode::Threaded);
+			QCOMPARE(qmudResolveLuaExecutorBackendMode("threaded", false), LuaExecutorBackendMode::Direct);
+			QCOMPARE(qmudResolveLuaExecutorBackendMode("worker", false), LuaExecutorBackendMode::Direct);
+		}
+
+		void resolveModeDefaultsToDirect()
+		{
+			QCOMPARE(qmudResolveLuaExecutorBackendMode({}, true), LuaExecutorBackendMode::Direct);
+			QCOMPARE(qmudResolveLuaExecutorBackendMode("direct", true), LuaExecutorBackendMode::Direct);
+			QCOMPARE(qmudResolveLuaExecutorBackendMode("custom", true), LuaExecutorBackendMode::Direct);
+		}
+
+		void bridgePolicyClassifiesWorkerLocalOperations()
+		{
+			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::SetWorldRuntime),
+			         LuaExecutorBridgePolicy::WorkerLocal);
+			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::LoadScript),
+			         LuaExecutorBridgePolicy::WorkerLocal);
+			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::RefreshLuaCallbackCatalogNow),
+			         LuaExecutorBridgePolicy::WorkerLocal);
+			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::LuaState),
+			         LuaExecutorBridgePolicy::WorkerLocal);
+		}
+
+		void bridgePolicyClassifiesUiSyncOperations()
+		{
+			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::CallFunctionNoArgs),
+			         LuaExecutorBridgePolicy::UiSync);
+			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::CallProcedureWithString),
+			         LuaExecutorBridgePolicy::UiSync);
+			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::CallMxpStartTag),
+			         LuaExecutorBridgePolicy::UiSync);
+			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::ExecuteScript),
+			         LuaExecutorBridgePolicy::UiSync);
+		}
+
+		void bridgePolicyClassificationIsExhaustive()
+		{
+			constexpr std::array workerLocalOperations{
+			    LuaExecutorOperation::SetWorldRuntime,
+			    LuaExecutorOperation::SetPluginInfo,
+			    LuaExecutorOperation::SetScriptText,
+			    LuaExecutorOperation::ResetState,
+			    LuaExecutorOperation::TeardownEngine,
+			    LuaExecutorOperation::ApplyPackageRestrictions,
+			    LuaExecutorOperation::SetObservedPluginCallbacks,
+			    LuaExecutorOperation::HasObservedPluginCallback,
+			    LuaExecutorOperation::SetCallbackCatalogObserver,
+			    LuaExecutorOperation::LoadScript,
+			    LuaExecutorOperation::HasFunction,
+			    LuaExecutorOperation::RefreshLuaCallbackCatalogNow,
+			    LuaExecutorOperation::LuaState,
+			};
+			for (const LuaExecutorOperation operation : workerLocalOperations)
+				QCOMPARE(qmudLuaExecutorBridgePolicy(operation), LuaExecutorBridgePolicy::WorkerLocal);
+
+			constexpr std::array uiSyncOperations{
+			    LuaExecutorOperation::CallFunctionNoArgs,
+			    LuaExecutorOperation::CallFunctionWithString,
+			    LuaExecutorOperation::CallFunctionWithBytes,
+			    LuaExecutorOperation::CallFunctionWithBytesInOut,
+			    LuaExecutorOperation::CallFunctionWithStringInOut,
+			    LuaExecutorOperation::CallFunctionWithNumberAndString,
+			    LuaExecutorOperation::CallFunctionWithTwoNumbersAndString,
+			    LuaExecutorOperation::CallFunctionWithNumberAndBytes,
+			    LuaExecutorOperation::CallFunctionWithNumberAndUtf8Strings,
+			    LuaExecutorOperation::CallProcedureWithString,
+			    LuaExecutorOperation::CallMxpError,
+			    LuaExecutorOperation::CallMxpStartUp,
+			    LuaExecutorOperation::CallMxpShutDown,
+			    LuaExecutorOperation::CallMxpStartTag,
+			    LuaExecutorOperation::CallMxpEndTag,
+			    LuaExecutorOperation::CallMxpSetVariable,
+			    LuaExecutorOperation::CallFunctionWithStringsAndWildcards,
+			    LuaExecutorOperation::ExecuteScript,
+			};
+			for (const LuaExecutorOperation operation : uiSyncOperations)
+				QCOMPARE(qmudLuaExecutorBridgePolicy(operation), LuaExecutorBridgePolicy::UiSync);
+		}
+
+		void crossStateMarshalsSupportedTypes()
+		{
+			RawLuaStateOwner caller(luaL_newstate());
+			RawLuaStateOwner target(luaL_newstate());
+			QVERIFY(caller.get());
+			QVERIFY(target.get());
+			QVERIFY(runLuaChunk(target.get(), "function cb(a,b,c,d) return a,b,c,d end"));
+
+			lua_pushnil(caller.get());
+			lua_pushboolean(caller.get(), 1);
+			lua_pushnumber(caller.get(), 42.5);
+			lua_pushstring(caller.get(), "abc");
+
+			const auto result = qmudCallPluginLuaWithMarshalling(caller.get(), target.get(), "cb", 1);
+			QCOMPARE(result.error, CallPluginLuaMarshallingError::None);
+			QCOMPARE(result.returnCount, 4);
+			QCOMPARE(lua_gettop(caller.get()), 8);
+			QVERIFY(lua_isnil(caller.get(), 5));
+			QVERIFY(lua_toboolean(caller.get(), 6));
+			QCOMPARE(lua_tonumber(caller.get(), 7), 42.5);
+			QCOMPARE(QString::fromUtf8(lua_tostring(caller.get(), 8)), QStringLiteral("abc"));
+		}
+
+		void crossStateRejectsUnsupportedArgumentType()
+		{
+			RawLuaStateOwner caller(luaL_newstate());
+			RawLuaStateOwner target(luaL_newstate());
+			QVERIFY(caller.get());
+			QVERIFY(target.get());
+			QVERIFY(runLuaChunk(target.get(), "function cb(x) return x end"));
+
+			lua_newtable(caller.get());
+			const auto result = qmudCallPluginLuaWithMarshalling(caller.get(), target.get(), "cb", 1);
+			QCOMPARE(result.error, CallPluginLuaMarshallingError::UnsupportedArgumentType);
+			QCOMPARE(result.index, 1);
+			QCOMPARE(QString::fromLatin1(result.typeName), QStringLiteral("table"));
+			QCOMPARE(lua_gettop(target.get()), 0);
+		}
+
+		void crossStateRejectsUnsupportedReturnType()
+		{
+			RawLuaStateOwner caller(luaL_newstate());
+			RawLuaStateOwner target(luaL_newstate());
+			QVERIFY(caller.get());
+			QVERIFY(target.get());
+			QVERIFY(runLuaChunk(target.get(), "function cb() return {} end"));
+
+			const auto result = qmudCallPluginLuaWithMarshalling(caller.get(), target.get(), "cb", 1);
+			QCOMPARE(result.error, CallPluginLuaMarshallingError::UnsupportedReturnType);
+			QCOMPARE(result.index, 1);
+			QCOMPARE(QString::fromLatin1(result.typeName), QStringLiteral("table"));
+			QCOMPARE(lua_gettop(target.get()), 0);
+		}
+
+		void crossStateReportsRuntimeError()
+		{
+			RawLuaStateOwner caller(luaL_newstate());
+			RawLuaStateOwner target(luaL_newstate());
+			QVERIFY(caller.get());
+			QVERIFY(target.get());
+			QVERIFY(runLuaChunk(target.get(), "function cb() error('boom') end"));
+
+			const auto result = qmudCallPluginLuaWithMarshalling(caller.get(), target.get(), "cb", 1);
+			QCOMPARE(result.error, CallPluginLuaMarshallingError::RuntimeError);
+			QVERIFY(!result.runtimeError.trimmed().isEmpty());
+			QCOMPARE(lua_gettop(target.get()), 0);
+		}
+
+		void reportsNoSuchRoutine()
+		{
+			RawLuaStateOwner caller(luaL_newstate());
+			RawLuaStateOwner target(luaL_newstate());
+			QVERIFY(caller.get());
+			QVERIFY(target.get());
+
+			const auto result =
+			    qmudCallPluginLuaWithMarshalling(caller.get(), target.get(), "pkg.inner.missing", 1);
+			QCOMPARE(result.error, CallPluginLuaMarshallingError::NoSuchRoutine);
+		}
+
+		void sameStateInvocationReturnsFunctionResults()
+		{
+			RawLuaStateOwner state(luaL_newstate());
+			QVERIFY(state.get());
+			QVERIFY(runLuaChunk(state.get(), "function add_pair(a,b) return a+b,'ok' end"));
+
+			lua_pushnumber(state.get(), 2);
+			lua_pushnumber(state.get(), 3);
+			const auto result = qmudCallPluginLuaWithMarshalling(state.get(), state.get(), "add_pair", 1);
+			QCOMPARE(result.error, CallPluginLuaMarshallingError::None);
+			QCOMPARE(result.returnCount, 2);
+			QCOMPARE(lua_gettop(state.get()), 2);
+			QCOMPARE(lua_tonumber(state.get(), 1), 5.0);
+			QCOMPARE(QString::fromUtf8(lua_tostring(state.get(), 2)), QStringLiteral("ok"));
+		}
+
 		void getfenvAndSetfenvWorkForFunctionClosures()
 		{
 			LuaStateOwner state = makeCompatLuaState();
@@ -147,13 +393,68 @@ class tst_LuaSupportCompat : public QObject
 			QVERIFY(state);
 
 			const auto result = evaluateLuaToString(
-			    state.get(), QByteArrayLiteral("module(\"compat_mod\")\n"
+			    state.get(), QByteArrayLiteral("local tostring = tostring\n"
+			                                   "local package = package\n"
+			                                   "local globals = _G\n"
+			                                   "module(\"compat_mod\")\n"
 			                                   "value = 42\n"
-			                                   "return tostring(compat_mod.value) .. \":\" .. "
+			                                   "return tostring(globals.compat_mod.value) .. \":\" .. "
 			                                   "tostring(package.loaded.compat_mod.value) .. \":\" .. "
 			                                   "tostring(value)"));
 			QVERIFY2(result.ok, qPrintable(result.error));
 			QCOMPARE(result.value, QStringLiteral("42:42:42"));
+		}
+
+		void moduleShimSetsLegacyModuleFields()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			const auto result = evaluateLuaToString(
+			    state.get(),
+			    QByteArrayLiteral("local tostring = tostring\n"
+			                      "local package = package\n"
+			                      "module(\"compat.parent\")\n"
+			                      "return tostring(_NAME) .. \":\" .. "
+			                      "tostring(_M == package.loaded[\"compat.parent\"]) .. \":\" .. "
+			                      "tostring(_PACKAGE)"));
+			QVERIFY2(result.ok, qPrintable(result.error));
+			QCOMPARE(result.value, QStringLiteral("compat.parent:true:compat."));
+		}
+
+		void moduleShimCreatesDottedGlobalPath()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			const auto result = evaluateLuaToString(
+			    state.get(), QByteArrayLiteral("local tostring = tostring\n"
+			                                   "local type = type\n"
+			                                   "local package = package\n"
+			                                   "local globals = _G\n"
+			                                   "module(\"compat.path.deep\")\n"
+			                                   "value = 7\n"
+			                                   "return tostring(type(globals.compat)) .. \":\" .. "
+			                                   "tostring(type(globals.compat.path)) .. \":\" .. "
+			                                   "tostring(globals.compat.path.deep.value) .. \":\" .. "
+			                                   "tostring(package.loaded[\"compat.path.deep\"] == "
+			                                   "globals.compat.path.deep)"));
+			QVERIFY2(result.ok, qPrintable(result.error));
+			QCOMPARE(result.value, QStringLiteral("table:table:7:true"));
+		}
+
+		void moduleShimSupportsPackageSeeallOption()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			const auto result = evaluateLuaToString(
+			    state.get(), QByteArrayLiteral("local tostring = tostring\n"
+			                                   "module(\"compat.seeall\", package.seeall)\n"
+			                                   "return tostring(type(print)) .. \":\" .. "
+			                                   "tostring(getmetatable(_M).__index == _G)"));
+			QVERIFY2(result.ok, qPrintable(result.error));
+			QCOMPARE(result.value, QStringLiteral("function:true"));
 		}
 
 		void unpackAliasUsesTableUnpackBehaviour()
@@ -270,6 +571,103 @@ class tst_LuaSupportCompat : public QObject
 			QString callError;
 			QVERIFY(!QMudLuaSupport::callLuaNamedProcedureWithString(
 			    state.get(), QStringLiteral("mapper.missing_callback"), QStringLiteral("ARG"), &hasFunction,
+			    &callError));
+			QVERIFY(!hasFunction);
+			QVERIFY(callError.isEmpty());
+		}
+
+		void pushLuaFunctionByNameResolvesGlobalAndNestedFunctions()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			QString execError;
+			QVERIFY2(executeLuaChunk(state.get(),
+			                         QByteArrayLiteral("function global_cb(v) return v end\n"
+			                                           "nested = { hooks = {} }\n"
+			                                           "function nested.hooks.cb(v) return v end"),
+			                         execError),
+			         qPrintable(execError));
+
+			const int stackBeforeGlobal = lua_gettop(state.get());
+			QVERIFY(QMudLuaSupport::pushLuaFunctionByName(state.get(), QStringLiteral("global_cb")));
+			QVERIFY(lua_isfunction(state.get(), -1));
+			lua_pop(state.get(), 1);
+			QCOMPARE(lua_gettop(state.get()), stackBeforeGlobal);
+
+			const int stackBeforeNested = lua_gettop(state.get());
+			QVERIFY(QMudLuaSupport::pushLuaFunctionByName(state.get(), QStringLiteral("nested.hooks.cb")));
+			QVERIFY(lua_isfunction(state.get(), -1));
+			lua_pop(state.get(), 1);
+			QCOMPARE(lua_gettop(state.get()), stackBeforeNested);
+		}
+
+		void pushLuaFunctionByNameRejectsInvalidLookupAndKeepsStackBalanced()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			QString execError;
+			QVERIFY2(executeLuaChunk(state.get(),
+			                         QByteArrayLiteral("root = { child = {} }\n"
+			                                           "root.child.not_fn = 7\n"
+			                                           "root.leaf = 3"),
+			                         execError),
+			         qPrintable(execError));
+
+			const int stackBeforeMissing = lua_gettop(state.get());
+			QVERIFY(!QMudLuaSupport::pushLuaFunctionByName(state.get(), QStringLiteral("root.missing")));
+			QCOMPARE(lua_gettop(state.get()), stackBeforeMissing);
+
+			const int stackBeforeNotFunction = lua_gettop(state.get());
+			QVERIFY(!QMudLuaSupport::pushLuaFunctionByName(state.get(), QStringLiteral("root.child.not_fn")));
+			QCOMPARE(lua_gettop(state.get()), stackBeforeNotFunction);
+
+			const int stackBeforeNonTableIntermediate = lua_gettop(state.get());
+			QVERIFY(!QMudLuaSupport::pushLuaFunctionByName(state.get(), QStringLiteral("root.leaf.deeper")));
+			QCOMPARE(lua_gettop(state.get()), stackBeforeNonTableIntermediate);
+		}
+
+		void namedProcedureCallSupportsGlobalFunctionName()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			QString execError;
+			QVERIFY2(executeLuaChunk(state.get(),
+			                         QByteArrayLiteral("function global_hyperlink(hash)\n"
+			                                           "  _G.__qmud_global_proc_arg = hash\n"
+			                                           "end"),
+			                         execError),
+			         qPrintable(execError));
+
+			bool    hasFunction = false;
+			QString callError;
+			QVERIFY(QMudLuaSupport::callLuaNamedProcedureWithString(
+			    state.get(), QStringLiteral("global_hyperlink"), QStringLiteral("G1"), &hasFunction,
+			    &callError));
+			QVERIFY(hasFunction);
+			QVERIFY(callError.isEmpty());
+
+			const auto result = evaluateLuaToString(
+			    state.get(), QByteArrayLiteral("return tostring(__qmud_global_proc_arg)"));
+			QVERIFY2(result.ok, qPrintable(result.error));
+			QCOMPARE(result.value, QStringLiteral("G1"));
+		}
+
+		void namedProcedureCallMissingIntermediateTableReportsNoFunction()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			QString execError;
+			QVERIFY2(executeLuaChunk(state.get(), QByteArrayLiteral("mapper = { wrong = 5 }"), execError),
+			         qPrintable(execError));
+
+			bool    hasFunction = true;
+			QString callError;
+			QVERIFY(!QMudLuaSupport::callLuaNamedProcedureWithString(
+			    state.get(), QStringLiteral("mapper.wrong.callback"), QStringLiteral("ARG"), &hasFunction,
 			    &callError));
 			QVERIFY(!hasFunction);
 			QVERIFY(callError.isEmpty());
@@ -660,8 +1058,8 @@ class tst_LuaSupportCompat : public QObject
 		// NOLINTEND(readability-convert-member-functions-to-static)
 };
 
-QTEST_MAIN(tst_LuaSupportCompat)
+QTEST_MAIN(tst_LuaExecution)
 
-#if __has_include("tst_LuaSupportCompat.moc")
-#include "tst_LuaSupportCompat.moc"
+#if __has_include("tst_LuaExecution.moc")
+#include "tst_LuaExecution.moc"
 #endif

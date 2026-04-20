@@ -152,9 +152,10 @@ target_compile_definitions(tst_TtsEngine
         QMUD_ENABLE_TEXT_TO_SPEECH=${QMUD_ENABLE_TEXT_TO_SPEECH_VALUE})
 
 if (QMUD_ENABLE_LUA_SCRIPTING)
-    qmud_add_qtest(tst_LuaSupportCompat
+    qmud_add_qtest(tst_LuaExecution
             SOURCES
-            unit/tst_LuaSupportCompat.cpp
+            unit/tst_LuaExecution.cpp
+            "${CMAKE_SOURCE_DIR}/src/helpers/LuaExecutionUtils.cpp"
             "${CMAKE_SOURCE_DIR}/src/LuaSupport.cpp"
             "${CMAKE_SOURCE_DIR}/src/Sqlite3Lua.cpp"
             "${CMAKE_SOURCE_DIR}/src/Environment.cpp"
@@ -164,13 +165,14 @@ if (QMUD_ENABLE_LUA_SCRIPTING)
             LABELS
             unit)
     if (TARGET Lua::Lua)
-        target_link_libraries(tst_LuaSupportCompat PRIVATE Lua::Lua)
+        target_link_libraries(tst_LuaExecution PRIVATE Lua::Lua)
     endif ()
     if (DEFINED LUA_INCLUDE_DIR)
-        target_include_directories(tst_LuaSupportCompat SYSTEM BEFORE PRIVATE ${LUA_INCLUDE_DIR})
+        target_include_directories(tst_LuaExecution SYSTEM BEFORE PRIVATE ${LUA_INCLUDE_DIR})
     elseif (DEFINED LUA_INCLUDE_DIRS)
-        target_include_directories(tst_LuaSupportCompat SYSTEM BEFORE PRIVATE ${LUA_INCLUDE_DIRS})
+        target_include_directories(tst_LuaExecution SYSTEM BEFORE PRIVATE ${LUA_INCLUDE_DIRS})
     endif ()
+    target_compile_definitions(tst_LuaExecution PRIVATE QMUD_ENABLE_LUA_SCRIPTING)
 
     qmud_add_qtest(tst_LuaLuacomShim
             SOURCES

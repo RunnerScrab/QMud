@@ -274,28 +274,29 @@ class WorldCommandProcessor : public QObject
 		                          bool multiLine = false) const;
 		struct TriggerScript
 		{
-				WorldRuntime::Plugin  *plugin{nullptr};
-				int                    index{-1};
+				quint64                runtimeId{0};
+				QString                pluginId;
 				QString                label;
+				QString                scriptName;
 				QString                line;
 				QStringList            wildcards;
 				QMap<QString, QString> namedWildcards;
 		};
 		struct DeferredScript
 		{
-				WorldRuntime::Plugin *plugin{nullptr};
-				QString               scriptText;
-				QString               description;
+				QString pluginId;
+				QString scriptText;
+				QString description;
 		};
 		struct TriggerEvaluationResult
 		{
-				bool                                            omitFromOutput{false};
-				bool                                            omitFromLog{false};
-				QVector<WorldRuntime::StyleSpan>                spans;
-				QString                                         extraOutput;
-				QVector<DeferredScript>                         deferredScripts;
-				QVector<TriggerScript>                          triggerScripts;
-				QVector<QPair<WorldRuntime::Plugin *, QString>> oneShotTriggers;
+				bool                             omitFromOutput{false};
+				bool                             omitFromLog{false};
+				QVector<WorldRuntime::StyleSpan> spans;
+				QString                          extraOutput;
+				QVector<DeferredScript>          deferredScripts;
+				QVector<TriggerScript>           triggerScripts;
+				QVector<quint64>                 oneShotTriggers;
 		};
 		/**
 		 * @brief Evaluates all trigger sets for an incoming line.
@@ -315,9 +316,10 @@ class WorldCommandProcessor : public QObject
 		bool findVariable(const QString &name, QString &value, const WorldRuntime::Plugin *plugin) const;
 		struct AliasRef
 		{
-				WorldRuntime::Plugin  *plugin{nullptr};
-				int                    index{-1};
-				QString                name;
+				quint64                runtimeId{0};
+				QString                pluginId;
+				QString                label;
+				QString                scriptName;
 				QStringList            wildcards;
 				QMap<QString, QString> namedWildcards;
 		};

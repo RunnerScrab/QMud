@@ -34,6 +34,7 @@
 #include "WorldRuntime.h"
 #include "WorldView.h"
 #include "dialogs/SpellCheckDialog.h"
+#include "helpers/LuaExecutionUtils.h"
 #include "scripting/ScriptingErrors.h"
 
 #include <QApplication>
@@ -52,6 +53,7 @@
 #include <QDialogButtonBox>
 #include <QDockWidget>
 #include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -68,6 +70,7 @@
 #include <QMetaType>
 #include <QOperatingSystemVersion>
 #include <QPlainTextEdit>
+#include <QPointer>
 #include <QProcess>
 #include <QProgressDialog>
 #include <QPushButton>
@@ -96,6 +99,7 @@
 #include <array>
 #include <limits>
 #include <memory>
+#include <type_traits>
 #ifdef Q_OS_WIN
 #include <winnls.h>
 #ifndef VER_PLATFORM_WIN32_NT
@@ -248,10 +252,8 @@ static void             refreshLuaFunctionSetForState(lua_State *L, QSet<QString
 static bool             optBool(lua_State *L, int index, bool defaultValue);
 
 static QString          concatLuaArgs(lua_State *L, int startIndex, const QString &delimiter = QString());
-static WorldRuntime    *runtimeFromLua(lua_State *L);
 static void             pushVariant(lua_State *L, const QVariant &value);
 static WorldRuntime    *runtimeFromLuaUpvalue(lua_State *L);
-static QString          runtimeWorldIdFromLuaUpvalue(lua_State *L);
 static TextChildWindow *findNotepadWindow(const QString &title, WorldRuntime *ownerRuntime = nullptr,
                                           const QString &worldId = QString());
 static void             pushWorldProxy(lua_State *L, LuaCallbackEngine *engine, WorldRuntime *runtime,
@@ -263,8 +265,13 @@ static void             pushStringList(lua_State *L, const QStringList &list);
 static bool             isEnabledValue(const QString &value);
 static bool             parseBooleanKeywordValue(const QString &text, bool &out);
 static QString          attrFlag(bool value);
-static bool             resolvePluginContext(const LuaCallbackEngine *engine, WorldRuntime *runtime,
-                                             WorldRuntime::Plugin *&plugin, int &errorCode);
+template <typename Func>
+static auto runOnRuntimeThread(WorldRuntime *runtime, Func &&func, std::invoke_result_t<Func> fallbackValue)
+    -> std::invoke_result_t<Func>;
+template <typename Func>
+static auto runOnRuntimeThreadAllowNestedEvents(WorldRuntime *runtime, Func &&func,
+                                                std::invoke_result_t<Func> fallbackValue)
+    -> std::invoke_result_t<Func>;
 
 namespace
 {
@@ -384,10 +391,45 @@ void LuaStateDeleter::operator()(lua_State *state) const
 
 LuaCallbackEngine::LuaCallbackEngine() = default;
 
-LuaCallbackEngine::~LuaCallbackEngine() = default;
+LuaCallbackEngine::~LuaCallbackEngine()
+{
+#ifndef NDEBUG
+	if (m_executionThread && m_executionThread != QThread::currentThread())
+	{
+		qFatal("LuaCallbackEngine destroyed on wrong thread. Expected=%p current=%p",
+		       static_cast<void *>(m_executionThread), static_cast<void *>(QThread::currentThread()));
+	}
+#endif
+}
+
+void LuaCallbackEngine::bindOrAssertExecutionThread(const char *context) const
+{
+	QThread *const currentThread = QThread::currentThread();
+	if (!m_executionThread)
+	{
+		m_executionThread = currentThread;
+		return;
+	}
+#ifndef NDEBUG
+	if (m_executionThread != currentThread)
+	{
+		qFatal("LuaCallbackEngine thread-affinity violation at %s. Expected=%p current=%p",
+		       context ? context : "unknown", static_cast<void *>(m_executionThread),
+		       static_cast<void *>(currentThread));
+	}
+#else
+	Q_UNUSED(context);
+#endif
+}
+
+void LuaCallbackEngine::clearExecutionThreadAffinity() const
+{
+	m_executionThread = nullptr;
+}
 
 void LuaCallbackEngine::applyPackageRestrictions(bool enablePackage)
 {
+	bindOrAssertExecutionThread("LuaCallbackEngine::applyPackageRestrictions");
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	m_allowPackage = enablePackage;
 	if (m_state && (!m_packageRestrictionsApplied || m_packageRestrictionsAppliedValue != enablePackage))
@@ -403,6 +445,7 @@ void LuaCallbackEngine::applyPackageRestrictions(bool enablePackage)
 
 void LuaCallbackEngine::setScriptText(const QString &script)
 {
+	bindOrAssertExecutionThread("LuaCallbackEngine::setScriptText");
 	m_script       = script;
 	m_scriptLoaded = false;
 	m_luaFunctionsSet.clear();
@@ -416,6 +459,7 @@ void LuaCallbackEngine::setScriptText(const QString &script)
 
 bool LuaCallbackEngine::loadScript()
 {
+	bindOrAssertExecutionThread("LuaCallbackEngine::loadScript");
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	return ensureState();
 #else
@@ -425,6 +469,7 @@ bool LuaCallbackEngine::loadScript()
 
 void LuaCallbackEngine::resetState()
 {
+	bindOrAssertExecutionThread("LuaCallbackEngine::resetState");
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	const bool hadObservedCallbacks = !m_observedPluginCallbackPresence.isEmpty();
 	m_ownedState.reset();
@@ -441,19 +486,43 @@ void LuaCallbackEngine::resetState()
 
 void LuaCallbackEngine::setWorldRuntime(WorldRuntime *runtime)
 {
-	m_worldRuntime       = runtime;
-	m_worldBindingsReady = false;
+	bindOrAssertExecutionThread("LuaCallbackEngine::setWorldRuntime");
+	m_worldRuntime                  = runtime;
+	m_worldBindingsReady            = false;
+	m_reportedRuntimeThreadMismatch = false;
 }
 
 WorldRuntime *LuaCallbackEngine::swapWorldRuntime(WorldRuntime *runtime)
 {
-	WorldRuntime *previous = m_worldRuntime;
-	m_worldRuntime         = runtime;
+	bindOrAssertExecutionThread("LuaCallbackEngine::swapWorldRuntime");
+	WorldRuntime *previous          = m_worldRuntime;
+	m_worldRuntime                  = runtime;
+	m_reportedRuntimeThreadMismatch = false;
 	return previous;
 }
 
 WorldRuntime *LuaCallbackEngine::worldRuntime() const
 {
+	bindOrAssertExecutionThread("LuaCallbackEngine::worldRuntime");
+	if (m_worldRuntime && m_worldRuntime->thread() != QThread::currentThread())
+	{
+		if (!m_reportedRuntimeThreadMismatch)
+		{
+			m_reportedRuntimeThreadMismatch = true;
+			qWarning().noquote() << QStringLiteral(
+			    "[QMud][LuaExecutor] runtime affinity mismatch in LuaCallbackEngine::worldRuntime; "
+			    "denying runtime access on this thread");
+		}
+		return nullptr;
+	}
+	m_reportedRuntimeThreadMismatch = false;
+	qmudAssertObjectThreadAffinity(m_worldRuntime, "LuaCallbackEngine::worldRuntime");
+	return m_worldRuntime;
+}
+
+WorldRuntime *LuaCallbackEngine::worldRuntimeForBridgedCall() const
+{
+	bindOrAssertExecutionThread("LuaCallbackEngine::worldRuntimeForBridgedCall");
 	return m_worldRuntime;
 }
 
@@ -480,11 +549,13 @@ const QSet<QString> &LuaCallbackEngine::luaFunctionsSet() const
 
 void LuaCallbackEngine::setCallbackCatalogObserver(CallbackCatalogObserver observer)
 {
+	bindOrAssertExecutionThread("LuaCallbackEngine::setCallbackCatalogObserver");
 	m_callbackCatalogObserver = std::move(observer);
 }
 
 void LuaCallbackEngine::setObservedPluginCallbacks(const QSet<QString> &callbackNames)
 {
+	bindOrAssertExecutionThread("LuaCallbackEngine::setObservedPluginCallbacks");
 	if (m_observedPluginCallbacks == callbackNames)
 		return;
 	m_observedPluginCallbacks = callbackNames;
@@ -498,6 +569,7 @@ bool LuaCallbackEngine::hasObservedPluginCallback(const QString &functionName) c
 
 void LuaCallbackEngine::refreshLuaCallbackCatalogNow()
 {
+	bindOrAssertExecutionThread("LuaCallbackEngine::refreshLuaCallbackCatalogNow");
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	if (m_observedPluginCallbacks.isEmpty())
 	{
@@ -532,23 +604,27 @@ void LuaCallbackEngine::refreshLuaCallbackCatalogNow()
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 lua_State *LuaCallbackEngine::luaState() const
 {
+	bindOrAssertExecutionThread("LuaCallbackEngine::luaState");
 	return m_state;
 }
 #endif
 
 void LuaCallbackEngine::setPluginInfo(const QString &id, const QString &name)
 {
+	bindOrAssertExecutionThread("LuaCallbackEngine::setPluginInfo");
 	m_pluginId   = id;
 	m_pluginName = name;
 }
 
 QString LuaCallbackEngine::pluginId() const
 {
+	bindOrAssertExecutionThread("LuaCallbackEngine::pluginId");
 	return m_pluginId;
 }
 
 QString LuaCallbackEngine::pluginName() const
 {
+	bindOrAssertExecutionThread("LuaCallbackEngine::pluginName");
 	return m_pluginName;
 }
 
@@ -575,7 +651,7 @@ static int luaResetStatusTime(lua_State *L)
 	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	if (WorldRuntime *runtime = engine->worldRuntime())
+	if (WorldRuntime *runtime = engine->worldRuntimeForBridgedCall())
 		runtime->resetStatusTime();
 	return 0;
 }
@@ -595,19 +671,105 @@ static MainWindow *resolveMainWindow()
 	return dynamic_cast<MainWindow *>(host);
 }
 
+template <typename Func>
+static auto runOnMainWindowThread(Func &&func, std::invoke_result_t<Func, MainWindow *> fallbackValue)
+    -> std::invoke_result_t<Func, MainWindow *>
+{
+	using ReturnType           = std::invoke_result_t<Func, MainWindow *>;
+	QPointer<MainWindow> frame = resolveMainWindow();
+	if (!frame)
+		return fallbackValue;
+	QPointer<QThread> frameThread = frame->thread();
+	if (!frameThread)
+		return fallbackValue;
+	if (QThread::currentThread() == frameThread.data())
+		return func(frame.data());
+
+	ReturnType result   = fallbackValue;
+	const bool resolved = QMetaObject::invokeMethod(
+	    frame.data(),
+	    [&]()
+	    {
+		    if (frame)
+			    result = func(frame.data());
+	    },
+	    Qt::BlockingQueuedConnection);
+	return resolved ? result : fallbackValue;
+}
+
+template <typename Func>
+static auto runOnMainWindowThreadAllowNestedEvents(Func                                   &&func,
+                                                   std::invoke_result_t<Func, MainWindow *> fallbackValue)
+    -> std::invoke_result_t<Func, MainWindow *>
+{
+	using ReturnType           = std::invoke_result_t<Func, MainWindow *>;
+	QPointer<MainWindow> frame = resolveMainWindow();
+	if (!frame)
+		return fallbackValue;
+	QPointer<QThread> frameThread = frame->thread();
+	if (!frameThread)
+		return fallbackValue;
+	if (QThread::currentThread() == frameThread.data())
+		return func(frame.data());
+
+	ReturnType result    = fallbackValue;
+	bool       completed = false;
+	QEventLoop loop;
+	QObject::connect(frame.data(), &QObject::destroyed, &loop, &QEventLoop::quit, Qt::QueuedConnection);
+	QObject::connect(frameThread.data(), &QThread::finished, &loop, &QEventLoop::quit, Qt::QueuedConnection);
+	const bool queued = QMetaObject::invokeMethod(
+	    frame.data(),
+	    [&]()
+	    {
+		    if (frame)
+		    {
+			    result    = func(frame.data());
+			    completed = true;
+		    }
+		    QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection);
+	    },
+	    Qt::QueuedConnection);
+	if (!queued)
+		return fallbackValue;
+	loop.exec();
+	return completed ? result : fallbackValue;
+}
+
 template <typename MatchFn> static WorldRuntime *findWorldRuntimeWhere(MatchFn &&matches)
 {
-	MainWindowHost *host = resolveMainWindowHost(nullptr);
-	if (!host)
+	MainWindow *frame = resolveMainWindow();
+	if (!frame)
 		return nullptr;
-	for (const WorldWindowDescriptor &entry : host->worldWindowDescriptors())
+
+	auto findMatching = [&]() -> WorldRuntime *
 	{
-		if (!entry.runtime)
-			continue;
-		if (matches(entry.runtime))
-			return entry.runtime;
-	}
-	return nullptr;
+		for (const WorldWindowDescriptor &entry : frame->worldWindowDescriptors())
+		{
+			if (!entry.runtime)
+				continue;
+			if (matches(entry.runtime))
+				return entry.runtime;
+		}
+		return nullptr;
+	};
+
+	if (QThread::currentThread() == frame->thread())
+		return findMatching();
+
+	WorldRuntime *result = nullptr;
+	QEventLoop    loop;
+	const bool    queued = QMetaObject::invokeMethod(
+        frame,
+        [&]()
+        {
+            result = findMatching();
+            QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection);
+        },
+        Qt::QueuedConnection);
+	if (!queued)
+		return nullptr;
+	loop.exec();
+	return result;
 }
 
 static WorldChildWindow *findWorldWindowByOrdinal(const MainWindowHost &host, const WorldRuntime &runtime,
@@ -631,14 +793,21 @@ static void addScriptTimeForRuntime(WorldRuntime *runtime, const qint64 nanos)
 {
 	if (!runtime || nanos <= 0)
 		return;
-	runtime->addScriptTime(nanos);
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    runtime->addScriptTime(nanos);
+		    return 0;
+	    },
+	    0);
 }
 
 static void addScriptTimeForEngine(const LuaCallbackEngine &engine, const qint64 nanos)
 {
 	if (nanos <= 0)
 		return;
-	addScriptTimeForRuntime(engine.worldRuntime(), nanos);
+	addScriptTimeForRuntime(engine.worldRuntimeForBridgedCall(), nanos);
 }
 
 class ScriptExecutionDepthGuard
@@ -668,12 +837,17 @@ static bool activateWorldForRuntime(WorldRuntime *runtime)
 {
 	if (!runtime)
 		return false;
-	MainWindowHost *host = resolveMainWindowHostForRuntime(runtime);
-	if (!host)
-		host = resolveMainWindowHost(QApplication::activeWindow());
-	if (!host)
-		return false;
-	return host->activateWorldRuntime(runtime);
+	return runOnMainWindowThreadAllowNestedEvents(
+	    [runtime](MainWindow *mw) -> bool
+	    {
+		    MainWindowHost *host = resolveMainWindowHostForRuntime(runtime);
+		    if (!host)
+			    host = resolveMainWindowHost(QApplication::activeWindow());
+		    if (!host)
+			    host = mw;
+		    return host ? host->activateWorldRuntime(runtime) : false;
+	    },
+	    false);
 }
 
 static bool activateMainWindow(MainWindow *mw)
@@ -691,13 +865,11 @@ static bool activateMainWindow(MainWindow *mw)
 
 static int luaActivateNotepad(lua_State *L)
 {
-	const char   *title   = luaL_checkstring(L, 1);
+	const QString title   = QString::fromUtf8(luaL_checkstring(L, 1));
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
-	MainWindow   *mw      = resolveMainWindow();
-	bool          ok      = false;
-	if (mw)
-		ok = mw->activateNotepad(QString::fromUtf8(title), runtime);
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const bool    ok      = runOnMainWindowThreadAllowNestedEvents(
+        [&](const MainWindow *mw) -> bool { return mw->activateNotepad(title, runtime); }, false);
 	lua_pushboolean(L, ok);
 	return 1;
 }
@@ -707,7 +879,7 @@ static int luaActivate(lua_State *L)
 	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	activateWorldForRuntime(engine->worldRuntime());
+	activateWorldForRuntime(engine->worldRuntimeForBridgedCall());
 	return 0;
 }
 
@@ -715,8 +887,13 @@ static int luaActivateClient(lua_State *L)
 {
 	const int stackTop = lua_gettop(L);
 	Q_UNUSED(stackTop);
-	MainWindow *mw = resolveMainWindow();
-	activateMainWindow(mw);
+	runOnMainWindowThreadAllowNestedEvents(
+	    [](MainWindow *mw) -> bool
+	    {
+		    activateMainWindow(mw);
+		    return true;
+	    },
+	    false);
 	return 0;
 }
 
@@ -728,7 +905,7 @@ static int luaAddFont(lua_State *L)
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -748,7 +925,7 @@ static int luaAddMapperComment(lua_State *L)
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -845,7 +1022,7 @@ static int luaAddToMapper(lua_State *L)
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -861,7 +1038,7 @@ static int luaAddToMapper(lua_State *L)
 static int luaAdjustColour(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -891,7 +1068,7 @@ static int luaAnsiNote(lua_State *L)
 	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	if (const QString text = concatLuaArgs(L, 1); text.isEmpty())
@@ -904,7 +1081,7 @@ static int luaAnsiNote(lua_State *L)
 static int luaBlendPixel(lua_State *L)
 {
 	const auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	const WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	const WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, -1);
@@ -923,7 +1100,7 @@ static int luaBookmark(lua_State *L)
 	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 
@@ -941,7 +1118,7 @@ static int luaGetBoldColour(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -964,7 +1141,7 @@ static int luaSetBoldColour(lua_State *L)
 	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 
@@ -984,7 +1161,7 @@ static int luaBroadcastPlugin(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -993,8 +1170,14 @@ static int luaBroadcastPlugin(lua_State *L)
 
 	const long  message = static_cast<long>(luaL_checknumber(L, 1));
 	const char *text    = luaL_optstring(L, 2, "");
-	const int   count =
-	    runtime->broadcastPlugin(message, QString::fromUtf8(text), engine->pluginId(), engine->pluginName());
+	const int   count   = runOnRuntimeThreadAllowNestedEvents(
+        runtime,
+        [&]() -> int
+        {
+            return runtime->broadcastPlugin(message, QString::fromUtf8(text), engine->pluginId(),
+		                                        engine->pluginName());
+        },
+        0);
 	lua_pushnumber(L, count);
 	return 1;
 }
@@ -1007,7 +1190,7 @@ static int luaChangeDir(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -1035,7 +1218,7 @@ static int luaChatAcceptCalls(lua_State *L)
 		lua_pushnumber(L, eCannotCreateChatSocket);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eCannotCreateChatSocket);
@@ -1054,7 +1237,7 @@ static int luaChatCall(lua_State *L)
 		lua_pushnumber(L, eCannotCreateChatSocket);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eCannotCreateChatSocket);
@@ -1074,7 +1257,7 @@ static int luaChatCallzChat(lua_State *L)
 		lua_pushnumber(L, eCannotCreateChatSocket);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eCannotCreateChatSocket);
@@ -1094,7 +1277,7 @@ static int luaChatDisconnect(lua_State *L)
 		lua_pushnumber(L, eChatIDNotFound);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eChatIDNotFound);
@@ -1113,7 +1296,7 @@ static int luaChatDisconnectAll(lua_State *L)
 		lua_pushnumber(L, eOK);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eOK);
@@ -1131,7 +1314,7 @@ static int luaChatEverybody(lua_State *L)
 		lua_pushnumber(L, eNoChatConnections);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoChatConnections);
@@ -1151,7 +1334,7 @@ static int luaChatGetID(lua_State *L)
 		lua_pushnumber(L, eChatPersonNotFound);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eChatPersonNotFound);
@@ -1170,7 +1353,7 @@ static int luaChatGroup(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -1191,7 +1374,7 @@ static int luaChatID(lua_State *L)
 		lua_pushnumber(L, eChatIDNotFound);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eChatIDNotFound);
@@ -1212,7 +1395,7 @@ static int luaChatMessage(lua_State *L)
 		lua_pushnumber(L, eChatIDNotFound);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eChatIDNotFound);
@@ -1233,7 +1416,7 @@ static int luaChatNameChange(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -1249,7 +1432,7 @@ static int luaChatNote(lua_State *L)
 	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const auto    noteType = static_cast<short>(luaL_checkinteger(L, 1));
@@ -1266,7 +1449,7 @@ static int luaChatPasteEverybody(lua_State *L)
 		lua_pushnumber(L, eNoChatConnections);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoChatConnections);
@@ -1284,7 +1467,7 @@ static int luaChatPasteText(lua_State *L)
 		lua_pushnumber(L, eNoChatConnections);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoChatConnections);
@@ -1303,7 +1486,7 @@ static int luaChatPeekConnections(lua_State *L)
 		lua_pushnumber(L, eChatIDNotFound);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eChatIDNotFound);
@@ -1322,7 +1505,7 @@ static int luaChatPersonal(lua_State *L)
 		lua_pushnumber(L, eChatPersonNotFound);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eChatPersonNotFound);
@@ -1343,7 +1526,7 @@ static int luaChatPing(lua_State *L)
 		lua_pushnumber(L, eChatIDNotFound);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eChatIDNotFound);
@@ -1362,7 +1545,7 @@ static int luaChatRequestConnections(lua_State *L)
 		lua_pushnumber(L, eChatIDNotFound);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eChatIDNotFound);
@@ -1381,7 +1564,7 @@ static int luaChatSendFile(lua_State *L)
 		lua_pushnumber(L, eChatIDNotFound);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eChatIDNotFound);
@@ -1398,7 +1581,7 @@ static int luaChatStopAcceptingCalls(lua_State *L)
 	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	runtime->chatStopAcceptingCalls();
@@ -1413,7 +1596,7 @@ static int luaChatStopFileTransfer(lua_State *L)
 		lua_pushnumber(L, eChatIDNotFound);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eChatIDNotFound);
@@ -1432,7 +1615,7 @@ static int luaCloseNotepad(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -1453,7 +1636,7 @@ static int luaColourNameToRGB(lua_State *L)
 		lua_pushnumber(L, static_cast<lua_Number>(colourNameFallback(name)));
 		return 1;
 	}
-	const WorldRuntime *runtime = engine->worldRuntime();
+	const WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	const QString       name    = QString::fromUtf8(luaL_checkstring(L, 1));
 	long                value   = runtime ? WorldRuntime::colourNameToRGB(name) : -1;
 	if (value == -1)
@@ -1465,53 +1648,60 @@ static int luaColourNameToRGB(lua_State *L)
 static int luaColourNote(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 
-	const QString        textColour = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString        backColour = QString::fromUtf8(luaL_checkstring(L, 2));
-	const QString        text       = QString::fromUtf8(luaL_checkstring(L, 3));
+	const QString textColour = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString backColour = QString::fromUtf8(luaL_checkstring(L, 2));
+	const QString text       = QString::fromUtf8(luaL_checkstring(L, 3));
+	const QColor  fore       = WorldView::parseColor(textColour);
+	const QColor  back       = WorldView::parseColor(backColour);
 
-	const bool           oldNotesInRgb     = runtime->notesInRgb();
-	const long           oldFore           = runtime->noteColourFore();
-	const long           oldBack           = runtime->noteColourBack();
-	const int            oldNoteTextColour = runtime->noteTextColour();
-	const unsigned short noteStyle         = runtime->noteStyle();
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    const bool           oldNotesInRgb     = runtime->notesInRgb();
+		    const long           oldFore           = runtime->noteColourFore();
+		    const long           oldBack           = runtime->noteColourBack();
+		    const int            oldNoteTextColour = runtime->noteTextColour();
+		    const unsigned short noteStyle         = runtime->noteStyle();
 
-	if (!runtime->notesInRgb())
-	{
-		runtime->setNoteColourFore(runtime->noteColourFore());
-		runtime->setNoteColourBack(runtime->noteColourBack());
-	}
+		    if (!runtime->notesInRgb())
+		    {
+			    runtime->setNoteColourFore(runtime->noteColourFore());
+			    runtime->setNoteColourBack(runtime->noteColourBack());
+		    }
 
-	const QColor fore = WorldView::parseColor(textColour);
-	const QColor back = WorldView::parseColor(backColour);
-	if (fore.isValid())
-		runtime->setNoteColourFore(colorValue(fore));
-	if (back.isValid())
-		runtime->setNoteColourBack(colorValue(back));
+		    if (fore.isValid())
+			    runtime->setNoteColourFore(colorValue(fore));
+		    if (back.isValid())
+			    runtime->setNoteColourBack(colorValue(back));
 
-	WorldRuntime::StyleSpan span;
-	span.length    = sizeToInt(text.size());
-	span.fore      = colorFromValue(runtime->noteColourFore());
-	span.back      = colorFromValue(runtime->noteColourBack());
-	span.bold      = (noteStyle & kStyleHilite) != 0;
-	span.underline = (noteStyle & kStyleUnderline) != 0;
-	span.blink     = (noteStyle & kStyleBlink) != 0;
-	span.inverse   = (noteStyle & kStyleInverse) != 0;
-	span.changed   = true;
-	runtime->outputStyledText(text, {span}, true, true);
+		    WorldRuntime::StyleSpan span;
+		    span.length    = sizeToInt(text.size());
+		    span.fore      = colorFromValue(runtime->noteColourFore());
+		    span.back      = colorFromValue(runtime->noteColourBack());
+		    span.bold      = (noteStyle & kStyleHilite) != 0;
+		    span.underline = (noteStyle & kStyleUnderline) != 0;
+		    span.blink     = (noteStyle & kStyleBlink) != 0;
+		    span.inverse   = (noteStyle & kStyleInverse) != 0;
+		    span.changed   = true;
+		    runtime->outputStyledText(text, {span}, true, true);
 
-	if (oldNotesInRgb)
-	{
-		runtime->setNoteColourFore(oldFore);
-		runtime->setNoteColourBack(oldBack);
-	}
-	else
-	{
-		runtime->setNoteTextColour(oldNoteTextColour);
-	}
+		    if (oldNotesInRgb)
+		    {
+			    runtime->setNoteColourFore(oldFore);
+			    runtime->setNoteColourBack(oldBack);
+		    }
+		    else
+		    {
+			    runtime->setNoteTextColour(oldNoteTextColour);
+		    }
+		    return 0;
+	    },
+	    0);
 
 	return 0;
 }
@@ -1519,7 +1709,7 @@ static int luaColourNote(lua_State *L)
 static int luaColourTell(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 
@@ -1529,45 +1719,52 @@ static int luaColourTell(lua_State *L)
 	if (text.isEmpty())
 		return 0;
 
-	const bool           oldNotesInRgb     = runtime->notesInRgb();
-	const long           oldFore           = runtime->noteColourFore();
-	const long           oldBack           = runtime->noteColourBack();
-	const int            oldNoteTextColour = runtime->noteTextColour();
-	const unsigned short noteStyle         = runtime->noteStyle();
-
-	if (!runtime->notesInRgb())
-	{
-		runtime->setNoteColourFore(runtime->noteColourFore());
-		runtime->setNoteColourBack(runtime->noteColourBack());
-	}
-
 	const QColor fore = WorldView::parseColor(textColour);
 	const QColor back = WorldView::parseColor(backColour);
-	if (fore.isValid())
-		runtime->setNoteColourFore(colorValue(fore));
-	if (back.isValid())
-		runtime->setNoteColourBack(colorValue(back));
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    const bool           oldNotesInRgb     = runtime->notesInRgb();
+		    const long           oldFore           = runtime->noteColourFore();
+		    const long           oldBack           = runtime->noteColourBack();
+		    const int            oldNoteTextColour = runtime->noteTextColour();
+		    const unsigned short noteStyle         = runtime->noteStyle();
 
-	WorldRuntime::StyleSpan span;
-	span.length    = sizeToInt(text.size());
-	span.fore      = colorFromValue(runtime->noteColourFore());
-	span.back      = colorFromValue(runtime->noteColourBack());
-	span.bold      = (noteStyle & kStyleHilite) != 0;
-	span.underline = (noteStyle & kStyleUnderline) != 0;
-	span.blink     = (noteStyle & kStyleBlink) != 0;
-	span.inverse   = (noteStyle & kStyleInverse) != 0;
-	span.changed   = true;
-	runtime->outputStyledText(text, {span}, true, false);
+		    if (!runtime->notesInRgb())
+		    {
+			    runtime->setNoteColourFore(runtime->noteColourFore());
+			    runtime->setNoteColourBack(runtime->noteColourBack());
+		    }
 
-	if (oldNotesInRgb)
-	{
-		runtime->setNoteColourFore(oldFore);
-		runtime->setNoteColourBack(oldBack);
-	}
-	else
-	{
-		runtime->setNoteTextColour(oldNoteTextColour);
-	}
+		    if (fore.isValid())
+			    runtime->setNoteColourFore(colorValue(fore));
+		    if (back.isValid())
+			    runtime->setNoteColourBack(colorValue(back));
+
+		    WorldRuntime::StyleSpan span;
+		    span.length    = sizeToInt(text.size());
+		    span.fore      = colorFromValue(runtime->noteColourFore());
+		    span.back      = colorFromValue(runtime->noteColourBack());
+		    span.bold      = (noteStyle & kStyleHilite) != 0;
+		    span.underline = (noteStyle & kStyleUnderline) != 0;
+		    span.blink     = (noteStyle & kStyleBlink) != 0;
+		    span.inverse   = (noteStyle & kStyleInverse) != 0;
+		    span.changed   = true;
+		    runtime->outputStyledText(text, {span}, true, false);
+
+		    if (oldNotesInRgb)
+		    {
+			    runtime->setNoteColourFore(oldFore);
+			    runtime->setNoteColourBack(oldBack);
+		    }
+		    else
+		    {
+			    runtime->setNoteTextColour(oldNoteTextColour);
+		    }
+		    return 0;
+	    },
+	    0);
 
 	return 0;
 }
@@ -1577,7 +1774,7 @@ static int luaSetCustomColourBackground(lua_State *L)
 	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const int    index  = static_cast<int>(luaL_checkinteger(L, 1));
@@ -1596,7 +1793,7 @@ static int luaGetCustomColourBackground(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	const WorldRuntime *runtime = engine->worldRuntime();
+	const WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -1612,7 +1809,7 @@ static int luaSetCustomColourText(lua_State *L)
 	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const int    index  = static_cast<int>(luaL_checkinteger(L, 1));
@@ -1631,7 +1828,7 @@ static int luaGetCustomColourText(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	const WorldRuntime *runtime = engine->worldRuntime();
+	const WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -1650,14 +1847,15 @@ static int luaDebug(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
 	const QString  command = QString::fromUtf8(luaL_optstring(L, 1, ""));
-	const QVariant value   = runtime->debugCommand(command);
+	const QVariant value =
+	    runOnRuntimeThread(runtime, [&]() -> QVariant { return runtime->debugCommand(command); }, QVariant());
 	if (!value.isValid())
 	{
 		lua_pushnil(L);
@@ -1670,7 +1868,7 @@ static int luaDebug(lua_State *L)
 static int luaDeleteAllMapItems(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -1683,7 +1881,7 @@ static int luaDeleteAllMapItems(lua_State *L)
 static int luaDeleteLastMapItem(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -1696,18 +1894,30 @@ static int luaDeleteLastMapItem(lua_State *L)
 static int luaDeleteCommandHistory(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
-	if (WorldView *view = runtime->view())
-		view->clearCommandHistory();
+	if (QThread::currentThread() == runtime->thread())
+	{
+		if (WorldView *view = runtime->view())
+			view->clearCommandHistory();
+		return 0;
+	}
+	QMetaObject::invokeMethod(
+	    runtime,
+	    [runtime]
+	    {
+		    if (WorldView *view = runtime->view())
+			    view->clearCommandHistory();
+	    },
+	    Qt::BlockingQueuedConnection);
 	return 0;
 }
 
 static int luaDeleteOutput(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	runtime->deleteOutput();
@@ -1717,7 +1927,7 @@ static int luaDeleteOutput(lua_State *L)
 static int luaDeleteLines(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const int count = static_cast<int>(luaL_checkinteger(L, 1));
@@ -1728,7 +1938,7 @@ static int luaDeleteLines(lua_State *L)
 static int luaDeleteVariable(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -1742,7 +1952,7 @@ static int luaDeleteVariable(lua_State *L)
 static int luaDiscardQueue(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -1764,9 +1974,78 @@ static void commitTriggerListMutation(WorldRuntime *runtime, const WorldRuntime:
 static void commitAliasListMutation(WorldRuntime *runtime, const WorldRuntime::Plugin *plugin);
 static void commitTimerListMutation(WorldRuntime *runtime, const WorldRuntime::Plugin *plugin,
                                     bool structureChanged = false);
+static bool resolvePluginContextById(WorldRuntime *runtime, const QString &pluginId,
+                                     WorldRuntime::Plugin *&plugin, int &errorCode);
 
-static int  addTempTimer(const LuaCallbackEngine *engine, double seconds, const QString &text,
-                         const int sendTo)
+template <typename Func>
+static auto runOnRuntimeThread(WorldRuntime *runtime, Func &&func, std::invoke_result_t<Func> fallbackValue)
+    -> std::invoke_result_t<Func>
+{
+	using ReturnType = std::invoke_result_t<Func>;
+	QPointer<WorldRuntime> runtimeGuard(runtime);
+	if (!runtimeGuard)
+		return fallbackValue;
+	QPointer<QThread> runtimeThread = runtimeGuard->thread();
+	if (!runtimeThread)
+		return fallbackValue;
+	if (QThread::currentThread() == runtimeThread.data())
+		return func();
+
+	ReturnType result   = fallbackValue;
+	const bool resolved = QMetaObject::invokeMethod(
+	    runtimeGuard.data(),
+	    [&]()
+	    {
+		    if (runtimeGuard)
+			    result = func();
+	    },
+	    Qt::BlockingQueuedConnection);
+	return resolved ? result : fallbackValue;
+}
+
+template <typename Func>
+static auto runOnRuntimeThreadAllowNestedEvents(WorldRuntime *runtime, Func &&func,
+                                                std::invoke_result_t<Func> fallbackValue)
+    -> std::invoke_result_t<Func>
+{
+	using ReturnType = std::invoke_result_t<Func>;
+	QPointer<WorldRuntime> runtimeGuard(runtime);
+	if (!runtimeGuard)
+		return fallbackValue;
+	QPointer<QThread> runtimeThread = runtimeGuard->thread();
+	if (!runtimeThread)
+		return fallbackValue;
+	if (QThread::currentThread() == runtimeThread.data())
+		return func();
+
+	ReturnType result    = fallbackValue;
+	bool       completed = false;
+	QEventLoop loop;
+	QObject::connect(runtimeGuard.data(), &QObject::destroyed, &loop, &QEventLoop::quit,
+	                 Qt::QueuedConnection);
+	QObject::connect(runtimeThread.data(), &QThread::finished, &loop, &QEventLoop::quit,
+	                 Qt::QueuedConnection);
+	const bool queued = QMetaObject::invokeMethod(
+	    runtimeGuard.data(),
+	    [&]()
+	    {
+		    if (runtimeGuard)
+		    {
+			    result    = func();
+			    completed = true;
+		    }
+		    QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection);
+	    },
+	    Qt::QueuedConnection);
+	if (!queued)
+		return fallbackValue;
+
+	loop.exec();
+	return completed ? result : fallbackValue;
+}
+
+static int addTempTimer(const LuaCallbackEngine *engine, double seconds, const QString &text,
+                        const int sendTo)
 {
 	if (!engine)
 		return eWorldClosed;
@@ -1787,37 +2066,44 @@ static int  addTempTimer(const LuaCallbackEngine *engine, double seconds, const 
 	if (seconds < 0.0 || seconds > 59.9999)
 		return eTimeInvalid;
 
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return eWorldClosed;
+	const QString pluginId = engine->pluginId();
 
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-		return errorCode;
+	return runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    WorldRuntime::Plugin *plugin = nullptr;
+		    if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+			    return errorCode;
 
-	QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
+		    QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
 
-	WorldRuntime::Timer         timer;
-	timer.attributes.insert(QStringLiteral("name"), makeAutoName(QStringLiteral("*timer")));
-	timer.children.insert(QStringLiteral("send"), text);
-	timer.attributes.insert(QStringLiteral("at_time"), QStringLiteral("0"));
-	timer.attributes.insert(QStringLiteral("hour"), QString::number(hours));
-	timer.attributes.insert(QStringLiteral("minute"), QString::number(minutes));
-	timer.attributes.insert(QStringLiteral("second"), QString::number(seconds, 'f', 4));
-	timer.attributes.insert(QStringLiteral("offset_hour"), QStringLiteral("0"));
-	timer.attributes.insert(QStringLiteral("offset_minute"), QStringLiteral("0"));
-	timer.attributes.insert(QStringLiteral("offset_second"), QStringLiteral("0"));
-	timer.attributes.insert(QStringLiteral("send_to"), QString::number(sendTo));
-	timer.attributes.insert(QStringLiteral("enabled"), attrFlag(true));
-	timer.attributes.insert(QStringLiteral("one_shot"), attrFlag(true));
-	timer.attributes.insert(QStringLiteral("temporary"), attrFlag(true));
-	timer.attributes.insert(QStringLiteral("active_closed"), attrFlag(true));
-	applyTimerDefaults(timer);
-	resetTimerFields(timer);
+		    WorldRuntime::Timer         timer;
+		    timer.attributes.insert(QStringLiteral("name"), makeAutoName(QStringLiteral("*timer")));
+		    timer.children.insert(QStringLiteral("send"), text);
+		    timer.attributes.insert(QStringLiteral("at_time"), QStringLiteral("0"));
+		    timer.attributes.insert(QStringLiteral("hour"), QString::number(hours));
+		    timer.attributes.insert(QStringLiteral("minute"), QString::number(minutes));
+		    timer.attributes.insert(QStringLiteral("second"), QString::number(seconds, 'f', 4));
+		    timer.attributes.insert(QStringLiteral("offset_hour"), QStringLiteral("0"));
+		    timer.attributes.insert(QStringLiteral("offset_minute"), QStringLiteral("0"));
+		    timer.attributes.insert(QStringLiteral("offset_second"), QStringLiteral("0"));
+		    timer.attributes.insert(QStringLiteral("send_to"), QString::number(sendTo));
+		    timer.attributes.insert(QStringLiteral("enabled"), attrFlag(true));
+		    timer.attributes.insert(QStringLiteral("one_shot"), attrFlag(true));
+		    timer.attributes.insert(QStringLiteral("temporary"), attrFlag(true));
+		    timer.attributes.insert(QStringLiteral("active_closed"), attrFlag(true));
+		    applyTimerDefaults(timer);
+		    resetTimerFields(timer);
 
-	timers.push_back(timer);
-	commitTimerListMutation(runtime, plugin, true);
-	return eOK;
+		    timers.push_back(timer);
+		    commitTimerListMutation(runtime, plugin, true);
+		    return eOK;
+	    },
+	    eWorldClosed);
 }
 
 static int luaDoAfter(lua_State *L)
@@ -1867,19 +2153,18 @@ static int luaDoCommand(lua_State *L)
 		return 1;
 	}
 	const QString cmdName = qmudCommandIdToString(id);
-	MainWindow   *mw      = resolveMainWindow();
-	if (!mw)
-	{
-		lua_pushnumber(L, eNoSuchCommand);
-		return 1;
-	}
-	if (QAction *action = mw->actionForCommand(cmdName))
-	{
-		action->trigger();
-		lua_pushnumber(L, eOK);
-		return 1;
-	}
-	lua_pushnumber(L, eNoSuchCommand);
+	const int     result  = runOnMainWindowThreadAllowNestedEvents(
+        [&](const MainWindow *mw) -> int
+        {
+            if (QAction *action = mw->actionForCommand(cmdName))
+            {
+                action->trigger();
+                return eOK;
+            }
+            return eNoSuchCommand;
+        },
+        eNoSuchCommand);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
@@ -1895,7 +2180,7 @@ static int luaEditDistance(lua_State *L)
 static int luaEnableGroup(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -1907,16 +2192,10 @@ static int luaEnableGroup(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	const bool            enabled = optBool(L, 2, true);
+	const bool    enabled  = optBool(L, 2, true);
+	const QString pluginId = engine ? engine->pluginId() : QString();
 
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-
-	auto setEnabled = [&](auto &list)
+	auto          setEnabled = [&](auto &list)
 	{
 		int changed = 0;
 		for (auto &item : list)
@@ -1930,16 +2209,25 @@ static int luaEnableGroup(lua_State *L)
 		return changed;
 	};
 
-	QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
-	QList<WorldRuntime::Alias>   &aliases  = mutableAliasList(runtime, plugin);
-	QList<WorldRuntime::Timer>   &timers   = mutableTimerList(runtime, plugin);
+	const int changed = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    WorldRuntime::Plugin *plugin = nullptr;
+		    if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+			    return 0;
+		    QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
+		    QList<WorldRuntime::Alias>   &aliases  = mutableAliasList(runtime, plugin);
+		    QList<WorldRuntime::Timer>   &timers   = mutableTimerList(runtime, plugin);
 
-	const int                     changed = setEnabled(triggers) + setEnabled(aliases) + setEnabled(timers);
+		    const int changedCount = setEnabled(triggers) + setEnabled(aliases) + setEnabled(timers);
 
-	commitTriggerListMutation(runtime, plugin);
-	commitAliasListMutation(runtime, plugin);
-	commitTimerListMutation(runtime, plugin);
-
+		    commitTriggerListMutation(runtime, plugin);
+		    commitAliasListMutation(runtime, plugin);
+		    commitTimerListMutation(runtime, plugin);
+		    return changedCount;
+	    },
+	    0);
 	lua_pushnumber(L, changed);
 	return 1;
 }
@@ -1947,7 +2235,7 @@ static int luaEnableGroup(lua_State *L)
 static int luaEnableMapping(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const bool enabled = optBool(L, 1, true);
@@ -1958,7 +2246,7 @@ static int luaEnableMapping(lua_State *L)
 static int luaErrorDesc(lua_State *L)
 {
 	const auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	const WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	const WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
@@ -1973,7 +2261,7 @@ static int luaErrorDesc(lua_State *L)
 static int luaEvaluateSpeedwalk(lua_State *L)
 {
 	const auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	const WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	const WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
@@ -1988,21 +2276,23 @@ static int luaEvaluateSpeedwalk(lua_State *L)
 static int luaExecute(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString input = QString::fromUtf8(luaL_checkstring(L, 1));
-	lua_pushnumber(L, runtime->executeCommand(input));
+	const QString input  = QString::fromUtf8(luaL_checkstring(L, 1));
+	const int     result = runOnRuntimeThreadAllowNestedEvents(
+        runtime, [&]() -> int { return runtime->executeCommand(input); }, eWorldClosed);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaExportXML(lua_State *L)
 {
-	const auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	const WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
@@ -2088,138 +2378,138 @@ static int luaExportXML(lua_State *L)
 		}
 	};
 
-	QString     xml;
-	QTextStream out(&xml);
-	out.setEncoding(QStringConverter::Utf8);
-	const auto nl = QStringLiteral("\r\n");
+	const QString xml = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> QString
+	    {
+		    QString     xmlOut;
+		    QTextStream out(&xmlOut);
+		    out.setEncoding(QStringConverter::Utf8);
+		    const auto nl = QStringLiteral("\r\n");
 
-	switch (type)
-	{
-	case 0: // trigger
-	{
-		for (const auto &tr : runtime->triggers())
-		{
-			if (const QString name = tr.attributes.value(QStringLiteral("name")).trimmed().toLower();
-			    name != targetName)
-				continue;
-			out << "<triggers>" << nl;
-			out << nl << "  <trigger ";
-			writeAttributes(out, tr.attributes);
-			out << ">" << nl;
-			writeChildren(out, tr.children, nl);
-			out << nl << "  </trigger>" << nl;
-			out << "</triggers>" << nl;
-			lua_pushstring(L, xml.toUtf8().constData());
-			return 1;
-		}
-		break;
-	}
-	case 1: // alias
-	{
-		for (const auto &al : runtime->aliases())
-		{
-			if (const QString name = al.attributes.value(QStringLiteral("name")).trimmed().toLower();
-			    name != targetName)
-				continue;
-			out << "<aliases>" << nl;
-			out << nl << "  <alias ";
-			writeAttributes(out, al.attributes);
-			out << ">" << nl;
-			writeChildren(out, al.children, nl);
-			out << nl << "  </alias>" << nl;
-			out << "</aliases>" << nl;
-			lua_pushstring(L, xml.toUtf8().constData());
-			return 1;
-		}
-		break;
-	}
-	case 2: // timer
-	{
-		for (const auto &tm : runtime->timers())
-		{
-			if (const QString name = tm.attributes.value(QStringLiteral("name")).trimmed().toLower();
-			    name != targetName)
-				continue;
-			out << "<timers>" << nl;
-			out << nl << "  <timer ";
-			writeAttributes(out, tm.attributes);
-			out << ">" << nl;
-			writeChildren(out, tm.children, nl);
-			out << nl << "  </timer>" << nl;
-			out << "</timers>" << nl;
-			lua_pushstring(L, xml.toUtf8().constData());
-			return 1;
-		}
-		break;
-	}
-	case 3: // macro
-	{
-		for (const auto &[attributes, children] : runtime->macros())
-		{
-			if (const QString name = attributes.value(QStringLiteral("name")).trimmed();
-			    name.trimmed().toLower() == targetName)
-			{
-				QString typeText = attributes.value(QStringLiteral("type")).trimmed();
-				if (typeText.isEmpty())
-					typeText = QStringLiteral("replace");
-				if (typeText != QStringLiteral("replace") && typeText != QStringLiteral("send_now") &&
-				    typeText != QStringLiteral("insert"))
-					typeText = QStringLiteral("unknown");
-				const QString send = children.value(QStringLiteral("send"));
-				out << "<macros>" << nl;
-				out << nl << "  <macro ";
-				out << "name=\"" << fixXmlString(name) << "\" ";
-				out << "type=\"" << fixXmlString(typeText) << "\" ";
-				out << ">" << nl;
-				out << "  <send>" << fixXmlMultiline(send) << "</send>";
-				out << nl << "  </macro>" << nl;
-				out << "</macros>" << nl;
-				lua_pushstring(L, xml.toUtf8().constData());
-				return 1;
-			}
-		}
-		break;
-	}
-	case 4: // variable
-	{
-		for (const auto &[attributes, content] : runtime->variables())
-		{
-			if (const QString name = attributes.value(QStringLiteral("name")).trimmed().toLower();
-			    name != targetName)
-				continue;
-			out << "<variables>" << nl;
-			out << "  <variable name=\"" << fixXmlString(attributes.value(QStringLiteral("name"))) << "\">"
-			    << fixXmlMultiline(content) << "</variable>" << nl;
-			out << "</variables>" << nl;
-			lua_pushstring(L, xml.toUtf8().constData());
-			return 1;
-		}
-		break;
-	}
-	case 5: // keypad
-	{
-		for (const auto &[attributes, content] : runtime->keypadEntries())
-		{
-			if (const QString name = attributes.value(QStringLiteral("name")).trimmed().toLower();
-			    name != targetName)
-				continue;
-			out << "<keypad>" << nl;
-			out << nl << "  <key ";
-			out << "name=\"" << fixXmlString(attributes.value(QStringLiteral("name"))) << "\" ";
-			out << ">" << nl;
-			out << "  <send>" << fixXmlMultiline(content) << "</send>";
-			out << nl << "  </key>" << nl;
-			out << "</keypad>" << nl;
-			lua_pushstring(L, xml.toUtf8().constData());
-			return 1;
-		}
-		break;
-	}
-	default:
-		break;
-	}
-
-	lua_pushstring(L, "");
+		    switch (type)
+		    {
+		    case 0: // trigger
+		    {
+			    for (const auto &tr : runtime->triggers())
+			    {
+				    if (const QString name = tr.attributes.value(QStringLiteral("name")).trimmed().toLower();
+				        name != targetName)
+					    continue;
+				    out << "<triggers>" << nl;
+				    out << nl << "  <trigger ";
+				    writeAttributes(out, tr.attributes);
+				    out << ">" << nl;
+				    writeChildren(out, tr.children, nl);
+				    out << nl << "  </trigger>" << nl;
+				    out << "</triggers>" << nl;
+				    return xmlOut;
+			    }
+			    break;
+		    }
+		    case 1: // alias
+		    {
+			    for (const auto &al : runtime->aliases())
+			    {
+				    if (const QString name = al.attributes.value(QStringLiteral("name")).trimmed().toLower();
+				        name != targetName)
+					    continue;
+				    out << "<aliases>" << nl;
+				    out << nl << "  <alias ";
+				    writeAttributes(out, al.attributes);
+				    out << ">" << nl;
+				    writeChildren(out, al.children, nl);
+				    out << nl << "  </alias>" << nl;
+				    out << "</aliases>" << nl;
+				    return xmlOut;
+			    }
+			    break;
+		    }
+		    case 2: // timer
+		    {
+			    for (const auto &tm : runtime->timers())
+			    {
+				    if (const QString name = tm.attributes.value(QStringLiteral("name")).trimmed().toLower();
+				        name != targetName)
+					    continue;
+				    out << "<timers>" << nl;
+				    out << nl << "  <timer ";
+				    writeAttributes(out, tm.attributes);
+				    out << ">" << nl;
+				    writeChildren(out, tm.children, nl);
+				    out << nl << "  </timer>" << nl;
+				    out << "</timers>" << nl;
+				    return xmlOut;
+			    }
+			    break;
+		    }
+		    case 3: // macro
+		    {
+			    for (const auto &[attributes, children] : runtime->macros())
+			    {
+				    if (const QString name = attributes.value(QStringLiteral("name")).trimmed();
+				        name.trimmed().toLower() == targetName)
+				    {
+					    QString typeText = attributes.value(QStringLiteral("type")).trimmed();
+					    if (typeText.isEmpty())
+						    typeText = QStringLiteral("replace");
+					    if (typeText != QStringLiteral("replace") && typeText != QStringLiteral("send_now") &&
+					        typeText != QStringLiteral("insert"))
+						    typeText = QStringLiteral("unknown");
+					    const QString send = children.value(QStringLiteral("send"));
+					    out << "<macros>" << nl;
+					    out << nl << "  <macro ";
+					    out << "name=\"" << fixXmlString(name) << "\" ";
+					    out << "type=\"" << fixXmlString(typeText) << "\" ";
+					    out << ">" << nl;
+					    out << "  <send>" << fixXmlMultiline(send) << "</send>";
+					    out << nl << "  </macro>" << nl;
+					    out << "</macros>" << nl;
+					    return xmlOut;
+				    }
+			    }
+			    break;
+		    }
+		    case 4: // variable
+		    {
+			    for (const auto &[attributes, content] : runtime->variables())
+			    {
+				    if (const QString name = attributes.value(QStringLiteral("name")).trimmed().toLower();
+				        name != targetName)
+					    continue;
+				    out << "<variables>" << nl;
+				    out << "  <variable name=\"" << fixXmlString(attributes.value(QStringLiteral("name")))
+				        << "\">" << fixXmlMultiline(content) << "</variable>" << nl;
+				    out << "</variables>" << nl;
+				    return xmlOut;
+			    }
+			    break;
+		    }
+		    case 5: // keypad
+		    {
+			    for (const auto &[attributes, content] : runtime->keypadEntries())
+			    {
+				    if (const QString name = attributes.value(QStringLiteral("name")).trimmed().toLower();
+				        name != targetName)
+					    continue;
+				    out << "<keypad>" << nl;
+				    out << nl << "  <key ";
+				    out << "name=\"" << fixXmlString(attributes.value(QStringLiteral("name"))) << "\" ";
+				    out << ">" << nl;
+				    out << "  <send>" << fixXmlMultiline(content) << "</send>";
+				    out << nl << "  </key>" << nl;
+				    out << "</keypad>" << nl;
+				    return xmlOut;
+			    }
+			    break;
+		    }
+		    default:
+			    break;
+		    }
+		    return {};
+	    },
+	    QString());
+	lua_pushstring(L, xml.toUtf8().constData());
 	return 1;
 }
 
@@ -2236,7 +2526,7 @@ static QString fixupHtmlString(const QString &source)
 static int luaFilterPixel(lua_State *L)
 {
 	const auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	const WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	const WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, -1);
@@ -2269,15 +2559,20 @@ static int luaFlashIcon(lua_State *L)
 {
 	const int stackTop = lua_gettop(L);
 	Q_UNUSED(stackTop);
-	if (MainWindow *mw = resolveMainWindow())
-		QApplication::alert(mw, 0);
+	runOnMainWindowThread(
+	    [](MainWindow *mw) -> bool
+	    {
+		    QApplication::alert(mw, 0);
+		    return true;
+	    },
+	    false);
 	return 0;
 }
 
 static int luaFlushLog(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -2290,7 +2585,7 @@ static int luaFlushLog(lua_State *L)
 static int luaGenerateName(lua_State *L)
 {
 	const auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	const WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	const WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -2308,7 +2603,13 @@ static int luaGenerateName(lua_State *L)
 
 static int luaGetChatInfo(lua_State *L)
 {
-	const WorldRuntime *runtime = runtimeFromLua(L);
+	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	if (!engine)
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	const WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -2323,7 +2624,13 @@ static int luaGetChatInfo(lua_State *L)
 
 static int luaGetChatList(lua_State *L)
 {
-	const WorldRuntime *runtime = runtimeFromLua(L);
+	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	if (!engine)
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	const WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -2347,7 +2654,13 @@ static int luaGetChatList(lua_State *L)
 
 static int luaGetChatOption(lua_State *L)
 {
-	const WorldRuntime *runtime = runtimeFromLua(L);
+	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	if (!engine)
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	const WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -2362,7 +2675,14 @@ static int luaGetChatOption(lua_State *L)
 
 static int luaGetClipboard(lua_State *L)
 {
-	const QString text = QGuiApplication::clipboard()->text();
+	const QString text = runOnMainWindowThread(
+	    [](MainWindow *) -> QString
+	    {
+		    if (QClipboard *clipboard = QGuiApplication::clipboard())
+			    return clipboard->text();
+		    return {};
+	    },
+	    {});
 	lua_pushstring(L, text.toLocal8Bit().constData());
 	return 1;
 }
@@ -2387,27 +2707,27 @@ static void pushWindowPositionTable(lua_State *L, const QRect &rect)
 static int luaGetCommand(lua_State *L)
 {
 	const auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	const WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
-	if (!runtime || !runtime->view())
+	const WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	if (!runtime)
 	{
 		lua_pushstring(L, "");
 		return 1;
 	}
-	lua_pushstring(L, runtime->view()->inputText().toLocal8Bit().constData());
+	lua_pushstring(L, runtime->commandInputText().toLocal8Bit().constData());
 	return 1;
 }
 
 static int luaGetCommandList(lua_State *L)
 {
 	const auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	const WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
-	if (!runtime || !runtime->view())
+	const WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
 	const int         count       = static_cast<int>(luaL_checkinteger(L, 1));
-	const QStringList history     = runtime->view()->commandHistoryList();
+	const QStringList history     = runtime->commandHistorySnapshot();
 	const int         historySize = sizeToInt(history.size());
 	const int         takeCount   = count <= 0 ? historySize : qMin(count, historySize);
 	if (takeCount <= 0)
@@ -2429,7 +2749,7 @@ static int luaGetCommandList(lua_State *L)
 static int luaGetCurrentValue(lua_State *L)
 {
 	const auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	const WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	const WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -2446,7 +2766,7 @@ static int luaGetCurrentValue(lua_State *L)
 			return 1;
 		}
 		const QString canonical       = QString::fromLatin1(numeric->name);
-		const QString value           = runtime->worldAttributes().value(canonical);
+		const QString value           = runtime->worldAttributeValue(canonical);
 		const QString trimmed         = value.trimmed().toLower();
 		const bool    isBooleanOption = numeric->minValue == 0 && numeric->maxValue == 0;
 		if (numeric->flags & OPT_RGB_COLOUR)
@@ -2496,8 +2816,8 @@ static int luaGetCurrentValue(lua_State *L)
 	constexpr int kOptMultiline = 0x000001;
 	const QString canonical     = QString::fromLatin1(alpha->name);
 	const bool    isMultiline   = (alpha->flags & kOptMultiline) != 0;
-	const QString value         = isMultiline ? runtime->worldMultilineAttributes().value(canonical)
-	                                          : runtime->worldAttributes().value(canonical);
+	const QString value         = isMultiline ? runtime->worldMultilineAttributeValue(canonical)
+	                                          : runtime->worldAttributeValue(canonical);
 	lua_pushstring(L, value.toLocal8Bit().constData());
 	return 1;
 }
@@ -2632,14 +2952,15 @@ static int luaGetDeviceCaps(lua_State *L)
 static int luaGetEntity(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
 		return 1;
 	}
-	const QString name  = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString value = runtime->getEntityValue(name);
+	const QString name = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString value =
+	    runOnRuntimeThread(runtime, [&]() -> QString { return runtime->getEntityValue(name); }, QString());
 	lua_pushstring(L, value.toLocal8Bit().constData());
 	return 1;
 }
@@ -2689,7 +3010,8 @@ static int luaGetXMLEntity(lua_State *L)
 
 static int luaGetFrame(lua_State *L)
 {
-	MainWindow *mw = resolveMainWindow();
+	MainWindow *mw = runOnMainWindowThread([](MainWindow *frame) -> MainWindow * { return frame; },
+	                                       static_cast<MainWindow *>(nullptr));
 	lua_pushlightuserdata(L, mw);
 	return 1;
 }
@@ -2805,7 +3127,7 @@ static int luaGetHostName(lua_State *L)
 static int luaGetInternalCommandsList(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -2830,7 +3152,7 @@ static int luaGetInternalCommandsList(lua_State *L)
 static int luaGetLineInfo(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -2839,7 +3161,8 @@ static int luaGetLineInfo(lua_State *L)
 	const int               lineNumber = static_cast<int>(luaL_checkinteger(L, 1));
 	const int               infoType   = static_cast<int>(luaL_optinteger(L, 2, 0));
 	WorldRuntime::LineEntry entry;
-	const bool              hasLine = runtime->luaContextLineEntry(lineNumber, entry);
+	const bool              hasLine = runOnRuntimeThread(
+        runtime, [&]() -> bool { return runtime->luaContextLineEntry(lineNumber, entry); }, false);
 	if (infoType == 0)
 	{
 		if (!hasLine)
@@ -2971,7 +3294,7 @@ static int luaGetLineInfo(lua_State *L)
 static int luaGetLoadedValue(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -2988,7 +3311,7 @@ static int luaGetLoadedValue(lua_State *L)
 			return 1;
 		}
 		const QString canonical = QString::fromLatin1(numeric->name);
-		const QString value     = runtime->worldAttributes().value(canonical);
+		const QString value     = runtime->worldAttributeValue(canonical);
 		const QString trimmed   = value.trimmed();
 		if (bool boolValue = false; parseBooleanKeywordValue(trimmed, boolValue))
 		{
@@ -3015,68 +3338,90 @@ static int luaGetLoadedValue(lua_State *L)
 	constexpr int kOptMultiline = 0x000001;
 	const QString canonical     = QString::fromLatin1(alpha->name);
 	const bool    isMultiline   = (alpha->flags & kOptMultiline) != 0;
-	const QString value         = isMultiline ? runtime->worldMultilineAttributes().value(canonical)
-	                                          : runtime->worldAttributes().value(canonical);
+	const QString value         = isMultiline ? runtime->worldMultilineAttributeValue(canonical)
+	                                          : runtime->worldAttributeValue(canonical);
 	lua_pushstring(L, value.toLocal8Bit().constData());
 	return 1;
 }
 
 static int luaGetMainWindowPosition(lua_State *L)
 {
-	MainWindow *mw = resolveMainWindow();
-	if (!mw)
-		return 0;
-
 	const bool useGetWindowRect = optBool(L, 1, false);
-	QRect      rect             = useGetWindowRect ? mw->frameGeometry() : mw->normalGeometry();
-	if (!rect.isValid())
-		rect = mw->geometry();
+	QRect      rect;
+	const bool resolved = runOnMainWindowThread(
+	    [&](const MainWindow *mw) -> bool
+	    {
+		    rect = useGetWindowRect ? mw->frameGeometry() : mw->normalGeometry();
+		    if (!rect.isValid())
+			    rect = mw->geometry();
+		    return true;
+	    },
+	    false);
+	if (!resolved)
+		return 0;
 	pushWindowPositionTable(L, rect);
 	return 1;
 }
 
 static int luaGetWorldWindowPosition(lua_State *L)
 {
-	MainWindowHost *host = resolveMainWindowHost(nullptr);
-	if (!host)
-		return 0;
-
-	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 		return 0;
 
-	const int         which            = static_cast<int>(luaL_optinteger(L, 1, 1));
-	const bool        screen           = optBool(L, 2, false);
-	const bool        useGetWindowRect = optBool(L, 3, false);
+	const int  which            = static_cast<int>(luaL_optinteger(L, 1, 1));
+	const bool screen           = optBool(L, 2, false);
+	const bool useGetWindowRect = optBool(L, 3, false);
 
-	WorldChildWindow *window = findWorldWindowByOrdinal(*host, *runtime, which);
-	if (!window)
+	QRect      rect;
+	const bool resolved = runOnMainWindowThread(
+	    [&](MainWindow *frame) -> bool
+	    {
+		    MainWindowHost *host = resolveMainWindowHost(frame);
+		    if (!host)
+			    host = frame;
+		    WorldChildWindow *window = findWorldWindowByOrdinal(*host, *runtime, which);
+		    if (!window)
+			    return false;
+
+		    rect = useGetWindowRect ? window->frameGeometry() : window->normalGeometry();
+		    if (!rect.isValid())
+			    rect = window->geometry();
+		    if (screen)
+		    {
+			    const QPoint topLeft = window->mapToGlobal(rect.topLeft());
+			    rect.moveTopLeft(topLeft);
+		    }
+		    return true;
+	    },
+	    false);
+	if (!resolved)
 		return 0;
-
-	QRect rect = useGetWindowRect ? window->frameGeometry() : window->normalGeometry();
-	if (!rect.isValid())
-		rect = window->geometry();
-	if (screen)
-	{
-		const QPoint topLeft = window->mapToGlobal(rect.topLeft());
-		rect.moveTopLeft(topLeft);
-	}
 	pushWindowPositionTable(L, rect);
 	return 1;
 }
 
 static int luaGetNotepadWindowPosition(lua_State *L)
 {
-	const QString    title = QString::fromUtf8(luaL_checkstring(L, 1));
-	TextChildWindow *text =
-	    findNotepadWindow(title, runtimeFromLuaUpvalue(L), runtimeWorldIdFromLuaUpvalue(L));
-	if (!text)
+	const QString title   = QString::fromUtf8(luaL_checkstring(L, 1));
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
+	const QString worldId =
+	    runtime ? runtime->worldAttributeValue(QStringLiteral("id")).trimmed() : QString();
+	QRect      rect;
+	const bool resolved = runOnMainWindowThread(
+	    [&](MainWindow *) -> bool
+	    {
+		    TextChildWindow *text = findNotepadWindow(title, runtime, worldId);
+		    if (!text)
+			    return false;
+		    rect = text->normalGeometry();
+		    if (!rect.isValid())
+			    rect = text->geometry();
+		    return true;
+	    },
+	    false);
+	if (!resolved)
 		return 0;
-
-	QRect rect = text->normalGeometry();
-	if (!rect.isValid())
-		rect = text->geometry();
 	pushWindowPositionTable(L, rect);
 	return 1;
 }
@@ -3084,7 +3429,7 @@ static int luaGetNotepadWindowPosition(lua_State *L)
 static int luaGetMapColour(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -3098,7 +3443,7 @@ static int luaGetMapColour(lua_State *L)
 static int luaGetMappingItem(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -3118,7 +3463,7 @@ static int luaGetMappingItem(lua_State *L)
 static int luaGetMappingString(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
@@ -3131,15 +3476,19 @@ static int luaGetMappingString(lua_State *L)
 
 static int luaGetNotepadLength(lua_State *L)
 {
-	const QString    title = QString::fromUtf8(luaL_checkstring(L, 1));
-	TextChildWindow *text =
-	    findNotepadWindow(title, runtimeFromLuaUpvalue(L), runtimeWorldIdFromLuaUpvalue(L));
-	if (!text || !text->editor())
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	const auto length = text->editor()->toPlainText().length();
+	const QString title   = QString::fromUtf8(luaL_checkstring(L, 1));
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
+	const QString worldId =
+	    runtime ? runtime->worldAttributeValue(QStringLiteral("id")).trimmed() : QString();
+	const int length = runOnMainWindowThread(
+	    [&](MainWindow *) -> int
+	    {
+		    TextChildWindow *text = findNotepadWindow(title, runtime, worldId);
+		    if (!text || !text->editor())
+			    return 0;
+		    return sizeToInt(text->editor()->toPlainText().length());
+	    },
+	    0);
 	lua_pushnumber(L, static_cast<lua_Number>(length));
 	return 1;
 }
@@ -3147,24 +3496,52 @@ static int luaGetNotepadLength(lua_State *L)
 static int luaGetNotepadList(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const bool    all        = QMudLuaSupport::optBoolean(L, 1, false);
-	const auto    ownerToken = reinterpret_cast<quintptr>(runtime);
-	const QString worldId    = runtime->worldAttributes().value(QStringLiteral("id")).trimmed();
+	const bool        all        = QMudLuaSupport::optBoolean(L, 1, false);
+	const auto        ownerToken = reinterpret_cast<quintptr>(runtime);
+	const QString     worldId    = runtime->worldAttributeValue(QStringLiteral("id")).trimmed();
 
-	MainWindow   *frame = resolveMainWindow();
-	if (!frame)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	auto *mdi = frame->findChild<QMdiArea *>();
-	if (!mdi)
+	const QStringList titles = runOnMainWindowThread(
+	    [&](const MainWindow *frame) -> QStringList
+	    {
+		    auto *mdi = frame->findChild<QMdiArea *>();
+		    if (!mdi)
+			    return {};
+
+		    QStringList result;
+		    for (const QList<QMdiSubWindow *> windows = mdi->subWindowList(QMdiArea::CreationOrder);
+		         QMdiSubWindow *sub : windows)
+		    {
+			    auto *text = qobject_cast<TextChildWindow *>(sub);
+			    if (!text)
+				    continue;
+			    if (!all)
+			    {
+				    if (const auto relatedToken = text->property("worldRuntimeToken").toULongLong();
+				        relatedToken == ownerToken)
+				    {
+					    // Matched this runtime instance.
+				    }
+				    else
+				    {
+					    if (relatedToken != 0)
+						    continue;
+					    if (const QString related = text->property("worldId").toString();
+					        related.isEmpty() || related.compare(worldId, Qt::CaseInsensitive) != 0)
+						    continue;
+				    }
+			    }
+			    result.push_back(text->windowTitle());
+		    }
+		    return result;
+	    },
+	    {});
+	if (titles.isEmpty())
 	{
 		lua_pushnil(L);
 		return 1;
@@ -3172,51 +3549,29 @@ static int luaGetNotepadList(lua_State *L)
 
 	lua_newtable(L);
 	int index = 1;
-	for (const QList<QMdiSubWindow *> windows = mdi->subWindowList(QMdiArea::CreationOrder);
-	     QMdiSubWindow *sub : windows)
+	for (const QString &title : titles)
 	{
-		auto *text = qobject_cast<TextChildWindow *>(sub);
-		if (!text)
-			continue;
-		if (!all)
-		{
-			if (const auto relatedToken = text->property("worldRuntimeToken").toULongLong();
-			    relatedToken == ownerToken)
-			{
-				// Matched this runtime instance.
-			}
-			else
-			{
-				if (relatedToken != 0)
-					continue;
-				if (const QString related = text->property("worldId").toString();
-				    related.isEmpty() || related.compare(worldId, Qt::CaseInsensitive) != 0)
-					continue;
-			}
-		}
-		lua_pushstring(L, text->windowTitle().toLocal8Bit().constData());
+		lua_pushstring(L, title.toLocal8Bit().constData());
 		lua_rawseti(L, -2, index++);
-	}
-	if (index == 1)
-	{
-		lua_pop(L, 1);
-		lua_pushnil(L);
-		return 1;
 	}
 	return 1;
 }
 
 static int luaGetNotepadText(lua_State *L)
 {
-	const QString    title = QString::fromUtf8(luaL_checkstring(L, 1));
-	TextChildWindow *text =
-	    findNotepadWindow(title, runtimeFromLuaUpvalue(L), runtimeWorldIdFromLuaUpvalue(L));
-	if (!text || !text->editor())
-	{
-		lua_pushstring(L, "");
-		return 1;
-	}
-	const QString contents = text->editor()->toPlainText();
+	const QString title   = QString::fromUtf8(luaL_checkstring(L, 1));
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
+	const QString worldId =
+	    runtime ? runtime->worldAttributeValue(QStringLiteral("id")).trimmed() : QString();
+	const QString contents = runOnMainWindowThread(
+	    [&](MainWindow *) -> QString
+	    {
+		    TextChildWindow *text = findNotepadWindow(title, runtime, worldId);
+		    if (!text || !text->editor())
+			    return {};
+		    return text->editor()->toPlainText();
+	    },
+	    {});
 	lua_pushstring(L, contents.toLocal8Bit().constData());
 	return 1;
 }
@@ -3224,13 +3579,13 @@ static int luaGetNotepadText(lua_State *L)
 static int luaGetNotes(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
 		return 1;
 	}
-	const QString notes = runtime->worldMultilineAttributes().value(QStringLiteral("notes"));
+	const QString notes = runtime->worldMultilineAttributeValue(QStringLiteral("notes"));
 	lua_pushstring(L, notes.toLocal8Bit().constData());
 	return 1;
 }
@@ -3238,7 +3593,7 @@ static int luaGetNotes(lua_State *L)
 static int luaGetNoteStyle(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -3251,7 +3606,7 @@ static int luaGetNoteStyle(lua_State *L)
 static int luaGetScriptTime(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0.0);
@@ -3264,59 +3619,59 @@ static int luaGetScriptTime(lua_State *L)
 static int luaGetSelectionEndColumn(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
-	if (!runtime || !runtime->view())
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	lua_pushnumber(L, runtime->view()->outputSelectionEndColumn());
+	lua_pushnumber(L, runtime->outputSelectionEndColumn());
 	return 1;
 }
 
 static int luaGetSelectionEndLine(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
-	if (!runtime || !runtime->view())
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	lua_pushnumber(L, runtime->view()->outputSelectionEndLine());
+	lua_pushnumber(L, runtime->outputSelectionEndLine());
 	return 1;
 }
 
 static int luaGetSelectionStartColumn(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
-	if (!runtime || !runtime->view())
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	lua_pushnumber(L, runtime->view()->outputSelectionStartColumn());
+	lua_pushnumber(L, runtime->outputSelectionStartColumn());
 	return 1;
 }
 
 static int luaGetSelectionStartLine(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
-	if (!runtime || !runtime->view())
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	lua_pushnumber(L, runtime->view()->outputSelectionStartLine());
+	lua_pushnumber(L, runtime->outputSelectionStartLine());
 	return 1;
 }
 
 static int luaGetSoundStatus(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, -3);
@@ -3407,7 +3762,7 @@ static int pushStyleInfoTable(lua_State *L, const WorldRuntime::LineEntry &entry
 static int luaGetStyleInfo(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -3417,7 +3772,8 @@ static int luaGetStyleInfo(lua_State *L)
 	const int               styleNumber = static_cast<int>(luaL_optinteger(L, 2, 0));
 	const int               infoType    = static_cast<int>(luaL_optinteger(L, 3, 0));
 	WorldRuntime::LineEntry entry;
-	const bool              hasLine = runtime->luaContextLineEntry(lineNumber, entry);
+	const bool              hasLine = runOnRuntimeThread(
+        runtime, [&]() -> bool { return runtime->luaContextLineEntry(lineNumber, entry); }, false);
 	if (styleNumber == 0 || infoType == 0)
 	{
 		if (!hasLine)
@@ -3608,7 +3964,7 @@ static int luaGetStyleInfo(lua_State *L)
 static int luaGetSysColor(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -3748,7 +4104,7 @@ static int luaGetUdpPort(lua_State *L)
 static int luaUdpListen(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -3763,7 +4119,8 @@ static int luaUdpListen(lua_State *L)
 	const QString ip     = QString::fromUtf8(luaL_checkstring(L, 1));
 	const int     port   = static_cast<int>(luaL_checkinteger(L, 2));
 	const QString script = QString::fromUtf8(luaL_checkstring(L, 3));
-	const int     result = runtime->udpListen(pluginId, ip, port, script);
+	const int     result = runOnRuntimeThread(
+        runtime, [&]() -> int { return runtime->udpListen(pluginId, ip, port, script); }, eWorldClosed);
 	lua_pushnumber(L, result);
 	return 1;
 }
@@ -3771,13 +4128,14 @@ static int luaUdpListen(lua_State *L)
 static int luaUdpPortList(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QList<int> ports = runtime->udpPortList();
+	const QList<int> ports =
+	    runOnRuntimeThread(runtime, [&]() -> QList<int> { return runtime->udpPortList(); }, QList<int>());
 	if (ports.isEmpty())
 	{
 		lua_pushnil(L);
@@ -3796,7 +4154,7 @@ static int luaUdpPortList(lua_State *L)
 static int luaUdpSend(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -3815,7 +4173,7 @@ static int luaUdpSend(lua_State *L)
 static int luaGetUniqueNumber(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -3843,15 +4201,21 @@ static int luaGetWorldById(lua_State *L)
 
 static int pushWorldAttributeList(lua_State *L, const QString &attributeName)
 {
-	MainWindowHost *host = resolveMainWindowHost(nullptr);
-	if (!host)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
+	const QStringList values = runOnMainWindowThread(
+	    [&](const MainWindow *frame) -> QStringList
+	    {
+		    QStringList collected;
+		    for (const WorldWindowDescriptor &entry : frame->worldWindowDescriptors())
+		    {
+			    if (!entry.runtime)
+				    continue;
+			    collected.push_back(entry.runtime->worldAttributeValue(attributeName));
+		    }
+		    return collected;
+	    },
+	    {});
 
-	const QVector<WorldWindowDescriptor> worlds = host->worldWindowDescriptors();
-	if (worlds.isEmpty())
+	if (values.isEmpty())
 	{
 		lua_pushnil(L);
 		return 1;
@@ -3859,20 +4223,10 @@ static int pushWorldAttributeList(lua_State *L, const QString &attributeName)
 
 	lua_newtable(L);
 	int index = 1;
-	for (const WorldWindowDescriptor &entry : worlds)
+	for (const QString &value : values)
 	{
-		if (!entry.runtime)
-			continue;
-		const QMap<QString, QString> &attributes = entry.runtime->worldAttributes();
-		const auto                    attrIt     = attributes.constFind(attributeName);
-		const QString                 value      = attrIt != attributes.cend() ? attrIt.value() : QString{};
 		lua_pushstring(L, value.toLocal8Bit().constData());
 		lua_rawseti(L, -2, index++);
-	}
-	if (index == 1)
-	{
-		lua_pop(L, 1);
-		lua_pushnil(L);
 	}
 	return 1;
 }
@@ -3881,9 +4235,7 @@ static int pushWorldProxyResult(lua_State *L, LuaCallbackEngine *engine, WorldRu
 {
 	if (!engine || !runtime)
 		return 0;
-	const QMap<QString, QString> &attributes = runtime->worldAttributes();
-	const auto                    idIt       = attributes.constFind(QStringLiteral("id"));
-	const QString                 worldId    = idIt != attributes.cend() ? idIt.value() : QString{};
+	const QString worldId = runtime->worldAttributeValue(QStringLiteral("id"));
 	pushWorldProxy(L, engine, runtime, worldId);
 	return 1;
 }
@@ -4004,20 +4356,25 @@ static bool queryHelpRow(const QSqlDatabase &db, const QString &sql, const QStri
 
 static bool showHelpDialog(const QString &title, const QString &html)
 {
-	QDialog dialog(resolveMainWindow());
-	dialog.setWindowTitle(title);
-	dialog.setWindowFlags(dialog.windowFlags() | Qt::Tool);
-	QVBoxLayout  layout(&dialog);
-	QTextBrowser browser;
-	browser.setOpenExternalLinks(true);
-	browser.setHtml(html);
-	layout.addWidget(&browser);
-	QDialogButtonBox buttons(QDialogButtonBox::Close);
-	QObject::connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-	QObject::connect(&buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-	layout.addWidget(&buttons);
-	dialog.exec();
-	return true;
+	return runOnMainWindowThreadAllowNestedEvents(
+	    [&](MainWindow *frame) -> bool
+	    {
+		    QDialog dialog(frame);
+		    dialog.setWindowTitle(title);
+		    dialog.setWindowFlags(dialog.windowFlags() | Qt::Tool);
+		    QVBoxLayout  layout(&dialog);
+		    QTextBrowser browser;
+		    browser.setOpenExternalLinks(true);
+		    browser.setHtml(html);
+		    layout.addWidget(&browser);
+		    QDialogButtonBox buttons(QDialogButtonBox::Close);
+		    QObject::connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+		    QObject::connect(&buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+		    layout.addWidget(&buttons);
+		    dialog.exec();
+		    return true;
+	    },
+	    false);
 }
 
 static bool showHelpTopic(const QString &prefix, const QString &topic)
@@ -4025,8 +4382,14 @@ static bool showHelpTopic(const QString &prefix, const QString &topic)
 	const QString dbPath = AppController::resolveHelpDatabasePath();
 	if (dbPath.isEmpty())
 	{
-		QMessageBox::information(resolveMainWindow(), QStringLiteral("Help"),
-		                         QStringLiteral("Help database (help.db) not found."));
+		runOnMainWindowThreadAllowNestedEvents(
+		    [](MainWindow *frame) -> bool
+		    {
+			    QMessageBox::information(frame, QStringLiteral("Help"),
+			                             QStringLiteral("Help database (help.db) not found."));
+			    return true;
+		    },
+		    false);
 		return false;
 	}
 	static int    connectionCounter = 0;
@@ -4106,8 +4469,14 @@ static bool showHelpTopic(const QString &prefix, const QString &topic)
 	QSqlDatabase::removeDatabase(connectionName);
 	if (!opened)
 	{
-		QMessageBox::warning(resolveMainWindow(), QStringLiteral("Help"),
-		                     QStringLiteral("Unable to open help database."));
+		runOnMainWindowThreadAllowNestedEvents(
+		    [](MainWindow *frame) -> bool
+		    {
+			    QMessageBox::warning(frame, QStringLiteral("Help"),
+			                         QStringLiteral("Unable to open help database."));
+			    return true;
+		    },
+		    false);
 		return false;
 	}
 	if (!handled)
@@ -4118,85 +4487,88 @@ static bool showHelpTopic(const QString &prefix, const QString &topic)
 static QString chooseHelpFromList(const QString &filter, const bool includeLua,
                                   const QSet<QString> &luaFunctions)
 {
-	QDialog dialog(resolveMainWindow());
-	dialog.setWindowTitle(QStringLiteral("Functions"));
-	dialog.setWindowFlags(dialog.windowFlags() | Qt::Tool);
-	QVBoxLayout layout(&dialog);
+	return runOnMainWindowThreadAllowNestedEvents(
+	    [&](MainWindow *frame) -> QString
+	    {
+		    QDialog dialog(frame);
+		    dialog.setWindowTitle(QStringLiteral("Functions"));
+		    dialog.setWindowFlags(dialog.windowFlags() | Qt::Tool);
+		    QVBoxLayout layout(&dialog);
 
-	QLabel      filterLabel(QStringLiteral("Filter"));
-	QLineEdit   filterEdit;
-	filterEdit.setText(filter);
-	layout.addWidget(&filterLabel);
-	layout.addWidget(&filterEdit);
+		    QLabel      filterLabel(QStringLiteral("Filter"));
+		    QLineEdit   filterEdit;
+		    filterEdit.setText(filter);
+		    layout.addWidget(&filterLabel);
+		    layout.addWidget(&filterEdit);
 
-	QListWidget list;
-	layout.addWidget(&list);
+		    QListWidget list;
+		    layout.addWidget(&list);
 
-	QPushButton     *luaButton = nullptr;
-	QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
-	if (includeLua)
-	{
-		luaButton = buttons.addButton(QStringLiteral("Lua functions"), QDialogButtonBox::ActionRole);
-	}
-	layout.addWidget(&buttons);
+		    QPushButton     *luaButton = nullptr;
+		    QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+		    if (includeLua)
+			    luaButton = buttons.addButton(QStringLiteral("Lua functions"), QDialogButtonBox::ActionRole);
+		    layout.addWidget(&buttons);
 
-	QObject::connect(&buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-	QObject::connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-	QObject::connect(&list, &QListWidget::itemDoubleClicked, &dialog, &QDialog::accept);
+		    QObject::connect(&buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+		    QObject::connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+		    QObject::connect(&list, &QListWidget::itemDoubleClicked, &dialog, &QDialog::accept);
 
-	auto populateList = [&]
-	{
-		const QString needle = filterEdit.text().trimmed();
-		list.clear();
-		const auto matches = [&](const QString &value)
-		{ return needle.isEmpty() || value.contains(needle, Qt::CaseInsensitive); };
-		for (int i = 0; kInternalFunctionMetadataTable[i].functionName[0]; ++i)
-		{
-			if (const QString name = QString::fromUtf8(kInternalFunctionMetadataTable[i].functionName);
-			    matches(name))
-				list.addItem(name);
-		}
-		if (includeLua)
-		{
-			for (const QString &entry : luaFunctions)
-			{
-				if (matches(entry))
-					list.addItem(entry);
-			}
-		}
-		list.sortItems();
-		if (list.count() == 1)
-			list.setCurrentRow(0);
-	};
+		    auto populateList = [&]
+		    {
+			    const QString needle = filterEdit.text().trimmed();
+			    list.clear();
+			    const auto matches = [&](const QString &value)
+			    { return needle.isEmpty() || value.contains(needle, Qt::CaseInsensitive); };
+			    for (int i = 0; kInternalFunctionMetadataTable[i].functionName[0]; ++i)
+			    {
+				    if (const QString name =
+				            QString::fromUtf8(kInternalFunctionMetadataTable[i].functionName);
+				        matches(name))
+					    list.addItem(name);
+			    }
+			    if (includeLua)
+			    {
+				    for (const QString &entry : luaFunctions)
+				    {
+					    if (matches(entry))
+						    list.addItem(entry);
+				    }
+			    }
+			    list.sortItems();
+			    if (list.count() == 1)
+				    list.setCurrentRow(0);
+		    };
 
-	QObject::connect(&filterEdit, &QLineEdit::textChanged, &dialog, [&](const QString &) { populateList(); });
-	if (luaButton)
-	{
-		QObject::connect(luaButton, &QPushButton::clicked, &dialog,
-		                 [&] { dialog.done(QDialog::Accepted + 1); });
-	}
+		    QObject::connect(&filterEdit, &QLineEdit::textChanged, &dialog,
+		                     [&](const QString &) { populateList(); });
+		    if (luaButton)
+			    QObject::connect(luaButton, &QPushButton::clicked, &dialog,
+			                     [&] { dialog.done(QDialog::Accepted + 1); });
 
-	populateList();
+		    populateList();
 
-	const int result = dialog.exec();
-	if (result == QDialog::Accepted + 1)
-		return QStringLiteral("DOC_lua");
-	if (result != QDialog::Accepted)
-		return {};
-	QListWidgetItem *item = list.currentItem();
-	return item ? item->text() : QString();
+		    const int result = dialog.exec();
+		    if (result == QDialog::Accepted + 1)
+			    return QStringLiteral("DOC_lua");
+		    if (result != QDialog::Accepted)
+			    return {};
+		    QListWidgetItem *item = list.currentItem();
+		    return item ? item->text() : QString();
+	    },
+	    {});
 }
 
 static int luaHelp(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 
-	QString filter                      = QString::fromUtf8(luaL_optstring(L, 1, ""));
-	filter                              = filter.trimmed().toLower();
-	const QSet<QString>   &luaFunctions = engine->luaFunctionsSet();
+	QString             filter       = QString::fromUtf8(luaL_optstring(L, 1, ""));
+	const QSet<QString> luaFunctions = engine->luaFunctionsSet();
+	filter                           = filter.trimmed().toLower();
 
 	QMap<QString, QString> luaSpecials;
 	luaSpecials.insert(QStringLiteral("lua"), QStringLiteral("lua"));
@@ -4212,73 +4584,82 @@ static int luaHelp(lua_State *L)
 	luaSpecials.insert(QStringLiteral("lua t"), QStringLiteral("lua_tables"));
 	luaSpecials.insert(QStringLiteral("lua u"), QStringLiteral("lua_utils"));
 
-	if (filter == QStringLiteral("lua bc"))
-	{
-		showHelpTopic(QStringLiteral("DOC_"), QStringLiteral("lua_bc"));
-		return 0;
-	}
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (filter == QStringLiteral("lua bc"))
+		    {
+			    showHelpTopic(QStringLiteral("DOC_"), QStringLiteral("lua_bc"));
+			    return 0;
+		    }
 
-	if (const QString key = filter.left(5); luaSpecials.contains(key))
-	{
-		showHelpTopic(QStringLiteral("DOC_"), luaSpecials.value(key));
-		return 0;
-	}
+		    if (const QString key = filter.left(5); luaSpecials.contains(key))
+		    {
+			    showHelpTopic(QStringLiteral("DOC_"), luaSpecials.value(key));
+			    return 0;
+		    }
 
-	if (!filter.isEmpty())
-	{
-		for (const QString &entry : luaFunctions)
-		{
-			if (entry.toLower() == filter)
-			{
-				showHelpTopic(QStringLiteral("LUA_"), entry);
-				return 0;
-			}
-		}
-		for (int i = 0; kInternalFunctionMetadataTable[i].functionName[0]; ++i)
-		{
-			if (const QString name = QString::fromUtf8(kInternalFunctionMetadataTable[i].functionName);
-			    name.toLower() == filter)
-			{
-				showHelpTopic(QStringLiteral("FNC_"), name);
-				return 0;
-			}
-		}
-	}
+		    if (!filter.isEmpty())
+		    {
+			    for (const QString &entry : luaFunctions)
+			    {
+				    if (entry.toLower() == filter)
+				    {
+					    showHelpTopic(QStringLiteral("LUA_"), entry);
+					    return 0;
+				    }
+			    }
+			    for (int i = 0; kInternalFunctionMetadataTable[i].functionName[0]; ++i)
+			    {
+				    if (const QString name =
+				            QString::fromUtf8(kInternalFunctionMetadataTable[i].functionName);
+				        name.toLower() == filter)
+				    {
+					    showHelpTopic(QStringLiteral("FNC_"), name);
+					    return 0;
+				    }
+			    }
+		    }
 
-	bool includeLua = !luaFunctions.isEmpty();
-	if (includeLua)
-	{
-		const QMap<QString, QString> &attrs = runtime->worldAttributes();
-		const bool    scriptsEnabled        = isEnabledValue(attrs.value(QStringLiteral("enable_scripts")));
-		const QString language              = attrs.value(QStringLiteral("script_language"));
-		includeLua                          = scriptsEnabled && (language.isEmpty() ||
-                                        language.compare(QStringLiteral("lua"), Qt::CaseInsensitive) == 0);
-	}
-	const QString selection = chooseHelpFromList(filter, includeLua, luaFunctions);
-	if (selection.isEmpty())
-		return 0;
-	if (selection == QStringLiteral("DOC_lua"))
-	{
-		showHelpTopic(QStringLiteral("DOC_"), QStringLiteral("lua"));
-		return 0;
-	}
-	const QString lower = selection.toLower();
-	for (const QString &entry : luaFunctions)
-	{
-		if (entry.toLower() == lower)
-		{
-			showHelpTopic(QStringLiteral("LUA_"), entry);
-			return 0;
-		}
-	}
-	showHelpTopic(QStringLiteral("FNC_"), selection);
+		    bool includeLua = !luaFunctions.isEmpty();
+		    if (includeLua)
+		    {
+			    const bool scriptsEnabled =
+			        isEnabledValue(runtime->worldAttributeValue(QStringLiteral("enable_scripts")));
+			    const QString language = runtime->worldAttributeValue(QStringLiteral("script_language"));
+			    includeLua =
+			        scriptsEnabled &&
+			        (language.isEmpty() || language.compare(QStringLiteral("lua"), Qt::CaseInsensitive) == 0);
+		    }
+		    const QString selection = chooseHelpFromList(filter, includeLua, luaFunctions);
+		    if (selection.isEmpty())
+			    return 0;
+		    if (selection == QStringLiteral("DOC_lua"))
+		    {
+			    showHelpTopic(QStringLiteral("DOC_"), QStringLiteral("lua"));
+			    return 0;
+		    }
+		    const QString lower = selection.toLower();
+		    for (const QString &entry : luaFunctions)
+		    {
+			    if (entry.toLower() == lower)
+			    {
+				    showHelpTopic(QStringLiteral("LUA_"), entry);
+				    return 0;
+			    }
+		    }
+		    showHelpTopic(QStringLiteral("FNC_"), selection);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaHyperlink(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 
@@ -4303,15 +4684,22 @@ static int luaHyperlink(lua_State *L)
 	span.fore       = WorldView::parseColor(textColour);
 	span.back       = WorldView::parseColor(backColour);
 
-	if (!span.fore.isValid())
-		span.fore =
-		    WorldView::parseColor(runtime->worldAttributes().value(QStringLiteral("hyperlink_colour")));
-	if (!span.back.isValid())
-		span.back = colorFromValue(runtime->noteColourBack());
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (!span.fore.isValid())
+			    span.fore =
+			        WorldView::parseColor(runtime->worldAttributeValue(QStringLiteral("hyperlink_colour")));
+		    if (!span.back.isValid())
+			    span.back = colorFromValue(runtime->noteColourBack());
 
-	QVector<WorldRuntime::StyleSpan> spans;
-	spans.push_back(span);
-	runtime->outputStyledText(outputText, spans, true, false);
+		    QVector<WorldRuntime::StyleSpan> spans;
+		    spans.push_back(span);
+		    runtime->outputStyledText(outputText, spans, true, false);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
@@ -4345,18 +4733,27 @@ static int luaImportXML(lua_State *L)
 static int luaInfo(lua_State *L)
 {
 	const QString message = concatLuaArgs(L, 1);
-	if (MainWindow *frame = resolveMainWindow())
-		frame->infoBarAppend(message);
+	runOnMainWindowThread(
+	    [&](const MainWindow *frame) -> int
+	    {
+		    frame->infoBarAppend(message);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaInfoBackground(lua_State *L)
 {
-	MainWindow *frame = resolveMainWindow();
-	if (!frame)
-		return 0;
-	const QString name = QString::fromUtf8(luaL_checkstring(L, 1));
-	frame->infoBarSetBackground(WorldView::parseColor(name));
+	const QString name  = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QColor  color = WorldView::parseColor(name);
+	runOnMainWindowThread(
+	    [&](const MainWindow *frame) -> int
+	    {
+		    frame->infoBarSetBackground(color);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
@@ -4364,18 +4761,27 @@ static int luaInfoClear(lua_State *L)
 {
 	const int stackTop = lua_gettop(L);
 	Q_UNUSED(stackTop);
-	if (MainWindow *frame = resolveMainWindow())
-		frame->infoBarClear();
+	runOnMainWindowThread(
+	    [](const MainWindow *frame) -> int
+	    {
+		    frame->infoBarClear();
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaInfoColour(lua_State *L)
 {
-	MainWindow *frame = resolveMainWindow();
-	if (!frame)
-		return 0;
-	const QString name = QString::fromUtf8(luaL_checkstring(L, 1));
-	frame->infoBarSetColour(WorldView::parseColor(name));
+	const QString name  = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QColor  color = WorldView::parseColor(name);
+	runOnMainWindowThread(
+	    [&](const MainWindow *frame) -> int
+	    {
+		    frame->infoBarSetColour(color);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
@@ -4384,8 +4790,13 @@ static int luaInfoFont(lua_State *L)
 	const QString fontName = QString::fromUtf8(luaL_checkstring(L, 1));
 	const int     size     = static_cast<int>(luaL_checkinteger(L, 2));
 	const int     style    = static_cast<int>(luaL_checkinteger(L, 3));
-	if (MainWindow *frame = resolveMainWindow())
-		frame->infoBarSetFont(fontName, size, style);
+	runOnMainWindowThread(
+	    [&](const MainWindow *frame) -> int
+	    {
+		    frame->infoBarSetFont(fontName, size, style);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
@@ -4397,17 +4808,25 @@ static int luaLogSend(lua_State *L)
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString text = concatLuaArgs(L, 1);
-	const bool    echo = isEnabledValue(runtime->worldAttributes().value(QStringLiteral("display_my_input")));
-	const int     result = runtime->sendCommand(text, echo, false, false, false, false);
-	if (result == eOK)
-		runtime->logInputCommand(text);
+	const QString text   = concatLuaArgs(L, 1);
+	const int     result = runOnRuntimeThreadAllowNestedEvents(
+        runtime,
+        [&]() -> int
+        {
+            const bool echo =
+                isEnabledValue(runtime->worldAttributeValue(QStringLiteral("display_my_input")));
+            const int sendResult = runtime->sendCommand(text, echo, false, false, false, false);
+            if (sendResult == eOK)
+                runtime->logInputCommand(text);
+            return sendResult;
+        },
+        eWorldClosed);
 	lua_pushnumber(L, result);
 	return 1;
 }
@@ -4415,7 +4834,7 @@ static int luaLogSend(lua_State *L)
 static int luaMakeRegularExpression(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
@@ -4430,7 +4849,7 @@ static int luaMakeRegularExpression(lua_State *L)
 static int luaMapColour(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const long original    = luaL_checkinteger(L, 1);
@@ -4442,7 +4861,7 @@ static int luaMapColour(lua_State *L)
 static int luaMapColourList(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -4472,54 +4891,53 @@ static QString showMenuDialog(const WorldView *view, const QStringList &items, c
 {
 	if (items.isEmpty())
 		return {};
+	return runOnMainWindowThreadAllowNestedEvents(
+	    [&](MainWindow *frame) -> QString
+	    {
+		    QDialog dialog(frame);
+		    dialog.setWindowTitle(QStringLiteral("Menu"));
+		    dialog.setWindowFlags(dialog.windowFlags() | Qt::Tool);
+		    QVBoxLayout layout(&dialog);
+		    QListWidget list;
+		    list.addItems(items);
+		    layout.addWidget(&list);
 
-	QDialog dialog(resolveMainWindow());
-	dialog.setWindowTitle(QStringLiteral("Menu"));
-	dialog.setWindowFlags(dialog.windowFlags() | Qt::Tool);
-	QVBoxLayout layout(&dialog);
-	QListWidget list;
-	list.addItems(items);
-	layout.addWidget(&list);
+		    QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+		    layout.addWidget(&buttons);
 
-	QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
-	layout.addWidget(&buttons);
+		    QObject::connect(&buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+		    QObject::connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+		    QObject::connect(&list, &QListWidget::itemDoubleClicked, &dialog, &QDialog::accept);
 
-	QObject::connect(&buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-	QObject::connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-	QObject::connect(&list, &QListWidget::itemDoubleClicked, &dialog, &QDialog::accept);
+		    if (!def.isEmpty())
+		    {
+			    if (const QList<QListWidgetItem *> matches = list.findItems(def, Qt::MatchExactly);
+			        !matches.isEmpty())
+				    list.setCurrentItem(matches.first());
+		    }
+		    if (view && view->inputEditor())
+		    {
+			    QPlainTextEdit *input  = view->inputEditor();
+			    QTextCursor     cursor = input->textCursor();
+			    cursor.setPosition(cursor.selectionEnd());
+			    const QRect  rect   = input->cursorRect(cursor);
+			    const QPoint global = input->mapToGlobal(rect.bottomLeft());
+			    dialog.move(global);
+		    }
 
-	if (!def.isEmpty())
-	{
-		if (const QList<QListWidgetItem *> matches = list.findItems(def, Qt::MatchExactly);
-		    !matches.isEmpty())
-			list.setCurrentItem(matches.first());
-	}
-	if (view && view->inputEditor())
-	{
-		QPlainTextEdit *input  = view->inputEditor();
-		QTextCursor     cursor = input->textCursor();
-		cursor.setPosition(cursor.selectionEnd());
-		const QRect  rect   = input->cursorRect(cursor);
-		const QPoint global = input->mapToGlobal(rect.bottomLeft());
-		dialog.move(global);
-	}
-
-	if (dialog.exec() != QDialog::Accepted)
-		return {};
-
-	QListWidgetItem *selected = list.currentItem();
-	if (!selected)
-		return {};
-	return selected->text();
+		    if (dialog.exec() != QDialog::Accepted)
+			    return {};
+		    QListWidgetItem *selected = list.currentItem();
+		    return selected ? selected->text() : QString();
+	    },
+	    {});
 }
 
 static int luaMenu(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
-	WorldView    *view    = runtime ? runtime->view() : nullptr;
-	// Legacy behavior: if there is no command-input view, return empty selection.
-	if (!view || !view->inputEditor())
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	if (!runtime)
 	{
 		lua_pushstring(L, "");
 		return 1;
@@ -4529,7 +4947,17 @@ static int luaMenu(lua_State *L)
 	QStringList   parts = items.split(QLatin1Char('|'), Qt::KeepEmptyParts);
 	parts.sort(Qt::CaseSensitive);
 	parts.removeDuplicates();
-	const QString result = showMenuDialog(view, parts, def);
+	const QString result = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> QString
+	    {
+		    WorldView *view = runtime->view();
+		    // Legacy behavior: if there is no command-input view, return empty selection.
+		    if (!view || !view->inputEditor())
+			    return {};
+		    return showMenuDialog(view, parts, def);
+	    },
+	    QString());
 	lua_pushstring(L, result.toLocal8Bit().constData());
 	return 1;
 }
@@ -4537,7 +4965,7 @@ static int luaMenu(lua_State *L)
 static int luaMetaphone(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
@@ -4553,7 +4981,7 @@ static int luaMetaphone(lua_State *L)
 static int luaGetMapping(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	lua_pushboolean(L, runtime && runtime->isMapping());
 	return 1;
 }
@@ -4561,7 +4989,7 @@ static int luaGetMapping(lua_State *L)
 static int luaSetMapping(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const bool enabled = optBool(L, 1, true);
@@ -4572,7 +5000,7 @@ static int luaSetMapping(lua_State *L)
 static int luaGetNormalColour(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -4586,7 +5014,7 @@ static int luaGetNormalColour(lua_State *L)
 static int luaSetNormalColour(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const int  which = static_cast<int>(luaL_checkinteger(L, 1));
@@ -4597,29 +5025,24 @@ static int luaSetNormalColour(lua_State *L)
 
 static int luaMoveMainWindow(lua_State *L)
 {
-	MainWindow *mw = resolveMainWindow();
-	if (!mw)
-		return 0;
 	const int left   = static_cast<int>(luaL_checkinteger(L, 1));
 	const int top    = static_cast<int>(luaL_checkinteger(L, 2));
 	const int width  = static_cast<int>(luaL_checkinteger(L, 3));
 	const int height = static_cast<int>(luaL_checkinteger(L, 4));
-	mw->setGeometry(left, top, width, height);
+	runOnMainWindowThread(
+	    [&](MainWindow *mw) -> bool
+	    {
+		    mw->setGeometry(left, top, width, height);
+		    return true;
+	    },
+	    false);
 	return 0;
-}
-
-static QString runtimeWorldIdFromLuaUpvalue(lua_State *L)
-{
-	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
-	if (!runtime)
-		return {};
-	return runtime->worldAttributes().value(QStringLiteral("id")).trimmed();
 }
 
 static WorldRuntime *runtimeFromLuaUpvalue(lua_State *L)
 {
 	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	return engine ? engine->worldRuntime() : nullptr;
+	return engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 }
 
 static TextChildWindow *findNotepadWindow(const QString &title, WorldRuntime *ownerRuntime,
@@ -4627,6 +5050,8 @@ static TextChildWindow *findNotepadWindow(const QString &title, WorldRuntime *ow
 {
 	MainWindow *frame = resolveMainWindow();
 	if (!frame)
+		return nullptr;
+	if (QThread::currentThread() != frame->thread())
 		return nullptr;
 	auto *mdi = frame->findChild<QMdiArea *>();
 	if (!mdi)
@@ -4660,11 +5085,7 @@ static TextChildWindow *findNotepadWindow(const QString &title, WorldRuntime *ow
 
 static int luaMoveWorldWindow(lua_State *L)
 {
-	MainWindowHost *host = resolveMainWindowHost(nullptr);
-	if (!host)
-		return 0;
-	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 		return 0;
 	const int left   = static_cast<int>(luaL_checkinteger(L, 1));
@@ -4673,24 +5094,42 @@ static int luaMoveWorldWindow(lua_State *L)
 	const int height = static_cast<int>(luaL_checkinteger(L, 4));
 	const int which  = static_cast<int>(luaL_optinteger(L, 5, 1));
 
-	if (WorldChildWindow *window = findWorldWindowByOrdinal(*host, *runtime, which))
-		window->setGeometry(left, top, width, height);
+	runOnMainWindowThread(
+	    [&](MainWindow *frame) -> bool
+	    {
+		    MainWindowHost *host = resolveMainWindowHost(frame);
+		    if (!host)
+			    host = frame;
+		    if (WorldChildWindow *window = findWorldWindowByOrdinal(*host, *runtime, which))
+			    window->setGeometry(left, top, width, height);
+		    return true;
+	    },
+	    false);
 	return 0;
 }
 
 static int luaMoveNotepadWindow(lua_State *L)
 {
-	const QString    title  = QString::fromUtf8(luaL_checkstring(L, 1));
-	const int        left   = static_cast<int>(luaL_checkinteger(L, 2));
-	const int        top    = static_cast<int>(luaL_checkinteger(L, 3));
-	const int        width  = static_cast<int>(luaL_checkinteger(L, 4));
-	const int        height = static_cast<int>(luaL_checkinteger(L, 5));
-
-	TextChildWindow *text =
-	    findNotepadWindow(title, runtimeFromLuaUpvalue(L), runtimeWorldIdFromLuaUpvalue(L));
-	if (text)
-		text->setGeometry(left, top, width, height);
-	lua_pushboolean(L, text != nullptr);
+	const QString title   = QString::fromUtf8(luaL_checkstring(L, 1));
+	const int     left    = static_cast<int>(luaL_checkinteger(L, 2));
+	const int     top     = static_cast<int>(luaL_checkinteger(L, 3));
+	const int     width   = static_cast<int>(luaL_checkinteger(L, 4));
+	const int     height  = static_cast<int>(luaL_checkinteger(L, 5));
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
+	const QString worldId =
+	    runtime ? runtime->worldAttributeValue(QStringLiteral("id")).trimmed() : QString();
+	const bool moved = runOnMainWindowThread(
+	    [&](MainWindow *) -> bool
+	    {
+		    if (TextChildWindow *text = findNotepadWindow(title, runtime, worldId); text)
+		    {
+			    text->setGeometry(left, top, width, height);
+			    return true;
+		    }
+		    return false;
+	    },
+	    false);
+	lua_pushboolean(L, moved);
 	return 1;
 }
 
@@ -4722,7 +5161,7 @@ static int luaMtSrand(lua_State *L)
 static int luaMtRand(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -4737,26 +5176,33 @@ static int luaNoteHr(lua_State *L)
 	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
-	if (WorldView *const view = runtime->view())
-	{
-		view->appendHorizontalRule();
-		return 0;
-	}
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (WorldView *const view = runtime->view())
+		    {
+			    view->appendHorizontalRule();
+			    return 0;
+		    }
 
-	int flags = WorldRuntime::LineHorizontalRule;
-	if (isEnabledValue(runtime->worldAttributes().value(QStringLiteral("log_notes"))))
-		flags |= WorldRuntime::LineLog;
-	runtime->addLine(QString(), flags, true);
+		    int flags = WorldRuntime::LineHorizontalRule;
+		    if (isEnabledValue(runtime->worldAttributeValue(QStringLiteral("log_notes"))))
+			    flags |= WorldRuntime::LineLog;
+		    runtime->addLine(QString(), flags, true);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaNoteColourName(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 
@@ -4781,7 +5227,7 @@ static int luaNoteColourName(lua_State *L)
 static int luaNoteColourRGB(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const long fore = luaL_checkinteger(L, 1);
@@ -4794,7 +5240,7 @@ static int luaNoteColourRGB(lua_State *L)
 static int luaGetNoteColour(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, -1);
@@ -4817,7 +5263,7 @@ static int luaGetNoteColour(lua_State *L)
 static int luaSetNoteColour(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const int value = static_cast<int>(luaL_checkinteger(L, 1));
@@ -4828,7 +5274,7 @@ static int luaSetNoteColour(lua_State *L)
 static int luaGetNoteColourBack(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -4841,7 +5287,7 @@ static int luaGetNoteColourBack(lua_State *L)
 static int luaSetNoteColourBack(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const long value = luaL_checkinteger(L, 1);
@@ -4852,7 +5298,7 @@ static int luaSetNoteColourBack(lua_State *L)
 static int luaGetNoteColourFore(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -4865,7 +5311,7 @@ static int luaGetNoteColourFore(lua_State *L)
 static int luaSetNoteColourFore(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const long value = luaL_checkinteger(L, 1);
@@ -4875,78 +5321,92 @@ static int luaSetNoteColourFore(lua_State *L)
 
 static int luaNotepadColour(lua_State *L)
 {
-	const QString    title      = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString    textColour = QString::fromUtf8(luaL_checkstring(L, 2));
-	const QString    backColour = QString::fromUtf8(luaL_checkstring(L, 3));
-	TextChildWindow *text =
-	    findNotepadWindow(title, runtimeFromLuaUpvalue(L), runtimeWorldIdFromLuaUpvalue(L));
-	if (!text || !text->editor())
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	const QColor fore = WorldView::parseColor(textColour);
-	const QColor back = WorldView::parseColor(backColour);
+	const QString title      = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString textColour = QString::fromUtf8(luaL_checkstring(L, 2));
+	const QString backColour = QString::fromUtf8(luaL_checkstring(L, 3));
+	const QColor  fore       = WorldView::parseColor(textColour);
+	const QColor  back       = WorldView::parseColor(backColour);
 	if (!fore.isValid() || !back.isValid())
 	{
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	QPalette pal = text->editor()->palette();
-	pal.setColor(QPalette::Text, fore);
-	pal.setColor(QPalette::Base, back);
-	text->editor()->setPalette(pal);
-	lua_pushnumber(L, 1);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
+	const QString worldId =
+	    runtime ? runtime->worldAttributeValue(QStringLiteral("id")).trimmed() : QString();
+	const int result = runOnMainWindowThread(
+	    [&](MainWindow *) -> int
+	    {
+		    TextChildWindow *text = findNotepadWindow(title, runtime, worldId);
+		    if (!text || !text->editor())
+			    return 0;
+		    QPalette pal = text->editor()->palette();
+		    pal.setColor(QPalette::Text, fore);
+		    pal.setColor(QPalette::Base, back);
+		    text->editor()->setPalette(pal);
+		    return 1;
+	    },
+	    0);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaNotepadFont(lua_State *L)
 {
-	const QString    title    = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString    fontName = QString::fromUtf8(luaL_checkstring(L, 2));
-	const int        size     = static_cast<int>(luaL_checkinteger(L, 3));
-	const int        style    = static_cast<int>(luaL_checkinteger(L, 4));
-	const int        charset  = static_cast<int>(luaL_optinteger(L, 5, 0));
-
-	TextChildWindow *text =
-	    findNotepadWindow(title, runtimeFromLuaUpvalue(L), runtimeWorldIdFromLuaUpvalue(L));
-	if (!text || !text->editor())
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	QFont font = text->editor()->font();
-	if (!fontName.isEmpty())
-		qmudApplyMonospaceFallback(font, fontName);
-	if (const QString charsetFamily = qmudFamilyForCharset(font.family(), charset);
-	    !charsetFamily.isEmpty() && charsetFamily != font.family())
-	{
-		qmudApplyMonospaceFallback(font, charsetFamily);
-	}
-	if (size > 0)
-		font.setPointSize(size);
-	font.setBold(style & 0x01);
-	font.setItalic(style & 0x02);
-	font.setUnderline(style & 0x04);
-	font.setStrikeOut(style & 0x08);
-	text->editor()->setFont(font);
-	lua_pushnumber(L, 1);
+	const QString title    = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString fontName = QString::fromUtf8(luaL_checkstring(L, 2));
+	const int     size     = static_cast<int>(luaL_checkinteger(L, 3));
+	const int     style    = static_cast<int>(luaL_checkinteger(L, 4));
+	const int     charset  = static_cast<int>(luaL_optinteger(L, 5, 0));
+	WorldRuntime *runtime  = runtimeFromLuaUpvalue(L);
+	const QString worldId =
+	    runtime ? runtime->worldAttributeValue(QStringLiteral("id")).trimmed() : QString();
+	const int result = runOnMainWindowThread(
+	    [&](MainWindow *) -> int
+	    {
+		    TextChildWindow *text = findNotepadWindow(title, runtime, worldId);
+		    if (!text || !text->editor())
+			    return 0;
+		    QFont font = text->editor()->font();
+		    if (!fontName.isEmpty())
+			    qmudApplyMonospaceFallback(font, fontName);
+		    if (const QString charsetFamily = qmudFamilyForCharset(font.family(), charset);
+		        !charsetFamily.isEmpty() && charsetFamily != font.family())
+		    {
+			    qmudApplyMonospaceFallback(font, charsetFamily);
+		    }
+		    if (size > 0)
+			    font.setPointSize(size);
+		    font.setBold(style & 0x01);
+		    font.setItalic(style & 0x02);
+		    font.setUnderline(style & 0x04);
+		    font.setStrikeOut(style & 0x08);
+		    text->editor()->setFont(font);
+		    return 1;
+	    },
+	    0);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaNotepadReadOnly(lua_State *L)
 {
-	const QString    title    = QString::fromUtf8(luaL_checkstring(L, 1));
-	const bool       readOnly = optBool(L, 2, true);
-	TextChildWindow *text =
-	    findNotepadWindow(title, runtimeFromLuaUpvalue(L), runtimeWorldIdFromLuaUpvalue(L));
-	if (!text || !text->editor())
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	text->editor()->setReadOnly(readOnly);
-	lua_pushnumber(L, 1);
+	const QString title    = QString::fromUtf8(luaL_checkstring(L, 1));
+	const bool    readOnly = optBool(L, 2, true);
+	WorldRuntime *runtime  = runtimeFromLuaUpvalue(L);
+	const QString worldId =
+	    runtime ? runtime->worldAttributeValue(QStringLiteral("id")).trimmed() : QString();
+	const int result = runOnMainWindowThread(
+	    [&](MainWindow *) -> int
+	    {
+		    TextChildWindow *text = findNotepadWindow(title, runtime, worldId);
+		    if (!text || !text->editor())
+			    return 0;
+		    text->editor()->setReadOnly(readOnly);
+		    return 1;
+	    },
+	    0);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
@@ -4959,22 +5419,27 @@ static int luaNotepadSaveMethod(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	TextChildWindow *text =
-	    findNotepadWindow(title, runtimeFromLuaUpvalue(L), runtimeWorldIdFromLuaUpvalue(L));
-	if (!text)
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	text->setProperty("save_method", method);
-	lua_pushnumber(L, 1);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
+	const QString worldId =
+	    runtime ? runtime->worldAttributeValue(QStringLiteral("id")).trimmed() : QString();
+	const int result = runOnMainWindowThread(
+	    [&](MainWindow *) -> int
+	    {
+		    TextChildWindow *text = findNotepadWindow(title, runtime, worldId);
+		    if (!text)
+			    return 0;
+		    text->setProperty("save_method", method);
+		    return 1;
+	    },
+	    0);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaNoteStyle(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const auto style = static_cast<unsigned short>(luaL_checkinteger(L, 1));
@@ -5021,7 +5486,8 @@ static int luaOpenBrowser(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	const bool ok = QDesktopServices::openUrl(QUrl(urlText));
+	const bool ok = runOnMainWindowThread([&urlText](MainWindow *) -> bool
+	                                      { return QDesktopServices::openUrl(QUrl(urlText)); }, false);
 	lua_pushnumber(L, ok ? eOK : eCouldNotOpenFile);
 	return 1;
 }
@@ -5029,20 +5495,22 @@ static int luaOpenBrowser(lua_State *L)
 static int luaPasteCommand(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
 		return 1;
 	}
-	WorldView *view = runtime->view();
-	if (!view)
-	{
-		lua_pushstring(L, "");
-		return 1;
-	}
 	const QString text     = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString replaced = view->pasteCommand(text);
+	const QString replaced = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> QString
+	    {
+		    if (WorldView *view = runtime->view())
+			    return view->pasteCommand(text);
+		    return {};
+	    },
+	    QString());
 	lua_pushstring(L, replaced.toLocal8Bit().constData());
 	return 1;
 }
@@ -5050,14 +5518,19 @@ static int luaPasteCommand(lua_State *L)
 static int luaPause(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
-	WorldView *view = runtime->view();
-	if (!view)
-		return 0;
 	const bool frozen = optBool(L, 1, true);
-	view->setFrozen(frozen);
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (WorldView *view = runtime->view())
+			    view->setFrozen(frozen);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
@@ -5070,7 +5543,9 @@ static int luaPickColour(lua_State *L)
 		const auto packed = static_cast<QMudColorRef>(suggested);
 		initial           = QColor(qmudRed(packed), qmudGreen(packed), qmudBlue(packed));
 	}
-	QColor chosen = QColorDialog::getColor(initial, resolveMainWindow(), QStringLiteral("Pick Colour"));
+	const QColor chosen = runOnMainWindowThreadAllowNestedEvents(
+	    [&](MainWindow *frame) -> QColor
+	    { return QColorDialog::getColor(initial, frame, QStringLiteral("Pick Colour")); }, {});
 	if (!chosen.isValid())
 	{
 		lua_pushnumber(L, -1);
@@ -5083,7 +5558,7 @@ static int luaPickColour(lua_State *L)
 static int luaPlaySound(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -5102,7 +5577,7 @@ static int luaPlaySound(lua_State *L)
 static int luaPlaySoundMemory(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -5123,7 +5598,7 @@ static int luaPlaySoundMemory(lua_State *L)
 static int luaStopSound(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -5138,19 +5613,21 @@ static int luaStopSound(lua_State *L)
 static int luaPushCommand(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
 		return 1;
 	}
-	WorldView *view = runtime->view();
-	if (!view)
-	{
-		lua_pushstring(L, "");
-		return 1;
-	}
-	const QString command = view->pushCommand();
+	const QString command = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> QString
+	    {
+		    if (WorldView *view = runtime->view())
+			    return view->pushCommand();
+		    return {};
+	    },
+	    QString());
 	lua_pushstring(L, command.toLocal8Bit().constData());
 	return 1;
 }
@@ -5158,20 +5635,23 @@ static int luaPushCommand(lua_State *L)
 static int luaQueue(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
-	{
-		lua_pushnumber(L, eWorldClosed);
-		return 1;
-	}
-	if (runtime->connectPhase() != WorldRuntime::eConnectConnectedToMud)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
 	const QString text   = QString::fromUtf8(luaL_checkstring(L, 1));
 	const bool    echo   = optBool(L, 2, true);
-	const int     result = runtime->sendCommand(text, echo, true, false, false, false);
+	const int     result = runOnRuntimeThreadAllowNestedEvents(
+        runtime,
+        [&]() -> int
+        {
+            if (runtime->connectPhase() != WorldRuntime::eConnectConnectedToMud)
+                return eWorldClosed;
+            return runtime->sendCommand(text, echo, true, false, false, false);
+        },
+        eWorldClosed);
 	lua_pushnumber(L, result);
 	return 1;
 }
@@ -5179,7 +5659,7 @@ static int luaQueue(lua_State *L)
 static int luaReadNamesFile(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -5193,14 +5673,21 @@ static int luaReadNamesFile(lua_State *L)
 static int luaRedraw(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
-	WorldView *view = runtime->view();
-	if (!view)
-		return 0;
-	view->update();
-	view->refreshMiniWindows();
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (WorldView *view = runtime->view())
+		    {
+			    view->update();
+			    view->refreshMiniWindows();
+		    }
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
@@ -5214,7 +5701,7 @@ static QString trimDirection(const QString &text)
 static int luaRemoveBacktracks(lua_State *L)
 {
 	auto          *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime  *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime  *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	AppController *app     = AppController::instance();
 	if (!runtime)
 	{
@@ -5304,43 +5791,66 @@ static int luaRemoveBacktracks(lua_State *L)
 static int luaGetRemoveMapReverses(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
-	lua_pushboolean(L, runtime && runtime->removeMapReverses());
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const bool    enabled =
+	    runOnRuntimeThread(runtime, [&]() -> bool { return runtime->removeMapReverses(); }, false);
+	lua_pushboolean(L, enabled);
 	return 1;
 }
 
 static int luaSetRemoveMapReverses(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const bool enabled = luaL_checknumber(L, 1) != 0;
-	runtime->setRemoveMapReverses(enabled);
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    runtime->setRemoveMapReverses(enabled);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaRepaint(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
-	WorldView *view = runtime->view();
-	if (!view)
-		return 0;
-	view->update();
-	view->refreshMiniWindows();
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (WorldView *view = runtime->view())
+		    {
+			    view->update();
+			    view->refreshMiniWindows();
+		    }
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaReset(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
-	runtime->resetMxp();
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    runtime->resetMxp();
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
@@ -5451,7 +5961,7 @@ static int luaTranslateDebug(lua_State *L)
 static int luaResetIP(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	runtime->resetIpCache();
@@ -5461,7 +5971,7 @@ static int luaResetIP(lua_State *L)
 static int luaReverseSpeedwalk(lua_State *L)
 {
 	auto          *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime  *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime  *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	AppController *app     = AppController::instance();
 	if (!runtime)
 	{
@@ -5536,7 +6046,7 @@ static int luaReverseSpeedwalk(lua_State *L)
 static int luaRGBColourToName(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
@@ -5551,7 +6061,7 @@ static int luaRGBColourToName(lua_State *L)
 static int luaSave(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushboolean(L, false);
@@ -5570,7 +6080,8 @@ static int luaSave(lua_State *L)
 	}
 	else if (fileName.isEmpty())
 	{
-		fileName = runtime->worldFilePath();
+		fileName =
+		    runOnRuntimeThread(runtime, [&]() -> QString { return runtime->worldFilePath(); }, QString());
 	}
 
 	if (fileName.isEmpty())
@@ -5580,23 +6091,20 @@ static int luaSave(lua_State *L)
 	}
 
 	QString    error;
-	const bool ok = runtime->saveWorldFile(fileName, &error);
+	const bool ok = runOnRuntimeThread(
+	    runtime, [&]() -> bool { return runtime->saveWorldFile(fileName, &error); }, false);
 	lua_pushboolean(L, ok ? 1 : 0);
 	return 1;
 }
 
 static int luaSaveNotepad(lua_State *L)
 {
-	const QString    title    = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString    fileName = QString::fromUtf8(luaL_checkstring(L, 2));
-	const bool       replace  = optBool(L, 3, false);
-	TextChildWindow *text =
-	    findNotepadWindow(title, runtimeFromLuaUpvalue(L), runtimeWorldIdFromLuaUpvalue(L));
-	if (!text || !text->editor())
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
+	const QString title    = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString fileName = QString::fromUtf8(luaL_checkstring(L, 2));
+	const bool    replace  = optBool(L, 3, false);
+	WorldRuntime *runtime  = runtimeFromLuaUpvalue(L);
+	const QString worldId =
+	    runtime ? runtime->worldAttributeValue(QStringLiteral("id")).trimmed() : QString();
 	if (fileName.isEmpty())
 	{
 		lua_pushnumber(L, 0);
@@ -5607,8 +6115,16 @@ static int luaSaveNotepad(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	QString    error;
-	const bool ok = text->saveToFile(fileName, &error);
+	const bool ok = runOnMainWindowThread(
+	    [&](MainWindow *) -> bool
+	    {
+		    TextChildWindow *text = findNotepadWindow(title, runtime, worldId);
+		    if (!text || !text->editor())
+			    return false;
+		    QString error;
+		    return text->saveToFile(fileName, &error);
+	    },
+	    false);
 	lua_pushnumber(L, ok ? 1 : 0);
 	return 1;
 }
@@ -5616,51 +6132,70 @@ static int luaSaveNotepad(lua_State *L)
 static int luaSelectCommand(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
-	WorldView *view = runtime->view();
-	if (!view)
-		return 0;
-	view->focusInput();
-	if (QPlainTextEdit *input = view->inputEditor())
-		input->selectAll();
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    WorldView *view = runtime->view();
+		    if (!view)
+			    return 0;
+		    view->focusInput();
+		    if (QPlainTextEdit *input = view->inputEditor())
+			    input->selectAll();
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaSendPkt(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	if (runtime->connectPhase() != WorldRuntime::eConnectConnectedToMud)
-	{
-		lua_pushnumber(L, eWorldClosed);
-		return 1;
-	}
-	size_t      packetLength = 0;
-	const char *packetData   = luaL_checklstring(L, 1, &packetLength);
-	runtime->sendToWorld(QByteArray(packetData, static_cast<int>(packetLength)));
-	lua_pushnumber(L, eOK);
+	size_t           packetLength = 0;
+	const char      *packetData   = luaL_checklstring(L, 1, &packetLength);
+	const QByteArray payload(packetData, static_cast<int>(packetLength));
+	const int        result = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            if (runtime->connectPhase() != WorldRuntime::eConnectConnectedToMud)
+                return eWorldClosed;
+            runtime->sendToWorld(payload);
+            return eOK;
+        },
+        eWorldClosed);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaSetBackgroundColour(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	const long oldColour = runtime->backgroundColour();
 	const long newColour = luaL_checkinteger(L, 1);
-	runtime->setBackgroundColour(newColour);
+	const long oldColour = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> long
+	    {
+		    const long previous = runtime->backgroundColour();
+		    runtime->setBackgroundColour(newColour);
+		    return previous;
+	    },
+	    0L);
 	lua_pushnumber(L, static_cast<lua_Number>(oldColour));
 	return 1;
 }
@@ -5668,7 +6203,7 @@ static int luaSetBackgroundColour(lua_State *L)
 static int luaSetBackgroundImage(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -5676,47 +6211,49 @@ static int luaSetBackgroundImage(lua_State *L)
 	}
 	const QString fileName = QString::fromUtf8(luaL_checkstring(L, 1));
 	const int     mode     = static_cast<int>(luaL_checkinteger(L, 2));
-	lua_pushnumber(L, runtime->setBackgroundImage(fileName, mode));
+	const int     result   = runOnRuntimeThread(
+        runtime, [&]() -> int { return runtime->setBackgroundImage(fileName, mode); }, eBadParameter);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaTransparency(lua_State *L)
 {
-	QWidget *window = resolveMainWindow();
-	if (!window)
-	{
-		lua_pushboolean(L, 0);
-		return 1;
-	}
 	const long key     = luaL_checkinteger(L, 1);
 	const int  amount  = static_cast<int>(luaL_checkinteger(L, 2));
 	const int  clamped = qBound(0, amount, 255);
-
-	// Use the same Qt window-mask/opacity path on all platforms.
-	if (key != -1)
-	{
-		const auto    packed = static_cast<QMudColorRef>(key);
-		const QColor  keyColor(qmudRed(packed), qmudGreen(packed), qmudBlue(packed));
-		const QPixmap snapshot = window->grab();
-		const QImage  image    = snapshot.toImage();
-		QBitmap       mask = QBitmap::fromImage(image.createMaskFromColor(keyColor.rgb(), Qt::MaskOutColor));
-		window->setMask(mask);
-		window->setAttribute(Qt::WA_TranslucentBackground, true);
-	}
-	else
-	{
-		window->clearMask();
-		window->setAttribute(Qt::WA_TranslucentBackground, false);
-	}
-	window->setWindowOpacity(static_cast<qreal>(clamped) / 255.0);
-	lua_pushboolean(L, 1);
+	const bool ok      = runOnMainWindowThread(
+        [&](MainWindow *window) -> bool
+        {
+            // Use the same Qt window-mask/opacity path on all platforms.
+            if (key != -1)
+            {
+                const auto    packed = static_cast<QMudColorRef>(key);
+                const QColor  keyColor(qmudRed(packed), qmudGreen(packed), qmudBlue(packed));
+                const QPixmap snapshot = window->grab();
+                const QImage  image    = snapshot.toImage();
+                const QBitmap mask =
+                    QBitmap::fromImage(image.createMaskFromColor(keyColor.rgb(), Qt::MaskOutColor));
+                window->setMask(mask);
+                window->setAttribute(Qt::WA_TranslucentBackground, true);
+            }
+            else
+            {
+                window->clearMask();
+                window->setAttribute(Qt::WA_TranslucentBackground, false);
+            }
+            window->setWindowOpacity(static_cast<qreal>(clamped) / 255.0);
+            return true;
+        },
+        false);
+	lua_pushboolean(L, ok);
 	return 1;
 }
 
 static int luaTextRectangle(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -5749,7 +6286,14 @@ static int luaTextRectangle(lua_State *L)
 	settings.borderWidth       = static_cast<int>(borderWidth);
 	settings.outsideFillColour = static_cast<int>(outsideFillColour);
 	settings.outsideFillStyle  = static_cast<int>(outsideFillStyle);
-	runtime->setTextRectangle(settings);
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    runtime->setTextRectangle(settings);
+		    return eOK;
+	    },
+	    eWorldClosed);
 
 	lua_pushnumber(L, eOK);
 	return 1;
@@ -5758,19 +6302,26 @@ static int luaTextRectangle(lua_State *L)
 static int luaSetEntity(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString contents = QString::fromUtf8(luaL_checkstring(L, 2));
-	runtime->setEntityValue(name, contents);
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    runtime->setEntityValue(name, contents);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaSetForegroundImage(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -5778,17 +6329,22 @@ static int luaSetForegroundImage(lua_State *L)
 	}
 	const QString fileName = QString::fromUtf8(luaL_checkstring(L, 1));
 	const int     mode     = static_cast<int>(luaL_checkinteger(L, 2));
-	lua_pushnumber(L, runtime->setForegroundImage(fileName, mode));
+	const int     result   = runOnRuntimeThread(
+        runtime, [&]() -> int { return runtime->setForegroundImage(fileName, mode); }, eBadParameter);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaSetFrameBackgroundColour(lua_State *L)
 {
-	MainWindow *frame = resolveMainWindow();
-	if (!frame)
-		return 0;
 	const long colour = luaL_checkinteger(L, 1);
-	frame->setFrameBackgroundColour(colour);
+	runOnMainWindowThread(
+	    [&](MainWindow *frame) -> bool
+	    {
+		    frame->setFrameBackgroundColour(colour);
+		    return true;
+	    },
+	    false);
 	return 0;
 }
 
@@ -5802,200 +6358,198 @@ static int luaSetToolBarPosition(lua_State *L)
 	};
 	static QHash<QToolBar *, ToolBarDockState> s_toolbarStates;
 	static QSet<QToolBar *>                    s_toolbarStateHooks;
-	MainWindow                                *frame = resolveMainWindow();
-	if (!frame)
-	{
-		lua_pushnumber(L, eBadParameter);
-		return 1;
-	}
-	const int    which   = static_cast<int>(luaL_checkinteger(L, 1));
-	const bool   doFloat = optBool(L, 2, false);
-	const int    side    = static_cast<int>(luaL_checkinteger(L, 3));
-	const int    top     = static_cast<int>(luaL_checkinteger(L, 4));
-	const int    left    = static_cast<int>(luaL_checkinteger(L, 5));
+	const int                                  which   = static_cast<int>(luaL_checkinteger(L, 1));
+	const bool                                 doFloat = optBool(L, 2, false);
+	const int                                  side    = static_cast<int>(luaL_checkinteger(L, 3));
+	const int                                  top     = static_cast<int>(luaL_checkinteger(L, 4));
+	const int                                  left    = static_cast<int>(luaL_checkinteger(L, 5));
 
-	QToolBar    *toolBar = nullptr;
-	QDockWidget *dock    = nullptr;
-	switch (which)
-	{
-	case 1:
-		toolBar = frame->mainToolbar();
-		break;
-	case 2:
-		toolBar = frame->worldToolbar();
-		break;
-	case 3:
-		toolBar = frame->activityToolbar();
-		break;
-	case 4:
-		dock = frame->infoDock();
-		break;
-	default:
-		lua_pushnumber(L, eBadParameter);
-		return 1;
-	}
+	const int                                  result = runOnMainWindowThread(
+        [&](MainWindow *frame) -> int
+        {
+            QToolBar    *toolBar = nullptr;
+            QDockWidget *dock    = nullptr;
+            switch (which)
+            {
+            case 1:
+                toolBar = frame->mainToolbar();
+                break;
+            case 2:
+                toolBar = frame->worldToolbar();
+                break;
+            case 3:
+                toolBar = frame->activityToolbar();
+                break;
+            case 4:
+                dock = frame->infoDock();
+                break;
+            default:
+                return eBadParameter;
+            }
 
-	if (toolBar && !s_toolbarStateHooks.contains(toolBar))
-	{
-		s_toolbarStateHooks.insert(toolBar);
-		auto *toolbarStates     = &s_toolbarStates;
-		auto *toolbarStateHooks = &s_toolbarStateHooks;
-		QObject::connect(toolBar, &QObject::destroyed, toolBar,
-		                 [toolbarStates, toolbarStateHooks](QObject *destroyed)
-		                 {
-			                 auto *removed = qobject_cast<QToolBar *>(destroyed);
-			                 if (!removed)
-				                 return;
-			                 toolbarStates->remove(removed);
-			                 toolbarStateHooks->remove(removed);
-		                 });
-	}
+            if (toolBar && !s_toolbarStateHooks.contains(toolBar))
+            {
+                s_toolbarStateHooks.insert(toolBar);
+                auto *toolbarStates     = &s_toolbarStates;
+                auto *toolbarStateHooks = &s_toolbarStateHooks;
+                QObject::connect(toolBar, &QObject::destroyed, toolBar,
+			                                                      [toolbarStates, toolbarStateHooks](QObject *destroyed)
+			                                                      {
+                                     auto *removed = qobject_cast<QToolBar *>(destroyed);
+                                     if (!removed)
+                                         return;
+                                     toolbarStates->remove(removed);
+                                     toolbarStateHooks->remove(removed);
+                                 });
+            }
 
-	if (dock)
-	{
-		if (doFloat)
-		{
-			if (side != 1 && side != 3)
-			{
-				lua_pushnumber(L, eBadParameter);
-				return 1;
-			}
-			dock->setFloating(true);
-			const QPoint pos = frame->mapToGlobal(QPoint(left, top));
-			dock->move(pos);
-		}
-		else
-		{
-			Qt::DockWidgetArea area;
-			switch (side)
-			{
-			case 1:
-			case 0:
-				area = Qt::TopDockWidgetArea;
-				break;
-			case 2:
-				area = Qt::BottomDockWidgetArea;
-				break;
-			case 3:
-				area = Qt::LeftDockWidgetArea;
-				break;
-			case 4:
-				area = Qt::RightDockWidgetArea;
-				break;
-			default:
-				lua_pushnumber(L, eBadParameter);
-				return 1;
-			}
-			frame->addDockWidget(area, dock);
-		}
-		lua_pushnumber(L, eOK);
-		return 1;
-	}
+            if (dock)
+            {
+                if (doFloat)
+                {
+                    if (side != 1 && side != 3)
+                        return eBadParameter;
+                    dock->setFloating(true);
+                    const QPoint pos = frame->mapToGlobal(QPoint(left, top));
+                    dock->move(pos);
+                }
+                else
+                {
+                    Qt::DockWidgetArea area;
+                    switch (side)
+                    {
+                    case 1:
+                    case 0:
+                        area = Qt::TopDockWidgetArea;
+                        break;
+                    case 2:
+                        area = Qt::BottomDockWidgetArea;
+                        break;
+                    case 3:
+                        area = Qt::LeftDockWidgetArea;
+                        break;
+                    case 4:
+                        area = Qt::RightDockWidgetArea;
+                        break;
+                    default:
+                        return eBadParameter;
+                    }
+                    frame->addDockWidget(area, dock);
+                }
+                return eOK;
+            }
 
-	if (!toolBar)
-	{
-		lua_pushnumber(L, eBadParameter);
-		return 1;
-	}
+            if (!toolBar)
+                return eBadParameter;
 
-	Qt::ToolBarArea area = Qt::TopToolBarArea;
-	switch (side)
-	{
-	case 1:
-	case 0:
-		area = Qt::TopToolBarArea;
-		break;
-	case 2:
-		area = Qt::BottomToolBarArea;
-		break;
-	case 3:
-		area = Qt::LeftToolBarArea;
-		break;
-	case 4:
-		area = Qt::RightToolBarArea;
-		break;
-	default:
-		lua_pushnumber(L, eBadParameter);
-		return 1;
-	}
+            Qt::ToolBarArea area = Qt::TopToolBarArea;
+            switch (side)
+            {
+            case 1:
+            case 0:
+                area = Qt::TopToolBarArea;
+                break;
+            case 2:
+                area = Qt::BottomToolBarArea;
+                break;
+            case 3:
+                area = Qt::LeftToolBarArea;
+                break;
+            case 4:
+                area = Qt::RightToolBarArea;
+                break;
+            default:
+                return eBadParameter;
+            }
 
-	if (doFloat)
-	{
-		if (side != 1 && side != 3)
-		{
-			lua_pushnumber(L, eBadParameter);
-			return 1;
-		}
-		frame->removeToolBar(toolBar);
-		toolBar->setFloatable(true);
-		toolBar->setMovable(true);
-		toolBar->setParent(frame);
-		toolBar->setWindowFlags(Qt::Tool);
-		toolBar->setOrientation(side == 3 ? Qt::Vertical : Qt::Horizontal);
-		toolBar->show();
-		const QPoint pos = frame->mapToGlobal(QPoint(left, top));
-		toolBar->move(pos);
-		ToolBarDockState state;
-		state.area     = area;
-		state.pos      = QPoint(left, top);
-		state.floating = true;
-		s_toolbarStates.insert(toolBar, state);
-	}
-	else
-	{
-		toolBar->setWindowFlags(Qt::Widget);
-		frame->addToolBar(area, toolBar);
-		toolBar->setOrientation(area == Qt::LeftToolBarArea || area == Qt::RightToolBarArea ? Qt::Vertical
-		                                                                                    : Qt::Horizontal);
+            if (doFloat)
+            {
+                if (side != 1 && side != 3)
+                    return eBadParameter;
+                frame->removeToolBar(toolBar);
+                toolBar->setFloatable(true);
+                toolBar->setMovable(true);
+                toolBar->setParent(frame);
+                toolBar->setWindowFlags(Qt::Tool);
+                toolBar->setOrientation(side == 3 ? Qt::Vertical : Qt::Horizontal);
+                toolBar->show();
+                const QPoint pos = frame->mapToGlobal(QPoint(left, top));
+                toolBar->move(pos);
+                ToolBarDockState state;
+                state.area     = area;
+                state.pos      = QPoint(left, top);
+                state.floating = true;
+                s_toolbarStates.insert(toolBar, state);
+            }
+            else
+            {
+                toolBar->setWindowFlags(Qt::Widget);
+                frame->addToolBar(area, toolBar);
+                toolBar->setOrientation(area == Qt::LeftToolBarArea || area == Qt::RightToolBarArea
+			                                                                 ? Qt::Vertical
+			                                                                 : Qt::Horizontal);
 
-		ToolBarDockState state;
-		state.area     = area;
-		state.pos      = QPoint(left, top);
-		state.floating = false;
-		s_toolbarStates.insert(toolBar, state);
+                ToolBarDockState state;
+                state.area     = area;
+                state.pos      = QPoint(left, top);
+                state.floating = false;
+                s_toolbarStates.insert(toolBar, state);
 
-		QVector<QToolBar *> areaToolbars;
-		for (const QVector known = {frame->mainToolbar(), frame->worldToolbar(), frame->activityToolbar()};
-		     QToolBar *candidate : known)
-		{
-			if (!candidate)
-				continue;
-			const auto it = s_toolbarStates.constFind(candidate);
-			if (it == s_toolbarStates.constEnd())
-				continue;
-			if (it->floating || it->area != area)
-				continue;
-			areaToolbars.append(candidate);
-		}
+                QVector<QToolBar *> areaToolbars;
+                for (const QVector known = {frame->mainToolbar(), frame->worldToolbar(),
+                                            frame->activityToolbar()};
+                     QToolBar *candidate : known)
+                {
+                    if (!candidate)
+                        continue;
+                    const auto it = s_toolbarStates.constFind(candidate);
+                    if (it == s_toolbarStates.constEnd())
+                        continue;
+                    if (it->floating || it->area != area)
+                        continue;
+                    areaToolbars.append(candidate);
+                }
 
-		if (!areaToolbars.isEmpty())
-		{
-			std::ranges::sort(
-			    areaToolbars,
-			    [&](QToolBar *a, QToolBar *b)
-			    {
-				    const ToolBarDockState &sa = s_toolbarStates.value(a);
-				    const ToolBarDockState &sb = s_toolbarStates.value(b);
-				    const int               primaryA =
-                        area == Qt::LeftToolBarArea || area == Qt::RightToolBarArea ? sa.pos.y() : sa.pos.x();
-				    const int primaryB =
-				        area == Qt::LeftToolBarArea || area == Qt::RightToolBarArea ? sb.pos.y() : sb.pos.x();
-				    return primaryA < primaryB;
-			    });
-			for (QToolBar *candidate : areaToolbars)
-				frame->removeToolBar(candidate);
-			for (QToolBar *candidate : areaToolbars)
-				frame->addToolBar(area, candidate);
-		}
-	}
+                if (!areaToolbars.isEmpty())
+                {
+                    std::ranges::sort(areaToolbars,
+				                                                       [&](QToolBar *a, QToolBar *b)
+				                                                       {
+                                          const ToolBarDockState &sa = s_toolbarStates.value(a);
+                                          const ToolBarDockState &sb = s_toolbarStates.value(b);
+                                          const int               primaryA =
+                                              area == Qt::LeftToolBarArea || area == Qt::RightToolBarArea
+					                                                                             ? sa.pos.y()
+					                                                                             : sa.pos.x();
+                                          const int primaryB =
+                                              area == Qt::LeftToolBarArea || area == Qt::RightToolBarArea
+					                                                               ? sb.pos.y()
+					                                                               : sb.pos.x();
+                                          return primaryA < primaryB;
+                                      });
+                    for (QToolBar *candidate : areaToolbars)
+                        frame->removeToolBar(candidate);
+                    for (QToolBar *candidate : areaToolbars)
+                        frame->addToolBar(area, candidate);
+                }
+            }
 
-	lua_pushnumber(L, eOK);
+            return eOK;
+        },
+        eBadParameter);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaSetChatOption(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	if (!engine)
+	{
+		lua_pushnumber(L, eChatIDNotFound);
+		return 1;
+	}
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eChatIDNotFound);
@@ -6011,7 +6565,7 @@ static int luaSetChatOption(lua_State *L)
 static int luaSetChanged(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const bool changed = optBool(L, 1, true);
@@ -6022,81 +6576,95 @@ static int luaSetChanged(lua_State *L)
 static int luaSetClipboard(lua_State *L)
 {
 	const QString text = concatLuaArgs(L, 1);
-	QGuiApplication::clipboard()->setText(text);
+	runOnMainWindowThread(
+	    [&](MainWindow *) -> bool
+	    {
+		    if (QClipboard *clipboard = QGuiApplication::clipboard())
+			    clipboard->setText(text);
+		    return true;
+	    },
+	    false);
 	return 0;
 }
 
 static int luaSetCommand(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldView *view = runtime->view();
-	if (!view)
-	{
-		lua_pushnumber(L, eBadParameter);
-		return 1;
-	}
-	if (!view->inputText().isEmpty())
-	{
-		lua_pushnumber(L, eCommandNotEmpty);
-		return 1;
-	}
 	const QString message = QString::fromUtf8(luaL_checkstring(L, 1));
-	view->setInputText(message, true);
-	lua_pushnumber(L, eOK);
+	const int     result  = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldView *view = runtime->view();
+            if (!view)
+                return eBadParameter;
+            if (!view->inputText().isEmpty())
+                return eCommandNotEmpty;
+            view->setInputText(message, true);
+            return eOK;
+        },
+        eBadParameter);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaSetCommandSelection(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldView *view = runtime->view();
-	if (!view)
-	{
-		lua_pushnumber(L, eBadParameter);
-		return 1;
-	}
-	const int first = static_cast<int>(luaL_checkinteger(L, 1));
-	const int last  = static_cast<int>(luaL_checkinteger(L, 2));
-	lua_pushnumber(L, view->setCommandSelection(first, last));
+	const int first  = static_cast<int>(luaL_checkinteger(L, 1));
+	const int last   = static_cast<int>(luaL_checkinteger(L, 2));
+	const int result = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (WorldView *view = runtime->view())
+			    return view->setCommandSelection(first, last);
+		    return eBadParameter;
+	    },
+	    eBadParameter);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaSetCommandWindowHeight(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldView *view = runtime->view();
-	if (!view)
-	{
-		lua_pushnumber(L, eBadParameter);
-		return 1;
-	}
 	const int height = static_cast<int>(luaL_checkinteger(L, 1));
-	lua_pushnumber(L, view->setCommandWindowHeight(height));
+	const int result = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (WorldView *view = runtime->view())
+			    return view->setCommandWindowHeight(height);
+		    return eBadParameter;
+	    },
+	    eBadParameter);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaSetUnseenLines(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const int count = static_cast<int>(luaL_checkinteger(L, 1));
@@ -6107,37 +6675,45 @@ static int luaSetUnseenLines(lua_State *L)
 static int luaSetWorldWindowStatus(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
-	MainWindowHost *host = resolveMainWindowHostForRuntime(runtime);
-	if (!host)
-		return 0;
-	WorldChildWindow *child = host->findWorldChildWindow(runtime);
-	if (!child)
-		return 0;
-	switch (static_cast<int>(luaL_checkinteger(L, 1)))
-	{
-	case 1:
-		child->showMaximized();
-		break;
-	case 2:
-		child->showMinimized();
-		break;
-	case 4:
-	case 3:
-		child->showNormal();
-		break;
-	default:
-		break;
-	}
+	const int requestedStatus = static_cast<int>(luaL_checkinteger(L, 1));
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    MainWindowHost *host = resolveMainWindowHostForRuntime(runtime);
+		    if (!host)
+			    return 0;
+		    WorldChildWindow *child = host->findWorldChildWindow(runtime);
+		    if (!child)
+			    return 0;
+		    switch (requestedStatus)
+		    {
+		    case 1:
+			    child->showMaximized();
+			    break;
+		    case 2:
+			    child->showMinimized();
+			    break;
+		    case 4:
+		    case 3:
+			    child->showNormal();
+			    break;
+		    default:
+			    break;
+		    }
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaShiftTabCompleteItem(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -6151,28 +6727,40 @@ static int luaShiftTabCompleteItem(lua_State *L)
 static int luaShowInfoBar(lua_State *L)
 {
 	const bool visible = optBool(L, 1, true);
-	if (MainWindow *frame = resolveMainWindow())
-		frame->setInfoBarVisible(visible);
+	runOnMainWindowThread(
+	    [&](const MainWindow *frame) -> int
+	    {
+		    frame->setInfoBarVisible(visible);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaSimulate(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const QString text = concatLuaArgs(L, 1);
-	runtime->setDoingSimulate(true);
-	runtime->receiveRawData(text.toUtf8());
-	runtime->setDoingSimulate(false);
+	runOnRuntimeThreadAllowNestedEvents(
+	    runtime,
+	    [&]() -> int
+	    {
+		    runtime->setDoingSimulate(true);
+		    runtime->receiveRawData(text.toUtf8());
+		    runtime->setDoingSimulate(false);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaSound(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -6192,13 +6780,13 @@ static int luaSound(lua_State *L)
 static int luaGetSpeedWalkDelay(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	const QString value = runtime->worldAttributes().value(QStringLiteral("speed_walk_delay"));
+	const QString value = runtime->worldAttributeValue(QStringLiteral("speed_walk_delay"));
 	lua_pushnumber(L, value.toInt());
 	return 1;
 }
@@ -6206,7 +6794,7 @@ static int luaGetSpeedWalkDelay(lua_State *L)
 static int luaSetSpeedWalkDelay(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const int delay = static_cast<int>(luaL_checkinteger(L, 1));
@@ -6292,95 +6880,94 @@ static int luaSpellCheck(lua_State *L)
 static int luaSpellCheckCommand(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
-	if (!runtime || !runtime->view())
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	if (!runtime)
 	{
 		lua_pushnumber(L, -1);
 		return 1;
 	}
 
-	AppController *controller = AppController::instance();
-	if (!controller || !controller->ensureSpellCheckerLoaded())
-	{
-		lua_pushnumber(L, -1);
-		return 1;
-	}
-	lua_State *spell = controller->spellCheckerLuaState();
-	if (!spell)
-	{
-		lua_pushnumber(L, -1);
-		return 1;
-	}
-
-	QPlainTextEdit *input = runtime->view()->inputEditor();
-	if (!input)
-	{
-		lua_pushnumber(L, -1);
-		return 1;
-	}
-
-	QTextCursor cursor    = input->textCursor();
-	const int   origStart = cursor.selectionStart();
-	const int   origEnd   = cursor.selectionEnd();
-
-	int         startCol = static_cast<int>(luaL_optinteger(L, 1, -1));
-	int         endCol   = static_cast<int>(luaL_optinteger(L, 2, -1));
+	int startCol = static_cast<int>(luaL_optinteger(L, 1, -1));
+	int endCol   = static_cast<int>(luaL_optinteger(L, 2, -1));
 	if (startCol > 0)
 		startCol -= 1;
-	if (endCol > startCol && startCol >= 0 && endCol >= 0)
-	{
-		QTextCursor selection = input->textCursor();
-		selection.setPosition(startCol);
-		selection.setPosition(endCol, QTextCursor::KeepAnchor);
-		input->setTextCursor(selection);
-	}
+	const int result = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    WorldView *view = runtime->view();
+		    if (!view)
+			    return -1;
 
-	QTextCursor activeCursor = input->textCursor();
-	QString     selected     = activeCursor.selectedText();
-	bool        all          = false;
-	if (selected.isEmpty())
-	{
-		all      = true;
-		selected = input->toPlainText();
-	}
+		    AppController *controller = AppController::instance();
+		    if (!controller || !controller->ensureSpellCheckerLoaded())
+			    return -1;
+		    lua_State *spell = controller->spellCheckerLuaState();
+		    if (!spell)
+			    return -1;
 
-	lua_settop(spell, 0);
-	lua_getglobal(spell, "spellcheck");
-	if (!lua_isfunction(spell, -1))
-	{
-		lua_settop(spell, 0);
-		lua_pushnumber(L, -1);
-		return 1;
-	}
-	const QByteArray textBytes = selected.toUtf8();
-	lua_pushlstring(spell, textBytes.constData(), textBytes.size());
-	lua_pushboolean(spell, all);
-	if (const int error = QMudLuaSupport::callLuaWithTraceback(spell, 2, 1); error)
-	{
-		QMudLuaSupport::luaError(spell, "Run-time error", "spellcheck", "Command-line spell-check");
-		controller->closeSpellChecker();
-		lua_settop(spell, 0);
-		lua_pushnumber(L, -1);
-		return 1;
-	}
+		    QPlainTextEdit *input = view->inputEditor();
+		    if (!input)
+			    return -1;
 
-	int result = 0;
-	if (lua_isstring(spell, -1))
-	{
-		const QString replacement = QString::fromUtf8(lua_tostring(spell, -1));
-		if (all)
-			input->selectAll();
-		QTextCursor replaceCursor = input->textCursor();
-		replaceCursor.insertText(replacement);
-		result = 1;
-	}
-	lua_settop(spell, 0);
+		    QTextCursor cursor    = input->textCursor();
+		    const int   origStart = cursor.selectionStart();
+		    const int   origEnd   = cursor.selectionEnd();
 
-	QTextCursor restore = input->textCursor();
-	restore.setPosition(origStart);
-	restore.setPosition(origEnd, QTextCursor::KeepAnchor);
-	input->setTextCursor(restore);
+		    if (endCol > startCol && startCol >= 0 && endCol >= 0)
+		    {
+			    QTextCursor selection = input->textCursor();
+			    selection.setPosition(startCol);
+			    selection.setPosition(endCol, QTextCursor::KeepAnchor);
+			    input->setTextCursor(selection);
+		    }
 
+		    QTextCursor activeCursor = input->textCursor();
+		    QString     selected     = activeCursor.selectedText();
+		    bool        all          = false;
+		    if (selected.isEmpty())
+		    {
+			    all      = true;
+			    selected = input->toPlainText();
+		    }
+
+		    lua_settop(spell, 0);
+		    lua_getglobal(spell, "spellcheck");
+		    if (!lua_isfunction(spell, -1))
+		    {
+			    lua_settop(spell, 0);
+			    return -1;
+		    }
+		    const QByteArray textBytes = selected.toUtf8();
+		    lua_pushlstring(spell, textBytes.constData(), textBytes.size());
+		    lua_pushboolean(spell, all);
+		    if (const int error = QMudLuaSupport::callLuaWithTraceback(spell, 2, 1); error)
+		    {
+			    QMudLuaSupport::luaError(spell, "Run-time error", "spellcheck", "Command-line spell-check");
+			    controller->closeSpellChecker();
+			    lua_settop(spell, 0);
+			    return -1;
+		    }
+
+		    int resultValue = 0;
+		    if (lua_isstring(spell, -1))
+		    {
+			    const QString replacement = QString::fromUtf8(lua_tostring(spell, -1));
+			    if (all)
+				    input->selectAll();
+			    QTextCursor replaceCursor = input->textCursor();
+			    replaceCursor.insertText(replacement);
+			    resultValue = 1;
+		    }
+		    lua_settop(spell, 0);
+
+		    QTextCursor restore = input->textCursor();
+		    restore.setPosition(origStart);
+		    restore.setPosition(origEnd, QTextCursor::KeepAnchor);
+		    input->setTextCursor(restore);
+		    return resultValue;
+	    },
+	    -1);
 	lua_pushnumber(L, result);
 	return 1;
 }
@@ -6433,7 +7020,7 @@ static int luaSpellCheckDlg(lua_State *L)
 static int luaSetInputFont(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const QString fontName  = QString::fromUtf8(luaL_checkstring(L, 1));
@@ -6444,26 +7031,40 @@ static int luaSetInputFont(lua_State *L)
 	runtime->setWorldAttribute(QStringLiteral("input_font_height"), QString::number(pointSize));
 	runtime->setWorldAttribute(QStringLiteral("input_font_weight"), QString::number(weight));
 	runtime->setWorldAttribute(QStringLiteral("input_font_italic"), QString::number(italic));
-	if (WorldView *view = runtime->view())
-		view->applyRuntimeSettings();
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (WorldView *view = runtime->view())
+			    view->applyRuntimeSettings();
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaSetMainTitle(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const QString title = concatLuaArgs(L, 1);
-	runtime->setMainTitleOverride(title);
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    runtime->setMainTitleOverride(title);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaSetNotes(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const QString notes = QString::fromUtf8(luaL_checkstring(L, 1));
@@ -6474,92 +7075,119 @@ static int luaSetNotes(lua_State *L)
 static int luaSetOutputFont(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const QString fontName  = QString::fromUtf8(luaL_checkstring(L, 1));
 	const int     pointSize = static_cast<int>(luaL_checkinteger(L, 2));
 	runtime->setWorldAttribute(QStringLiteral("output_font_name"), fontName);
 	runtime->setWorldAttribute(QStringLiteral("output_font_height"), QString::number(pointSize));
-	if (WorldView *view = runtime->view())
-		view->applyRuntimeSettings();
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (WorldView *view = runtime->view())
+			    view->applyRuntimeSettings();
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaSetScroll(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
-	{
-		lua_pushnumber(L, eBadParameter);
-		return 1;
-	}
-	WorldView *view = runtime->view();
-	if (!view)
 	{
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
 	const int  position = static_cast<int>(luaL_checkinteger(L, 1));
 	const bool visible  = optBool(L, 2, true);
-	lua_pushnumber(L, view->setOutputScroll(position, visible));
+	const int  result   = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            if (WorldView *view = runtime->view())
+                return view->setOutputScroll(position, visible);
+            return eBadParameter;
+        },
+        eBadParameter);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaSetSelection(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
-		return 0;
-	WorldView *view = runtime->view();
-	if (!view)
 		return 0;
 	const int startLine   = static_cast<int>(luaL_checkinteger(L, 1));
 	const int endLine     = static_cast<int>(luaL_checkinteger(L, 2));
 	const int startColumn = static_cast<int>(luaL_checkinteger(L, 3));
 	const int endColumn   = static_cast<int>(luaL_checkinteger(L, 4));
-	view->setOutputSelection(startLine, endLine, startColumn, endColumn);
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (WorldView *view = runtime->view())
+			    view->setOutputSelection(startLine, endLine, startColumn, endColumn);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaSetTitle(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const QString title = concatLuaArgs(L, 1);
-	runtime->setWindowTitleOverride(title);
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    runtime->setWindowTitleOverride(title);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
 static int luaSetCursor(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldView *view = runtime->view();
-	if (!view)
-	{
-		lua_pushnumber(L, eBadParameter);
-		return 1;
-	}
 	const int cursor = static_cast<int>(luaL_checkinteger(L, 1));
-	view->setWorldCursor(cursor);
-	lua_pushnumber(L, eOK);
+	const int result = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (WorldView *view = runtime->view())
+		    {
+			    view->setWorldCursor(cursor);
+			    return eOK;
+		    }
+		    return eBadParameter;
+	    },
+	    eBadParameter);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaSetCustomColourName(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -6574,7 +7202,7 @@ static int luaSetCustomColourName(lua_State *L)
 static int luaBase64Decode(lua_State *L)
 {
 	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	if (WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr; !runtime)
+	if (WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr; !runtime)
 	{
 		lua_pushnil(L);
 		return 1;
@@ -6597,7 +7225,7 @@ static int luaBase64Decode(lua_State *L)
 static int luaBase64Encode(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
@@ -6612,42 +7240,36 @@ static int luaBase64Encode(lua_State *L)
 
 static int luaAppendToNotepad(lua_State *L)
 {
-	const char   *title    = luaL_checkstring(L, 1);
+	const QString title    = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString contents = concatLuaArgs(L, 2);
 	auto         *engine   = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime  = engine ? engine->worldRuntime() : nullptr;
-	MainWindow   *mw       = resolveMainWindow();
-	bool          ok       = false;
-	if (mw)
-		ok = mw->appendToNotepad(QString::fromUtf8(title), contents, false, runtime);
+	WorldRuntime *runtime  = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const bool    ok       = runOnMainWindowThreadAllowNestedEvents(
+        [&](MainWindow *mw) -> bool { return mw->appendToNotepad(title, contents, false, runtime); }, false);
 	lua_pushboolean(L, ok);
 	return 1;
 }
 
 static int luaReplaceNotepad(lua_State *L)
 {
-	const char   *title    = luaL_checkstring(L, 1);
+	const QString title    = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString contents = concatLuaArgs(L, 2);
 	auto         *engine   = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime  = engine ? engine->worldRuntime() : nullptr;
-	MainWindow   *mw       = resolveMainWindow();
-	bool          ok       = false;
-	if (mw)
-		ok = mw->appendToNotepad(QString::fromUtf8(title), contents, true, runtime);
+	WorldRuntime *runtime  = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const bool    ok       = runOnMainWindowThreadAllowNestedEvents(
+        [&](MainWindow *mw) -> bool { return mw->appendToNotepad(title, contents, true, runtime); }, false);
 	lua_pushboolean(L, ok);
 	return 0;
 }
 
 static int luaSendToNotepad(lua_State *L)
 {
-	const char   *title    = luaL_checkstring(L, 1);
+	const QString title    = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString contents = concatLuaArgs(L, 2);
 	auto         *engine   = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime  = engine ? engine->worldRuntime() : nullptr;
-	MainWindow   *mw       = resolveMainWindow();
-	bool          ok       = false;
-	if (mw)
-		ok = mw->sendToNotepad(QString::fromUtf8(title), contents, runtime);
+	WorldRuntime *runtime  = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const bool    ok       = runOnMainWindowThreadAllowNestedEvents(
+        [&](MainWindow *mw) -> bool { return mw->sendToNotepad(title, contents, runtime); }, false);
 	lua_pushboolean(L, ok);
 	return 1;
 }
@@ -6660,7 +7282,7 @@ static int luaGetConnectDuration(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime || !runtime->isConnected() || !runtime->connectTime().isValid())
 	{
 		lua_pushnumber(L, 0);
@@ -6679,7 +7301,7 @@ static int luaGetConnectTime(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime || !runtime->connectTime().isValid())
 	{
 		lua_pushnumber(L, 0);
@@ -6697,7 +7319,7 @@ static int luaGetStatusTime(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime || !runtime->statusTime().isValid())
 	{
 		lua_pushnumber(L, 0);
@@ -6715,23 +7337,18 @@ static int luaGetInfo(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	MainWindowHost               *host  = resolveMainWindowHostForRuntime(runtime);
-	auto                         *frame = dynamic_cast<MainWindow *>(host);
-
-	const int                     infoType = static_cast<int>(luaL_checkinteger(L, 1));
-	const QMap<QString, QString> &attrs    = runtime->worldAttributes();
-	const QMap<QString, QString> &multi    = runtime->worldMultilineAttributes();
-	auto                          getAttr  = [&](const QString &key) -> QString { return attrs.value(key); };
-	auto                          getMulti = [&](const QString &key) -> QString
+	const int infoType = static_cast<int>(luaL_checkinteger(L, 1));
+	auto      getAttr  = [&](const QString &key) -> QString { return runtime->worldAttributeValue(key); };
+	auto      getMulti = [&](const QString &key) -> QString
 	{
-		const QString multiValue = multi.value(key);
-		return multiValue.isEmpty() ? attrs.value(key) : multiValue;
+		const QString multiValue = runtime->worldMultilineAttributeValue(key);
+		return multiValue.isEmpty() ? runtime->worldAttributeValue(key) : multiValue;
 	};
 
 	QDateTime value;
@@ -7033,16 +7650,25 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	case 86:
 	{
-		QString word = runtime->wordUnderMenu();
-		if (word.isEmpty())
-		{
-			if (frame)
-			{
-				if (WorldChildWindow *world = frame->activeWorldChildWindow())
-					if (WorldView *view = world->view())
-						word = view->wordUnderCursor();
-			}
-		}
+		const QString word = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> QString
+		    {
+			    QString selectedWord = runtime->wordUnderMenu();
+			    if (!selectedWord.isEmpty())
+				    return selectedWord;
+			    MainWindowHost *host  = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame = dynamic_cast<MainWindow *>(host);
+			    if (!frame)
+				    return {};
+			    if (WorldChildWindow *world = frame->activeWorldChildWindow())
+			    {
+				    if (WorldView *view = world->view())
+					    return view->wordUnderCursor();
+			    }
+			    return {};
+		    },
+		    QString());
 		lua_pushstring(L, word.toLocal8Bit().constData());
 		return 1;
 	}
@@ -7081,34 +7707,58 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	case 280:
 	{
-		if (WorldView *view = runtime->view())
-			lua_pushnumber(L, view->outputClientHeight());
-		else
-			lua_pushnumber(L, 0);
+		const int height = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    if (WorldView *view = runtime->view())
+				    return view->outputClientHeight();
+			    return 0;
+		    },
+		    0);
+		lua_pushnumber(L, height);
 		return 1;
 	}
 	case 281:
 	{
-		if (WorldView *view = runtime->view())
-			lua_pushnumber(L, view->outputClientWidth());
-		else
-			lua_pushnumber(L, 0);
+		const int width = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    if (WorldView *view = runtime->view())
+				    return view->outputClientWidth();
+			    return 0;
+		    },
+		    0);
+		lua_pushnumber(L, width);
 		return 1;
 	}
 	case 263:
 	{
-		if (WorldView *view = runtime->view())
-			lua_pushnumber(L, view->height());
-		else
-			lua_pushnumber(L, 0);
+		const int height = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    if (WorldView *view = runtime->view())
+				    return view->height();
+			    return 0;
+		    },
+		    0);
+		lua_pushnumber(L, height);
 		return 1;
 	}
 	case 264:
 	{
-		if (WorldView *view = runtime->view())
-			lua_pushnumber(L, view->width());
-		else
-			lua_pushnumber(L, 0);
+		const int width = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    if (WorldView *view = runtime->view())
+				    return view->width();
+			    return 0;
+		    },
+		    0);
+		lua_pushnumber(L, width);
 		return 1;
 	}
 	case 282:
@@ -7116,22 +7766,34 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	case 283:
 	{
-		if (WorldView *view = runtime->view(); view && view->hasLastMousePosition())
-			lua_pushnumber(L, view->lastMousePosition().x());
-		else
-			lua_pushnumber(L, -1);
+		const int x = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    if (WorldView *view = runtime->view(); view && view->hasLastMousePosition())
+				    return view->lastMousePosition().x();
+			    return -1;
+		    },
+		    -1);
+		lua_pushnumber(L, x);
 		return 1;
 	}
 	case 284:
 	{
-		if (WorldView *view = runtime->view(); view && view->hasLastMousePosition())
-			lua_pushnumber(L, view->lastMousePosition().y());
-		else
-			lua_pushnumber(L, -1);
+		const int y = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    if (WorldView *view = runtime->view(); view && view->hasLastMousePosition())
+				    return view->lastMousePosition().y();
+			    return -1;
+		    },
+		    -1);
+		lua_pushnumber(L, y);
 		return 1;
 	}
 	case 285:
-		lua_pushboolean(L, runtime->view() != nullptr);
+		lua_pushboolean(L, runOnRuntimeThread(runtime, [&]() -> int { return runtime->view() ? 1 : 0; }, 0));
 		return 1;
 	case 286:
 		lua_pushnumber(L, runtime->triggersMatchedThisSession());
@@ -7144,66 +7806,82 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	case 290:
 	{
-		WorldView *view = runtime->view();
-		if (!view)
-		{
-			lua_pushnumber(L, 0);
-			return 1;
-		}
-		const WorldRuntime::TextRectangleSettings &settings = runtime->textRectangle();
-		const bool                                 textRectangleCompatActive =
-		    settings.left != 0 || settings.top != 0 || settings.right != 0 || settings.bottom != 0;
-		const QRect rect =
-		    textRectangleCompatActive ? view->outputTextRectangleUnreserved() : view->outputTextRectangle();
-		lua_pushnumber(L, rect.left());
+		const int left = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    WorldView *view = runtime->view();
+			    if (!view)
+				    return 0;
+			    const WorldRuntime::TextRectangleSettings &settings = runtime->textRectangle();
+			    const bool                                 textRectangleCompatActive =
+			        settings.left != 0 || settings.top != 0 || settings.right != 0 || settings.bottom != 0;
+			    const QRect rect = textRectangleCompatActive ? view->outputTextRectangleUnreserved()
+			                                                 : view->outputTextRectangle();
+			    return rect.left();
+		    },
+		    0);
+		lua_pushnumber(L, left);
 		return 1;
 	}
 	case 291:
 	{
-		WorldView *view = runtime->view();
-		if (!view)
-		{
-			lua_pushnumber(L, 0);
-			return 1;
-		}
-		const WorldRuntime::TextRectangleSettings &settings = runtime->textRectangle();
-		const bool                                 textRectangleCompatActive =
-		    settings.left != 0 || settings.top != 0 || settings.right != 0 || settings.bottom != 0;
-		const QRect rect =
-		    textRectangleCompatActive ? view->outputTextRectangleUnreserved() : view->outputTextRectangle();
-		lua_pushnumber(L, rect.top());
+		const int top = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    WorldView *view = runtime->view();
+			    if (!view)
+				    return 0;
+			    const WorldRuntime::TextRectangleSettings &settings = runtime->textRectangle();
+			    const bool                                 textRectangleCompatActive =
+			        settings.left != 0 || settings.top != 0 || settings.right != 0 || settings.bottom != 0;
+			    const QRect rect = textRectangleCompatActive ? view->outputTextRectangleUnreserved()
+			                                                 : view->outputTextRectangle();
+			    return rect.top();
+		    },
+		    0);
+		lua_pushnumber(L, top);
 		return 1;
 	}
 	case 292:
 	{
-		WorldView *view = runtime->view();
-		if (!view)
-		{
-			lua_pushnumber(L, 0);
-			return 1;
-		}
-		const WorldRuntime::TextRectangleSettings &settings = runtime->textRectangle();
-		const bool                                 textRectangleCompatActive =
-		    settings.left != 0 || settings.top != 0 || settings.right != 0 || settings.bottom != 0;
-		const QRect rect =
-		    textRectangleCompatActive ? view->outputTextRectangleUnreserved() : view->outputTextRectangle();
-		lua_pushnumber(L, rect.left() + rect.width());
+		const int right = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    WorldView *view = runtime->view();
+			    if (!view)
+				    return 0;
+			    const WorldRuntime::TextRectangleSettings &settings = runtime->textRectangle();
+			    const bool                                 textRectangleCompatActive =
+			        settings.left != 0 || settings.top != 0 || settings.right != 0 || settings.bottom != 0;
+			    const QRect rect = textRectangleCompatActive ? view->outputTextRectangleUnreserved()
+			                                                 : view->outputTextRectangle();
+			    return rect.left() + rect.width();
+		    },
+		    0);
+		lua_pushnumber(L, right);
 		return 1;
 	}
 	case 293:
 	{
-		WorldView *view = runtime->view();
-		if (!view)
-		{
-			lua_pushnumber(L, 0);
-			return 1;
-		}
-		const WorldRuntime::TextRectangleSettings &settings = runtime->textRectangle();
-		const bool                                 textRectangleCompatActive =
-		    settings.left != 0 || settings.top != 0 || settings.right != 0 || settings.bottom != 0;
-		const QRect rect =
-		    textRectangleCompatActive ? view->outputTextRectangleUnreserved() : view->outputTextRectangle();
-		lua_pushnumber(L, rect.top() + rect.height());
+		const int bottom = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    WorldView *view = runtime->view();
+			    if (!view)
+				    return 0;
+			    const WorldRuntime::TextRectangleSettings &settings = runtime->textRectangle();
+			    const bool                                 textRectangleCompatActive =
+			        settings.left != 0 || settings.top != 0 || settings.right != 0 || settings.bottom != 0;
+			    const QRect rect = textRectangleCompatActive ? view->outputTextRectangleUnreserved()
+			                                                 : view->outputTextRectangle();
+			    return rect.top() + rect.height();
+		    },
+		    0);
+		lua_pushnumber(L, bottom);
 		return 1;
 	}
 
@@ -7270,8 +7948,16 @@ static int luaGetInfo(lua_State *L)
 	}
 	case 120:
 	{
-		WorldView *view = runtime->view();
-		lua_pushboolean(L, view ? view->outputScrollBarWanted() : true);
+		const bool wanted = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> bool
+		    {
+			    if (WorldView *view = runtime->view())
+				    return view->outputScrollBarWanted();
+			    return true;
+		    },
+		    true);
+		lua_pushboolean(L, wanted);
 		return 1;
 	}
 	case 121:
@@ -7288,9 +7974,15 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	case 125:
 	{
-		bool fullScreen = false;
-		if (frame)
-			fullScreen = frame->isFullScreenMode();
+		const bool fullScreen = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> bool
+		    {
+			    MainWindowHost *host  = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame = dynamic_cast<MainWindow *>(host);
+			    return frame && frame->isFullScreenMode();
+		    },
+		    false);
 		lua_pushboolean(L, fullScreen);
 		return 1;
 	}
@@ -7458,9 +8150,15 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	case 296:
 	{
-		int pos = 0;
-		if (WorldView *view = runtime->view())
-			pos = view->outputScrollPosition();
+		const int pos = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    if (WorldView *view = runtime->view())
+				    return view->outputScrollPosition();
+			    return 0;
+		    },
+		    0);
 		lua_pushnumber(L, pos);
 		return 1;
 	}
@@ -7495,43 +8193,68 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	case 235:
 	{
-		int count = 0;
-		if (frame)
-			count = frame->worldWindowCount();
+		const int count = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host  = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame = dynamic_cast<MainWindow *>(host);
+			    return frame ? frame->worldWindowCount() : 0;
+		    },
+		    0);
 		lua_pushnumber(L, count);
 		return 1;
 	}
 	case 236:
 	{
-		int startCol = 0;
-		if (WorldView *view = runtime->view())
-			startCol = view->inputSelectionStartColumn();
+		const int startCol = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    if (WorldView *view = runtime->view())
+				    return view->inputSelectionStartColumn();
+			    return 0;
+		    },
+		    0);
 		lua_pushnumber(L, startCol);
 		return 1;
 	}
 	case 237:
 	{
-		int endCol = 0;
-		if (WorldView *view = runtime->view())
-			endCol = view->inputSelectionEndColumn();
+		const int endCol = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    if (WorldView *view = runtime->view())
+				    return view->inputSelectionEndColumn();
+			    return 0;
+		    },
+		    0);
 		lua_pushnumber(L, endCol);
 		return 1;
 	}
 	case 238:
 	{
-		int showCmd = kWindowShowNormal;
-		if (frame)
-		{
-			if (WorldChildWindow *world = frame->findWorldChildWindow(runtime))
-			{
-				if (!world->isVisible())
-					showCmd = kWindowShowHide;
-				else if (world->isMinimized())
-					showCmd = kWindowShowMinimized;
-				else if (world->isMaximized())
-					showCmd = kWindowShowMaximized;
-			}
-		}
+		const int showCmd = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host  = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame = dynamic_cast<MainWindow *>(host);
+			    if (!frame)
+				    return kWindowShowNormal;
+			    if (WorldChildWindow *world = frame->findWorldChildWindow(runtime))
+			    {
+				    if (!world->isVisible())
+					    return kWindowShowHide;
+				    if (world->isMinimized())
+					    return kWindowShowMinimized;
+				    if (world->isMaximized())
+					    return kWindowShowMaximized;
+			    }
+			    return kWindowShowNormal;
+		    },
+		    kWindowShowNormal);
 		lua_pushnumber(L, showCmd);
 		return 1;
 	}
@@ -7565,91 +8288,217 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	case 249:
 	{
-		const QWidget *client = frame ? frame->centralWidget() : nullptr;
-		lua_pushnumber(L, client ? client->height() : 0);
+		const int height = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host   = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame  = dynamic_cast<MainWindow *>(host);
+			    const QWidget  *client = frame ? frame->centralWidget() : nullptr;
+			    return client ? client->height() : 0;
+		    },
+		    0);
+		lua_pushnumber(L, height);
 		return 1;
 	}
 	case 250:
 	{
-		const QWidget *client = frame ? frame->centralWidget() : nullptr;
-		lua_pushnumber(L, client ? client->width() : 0);
+		const int width = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host   = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame  = dynamic_cast<MainWindow *>(host);
+			    const QWidget  *client = frame ? frame->centralWidget() : nullptr;
+			    return client ? client->width() : 0;
+		    },
+		    0);
+		lua_pushnumber(L, width);
 		return 1;
 	}
 	case 251:
 	{
-		const QToolBar *toolBar = frame ? frame->mainToolbar() : nullptr;
-		lua_pushnumber(L, toolBar ? toolBar->height() : 0);
+		const int height = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host    = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame   = dynamic_cast<MainWindow *>(host);
+			    const QToolBar *toolBar = frame ? frame->mainToolbar() : nullptr;
+			    return toolBar ? toolBar->height() : 0;
+		    },
+		    0);
+		lua_pushnumber(L, height);
 		return 1;
 	}
 	case 252:
 	{
-		const QToolBar *toolBar = frame ? frame->mainToolbar() : nullptr;
-		lua_pushnumber(L, toolBar ? toolBar->width() : 0);
+		const int width = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host    = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame   = dynamic_cast<MainWindow *>(host);
+			    const QToolBar *toolBar = frame ? frame->mainToolbar() : nullptr;
+			    return toolBar ? toolBar->width() : 0;
+		    },
+		    0);
+		lua_pushnumber(L, width);
 		return 1;
 	}
 	case 253:
 	{
-		const QToolBar *toolBar = frame ? frame->worldToolbar() : nullptr;
-		lua_pushnumber(L, toolBar ? toolBar->height() : 0);
+		const int height = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host    = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame   = dynamic_cast<MainWindow *>(host);
+			    const QToolBar *toolBar = frame ? frame->worldToolbar() : nullptr;
+			    return toolBar ? toolBar->height() : 0;
+		    },
+		    0);
+		lua_pushnumber(L, height);
 		return 1;
 	}
 	case 254:
 	{
-		const QToolBar *toolBar = frame ? frame->worldToolbar() : nullptr;
-		lua_pushnumber(L, toolBar ? toolBar->width() : 0);
+		const int width = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host    = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame   = dynamic_cast<MainWindow *>(host);
+			    const QToolBar *toolBar = frame ? frame->worldToolbar() : nullptr;
+			    return toolBar ? toolBar->width() : 0;
+		    },
+		    0);
+		lua_pushnumber(L, width);
 		return 1;
 	}
 	case 255:
 	{
-		const QToolBar *toolBar = frame ? frame->activityToolbar() : nullptr;
-		lua_pushnumber(L, toolBar ? toolBar->height() : 0);
+		const int height = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host    = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame   = dynamic_cast<MainWindow *>(host);
+			    const QToolBar *toolBar = frame ? frame->activityToolbar() : nullptr;
+			    return toolBar ? toolBar->height() : 0;
+		    },
+		    0);
+		lua_pushnumber(L, height);
 		return 1;
 	}
 	case 256:
 	{
-		const QToolBar *toolBar = frame ? frame->activityToolbar() : nullptr;
-		lua_pushnumber(L, toolBar ? toolBar->width() : 0);
+		const int width = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host    = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame   = dynamic_cast<MainWindow *>(host);
+			    const QToolBar *toolBar = frame ? frame->activityToolbar() : nullptr;
+			    return toolBar ? toolBar->width() : 0;
+		    },
+		    0);
+		lua_pushnumber(L, width);
 		return 1;
 	}
 	case 257:
 	{
-		const QWidget *infoBar = frame ? frame->infoBarWidget() : nullptr;
-		lua_pushnumber(L, infoBar ? infoBar->height() : 0);
+		const int height = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host    = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame   = dynamic_cast<MainWindow *>(host);
+			    const QWidget  *infoBar = frame ? frame->infoBarWidget() : nullptr;
+			    return infoBar ? infoBar->height() : 0;
+		    },
+		    0);
+		lua_pushnumber(L, height);
 		return 1;
 	}
 	case 258:
 	{
-		const QWidget *infoBar = frame ? frame->infoBarWidget() : nullptr;
-		lua_pushnumber(L, infoBar ? infoBar->width() : 0);
+		const int width = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host    = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame   = dynamic_cast<MainWindow *>(host);
+			    const QWidget  *infoBar = frame ? frame->infoBarWidget() : nullptr;
+			    return infoBar ? infoBar->width() : 0;
+		    },
+		    0);
+		lua_pushnumber(L, width);
 		return 1;
 	}
 	case 259:
 	{
-		const QStatusBar *statusBar = frame ? frame->frameStatusBar() : nullptr;
-		lua_pushnumber(L, statusBar ? statusBar->height() : 0);
+		const int height = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost   *host      = resolveMainWindowHostForRuntime(runtime);
+			    auto             *frame     = dynamic_cast<MainWindow *>(host);
+			    const QStatusBar *statusBar = frame ? frame->frameStatusBar() : nullptr;
+			    return statusBar ? statusBar->height() : 0;
+		    },
+		    0);
+		lua_pushnumber(L, height);
 		return 1;
 	}
 	case 260:
 	{
-		const QStatusBar *statusBar = frame ? frame->frameStatusBar() : nullptr;
-		lua_pushnumber(L, statusBar ? statusBar->width() : 0);
+		const int width = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost   *host      = resolveMainWindowHostForRuntime(runtime);
+			    auto             *frame     = dynamic_cast<MainWindow *>(host);
+			    const QStatusBar *statusBar = frame ? frame->frameStatusBar() : nullptr;
+			    return statusBar ? statusBar->width() : 0;
+		    },
+		    0);
+		lua_pushnumber(L, width);
 		return 1;
 	}
 	case 261:
 	{
-		int heightValue = 0;
-		if (frame)
-			if (WorldChildWindow *childWindow = frame->findWorldChildWindow(runtime))
-				heightValue = childWindow->height();
+		const int heightValue = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host  = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame = dynamic_cast<MainWindow *>(host);
+			    if (!frame)
+				    return 0;
+			    if (WorldChildWindow *childWindow = frame->findWorldChildWindow(runtime))
+				    return childWindow->height();
+			    return 0;
+		    },
+		    0);
 		lua_pushnumber(L, heightValue);
 		return 1;
 	}
 	case 262:
 	{
-		int widthValue = 0;
-		if (frame)
-			if (WorldChildWindow *childWindow = frame->findWorldChildWindow(runtime))
-				widthValue = childWindow->width();
+		const int widthValue = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    MainWindowHost *host  = resolveMainWindowHostForRuntime(runtime);
+			    auto           *frame = dynamic_cast<MainWindow *>(host);
+			    if (!frame)
+				    return 0;
+			    if (WorldChildWindow *childWindow = frame->findWorldChildWindow(runtime))
+				    return childWindow->width();
+			    return 0;
+		    },
+		    0);
 		lua_pushnumber(L, widthValue);
 		return 1;
 	}
@@ -7737,52 +8586,62 @@ static QString concatLuaArgs(lua_State *L, const int startIndex, const QString &
 
 static void reportLuaError(const LuaCallbackEngine &engine, const QString &message)
 {
-	if (WorldRuntime *runtime = engine.worldRuntime())
+	if (WorldRuntime *runtime = engine.worldRuntimeForBridgedCall())
 	{
-		const QString logFlag   = runtime->worldAttributes().value(QStringLiteral("log_script_errors"));
-		bool          logErrors = isEnabledValue(logFlag);
-		if (!logErrors)
-		{
-			if (bool parsedKeyword = false; parseBooleanKeywordValue(logFlag, parsedKeyword))
-				logErrors = parsedKeyword;
-		}
-		if (logErrors)
-		{
-			QString       logDir     = runtime->defaultLogDirectory();
-			const QString startupDir = runtime->startupDirectory();
-			if (logDir.isEmpty())
-				logDir = startupDir;
-			else if (QDir::isRelativePath(logDir) && !startupDir.isEmpty())
-				logDir = QDir(startupDir).filePath(logDir);
+		const bool handled = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> bool
+		    {
+			    const QString logFlag   = runtime->worldAttributeValue(QStringLiteral("log_script_errors"));
+			    bool          logErrors = isEnabledValue(logFlag);
+			    if (!logErrors)
+			    {
+				    if (bool parsedKeyword = false; parseBooleanKeywordValue(logFlag, parsedKeyword))
+					    logErrors = parsedKeyword;
+			    }
+			    if (logErrors)
+			    {
+				    QString       logDir     = runtime->defaultLogDirectory();
+				    const QString startupDir = runtime->startupDirectory();
+				    if (logDir.isEmpty())
+					    logDir = startupDir;
+				    else if (QDir::isRelativePath(logDir) && !startupDir.isEmpty())
+					    logDir = QDir(startupDir).filePath(logDir);
 
-			QDir dir(logDir.isEmpty() ? QDir::currentPath() : logDir);
-			if (!dir.exists())
-				dir.mkpath(QStringLiteral("."));
-			QFile file(dir.filePath(QStringLiteral("script_error_log.txt")));
-			if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
-			{
-				QTextStream out(&file);
-				out << "\n--- Scripting error on "
-				    << QDateTime::currentDateTime().toString(QStringLiteral("dddd, MMMM d, yyyy, h:mm AP"))
-				    << " ---\n";
-				out << message << "\n";
-			}
-		}
+				    QDir dir(logDir.isEmpty() ? QDir::currentPath() : logDir);
+				    if (!dir.exists())
+					    dir.mkpath(QStringLiteral("."));
+				    QFile file(dir.filePath(QStringLiteral("script_error_log.txt")));
+				    if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+				    {
+					    QTextStream out(&file);
+					    out << "\n--- Scripting error on "
+					        << QDateTime::currentDateTime().toString(
+					               QStringLiteral("dddd, MMMM d, yyyy, h:mm AP"))
+					        << " ---\n";
+					    out << message << "\n";
+				    }
+			    }
 
-		const QString flag =
-		    runtime->worldAttributes().value(QStringLiteral("script_errors_to_output_window"));
-		bool toOutput = isEnabledValue(flag);
-		if (!toOutput)
-		{
-			if (bool parsedKeyword = false; parseBooleanKeywordValue(flag, parsedKeyword))
-				toOutput = parsedKeyword;
-		}
-		if ((toOutput || runtime->forceScriptErrorOutputToWorld()) &&
-		    !runtime->suppressScriptErrorOutputToWorld())
-		{
-			runtime->outputText(message, true, true);
+			    const QString flag =
+			        runtime->worldAttributeValue(QStringLiteral("script_errors_to_output_window"));
+			    bool toOutput = isEnabledValue(flag);
+			    if (!toOutput)
+			    {
+				    if (bool parsedKeyword = false; parseBooleanKeywordValue(flag, parsedKeyword))
+					    toOutput = parsedKeyword;
+			    }
+			    if ((toOutput || runtime->forceScriptErrorOutputToWorld()) &&
+			        !runtime->suppressScriptErrorOutputToWorld())
+			    {
+				    runtime->outputText(message, true, true);
+				    return true;
+			    }
+			    return false;
+		    },
+		    false);
+		if (handled)
 			return;
-		}
 	}
 	qWarning() << message;
 }
@@ -7793,8 +8652,11 @@ static int luaReportRequireFailure(lua_State *L)
 	if (!engine)
 		return 0;
 
-	WorldRuntime *runtime = engine->worldRuntime();
-	if (!runtime || !runtime->forceScriptErrorOutputToWorld())
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
+	if (!runtime)
+		return 0;
+	if (!runOnRuntimeThread(
+	        runtime, [&]() -> bool { return runtime->forceScriptErrorOutputToWorld(); }, false))
 		return 0;
 
 	const QString module  = QString::fromUtf8(luaL_optstring(L, 1, ""));
@@ -7853,12 +8715,6 @@ static long luaToLongOpt(lua_State *L, const int index, const long defaultValue)
 	return static_cast<long>(value);
 }
 
-static WorldRuntime *runtimeFromLua(lua_State *L)
-{
-	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	return engine ? engine->worldRuntime() : nullptr;
-}
-
 static QString pluginIdFromLua(lua_State *L)
 {
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
@@ -7890,53 +8746,68 @@ static int luaUtilsTimer(lua_State *L)
 
 static int luaUtilsFontPicker(lua_State *L)
 {
-	const char *fontname   = luaL_optstring(L, 1, "");
-	const int   fontsize   = static_cast<int>(luaL_optnumber(L, 2, 10));
-	const int   fontcolour = static_cast<int>(luaL_optnumber(L, 3, 0));
+	const char  *fontname   = luaL_optstring(L, 1, "");
+	const int    fontsize   = static_cast<int>(luaL_optnumber(L, 2, 10));
+	const int    fontcolour = static_cast<int>(luaL_optnumber(L, 3, 0));
 
-	QFont       font(QString::fromUtf8(fontname), fontsize);
-	bool        ok     = false;
-	const QFont chosen = QFontDialog::getFont(&ok, font, resolveMainWindow(), QStringLiteral("Select Font"));
-	if (!ok)
+	const QFont  initialFont(QString::fromUtf8(fontname), fontsize);
+	const QColor initialColour = colourFromRef(fontcolour);
+	struct FontPickerResult
+	{
+			bool   accepted{false};
+			QFont  font;
+			QColor colour;
+	};
+	const FontPickerResult result = runOnMainWindowThreadAllowNestedEvents(
+	    [&](MainWindow *frame) -> FontPickerResult
+	    {
+		    FontPickerResult pickerResult;
+		    bool             ok = false;
+		    pickerResult.font = QFontDialog::getFont(&ok, initialFont, frame, QStringLiteral("Select Font"));
+		    if (!ok)
+			    return pickerResult;
+		    pickerResult.accepted = true;
+		    pickerResult.colour =
+		        QColorDialog::getColor(initialColour, frame, QStringLiteral("Select Colour"));
+		    if (!pickerResult.colour.isValid())
+			    pickerResult.colour = initialColour;
+		    return pickerResult;
+	    },
+	    {});
+	if (!result.accepted)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
 
-	QColor       colour = colourFromRef(fontcolour);
-	const QColor picked =
-	    QColorDialog::getColor(colour, resolveMainWindow(), QStringLiteral("Select Colour"));
-	if (picked.isValid())
-		colour = picked;
-
 	lua_newtable(L);
 
-	const QString family    = chosen.family();
+	const QString family    = result.font.family();
 	QByteArray    nameBytes = family.toUtf8();
 	lua_pushlstring(L, nameBytes.constData(), nameBytes.size());
 	lua_setfield(L, -2, "name");
 
-	const QString styleName  = QFontDatabase::styleString(chosen);
+	const QString styleName  = QFontDatabase::styleString(result.font);
 	QByteArray    styleBytes = styleName.toUtf8();
 	lua_pushlstring(L, styleBytes.constData(), styleBytes.size());
 	lua_setfield(L, -2, "style");
 
-	lua_pushnumber(L, chosen.pointSize());
+	lua_pushnumber(L, result.font.pointSize());
 	lua_setfield(L, -2, "size");
 
-	lua_pushnumber(L, colourRefFromQColor(colour));
+	lua_pushnumber(L, colourRefFromQColor(result.colour));
 	lua_setfield(L, -2, "colour");
 
-	lua_pushboolean(L, chosen.bold());
+	lua_pushboolean(L, result.font.bold());
 	lua_setfield(L, -2, "bold");
 
-	lua_pushboolean(L, chosen.italic());
+	lua_pushboolean(L, result.font.italic());
 	lua_setfield(L, -2, "italic");
 
-	lua_pushboolean(L, chosen.underline());
+	lua_pushboolean(L, result.font.underline());
 	lua_setfield(L, -2, "underline");
 
-	lua_pushboolean(L, chosen.strikeOut());
+	lua_pushboolean(L, result.font.strikeOut());
 	lua_setfield(L, -2, "strikeout");
 
 	lua_pushnumber(L, 0);
@@ -8048,13 +8919,16 @@ static int luaUtilsMsgBoxInternal(lua_State *L)
 		luaL_error(L, "msgbox icon unknown");
 	}
 
-	QMessageBox box(icon, QString::fromUtf8(boxtitle), QString::fromUtf8(boxmsg), buttons,
-	                resolveMainWindow());
-	if (defaultButton != QMessageBox::NoButton)
-		box.setDefaultButton(defaultButton);
-
-	const auto  result = static_cast<QMessageBox::StandardButton>(box.exec());
-	const char *out    = nullptr;
+	const auto result = runOnMainWindowThreadAllowNestedEvents(
+	    [&](MainWindow *frame) -> QMessageBox::StandardButton
+	    {
+		    QMessageBox box(icon, QString::fromUtf8(boxtitle), QString::fromUtf8(boxmsg), buttons, frame);
+		    if (defaultButton != QMessageBox::NoButton)
+			    box.setDefaultButton(defaultButton);
+		    return static_cast<QMessageBox::StandardButton>(box.exec());
+	    },
+	    QMessageBox::NoButton);
+	const char *out = nullptr;
 	switch (result)
 	{
 	case QMessageBox::Yes:
@@ -8381,8 +9255,9 @@ static int luaUtilsInfo(lua_State *L)
 		lua_rawset(L, -3);
 
 		QString translatorFile;
-		if (WorldRuntime *runtime = runtimeFromLua(L))
-			translatorFile = runtime->translatorFile();
+		if (WorldRuntime *runtime = runtimeFromLuaUpvalue(L))
+			translatorFile = runOnRuntimeThread(
+			    runtime, [&]() -> QString { return runtime->translatorFile(); }, QString());
 		setString("translator_file", QDir::fromNativeSeparators(translatorFile));
 	}
 
@@ -8412,18 +9287,22 @@ static int luaUtilsInfoTypes(lua_State *L)
 static int luaUtilsSendToFront(lua_State *L)
 {
 	const QString titlePrefix = QString::fromUtf8(luaL_checkstring(L, 1));
-	bool          found       = false;
-	for (QWidget *widget : QApplication::topLevelWidgets())
-	{
-		if (!widget)
-			continue;
-		if (const QString title = widget->windowTitle(); !title.startsWith(titlePrefix))
-			continue;
-		widget->raise();
-		widget->activateWindow();
-		found = true;
-		break;
-	}
+	const bool    found       = runOnMainWindowThread(
+        [&titlePrefix](MainWindow *) -> bool
+        {
+            for (QWidget *widget : QApplication::topLevelWidgets())
+            {
+                if (!widget)
+                    continue;
+                if (const QString title = widget->windowTitle(); !title.startsWith(titlePrefix))
+                    continue;
+                widget->raise();
+                widget->activateWindow();
+                return true;
+            }
+            return false;
+        },
+        false);
 	lua_pushboolean(L, found ? 1 : 0);
 	return 1;
 }
@@ -8431,8 +9310,13 @@ static int luaUtilsSendToFront(lua_State *L)
 static int luaUtilsSetBackgroundColour(lua_State *L)
 {
 	const long colour = static_cast<long>(luaL_optnumber(L, 1, 0));
-	if (MainWindow *frame = resolveMainWindow())
-		frame->setFrameBackgroundColour(colour);
+	runOnMainWindowThread(
+	    [&](MainWindow *frame) -> bool
+	    {
+		    frame->setFrameBackgroundColour(colour);
+		    return true;
+	    },
+	    false);
 	return 0;
 }
 
@@ -8596,7 +9480,8 @@ static int luaUtilsShellExecute(lua_State *L)
 			if (const QFileInfo fi(url.toLocalFile()); fi.exists() && !fi.isDir())
 				url = QUrl::fromLocalFile(fi.absolutePath());
 		}
-		ok = QDesktopServices::openUrl(url);
+		ok = runOnMainWindowThread([&url](MainWindow *) -> bool { return QDesktopServices::openUrl(url); },
+		                           false);
 		if (!ok)
 			error = QStringLiteral("Failed to open target.");
 	}
@@ -8614,8 +9499,13 @@ static int luaUtilsShellExecute(lua_State *L)
 static int luaUtilsShowDebugStatus(lua_State *L)
 {
 	const bool enabled = optBool(L, 1, true);
-	if (MainWindow *frame = resolveMainWindow())
-		frame->setShowDebugStatus(enabled);
+	runOnMainWindowThread(
+	    [&](MainWindow *frame) -> bool
+	    {
+		    frame->setShowDebugStatus(enabled);
+		    return true;
+	    },
+	    false);
 	return 0;
 }
 
@@ -8640,15 +9530,33 @@ static int luaUtilsSpellCheckDialog(lua_State *L)
 		}
 	}
 
-	SpellCheckDialog dlg(misspelt, suggestions, resolveMainWindow());
-	if (dlg.exec() != QDialog::Accepted)
+	struct SpellCheckDialogResult
+	{
+			bool    accepted{false};
+			QString action;
+			QString replacement;
+	};
+	const SpellCheckDialogResult result = runOnMainWindowThreadAllowNestedEvents(
+	    [&](MainWindow *frame) -> SpellCheckDialogResult
+	    {
+		    SpellCheckDialog       dlg(misspelt, suggestions, frame);
+		    SpellCheckDialogResult dialogResult;
+		    if (dlg.exec() != QDialog::Accepted)
+			    return dialogResult;
+		    dialogResult.accepted    = true;
+		    dialogResult.action      = dlg.action();
+		    dialogResult.replacement = dlg.replacement();
+		    return dialogResult;
+	    },
+	    {});
+	if (!result.accepted)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
 
-	const QByteArray action      = dlg.action().toUtf8();
-	const QByteArray replacement = dlg.replacement().toUtf8();
+	const QByteArray action      = result.action.toUtf8();
+	const QByteArray replacement = result.replacement.toUtf8();
 	lua_pushlstring(L, action.constData(), action.size());
 	lua_pushlstring(L, replacement.constData(), replacement.size());
 	return 2;
@@ -9026,43 +9934,56 @@ static QString luaUtilsFilterString(lua_State *L)
 
 static int luaUtilsFilePicker(lua_State *L)
 {
-	const char *title            = luaL_optstring(L, 1, "");
-	const char *defaultName      = luaL_optstring(L, 2, "");
-	const char *defaultExtension = luaL_optstring(L, 3, "");
-	const bool  saveDialog       = optBool(L, 5, false);
+	const QString title            = QString::fromUtf8(luaL_optstring(L, 1, ""));
+	const QString defaultName      = QString::fromUtf8(luaL_optstring(L, 2, ""));
+	const QString defaultExtension = QString::fromUtf8(luaL_optstring(L, 3, ""));
+	const QString filterString     = luaUtilsFilterString(L);
+	const bool    saveDialog       = optBool(L, 5, false);
 
-	QString     initialDir = QDir::currentPath();
-	if (WorldRuntime *runtime = runtimeFromLua(L))
+	QString       initialDir = QDir::currentPath();
+	if (WorldRuntime *runtime = runtimeFromLuaUpvalue(L))
 	{
-		if (const QString runtimeDir = runtime->fileBrowsingDirectory(); !runtimeDir.isEmpty())
+		const QString runtimeDir = runOnRuntimeThread(
+		    runtime, [&]() -> QString { return runtime->fileBrowsingDirectory(); }, QString());
+		if (!runtimeDir.isEmpty())
 			initialDir = runtimeDir;
 	}
 
-	QFileDialog dialog(resolveMainWindow(), QString::fromUtf8(title), initialDir, luaUtilsFilterString(L));
-	dialog.setAcceptMode(saveDialog ? QFileDialog::AcceptSave : QFileDialog::AcceptOpen);
-	dialog.setFileMode(saveDialog ? QFileDialog::AnyFile : QFileDialog::ExistingFile);
-	if (defaultName[0] != '\0')
-		dialog.selectFile(QString::fromUtf8(defaultName));
-	if (defaultExtension[0] != '\0')
-		dialog.setDefaultSuffix(QString::fromUtf8(defaultExtension));
-
-	if (dialog.exec() != QDialog::Accepted)
+	const QString selectedPath = runOnMainWindowThreadAllowNestedEvents(
+	    [&](MainWindow *frame) -> QString
+	    {
+		    QFileDialog dialog(frame, title, initialDir, filterString);
+		    dialog.setAcceptMode(saveDialog ? QFileDialog::AcceptSave : QFileDialog::AcceptOpen);
+		    dialog.setFileMode(saveDialog ? QFileDialog::AnyFile : QFileDialog::ExistingFile);
+		    if (!defaultName.isEmpty())
+			    dialog.selectFile(defaultName);
+		    if (!defaultExtension.isEmpty())
+			    dialog.setDefaultSuffix(defaultExtension);
+		    if (dialog.exec() != QDialog::Accepted)
+			    return {};
+		    const QStringList files = dialog.selectedFiles();
+		    return files.isEmpty() ? QString() : files.first();
+	    },
+	    {});
+	if (selectedPath.isEmpty())
 	{
 		lua_pushnil(L);
 		return 1;
 	}
 
-	const QStringList files = dialog.selectedFiles();
-	if (files.isEmpty())
+	if (WorldRuntime *runtime = runtimeFromLuaUpvalue(L))
 	{
-		lua_pushnil(L);
-		return 1;
+		const QString absolutePath = QFileInfo(selectedPath).absolutePath();
+		runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    runtime->setFileBrowsingDirectory(absolutePath);
+			    return 0;
+		    },
+		    0);
 	}
-
-	const QString &path = files.first();
-	if (WorldRuntime *runtime = runtimeFromLua(L))
-		runtime->setFileBrowsingDirectory(QFileInfo(path).absolutePath());
-	const QByteArray bytes = QDir::toNativeSeparators(path).toUtf8();
+	const QByteArray bytes = QDir::toNativeSeparators(selectedPath).toUtf8();
 	lua_pushlstring(L, bytes.constData(), bytes.size());
 	return 1;
 }
@@ -9125,74 +10046,94 @@ static int luaUtilsTextBox(lua_State *L, const bool multiline)
 		boxHeight   = getInt("box_height");
 	}
 
-	QDialog dialog(resolveMainWindow());
-	dialog.setWindowTitle(QString::fromUtf8(inputtitle));
-	auto                              layout = std::make_unique<QVBoxLayout>(&dialog);
-	std::unique_ptr<QLabel>           messageLabel;
-	std::unique_ptr<QPlainTextEdit>   multilineEdit;
-	std::unique_ptr<QLineEdit>        singleLineEdit;
-	std::unique_ptr<QDialogButtonBox> buttons;
-
-	if (inputmsg[0] != '\0')
+	const QString messageText = QString::fromUtf8(inputmsg, sizeToInt(static_cast<qsizetype>(inputmsgLen)));
+	const QString titleText = QString::fromUtf8(inputtitle, sizeToInt(static_cast<qsizetype>(inputtitleLen)));
+	const QString defaultText  = QString::fromUtf8(inputdefault);
+	const QString inputFontStr = QString::fromUtf8(inputfont);
+	struct TextBoxResult
 	{
-		messageLabel = std::make_unique<QLabel>(QString::fromUtf8(inputmsg), &dialog);
-		messageLabel->setWordWrap(true);
-		layout->addWidget(messageLabel.get());
-	}
+			bool    accepted{false};
+			QString text;
+	};
+	const TextBoxResult result = runOnMainWindowThreadAllowNestedEvents(
+	    [&](MainWindow *frame) -> TextBoxResult
+	    {
+		    QDialog dialog(frame);
+		    dialog.setWindowTitle(titleText);
+		    auto                              layout = std::make_unique<QVBoxLayout>(&dialog);
+		    std::unique_ptr<QLabel>           messageLabel;
+		    std::unique_ptr<QPlainTextEdit>   multilineEdit;
+		    std::unique_ptr<QLineEdit>        singleLineEdit;
+		    std::unique_ptr<QDialogButtonBox> buttons;
 
-	QFont font;
-	if (inputfont[0] != '\0')
-		font = qmudPreferredMonospaceFont(QString::fromUtf8(inputfont), inputsize);
-	else if (inputsize > 0)
-		font = qmudPreferredMonospaceFont(QString(), inputsize);
+		    if (!messageText.isEmpty())
+		    {
+			    messageLabel = std::make_unique<QLabel>(messageText, &dialog);
+			    messageLabel->setWordWrap(true);
+			    layout->addWidget(messageLabel.get());
+		    }
 
-	QString result;
-	if (multiline)
-	{
-		multilineEdit = std::make_unique<QPlainTextEdit>(&dialog);
-		multilineEdit->setPlainText(QString::fromUtf8(inputdefault));
-		multilineEdit->setReadOnly(readOnly);
-		if (font.pointSize() > 0 || !font.family().isEmpty())
-			multilineEdit->setFont(font);
-		layout->addWidget(multilineEdit.get());
-		result = multilineEdit->toPlainText();
-		QObject::connect(&dialog, &QDialog::accepted,
-		                 [edit = multilineEdit.get(), &result] { result = edit->toPlainText(); });
-	}
-	else
-	{
-		singleLineEdit = std::make_unique<QLineEdit>(&dialog);
-		singleLineEdit->setText(QString::fromUtf8(inputdefault));
-		singleLineEdit->setReadOnly(readOnly);
-		if (maxLength > 0)
-			singleLineEdit->setMaxLength(maxLength);
-		if (font.pointSize() > 0 || !font.family().isEmpty())
-			singleLineEdit->setFont(font);
-		layout->addWidget(singleLineEdit.get());
-		result = singleLineEdit->text();
-		QObject::connect(&dialog, &QDialog::accepted,
-		                 [edit = singleLineEdit.get(), &result] { result = edit->text(); });
-	}
+		    QFont font;
+		    if (!inputFontStr.isEmpty())
+			    font = qmudPreferredMonospaceFont(inputFontStr, inputsize);
+		    else if (inputsize > 0)
+			    font = qmudPreferredMonospaceFont(QString(), inputsize);
 
-	buttons = std::make_unique<QDialogButtonBox>(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-	if (!okLabel.isEmpty())
-		buttons->button(QDialogButtonBox::Ok)->setText(okLabel);
-	if (!cancelLabel.isEmpty())
-		buttons->button(QDialogButtonBox::Cancel)->setText(cancelLabel);
-	QObject::connect(buttons.get(), &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-	QObject::connect(buttons.get(), &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-	layout->addWidget(buttons.get());
+		    QString textResult;
+		    if (multiline)
+		    {
+			    multilineEdit = std::make_unique<QPlainTextEdit>(&dialog);
+			    multilineEdit->setPlainText(defaultText);
+			    multilineEdit->setReadOnly(readOnly);
+			    if (font.pointSize() > 0 || !font.family().isEmpty())
+				    multilineEdit->setFont(font);
+			    layout->addWidget(multilineEdit.get());
+			    textResult = multilineEdit->toPlainText();
+			    QObject::connect(&dialog, &QDialog::accepted, [edit = multilineEdit.get(), &textResult]
+			                     { textResult = edit->toPlainText(); });
+		    }
+		    else
+		    {
+			    singleLineEdit = std::make_unique<QLineEdit>(&dialog);
+			    singleLineEdit->setText(defaultText);
+			    singleLineEdit->setReadOnly(readOnly);
+			    if (maxLength > 0)
+				    singleLineEdit->setMaxLength(maxLength);
+			    if (font.pointSize() > 0 || !font.family().isEmpty())
+				    singleLineEdit->setFont(font);
+			    layout->addWidget(singleLineEdit.get());
+			    textResult = singleLineEdit->text();
+			    QObject::connect(&dialog, &QDialog::accepted,
+			                     [edit = singleLineEdit.get(), &textResult] { textResult = edit->text(); });
+		    }
 
-	if (boxWidth > 0 || boxHeight > 0)
-		dialog.resize(qMax(200, boxWidth), qMax(120, boxHeight));
+		    buttons =
+		        std::make_unique<QDialogButtonBox>(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+		    if (!okLabel.isEmpty())
+			    buttons->button(QDialogButtonBox::Ok)->setText(okLabel);
+		    if (!cancelLabel.isEmpty())
+			    buttons->button(QDialogButtonBox::Cancel)->setText(cancelLabel);
+		    QObject::connect(buttons.get(), &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+		    QObject::connect(buttons.get(), &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+		    layout->addWidget(buttons.get());
 
-	if (dialog.exec() != QDialog::Accepted)
+		    if (boxWidth > 0 || boxHeight > 0)
+			    dialog.resize(qMax(200, boxWidth), qMax(120, boxHeight));
+
+		    TextBoxResult dialogResult;
+		    if (dialog.exec() != QDialog::Accepted)
+			    return dialogResult;
+		    dialogResult.accepted = true;
+		    dialogResult.text     = textResult;
+		    return dialogResult;
+	    },
+	    {});
+	if (!result.accepted)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-
-	const QByteArray outBytes = result.toUtf8();
+	const QByteArray outBytes = result.text.toUtf8();
 	lua_pushlstring(L, outBytes.constData(), outBytes.size());
 	return 1;
 }
@@ -9271,33 +10212,38 @@ static int luaUtilsListBox(lua_State *L)
 		choices.push_back(choice);
 	}
 
-	QDialog dialog(resolveMainWindow());
-	dialog.setWindowTitle(QString::fromUtf8(choosetitle));
-	auto layout = std::make_unique<QVBoxLayout>(&dialog);
-	auto label  = std::make_unique<QLabel>(QString::fromUtf8(choosemsg), &dialog);
-	auto list   = std::make_unique<QListWidget>(&dialog);
-	auto buttons =
-	    std::make_unique<QDialogButtonBox>(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-	label->setWordWrap(true);
-	layout->addWidget(label.get());
+	const QString chooseMessage =
+	    QString::fromUtf8(choosemsg, sizeToInt(static_cast<qsizetype>(choosemsgLen)));
+	const QString chooseTitle =
+	    QString::fromUtf8(choosetitle, sizeToInt(static_cast<qsizetype>(choosetitleLen)));
+	const int row = runOnMainWindowThreadAllowNestedEvents(
+	    [&](MainWindow *frame) -> int
+	    {
+		    QDialog dialog(frame);
+		    dialog.setWindowTitle(chooseTitle);
+		    auto layout = std::make_unique<QVBoxLayout>(&dialog);
+		    auto label  = std::make_unique<QLabel>(chooseMessage, &dialog);
+		    auto list   = std::make_unique<QListWidget>(&dialog);
+		    auto buttons =
+		        std::make_unique<QDialogButtonBox>(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+		    label->setWordWrap(true);
+		    layout->addWidget(label.get());
 
-	for (const Choice &choice : choices)
-		list->addItem(choice.value);
-	if (defaultIndex >= 0)
-		list->setCurrentRow(defaultIndex);
-	layout->addWidget(list.get());
-	QObject::connect(buttons.get(), &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-	QObject::connect(buttons.get(), &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-	QObject::connect(list.get(), &QListWidget::itemDoubleClicked, &dialog, &QDialog::accept);
-	layout->addWidget(buttons.get());
+		    for (const Choice &choice : choices)
+			    list->addItem(choice.value);
+		    if (defaultIndex >= 0)
+			    list->setCurrentRow(defaultIndex);
+		    layout->addWidget(list.get());
+		    QObject::connect(buttons.get(), &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+		    QObject::connect(buttons.get(), &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+		    QObject::connect(list.get(), &QListWidget::itemDoubleClicked, &dialog, &QDialog::accept);
+		    layout->addWidget(buttons.get());
 
-	if (dialog.exec() != QDialog::Accepted)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-
-	const int row = list->currentRow();
+		    if (dialog.exec() != QDialog::Accepted)
+			    return -1;
+		    return list->currentRow();
+	    },
+	    -1);
 	if (row < 0 || row >= choices.size())
 	{
 		lua_pushnil(L);
@@ -9316,7 +10262,7 @@ static int luaUtilsListBox(lua_State *L)
 
 static int luaUtilsMultiListBox(lua_State *L)
 {
-	const char   *title      = luaL_optstring(L, 1, "");
+	const QString title      = QString::fromUtf8(luaL_optstring(L, 1, ""));
 	constexpr int tableIndex = 2;
 	if (!lua_istable(L, tableIndex))
 		luaL_error(L, "must have table of choices as second argument");
@@ -9370,37 +10316,53 @@ static int luaUtilsMultiListBox(lua_State *L)
 		                  { return a.value.compare(b.value, Qt::CaseInsensitive) < 0; });
 	}
 
-	QDialog dialog(resolveMainWindow());
-	dialog.setWindowTitle(QString::fromUtf8(title));
-	auto layout = std::make_unique<QVBoxLayout>(&dialog);
-	auto list   = std::make_unique<QListWidget>(&dialog);
-	auto buttons =
-	    std::make_unique<QDialogButtonBox>(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-	list->setSelectionMode(QAbstractItemView::MultiSelection);
-	for (int i = 0; i < entries.size(); ++i)
+	struct MultiListResult
 	{
-		const Entry &e = entries.at(i);
-		list->addItem(e.value);
-		auto *item = list->item(list->count() - 1);
-		item->setData(Qt::UserRole, i);
-		if (!e.isNumber && defaultKeys.contains(e.stringKey))
-			item->setSelected(true);
-	}
-	layout->addWidget(list.get());
-	QObject::connect(buttons.get(), &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-	QObject::connect(buttons.get(), &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-	layout->addWidget(buttons.get());
+			bool         accepted{false};
+			QVector<int> indices;
+	};
+	const MultiListResult dialogResult = runOnMainWindowThreadAllowNestedEvents(
+	    [&](MainWindow *frame) -> MultiListResult
+	    {
+		    QDialog dialog(frame);
+		    dialog.setWindowTitle(title);
+		    auto layout = std::make_unique<QVBoxLayout>(&dialog);
+		    auto list   = std::make_unique<QListWidget>(&dialog);
+		    auto buttons =
+		        std::make_unique<QDialogButtonBox>(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+		    list->setSelectionMode(QAbstractItemView::MultiSelection);
+		    for (int i = 0; i < entries.size(); ++i)
+		    {
+			    const Entry &e = entries.at(i);
+			    list->addItem(e.value);
+			    auto *item = list->item(list->count() - 1);
+			    item->setData(Qt::UserRole, i);
+			    if (!e.isNumber && defaultKeys.contains(e.stringKey))
+				    item->setSelected(true);
+		    }
+		    layout->addWidget(list.get());
+		    QObject::connect(buttons.get(), &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+		    QObject::connect(buttons.get(), &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+		    layout->addWidget(buttons.get());
 
-	if (dialog.exec() != QDialog::Accepted)
+		    MultiListResult result;
+		    if (dialog.exec() != QDialog::Accepted)
+			    return result;
+		    result.accepted = true;
+		    for (QListWidgetItem *item : list->selectedItems())
+			    result.indices.push_back(item->data(Qt::UserRole).toInt());
+		    return result;
+	    },
+	    {});
+	if (!dialogResult.accepted)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
 
 	lua_newtable(L);
-	for (QListWidgetItem *item : list->selectedItems())
+	for (const int index : dialogResult.indices)
 	{
-		const int index = item->data(Qt::UserRole).toInt();
 		if (index < 0 || index >= entries.size())
 			continue;
 		if (const Entry &e = entries.at(index); e.isNumber)
@@ -9415,26 +10377,23 @@ static int luaUtilsMultiListBox(lua_State *L)
 
 static int luaUtilsActivateNotepad(lua_State *L)
 {
-	const char *title = luaL_checkstring(L, 1);
-	MainWindow *mw    = resolveMainWindow();
-	bool        ok    = false;
-	if (mw)
-		ok = mw->activateNotepad(QString::fromUtf8(title));
+	const QString title = QString::fromUtf8(luaL_checkstring(L, 1));
+	const bool    ok    = runOnMainWindowThreadAllowNestedEvents([&](const MainWindow *mw) -> bool
+                                                           { return mw->activateNotepad(title); }, false);
 	lua_pushboolean(L, ok);
 	return 1;
 }
 
 static int luaUtilsAppendToNotepad(lua_State *L)
 {
-	const char   *title    = luaL_checkstring(L, 1);
-	const char   *contents = luaL_checkstring(L, 2);
+	const QString title    = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString contents = QString::fromUtf8(luaL_checkstring(L, 2));
 	const bool    replace  = optBool(L, 3, false);
 	auto         *engine   = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime  = engine ? engine->worldRuntime() : nullptr;
-	MainWindow   *mw       = resolveMainWindow();
-	bool          ok       = false;
-	if (mw)
-		ok = mw->appendToNotepad(QString::fromUtf8(title), QString::fromUtf8(contents), replace, runtime);
+	WorldRuntime *runtime  = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const bool    ok       = runOnMainWindowThreadAllowNestedEvents(
+        [&](MainWindow *mw) -> bool { return mw->appendToNotepad(title, contents, replace, runtime); },
+        false);
 	lua_pushboolean(L, ok);
 	return 1;
 }
@@ -9556,7 +10515,9 @@ static int luaUtilsDirectoryPicker(lua_State *L)
 	const QString title      = QString::fromUtf8(luaL_optstring(L, 1, ""));
 	const QString defaultDir = QString::fromUtf8(luaL_optstring(L, 2, ""));
 	const QString initial    = defaultDir.isEmpty() ? QDir::currentPath() : defaultDir;
-	const QString chosen     = QFileDialog::getExistingDirectory(resolveMainWindow(), title, initial);
+	const QString chosen     = runOnMainWindowThreadAllowNestedEvents(
+        [&](MainWindow *frame) -> QString
+        { return QFileDialog::getExistingDirectory(frame, title, initial); }, {});
 	if (chosen.isEmpty())
 	{
 		lua_pushnil(L);
@@ -9615,43 +10576,45 @@ static int luaUtilsFilterPicker(lua_State *L)
 		                  { return a.value.localeAwareCompare(b.value) < 0; });
 	}
 
-	QDialog dialog(resolveMainWindow());
-	dialog.setWindowTitle(title);
-	auto layout = std::make_unique<QVBoxLayout>(&dialog);
-	auto filter = std::make_unique<QLineEdit>(&dialog);
-	auto list   = std::make_unique<QListWidget>(&dialog);
-	auto buttons =
-	    std::make_unique<QDialogButtonBox>(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-	filter->setPlaceholderText(QStringLiteral("Filter"));
-	filter->setText(initialFilter);
-	layout->addWidget(filter.get());
-	layout->addWidget(list.get());
-	auto refill = [listWidget = list.get(), filterWidget = filter.get(), &choices]
-	{
-		const QString needle = filterWidget->text().trimmed();
-		listWidget->clear();
-		for (int i = 0; i < choices.size(); ++i)
-		{
-			if (!needle.isEmpty() && !choices[i].value.contains(needle, Qt::CaseInsensitive))
-				continue;
-			listWidget->addItem(choices[i].value);
-			QListWidgetItem *item = listWidget->item(listWidget->count() - 1);
-			item->setData(Qt::UserRole, i);
-		}
-	};
-	QObject::connect(filter.get(), &QLineEdit::textChanged, &dialog, refill);
-	refill();
-	QObject::connect(buttons.get(), &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-	QObject::connect(buttons.get(), &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-	QObject::connect(list.get(), &QListWidget::itemDoubleClicked, &dialog, &QDialog::accept);
-	layout->addWidget(buttons.get());
+	const int idx = runOnMainWindowThreadAllowNestedEvents(
+	    [&](MainWindow *frame) -> int
+	    {
+		    QDialog dialog(frame);
+		    dialog.setWindowTitle(title);
+		    auto layout = std::make_unique<QVBoxLayout>(&dialog);
+		    auto filter = std::make_unique<QLineEdit>(&dialog);
+		    auto list   = std::make_unique<QListWidget>(&dialog);
+		    auto buttons =
+		        std::make_unique<QDialogButtonBox>(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+		    filter->setPlaceholderText(QStringLiteral("Filter"));
+		    filter->setText(initialFilter);
+		    layout->addWidget(filter.get());
+		    layout->addWidget(list.get());
+		    auto refill = [listWidget = list.get(), filterWidget = filter.get(), &choices]
+		    {
+			    const QString needle = filterWidget->text().trimmed();
+			    listWidget->clear();
+			    for (int i = 0; i < choices.size(); ++i)
+			    {
+				    if (!needle.isEmpty() && !choices[i].value.contains(needle, Qt::CaseInsensitive))
+					    continue;
+				    listWidget->addItem(choices[i].value);
+				    QListWidgetItem *item = listWidget->item(listWidget->count() - 1);
+				    item->setData(Qt::UserRole, i);
+			    }
+		    };
+		    QObject::connect(filter.get(), &QLineEdit::textChanged, &dialog, refill);
+		    refill();
+		    QObject::connect(buttons.get(), &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+		    QObject::connect(buttons.get(), &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+		    QObject::connect(list.get(), &QListWidget::itemDoubleClicked, &dialog, &QDialog::accept);
+		    layout->addWidget(buttons.get());
 
-	if (dialog.exec() != QDialog::Accepted || !list->currentItem())
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const int idx = list->currentItem()->data(Qt::UserRole).toInt();
+		    if (dialog.exec() != QDialog::Accepted || !list->currentItem())
+			    return -1;
+		    return list->currentItem()->data(Qt::UserRole).toInt();
+	    },
+	    -1);
 	if (idx < 0 || idx >= choices.size())
 	{
 		lua_pushnil(L);
@@ -10906,8 +11869,15 @@ static int luaProgressGc(lua_State *L)
 	{
 		if ((*ud)->dialog)
 		{
-			(*ud)->dialog->close();
-			delete (*ud)->dialog;
+			QProgressDialog *dialog = (*ud)->dialog;
+			runOnMainWindowThread(
+			    [dialog](MainWindow *) -> bool
+			    {
+				    dialog->close();
+				    delete dialog;
+				    return true;
+			    },
+			    false);
 			(*ud)->dialog = nullptr;
 		}
 		delete *ud;
@@ -10925,19 +11895,25 @@ static int luaProgressToString(lua_State *L)
 
 static int luaProgressNew(lua_State *L)
 {
-	const char *title = luaL_optstring(L, 1, "Progress ...");
-	auto       *ud    = static_cast<LuaProgressDialog **>(lua_newuserdata(L, sizeof(LuaProgressDialog *)));
-	*ud               = new LuaProgressDialog();
+	const QString title = QString::fromUtf8(luaL_optstring(L, 1, "Progress ..."));
+	auto         *ud    = static_cast<LuaProgressDialog **>(lua_newuserdata(L, sizeof(LuaProgressDialog *)));
+	*ud                 = new LuaProgressDialog();
 
-	auto *dlg = new QProgressDialog(resolveMainWindow());
-	dlg->setWindowTitle(QString::fromUtf8(title));
-	dlg->setLabelText(QString());
-	dlg->setCancelButtonText(QStringLiteral("Cancel"));
-	dlg->setRange(0, 100);
-	dlg->setValue(0);
-	dlg->setAutoClose(false);
-	dlg->setAutoReset(false);
-	dlg->show();
+	QProgressDialog *dlg = runOnMainWindowThread(
+	    [&](MainWindow *frame) -> QProgressDialog *
+	    {
+		    auto *dialog = new QProgressDialog(frame);
+		    dialog->setWindowTitle(title);
+		    dialog->setLabelText(QString());
+		    dialog->setCancelButtonText(QStringLiteral("Cancel"));
+		    dialog->setRange(0, 100);
+		    dialog->setValue(0);
+		    dialog->setAutoClose(false);
+		    dialog->setAutoReset(false);
+		    dialog->show();
+		    return dialog;
+	    },
+	    static_cast<QProgressDialog *>(nullptr));
 
 	(*ud)->dialog = dlg;
 	luaL_getmetatable(L, kProgressMetaName);
@@ -10948,9 +11924,15 @@ static int luaProgressNew(lua_State *L)
 static int luaProgressSetStatus(lua_State *L)
 {
 	LuaProgressDialog *p      = progressCheck(L);
-	const char        *status = luaL_checkstring(L, 2);
+	const QString      status = QString::fromUtf8(luaL_checkstring(L, 2));
 	if (p->dialog)
-		p->dialog->setLabelText(QString::fromUtf8(status));
+		runOnMainWindowThread(
+		    [dialog = p->dialog, status](MainWindow *) -> bool
+		    {
+			    dialog->setLabelText(status);
+			    return true;
+		    },
+		    false);
 	return 0;
 }
 
@@ -10960,7 +11942,13 @@ static int luaProgressSetRange(lua_State *L)
 	const int          start = static_cast<int>(luaL_checkinteger(L, 2));
 	const int          end   = static_cast<int>(luaL_checkinteger(L, 3));
 	if (p->dialog)
-		p->dialog->setRange(start, end);
+		runOnMainWindowThread(
+		    [dialog = p->dialog, start, end](MainWindow *) -> bool
+		    {
+			    dialog->setRange(start, end);
+			    return true;
+		    },
+		    false);
 	return 0;
 }
 
@@ -10969,7 +11957,13 @@ static int luaProgressSetPosition(lua_State *L)
 	LuaProgressDialog *p   = progressCheck(L);
 	const int          pos = static_cast<int>(luaL_checkinteger(L, 2));
 	if (p->dialog)
-		p->dialog->setValue(pos);
+		runOnMainWindowThread(
+		    [dialog = p->dialog, pos](MainWindow *) -> bool
+		    {
+			    dialog->setValue(pos);
+			    return true;
+		    },
+		    false);
 	return 0;
 }
 
@@ -10985,14 +11979,23 @@ static int luaProgressSetStep(lua_State *L)
 static int luaProgressStep(lua_State *L)
 {
 	if (LuaProgressDialog *p = progressCheck(L); p->dialog)
-		p->dialog->setValue(p->dialog->value() + p->step);
+		runOnMainWindowThread(
+		    [dialog = p->dialog, step = p->step](MainWindow *) -> bool
+		    {
+			    dialog->setValue(dialog->value() + step);
+			    return true;
+		    },
+		    false);
 	return 0;
 }
 
 static int luaProgressCheckCancel(lua_State *L)
 {
-	LuaProgressDialog *p = progressCheck(L);
-	lua_pushboolean(L, p->dialog ? p->dialog->wasCanceled() : 0);
+	LuaProgressDialog *p        = progressCheck(L);
+	const bool         canceled = p->dialog ? runOnMainWindowThread([dialog = p->dialog](MainWindow *) -> bool
+                                                            { return dialog->wasCanceled(); }, false)
+	                                        : false;
+	lua_pushboolean(L, canceled ? 1 : 0);
 	return 1;
 }
 
@@ -11407,11 +12410,18 @@ static int luaNote(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const QString text = concatLuaArgs(L, 1);
-	runtime->outputText(text, true, true);
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    runtime->outputText(text, true, true);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
@@ -11420,11 +12430,18 @@ static int luaPrint(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const QString text = concatLuaArgs(L, 1, QStringLiteral(" "));
-	runtime->outputText(text, true, true);
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    runtime->outputText(text, true, true);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
@@ -11433,11 +12450,18 @@ static int luaTell(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const QString text = concatLuaArgs(L, 1);
-	runtime->outputText(text, true, false);
+	runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    runtime->outputText(text, true, false);
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
@@ -11449,15 +12473,22 @@ static int luaSend(lua_State *L)
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString text = concatLuaArgs(L, 1);
-	const bool    echo = isEnabledValue(runtime->worldAttributes().value(QStringLiteral("display_my_input")));
-	const int     result = runtime->sendCommand(text, echo, false, false, false, false);
+	const QString text   = concatLuaArgs(L, 1);
+	const int     result = runOnRuntimeThreadAllowNestedEvents(
+        runtime,
+        [&]() -> int
+        {
+            const bool echo =
+                isEnabledValue(runtime->worldAttributeValue(QStringLiteral("display_my_input")));
+            return runtime->sendCommand(text, echo, false, false, false, false);
+        },
+        eWorldClosed);
 	lua_pushnumber(L, result);
 	return 1;
 }
@@ -11470,14 +12501,16 @@ static int luaSendNoEcho(lua_State *L)
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
 	const QString text   = concatLuaArgs(L, 1);
-	const int     result = runtime->sendCommand(text, false, false, false, false, false);
+	const int     result = runOnRuntimeThreadAllowNestedEvents(
+        runtime, [&]() -> int { return runtime->sendCommand(text, false, false, false, false, false); },
+        eWorldClosed);
 	lua_pushnumber(L, result);
 	return 1;
 }
@@ -11490,17 +12523,23 @@ static int luaSendImmediate(lua_State *L)
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString                 text     = concatLuaArgs(L, 1);
-	const QMap<QString, QString> &attrs    = runtime->worldAttributes();
-	const bool                    echo     = isEnabledValue(attrs.value(QStringLiteral("display_my_input")));
-	const bool                    logInput = isEnabledValue(attrs.value(QStringLiteral("log_input")));
-	const int                     result   = runtime->sendCommand(text, echo, false, logInput, false, true);
+	const QString text   = concatLuaArgs(L, 1);
+	const int     result = runOnRuntimeThreadAllowNestedEvents(
+        runtime,
+        [&]() -> int
+        {
+            const bool echo =
+                isEnabledValue(runtime->worldAttributeValue(QStringLiteral("display_my_input")));
+            const bool logInput = isEnabledValue(runtime->worldAttributeValue(QStringLiteral("log_input")));
+            return runtime->sendCommand(text, echo, false, logInput, false, true);
+        },
+        eWorldClosed);
 	lua_pushnumber(L, result);
 	return 1;
 }
@@ -11513,15 +12552,22 @@ static int luaSendPush(lua_State *L)
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString text = concatLuaArgs(L, 1);
-	const bool    echo = isEnabledValue(runtime->worldAttributes().value(QStringLiteral("display_my_input")));
-	const int     result = runtime->sendCommand(text, echo, false, false, true, false);
+	const QString text   = concatLuaArgs(L, 1);
+	const int     result = runOnRuntimeThreadAllowNestedEvents(
+        runtime,
+        [&]() -> int
+        {
+            const bool echo =
+                isEnabledValue(runtime->worldAttributeValue(QStringLiteral("display_my_input")));
+            return runtime->sendCommand(text, echo, false, false, true, false);
+        },
+        eWorldClosed);
 	lua_pushnumber(L, result);
 	return 1;
 }
@@ -11534,18 +12580,21 @@ static int luaSendSpecial(lua_State *L)
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const char *message = luaL_checkstring(L, 1);
-	const bool  echo    = optBool(L, 2, false);
-	const bool  queue   = optBool(L, 3, false);
-	const bool  log     = optBool(L, 4, false);
-	const bool  history = optBool(L, 5, false);
-	const int   result  = runtime->sendCommand(QString::fromUtf8(message), echo, queue, log, history, false);
+	const char   *message = luaL_checkstring(L, 1);
+	const bool    echo    = optBool(L, 2, false);
+	const bool    queue   = optBool(L, 3, false);
+	const bool    log     = optBool(L, 4, false);
+	const bool    history = optBool(L, 5, false);
+	const QString text    = QString::fromUtf8(message);
+	const int     result  = runOnRuntimeThreadAllowNestedEvents(
+        runtime, [&]() -> int { return runtime->sendCommand(text, echo, queue, log, history, false); },
+        eWorldClosed);
 	lua_pushnumber(L, result);
 	return 1;
 }
@@ -11558,22 +12607,26 @@ static int luaConnect(lua_State *L)
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	if (runtime->connectPhase() != WorldRuntime::eConnectNotConnected)
-	{
-		lua_pushnumber(L, eWorldOpen);
-		return 1;
-	}
-	const QMap<QString, QString> &attrs = runtime->worldAttributes();
-	const QString                 host  = attrs.value(QStringLiteral("site"));
-	const auto                    port  = static_cast<quint16>(attrs.value(QStringLiteral("port")).toUInt());
-	runtime->connectToWorld(host, port);
-	lua_pushnumber(L, eOK);
+	const int result = runOnRuntimeThreadAllowNestedEvents(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (runtime->connectPhase() != WorldRuntime::eConnectNotConnected)
+			    return eWorldOpen;
+		    const QString host = runtime->worldAttributeValue(QStringLiteral("site"));
+		    const auto    port =
+		        static_cast<quint16>(runtime->worldAttributeValue(QStringLiteral("port")).toUInt());
+		    runtime->connectToWorld(host, port);
+		    return eOK;
+	    },
+	    eWorldClosed);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
@@ -11585,20 +12638,26 @@ static int luaDisconnect(lua_State *L)
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	if (const int phase = runtime->connectPhase();
-	    phase == WorldRuntime::eConnectNotConnected || phase == WorldRuntime::eConnectDisconnecting)
-	{
-		lua_pushnumber(L, eWorldClosed);
-		return 1;
-	}
-	runtime->disconnectFromWorld();
-	lua_pushnumber(L, eOK);
+	const int result = runOnRuntimeThreadAllowNestedEvents(
+	    runtime,
+	    [&]() -> int
+	    {
+		    if (const int phase = runtime->connectPhase();
+		        phase == WorldRuntime::eConnectNotConnected || phase == WorldRuntime::eConnectDisconnecting)
+		    {
+			    return eWorldClosed;
+		    }
+		    runtime->disconnectFromWorld();
+		    return eOK;
+	    },
+	    eWorldClosed);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
@@ -11610,7 +12669,7 @@ static int luaIsConnected(lua_State *L)
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	lua_pushboolean(L, runtime && runtime->isConnected());
 	return 1;
 }
@@ -11623,7 +12682,7 @@ static int luaOpenLog(lua_State *L)
 		lua_pushnumber(L, eLogFileBadWrite);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eLogFileBadWrite);
@@ -11644,7 +12703,7 @@ static int luaCloseLog(lua_State *L)
 		lua_pushnumber(L, eLogFileNotOpen);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eLogFileNotOpen);
@@ -11663,7 +12722,7 @@ static int luaWriteLog(lua_State *L)
 		lua_pushnumber(L, eLogFileNotOpen);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eLogFileNotOpen);
@@ -11683,7 +12742,7 @@ static int luaIsLogOpen(lua_State *L)
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	lua_pushboolean(L, runtime && runtime->isLogOpen());
 	return 1;
 }
@@ -11696,7 +12755,7 @@ static int luaGetQueue(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -11738,7 +12797,7 @@ static int luaAcceleratorTo(lua_State *L)
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -11801,7 +12860,7 @@ static int luaAccelerator(lua_State *L)
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -11854,7 +12913,7 @@ static int luaAcceleratorList(lua_State *L)
 	lua_newtable(L);
 	if (!engine)
 		return 1;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 1;
 
@@ -11865,15 +12924,14 @@ static int luaAcceleratorList(lua_State *L)
 		int commandId = runtime->acceleratorCommandForKey(mapKey);
 		if (commandId < 0)
 			continue;
-		const WorldRuntime::AcceleratorEntry *entry = runtime->acceleratorEntryForCommand(commandId);
-		if (!entry)
-			continue;
-		const auto    keyCode   = static_cast<quint16>(mapKey & 0xFFFF);
-		const auto    virt      = static_cast<quint32>(mapKey >> 16 & 0xFFFFFFFF);
-		const QString keyString = AcceleratorUtils::acceleratorToString(virt, keyCode);
-		const QString line      = QStringLiteral("%1 = %2%3")
+		const QString commandText = runtime->acceleratorCommandText(commandId);
+		const int     sendTo      = runtime->acceleratorSendTarget(commandId);
+		const auto    keyCode     = static_cast<quint16>(mapKey & 0xFFFF);
+		const auto    virt        = static_cast<quint32>(mapKey >> 16 & 0xFFFFFFFF);
+		const QString keyString   = AcceleratorUtils::acceleratorToString(virt, keyCode);
+		const QString line        = QStringLiteral("%1 = %2%3")
 		                         .arg(keyString.isEmpty() ? QStringLiteral("<unknown>") : keyString,
-		                              entry->text, acceleratorSendTag(entry->sendTo));
+		                              commandText, acceleratorSendTag(sendTo));
 		const QByteArray bytes = line.toUtf8();
 		lua_pushlstring(L, bytes.constData(), bytes.size());
 		lua_rawseti(L, -2, index++);
@@ -11890,7 +12948,7 @@ static int luaGetReceivedBytes(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	lua_pushnumber(L, runtime ? static_cast<lua_Number>(runtime->bytesIn()) : 0.0);
 	return 1;
 }
@@ -11903,7 +12961,7 @@ static int luaGetSentBytes(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	lua_pushnumber(L, runtime ? static_cast<lua_Number>(runtime->bytesOut()) : 0.0);
 	return 1;
 }
@@ -11916,7 +12974,7 @@ static int luaGetLineCount(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	lua_pushnumber(L, runtime ? runtime->totalLinesReceived() : 0);
 	return 1;
 }
@@ -11929,7 +12987,7 @@ static int luaGetLinesInBufferCount(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	lua_pushnumber(L, runtime ? runtime->luaContextLinesInBufferCount() : 0);
 	return 1;
 }
@@ -11942,7 +13000,7 @@ static int luaGetRecentLines(lua_State *L)
 		lua_pushstring(L, "");
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
@@ -11954,14 +13012,9 @@ static int luaGetRecentLines(lua_State *L)
 		lua_pushstring(L, "");
 		return 1;
 	}
-	const QVector<WorldRuntime::LineEntry> &lines     = runtime->lines();
-	const int                               lineCount = sizeToInt(lines.size());
-	const int                               start     = qMax(0, lineCount - count);
-	QStringList                             out;
-	for (int i = start; i < lineCount; ++i)
-		out.append(lines.at(i).text);
+	const QStringList out = runtime->recentLines(count);
 	// Legacy behavior: GetRecentLines joins with '\n'.
-	const QString joined = out.join(QStringLiteral("\n"));
+	const QString     joined = out.join(QStringLiteral("\n"));
 	lua_pushstring(L, joined.toLocal8Bit().constData());
 	return 1;
 }
@@ -11993,7 +13046,7 @@ static int luaSetStatus(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const QString text = concatLuaArgs(L, 1);
@@ -12009,13 +13062,13 @@ static int luaGetEchoInput(lua_State *L)
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	const bool enabled = isEnabledValue(runtime->worldAttributes().value(QStringLiteral("display_my_input")));
+	const bool enabled = isEnabledValue(runtime->worldAttributeValue(QStringLiteral("display_my_input")));
 	lua_pushboolean(L, enabled);
 	return 1;
 }
@@ -12025,7 +13078,7 @@ static int luaSetEchoInput(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const bool enabled = optBool(L, 1, true);
@@ -12042,13 +13095,13 @@ static int luaGetLogInput(lua_State *L)
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	const bool enabled = isEnabledValue(runtime->worldAttributes().value(QStringLiteral("log_input")));
+	const bool enabled = isEnabledValue(runtime->worldAttributeValue(QStringLiteral("log_input")));
 	lua_pushboolean(L, enabled);
 	return 1;
 }
@@ -12058,7 +13111,7 @@ static int luaSetLogInput(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const bool enabled = optBool(L, 1, true);
@@ -12075,13 +13128,13 @@ static int luaGetLogNotes(lua_State *L)
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	const bool enabled = isEnabledValue(runtime->worldAttributes().value(QStringLiteral("log_notes")));
+	const bool enabled = isEnabledValue(runtime->worldAttributeValue(QStringLiteral("log_notes")));
 	lua_pushboolean(L, enabled);
 	return 1;
 }
@@ -12091,7 +13144,7 @@ static int luaSetLogNotes(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const bool enabled = optBool(L, 1, true);
@@ -12108,13 +13161,13 @@ static int luaGetLogOutput(lua_State *L)
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	const bool enabled = isEnabledValue(runtime->worldAttributes().value(QStringLiteral("log_output")));
+	const bool enabled = isEnabledValue(runtime->worldAttributeValue(QStringLiteral("log_output")));
 	lua_pushboolean(L, enabled);
 	return 1;
 }
@@ -12124,7 +13177,7 @@ static int luaSetLogOutput(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const bool enabled = optBool(L, 1, true);
@@ -12141,7 +13194,7 @@ static int luaGetTrace(lua_State *L)
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushboolean(L, 0);
@@ -12156,7 +13209,7 @@ static int luaSetTrace(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const bool enabled = optBool(L, 1, true);
@@ -12169,17 +13222,24 @@ static int luaTraceOut(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const QString message = concatLuaArgs(L, 1);
-	QMudTraceDispatch::emitTrace(
-	    message,
-	    QMudTraceDispatch::Callbacks{
-	        [runtime]() { return runtime->traceEnabled(); },
-	        [runtime](const bool enabled) { runtime->setTraceEnabled(enabled); },
-	        [runtime](const QString &text) { return runtime->firePluginTrace(text); },
-	        [runtime](const QString &line) { runtime->outputText(line, true, true); }});
+	runOnRuntimeThreadAllowNestedEvents(
+	    runtime,
+	    [&]() -> int
+	    {
+		    QMudTraceDispatch::emitTrace(
+		        message,
+		        QMudTraceDispatch::Callbacks{
+		            [runtime]() { return runtime->traceEnabled(); },
+		            [runtime](const bool enabled) { runtime->setTraceEnabled(enabled); },
+		            [runtime](const QString &text) { return runtime->firePluginTrace(text); },
+		            [runtime](const QString &line) { runtime->outputText(line, true, true); }});
+		    return 0;
+	    },
+	    0);
 	return 0;
 }
 
@@ -12191,13 +13251,13 @@ static int luaGetWorldID(lua_State *L)
 		lua_pushstring(L, "");
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
 		return 1;
 	}
-	const QString value = runtime->worldAttributes().value(QStringLiteral("id"));
+	const QString value = runtime->worldAttributeValue(QStringLiteral("id"));
 	lua_pushstring(L, value.toLocal8Bit().constData());
 	return 1;
 }
@@ -12210,13 +13270,13 @@ static int luaWorldName(lua_State *L)
 		lua_pushstring(L, "");
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
 		return 1;
 	}
-	const QString value = runtime->worldAttributes().value(QStringLiteral("name"));
+	const QString value = runtime->worldAttributeValue(QStringLiteral("name"));
 	lua_pushstring(L, value.toLocal8Bit().constData());
 	return 1;
 }
@@ -12229,13 +13289,13 @@ static int luaWorldAddress(lua_State *L)
 		lua_pushstring(L, "");
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
 		return 1;
 	}
-	const QString value = runtime->worldAttributes().value(QStringLiteral("site"));
+	const QString value = runtime->worldAttributeValue(QStringLiteral("site"));
 	lua_pushstring(L, value.toLocal8Bit().constData());
 	return 1;
 }
@@ -12248,14 +13308,14 @@ static int luaWorldPort(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
 		return 1;
 	}
 	bool      ok   = false;
-	const int port = runtime->worldAttributes().value(QStringLiteral("port")).toInt(&ok);
+	const int port = runtime->worldAttributeValue(QStringLiteral("port")).toInt(&ok);
 	lua_pushinteger(L, ok ? port : 0);
 	return 1;
 }
@@ -12284,7 +13344,7 @@ static int luaGetMappingCount(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	lua_pushnumber(L, runtime ? runtime->mappingCount() : 0);
 	return 1;
 }
@@ -12302,11 +13362,7 @@ static WorldRuntime *findWorldRuntimeByAttribute(const QString &attributeName, c
 		return nullptr;
 	return findWorldRuntimeWhere(
 	    [&attributeName, &value](const WorldRuntime *runtime)
-	    {
-		    const QMap<QString, QString> &attributes = runtime->worldAttributes();
-		    const auto                    attrIt     = attributes.constFind(attributeName);
-		    return attrIt != attributes.cend() && attrIt.value().compare(value, Qt::CaseInsensitive) == 0;
-	    });
+	    { return runtime->worldAttributeValue(attributeName).compare(value, Qt::CaseInsensitive) == 0; });
 }
 
 static WorldRuntime *findWorldRuntimeById(const QString &id)
@@ -12928,6 +13984,355 @@ static int findTimerIndex(const QList<WorldRuntime::Timer> &timers, const QStrin
 	return -1;
 }
 
+static bool fetchPluginTriggerSnapshot(WorldRuntime *runtime, const QString &pluginId, const QString &name,
+                                       WorldRuntime::Trigger &trigger)
+{
+	if (!runtime)
+		return false;
+	auto resolveOnRuntimeThread = [&]() -> bool
+	{
+		WorldRuntime::Plugin *plugin = runtime->pluginForId(pluginId);
+		if (!plugin)
+			return false;
+		const int index = findTriggerIndex(plugin->triggers, name);
+		if (index < 0)
+			return false;
+		trigger = plugin->triggers.at(index);
+		return true;
+	};
+	if (QThread::currentThread() == runtime->thread())
+		return resolveOnRuntimeThread();
+
+	bool found = false;
+	QMetaObject::invokeMethod(
+	    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	return found;
+}
+
+static bool fetchPluginAliasSnapshot(WorldRuntime *runtime, const QString &pluginId, const QString &name,
+                                     WorldRuntime::Alias &alias)
+{
+	if (!runtime)
+		return false;
+	auto resolveOnRuntimeThread = [&]() -> bool
+	{
+		WorldRuntime::Plugin *plugin = runtime->pluginForId(pluginId);
+		if (!plugin)
+			return false;
+		const int index = findAliasIndex(plugin->aliases, name);
+		if (index < 0)
+			return false;
+		alias = plugin->aliases.at(index);
+		return true;
+	};
+	if (QThread::currentThread() == runtime->thread())
+		return resolveOnRuntimeThread();
+
+	bool found = false;
+	QMetaObject::invokeMethod(
+	    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	return found;
+}
+
+static bool fetchPluginTimerSnapshot(WorldRuntime *runtime, const QString &pluginId, const QString &name,
+                                     WorldRuntime::Timer &timer)
+{
+	if (!runtime)
+		return false;
+	auto resolveOnRuntimeThread = [&]() -> bool
+	{
+		WorldRuntime::Plugin *plugin = runtime->pluginForId(pluginId);
+		if (!plugin)
+			return false;
+		const int index = findTimerIndex(plugin->timers, name);
+		if (index < 0)
+			return false;
+		timer = plugin->timers.at(index);
+		return true;
+	};
+	if (QThread::currentThread() == runtime->thread())
+		return resolveOnRuntimeThread();
+
+	bool found = false;
+	QMetaObject::invokeMethod(
+	    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	return found;
+}
+
+static bool fetchTriggerSnapshotForContext(WorldRuntime *runtime, const QString &pluginId,
+                                           const QString &name, WorldRuntime::Trigger &trigger,
+                                           bool *pluginMissing = nullptr)
+{
+	if (pluginMissing)
+		*pluginMissing = false;
+	if (!runtime)
+		return false;
+
+	bool localPluginMissing     = false;
+	auto resolveOnRuntimeThread = [&]() -> bool
+	{
+		const QList<WorldRuntime::Trigger> *triggers = nullptr;
+		if (pluginId.isEmpty())
+		{
+			triggers = &runtime->triggers();
+		}
+		else
+		{
+			WorldRuntime::Plugin *plugin = runtime->pluginForId(pluginId);
+			if (!plugin)
+			{
+				localPluginMissing = true;
+				return false;
+			}
+			triggers = &plugin->triggers;
+		}
+		const int index = findTriggerIndex(*triggers, name);
+		if (index < 0)
+			return false;
+		trigger = triggers->at(index);
+		return true;
+	};
+
+	bool found = false;
+	if (QThread::currentThread() == runtime->thread())
+	{
+		found = resolveOnRuntimeThread();
+	}
+	else
+	{
+		QMetaObject::invokeMethod(
+		    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	}
+
+	if (pluginMissing)
+		*pluginMissing = localPluginMissing;
+	return found;
+}
+
+static bool fetchAliasSnapshotForContext(WorldRuntime *runtime, const QString &pluginId, const QString &name,
+                                         WorldRuntime::Alias &alias, bool *pluginMissing = nullptr)
+{
+	if (pluginMissing)
+		*pluginMissing = false;
+	if (!runtime)
+		return false;
+
+	bool localPluginMissing     = false;
+	auto resolveOnRuntimeThread = [&]() -> bool
+	{
+		const QList<WorldRuntime::Alias> *aliases = nullptr;
+		if (pluginId.isEmpty())
+		{
+			aliases = &runtime->aliases();
+		}
+		else
+		{
+			WorldRuntime::Plugin *plugin = runtime->pluginForId(pluginId);
+			if (!plugin)
+			{
+				localPluginMissing = true;
+				return false;
+			}
+			aliases = &plugin->aliases;
+		}
+		const int index = findAliasIndex(*aliases, name);
+		if (index < 0)
+			return false;
+		alias = aliases->at(index);
+		return true;
+	};
+
+	bool found = false;
+	if (QThread::currentThread() == runtime->thread())
+	{
+		found = resolveOnRuntimeThread();
+	}
+	else
+	{
+		QMetaObject::invokeMethod(
+		    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	}
+
+	if (pluginMissing)
+		*pluginMissing = localPluginMissing;
+	return found;
+}
+
+static bool fetchTimerSnapshotForContext(WorldRuntime *runtime, const QString &pluginId, const QString &name,
+                                         WorldRuntime::Timer &timer, bool *pluginMissing = nullptr)
+{
+	if (pluginMissing)
+		*pluginMissing = false;
+	if (!runtime)
+		return false;
+
+	bool localPluginMissing     = false;
+	auto resolveOnRuntimeThread = [&]() -> bool
+	{
+		const QList<WorldRuntime::Timer> *timers = nullptr;
+		if (pluginId.isEmpty())
+		{
+			timers = &runtime->timers();
+		}
+		else
+		{
+			WorldRuntime::Plugin *plugin = runtime->pluginForId(pluginId);
+			if (!plugin)
+			{
+				localPluginMissing = true;
+				return false;
+			}
+			timers = &plugin->timers;
+		}
+		const int index = findTimerIndex(*timers, name);
+		if (index < 0)
+			return false;
+		timer = timers->at(index);
+		return true;
+	};
+
+	bool found = false;
+	if (QThread::currentThread() == runtime->thread())
+	{
+		found = resolveOnRuntimeThread();
+	}
+	else
+	{
+		QMetaObject::invokeMethod(
+		    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	}
+
+	if (pluginMissing)
+		*pluginMissing = localPluginMissing;
+	return found;
+}
+
+static bool fetchTriggerListForContext(WorldRuntime *runtime, const QString &pluginId,
+                                       QList<WorldRuntime::Trigger> &triggers, bool *pluginMissing = nullptr)
+{
+	if (pluginMissing)
+		*pluginMissing = false;
+	if (!runtime)
+		return false;
+
+	bool localPluginMissing     = false;
+	auto resolveOnRuntimeThread = [&]() -> bool
+	{
+		if (pluginId.isEmpty())
+		{
+			triggers = runtime->triggers();
+			return true;
+		}
+		WorldRuntime::Plugin *plugin = runtime->pluginForId(pluginId);
+		if (!plugin)
+		{
+			localPluginMissing = true;
+			return false;
+		}
+		triggers = plugin->triggers;
+		return true;
+	};
+
+	bool found = false;
+	if (QThread::currentThread() == runtime->thread())
+	{
+		found = resolveOnRuntimeThread();
+	}
+	else
+	{
+		QMetaObject::invokeMethod(
+		    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	}
+
+	if (pluginMissing)
+		*pluginMissing = localPluginMissing;
+	return found;
+}
+
+static bool fetchAliasListForContext(WorldRuntime *runtime, const QString &pluginId,
+                                     QList<WorldRuntime::Alias> &aliases, bool *pluginMissing = nullptr)
+{
+	if (pluginMissing)
+		*pluginMissing = false;
+	if (!runtime)
+		return false;
+
+	bool localPluginMissing     = false;
+	auto resolveOnRuntimeThread = [&]() -> bool
+	{
+		if (pluginId.isEmpty())
+		{
+			aliases = runtime->aliases();
+			return true;
+		}
+		WorldRuntime::Plugin *plugin = runtime->pluginForId(pluginId);
+		if (!plugin)
+		{
+			localPluginMissing = true;
+			return false;
+		}
+		aliases = plugin->aliases;
+		return true;
+	};
+
+	bool found = false;
+	if (QThread::currentThread() == runtime->thread())
+	{
+		found = resolveOnRuntimeThread();
+	}
+	else
+	{
+		QMetaObject::invokeMethod(
+		    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	}
+
+	if (pluginMissing)
+		*pluginMissing = localPluginMissing;
+	return found;
+}
+
+static bool fetchTimerListForContext(WorldRuntime *runtime, const QString &pluginId,
+                                     QList<WorldRuntime::Timer> &timers, bool *pluginMissing = nullptr)
+{
+	if (pluginMissing)
+		*pluginMissing = false;
+	if (!runtime)
+		return false;
+
+	bool localPluginMissing     = false;
+	auto resolveOnRuntimeThread = [&]() -> bool
+	{
+		if (pluginId.isEmpty())
+		{
+			timers = runtime->timers();
+			return true;
+		}
+		WorldRuntime::Plugin *plugin = runtime->pluginForId(pluginId);
+		if (!plugin)
+		{
+			localPluginMissing = true;
+			return false;
+		}
+		timers = plugin->timers;
+		return true;
+	};
+
+	bool found = false;
+	if (QThread::currentThread() == runtime->thread())
+	{
+		found = resolveOnRuntimeThread();
+	}
+	else
+	{
+		QMetaObject::invokeMethod(
+		    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	}
+
+	if (pluginMissing)
+		*pluginMissing = localPluginMissing;
+	return found;
+}
+
 static QList<WorldRuntime::Trigger> &mutableTriggerList(WorldRuntime *runtime, WorldRuntime::Plugin *plugin)
 {
 	return plugin ? plugin->triggers : runtime->triggersMutable();
@@ -12966,16 +14371,79 @@ static void commitTimerListMutation(WorldRuntime *runtime, const WorldRuntime::P
 		runtime->noteTimerStructureMutation();
 }
 
-static bool resolvePluginContext(const LuaCallbackEngine *engine, WorldRuntime *runtime,
-                                 WorldRuntime::Plugin *&plugin, int &errorCode)
+static int resetTimerForContext(WorldRuntime *runtime, const QString &pluginId, const QString &name)
+{
+	if (!runtime)
+		return eWorldClosed;
+
+	auto resetOnRuntimeThread = [&]() -> int
+	{
+		WorldRuntime::Plugin *plugin = nullptr;
+		if (!pluginId.isEmpty())
+		{
+			plugin = runtime->pluginForId(pluginId);
+			if (!plugin)
+				return eNoSuchPlugin;
+		}
+		QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
+		const int                   index  = findTimerIndex(timers, name);
+		if (index < 0)
+			return eTimerNotFound;
+		applyTimerDefaults(timers[index]);
+		resetTimerFields(timers[index]);
+		commitTimerListMutation(runtime, plugin);
+		return eOK;
+	};
+
+	if (QThread::currentThread() == runtime->thread())
+		return resetOnRuntimeThread();
+
+	int        result  = eWorldClosed;
+	const bool invoked = QMetaObject::invokeMethod(
+	    runtime, [&] { result = resetOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	return invoked ? result : eWorldClosed;
+}
+
+static void resetTimersForContext(WorldRuntime *runtime, const QString &pluginId)
+{
+	if (!runtime)
+		return;
+
+	auto resetOnRuntimeThread = [&]()
+	{
+		WorldRuntime::Plugin *plugin = nullptr;
+		if (!pluginId.isEmpty())
+		{
+			plugin = runtime->pluginForId(pluginId);
+			if (!plugin)
+				return;
+		}
+		for (QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin); auto &timer : timers)
+		{
+			applyTimerDefaults(timer);
+			resetTimerFields(timer);
+		}
+		commitTimerListMutation(runtime, plugin);
+	};
+
+	if (QThread::currentThread() == runtime->thread())
+	{
+		resetOnRuntimeThread();
+		return;
+	}
+
+	QMetaObject::invokeMethod(runtime, resetOnRuntimeThread, Qt::BlockingQueuedConnection);
+}
+
+static bool resolvePluginContextById(WorldRuntime *runtime, const QString &pluginId,
+                                     WorldRuntime::Plugin *&plugin, int &errorCode)
 {
 	plugin = nullptr;
-	if (!engine || !runtime)
+	if (!runtime)
 	{
 		errorCode = eWorldClosed;
 		return false;
 	}
-	const QString pluginId = engine->pluginId();
 	if (pluginId.isEmpty())
 		return true;
 	plugin = runtime->pluginForId(pluginId);
@@ -12992,9 +14460,10 @@ static int addTriggerInternal(const LuaCallbackEngine *engine, const QString &ra
                               const int colour, const int wildcard, const QString &soundFileName,
                               const QString &scriptName, const int sendTo, const int sequence)
 {
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return eWorldClosed;
+	const QString pluginId = engine ? engine->pluginId() : QString();
 
 	if (matchText.isEmpty())
 		return eTriggerCannotBeEmpty;
@@ -13013,59 +14482,67 @@ static int addTriggerInternal(const LuaCallbackEngine *engine, const QString &ra
 	if (name.isEmpty())
 		name = makeAutoName(QStringLiteral("*trigger"));
 
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-		return errorCode;
+	return runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    WorldRuntime::Plugin *plugin = nullptr;
+		    if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+			    return errorCode;
 
-	QList<WorldRuntime::Trigger> &triggers      = mutableTriggerList(runtime, plugin);
-	const int                     existingIndex = findTriggerIndex(triggers, name);
-	if (existingIndex >= 0 && !(flags & eReplace))
-		return eTriggerAlreadyExists;
+		    QList<WorldRuntime::Trigger> &triggers      = mutableTriggerList(runtime, plugin);
+		    const int                     existingIndex = findTriggerIndex(triggers, name);
+		    if (existingIndex >= 0 && !(flags & eReplace))
+			    return eTriggerAlreadyExists;
 
-	int insertIndex = existingIndex;
-	if (existingIndex >= 0)
-		triggers.removeAt(existingIndex);
-	else
-		insertIndex = static_cast<int>(triggers.size());
+		    int insertIndex = existingIndex;
+		    if (existingIndex >= 0)
+			    triggers.removeAt(existingIndex);
+		    else
+			    insertIndex = static_cast<int>(triggers.size());
 
-	WorldRuntime::Trigger trigger;
-	trigger.attributes.insert(QStringLiteral("name"), name);
-	trigger.attributes.insert(QStringLiteral("match"), matchText);
-	trigger.children.insert(QStringLiteral("send"), responseText);
-	if (!soundFileName.isEmpty())
-		trigger.attributes.insert(QStringLiteral("sound"), soundFileName);
-	if (!scriptName.isEmpty())
-		trigger.attributes.insert(QStringLiteral("script"), scriptName);
-	trigger.attributes.insert(QStringLiteral("send_to"), QString::number(sendTo));
-	trigger.attributes.insert(QStringLiteral("sequence"), QString::number(sequence));
-	trigger.attributes.insert(QStringLiteral("enabled"), attrFlag(flags & eEnabled));
-	trigger.attributes.insert(QStringLiteral("ignore_case"), attrFlag(flags & eIgnoreCase));
-	trigger.attributes.insert(QStringLiteral("omit_from_log"), attrFlag(flags & eOmitFromLog));
-	trigger.attributes.insert(QStringLiteral("omit_from_output"), attrFlag(flags & eOmitFromOutput));
-	trigger.attributes.insert(QStringLiteral("keep_evaluating"), attrFlag(flags & eKeepEvaluating));
-	trigger.attributes.insert(QStringLiteral("regexp"), attrFlag(flags & eTriggerRegularExpression));
-	trigger.attributes.insert(QStringLiteral("expand_variables"), attrFlag(flags & eExpandVariables));
-	trigger.attributes.insert(QStringLiteral("temporary"), attrFlag(flags & eTemporary));
-	trigger.attributes.insert(QStringLiteral("lowercase_wildcard"), attrFlag(flags & eLowercaseWildcard));
-	trigger.attributes.insert(QStringLiteral("one_shot"), attrFlag(flags & eTriggerOneShot));
-	trigger.attributes.insert(QStringLiteral("clipboard_arg"),
-	                          QString::number(wildcard >= 0 && wildcard <= 10 ? wildcard : 0));
-	trigger.attributes.insert(QStringLiteral("custom_colour"),
-	                          QString::number(customFromTriggerColour(colour)));
-	trigger.attributes.insert(QStringLiteral("variable"), name);
-	applyTriggerDefaults(trigger);
+		    WorldRuntime::Trigger trigger;
+		    trigger.attributes.insert(QStringLiteral("name"), name);
+		    trigger.attributes.insert(QStringLiteral("match"), matchText);
+		    trigger.children.insert(QStringLiteral("send"), responseText);
+		    if (!soundFileName.isEmpty())
+			    trigger.attributes.insert(QStringLiteral("sound"), soundFileName);
+		    if (!scriptName.isEmpty())
+			    trigger.attributes.insert(QStringLiteral("script"), scriptName);
+		    trigger.attributes.insert(QStringLiteral("send_to"), QString::number(sendTo));
+		    trigger.attributes.insert(QStringLiteral("sequence"), QString::number(sequence));
+		    trigger.attributes.insert(QStringLiteral("enabled"), attrFlag(flags & eEnabled));
+		    trigger.attributes.insert(QStringLiteral("ignore_case"), attrFlag(flags & eIgnoreCase));
+		    trigger.attributes.insert(QStringLiteral("omit_from_log"), attrFlag(flags & eOmitFromLog));
+		    trigger.attributes.insert(QStringLiteral("omit_from_output"), attrFlag(flags & eOmitFromOutput));
+		    trigger.attributes.insert(QStringLiteral("keep_evaluating"), attrFlag(flags & eKeepEvaluating));
+		    trigger.attributes.insert(QStringLiteral("regexp"), attrFlag(flags & eTriggerRegularExpression));
+		    trigger.attributes.insert(QStringLiteral("expand_variables"), attrFlag(flags & eExpandVariables));
+		    trigger.attributes.insert(QStringLiteral("temporary"), attrFlag(flags & eTemporary));
+		    trigger.attributes.insert(QStringLiteral("lowercase_wildcard"),
+		                              attrFlag(flags & eLowercaseWildcard));
+		    trigger.attributes.insert(QStringLiteral("one_shot"), attrFlag(flags & eTriggerOneShot));
+		    trigger.attributes.insert(QStringLiteral("clipboard_arg"),
+		                              QString::number(wildcard >= 0 && wildcard <= 10 ? wildcard : 0));
+		    trigger.attributes.insert(QStringLiteral("custom_colour"),
+		                              QString::number(customFromTriggerColour(colour)));
+		    trigger.attributes.insert(QStringLiteral("variable"), name);
+		    applyTriggerDefaults(trigger);
 
-	triggers.insert(insertIndex, trigger);
-	commitTriggerListMutation(runtime, plugin);
-	return eOK;
+		    triggers.insert(insertIndex, trigger);
+		    commitTriggerListMutation(runtime, plugin);
+		    return eOK;
+	    },
+	    eWorldClosed);
 }
 
 static int addAliasInternal(const LuaCallbackEngine *engine, const QString &rawName, const QString &matchText,
                             const QString &responseText, const int flags, const QString &scriptName)
 {
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return eWorldClosed;
+	const QString pluginId = engine ? engine->pluginId() : QString();
 
 	if (matchText.isEmpty())
 		return eAliasCannotBeEmpty;
@@ -13077,61 +14554,69 @@ static int addAliasInternal(const LuaCallbackEngine *engine, const QString &rawN
 	if (name.isEmpty())
 		name = makeAutoName(QStringLiteral("*alias"));
 
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-		return errorCode;
+	return runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    WorldRuntime::Plugin *plugin = nullptr;
+		    if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+			    return errorCode;
 
-	QList<WorldRuntime::Alias> &aliases       = mutableAliasList(runtime, plugin);
-	const int                   existingIndex = findAliasIndex(aliases, name);
-	if (existingIndex >= 0 && !(flags & eReplace))
-		return eAliasAlreadyExists;
+		    QList<WorldRuntime::Alias> &aliases       = mutableAliasList(runtime, plugin);
+		    const int                   existingIndex = findAliasIndex(aliases, name);
+		    if (existingIndex >= 0 && !(flags & eReplace))
+			    return eAliasAlreadyExists;
 
-	int insertIndex = existingIndex;
-	if (existingIndex >= 0)
-		aliases.removeAt(existingIndex);
-	else
-		insertIndex = static_cast<int>(aliases.size());
+		    int insertIndex = existingIndex;
+		    if (existingIndex >= 0)
+			    aliases.removeAt(existingIndex);
+		    else
+			    insertIndex = static_cast<int>(aliases.size());
 
-	int sendTo = eSendToWorld;
-	if (flags & eAliasSpeedWalk)
-		sendTo = eSendToSpeedwalk;
-	else if (flags & eAliasQueue)
-		sendTo = eSendToCommandQueue;
+		    int sendTo = eSendToWorld;
+		    if (flags & eAliasSpeedWalk)
+			    sendTo = eSendToSpeedwalk;
+		    else if (flags & eAliasQueue)
+			    sendTo = eSendToCommandQueue;
 
-	WorldRuntime::Alias alias;
-	alias.attributes.insert(QStringLiteral("name"), name);
-	alias.attributes.insert(QStringLiteral("match"), matchText);
-	alias.children.insert(QStringLiteral("send"), responseText);
-	if (!scriptName.isEmpty())
-		alias.attributes.insert(QStringLiteral("script"), scriptName);
-	alias.attributes.insert(QStringLiteral("send_to"), QString::number(sendTo));
-	alias.attributes.insert(QStringLiteral("sequence"), QString::number(DEFAULT_ALIAS_SEQUENCE));
-	alias.attributes.insert(QStringLiteral("enabled"), attrFlag(flags & eEnabled));
-	alias.attributes.insert(QStringLiteral("ignore_case"), attrFlag(flags & eIgnoreAliasCase));
-	alias.attributes.insert(QStringLiteral("omit_from_log"), attrFlag(flags & eOmitFromLogFile));
-	alias.attributes.insert(QStringLiteral("regexp"), attrFlag(flags & eAliasRegularExpression));
-	alias.attributes.insert(QStringLiteral("omit_from_output"), attrFlag(flags & eAliasOmitFromOutput));
-	alias.attributes.insert(QStringLiteral("expand_variables"), attrFlag(flags & eExpandVariables));
-	alias.attributes.insert(QStringLiteral("menu"), attrFlag(flags & eAliasMenu));
-	alias.attributes.insert(QStringLiteral("temporary"), attrFlag(flags & eTemporary));
-	alias.attributes.insert(QStringLiteral("one_shot"), attrFlag(flags & eAliasOneShot));
-	alias.attributes.insert(QStringLiteral("keep_evaluating"), attrFlag(flags & eKeepEvaluating));
-	applyAliasDefaults(alias);
+		    WorldRuntime::Alias alias;
+		    alias.attributes.insert(QStringLiteral("name"), name);
+		    alias.attributes.insert(QStringLiteral("match"), matchText);
+		    alias.children.insert(QStringLiteral("send"), responseText);
+		    if (!scriptName.isEmpty())
+			    alias.attributes.insert(QStringLiteral("script"), scriptName);
+		    alias.attributes.insert(QStringLiteral("send_to"), QString::number(sendTo));
+		    alias.attributes.insert(QStringLiteral("sequence"), QString::number(DEFAULT_ALIAS_SEQUENCE));
+		    alias.attributes.insert(QStringLiteral("enabled"), attrFlag(flags & eEnabled));
+		    alias.attributes.insert(QStringLiteral("ignore_case"), attrFlag(flags & eIgnoreAliasCase));
+		    alias.attributes.insert(QStringLiteral("omit_from_log"), attrFlag(flags & eOmitFromLogFile));
+		    alias.attributes.insert(QStringLiteral("regexp"), attrFlag(flags & eAliasRegularExpression));
+		    alias.attributes.insert(QStringLiteral("omit_from_output"),
+		                            attrFlag(flags & eAliasOmitFromOutput));
+		    alias.attributes.insert(QStringLiteral("expand_variables"), attrFlag(flags & eExpandVariables));
+		    alias.attributes.insert(QStringLiteral("menu"), attrFlag(flags & eAliasMenu));
+		    alias.attributes.insert(QStringLiteral("temporary"), attrFlag(flags & eTemporary));
+		    alias.attributes.insert(QStringLiteral("one_shot"), attrFlag(flags & eAliasOneShot));
+		    alias.attributes.insert(QStringLiteral("keep_evaluating"), attrFlag(flags & eKeepEvaluating));
+		    applyAliasDefaults(alias);
 
-	aliases.insert(insertIndex, alias);
-	commitAliasListMutation(runtime, plugin);
-	return eOK;
+		    aliases.insert(insertIndex, alias);
+		    commitAliasListMutation(runtime, plugin);
+		    return eOK;
+	    },
+	    eWorldClosed);
 }
 
 static int addTimerInternal(const LuaCallbackEngine *engine, const QString &rawName, const int hour,
                             const int minute, const double second, const QString &responseText,
                             const int flags, const QString &scriptName)
 {
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return eWorldClosed;
+	const QString pluginId = engine ? engine->pluginId() : QString();
 
-	QString name = rawName.trimmed();
+	QString       name = rawName.trimmed();
 	if (!name.isEmpty() && !isValidLabel(name))
 		return eInvalidObjectLabel;
 	if (name.isEmpty())
@@ -13142,50 +14627,56 @@ static int addTimerInternal(const LuaCallbackEngine *engine, const QString &rawN
 	if (!(flags & eAtTime) && hour == 0 && minute == 0 && second == 0.0)
 		return eTimeInvalid;
 
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-		return errorCode;
+	return runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    WorldRuntime::Plugin *plugin = nullptr;
+		    if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+			    return errorCode;
 
-	QList<WorldRuntime::Timer> &timers        = mutableTimerList(runtime, plugin);
-	const int                   existingIndex = findTimerIndex(timers, name);
-	if (existingIndex >= 0 && !(flags & eReplace))
-		return eTimerAlreadyExists;
+		    QList<WorldRuntime::Timer> &timers        = mutableTimerList(runtime, plugin);
+		    const int                   existingIndex = findTimerIndex(timers, name);
+		    if (existingIndex >= 0 && !(flags & eReplace))
+			    return eTimerAlreadyExists;
 
-	int insertIndex = existingIndex;
-	if (existingIndex >= 0)
-		timers.removeAt(existingIndex);
-	else
-		insertIndex = static_cast<int>(timers.size());
+		    int insertIndex = existingIndex;
+		    if (existingIndex >= 0)
+			    timers.removeAt(existingIndex);
+		    else
+			    insertIndex = static_cast<int>(timers.size());
 
-	int sendTo = eSendToWorld;
-	if (flags & eTimerSpeedWalk)
-		sendTo = eSendToSpeedwalk;
-	else if (flags & eTimerNote)
-		sendTo = eSendToOutput;
+		    int sendTo = eSendToWorld;
+		    if (flags & eTimerSpeedWalk)
+			    sendTo = eSendToSpeedwalk;
+		    else if (flags & eTimerNote)
+			    sendTo = eSendToOutput;
 
-	WorldRuntime::Timer timer;
-	timer.attributes.insert(QStringLiteral("name"), name);
-	timer.children.insert(QStringLiteral("send"), responseText);
-	timer.attributes.insert(QStringLiteral("at_time"), attrFlag(flags & eAtTime));
-	timer.attributes.insert(QStringLiteral("hour"), QString::number(hour));
-	timer.attributes.insert(QStringLiteral("minute"), QString::number(minute));
-	timer.attributes.insert(QStringLiteral("second"), QString::number(second, 'f', 4));
-	timer.attributes.insert(QStringLiteral("offset_hour"), QStringLiteral("0"));
-	timer.attributes.insert(QStringLiteral("offset_minute"), QStringLiteral("0"));
-	timer.attributes.insert(QStringLiteral("offset_second"), QStringLiteral("0"));
-	timer.attributes.insert(QStringLiteral("send_to"), QString::number(sendTo));
-	timer.attributes.insert(QStringLiteral("enabled"), attrFlag(flags & eEnabled));
-	timer.attributes.insert(QStringLiteral("one_shot"), attrFlag(flags & eOneShot));
-	timer.attributes.insert(QStringLiteral("temporary"), attrFlag(flags & eTemporary));
-	timer.attributes.insert(QStringLiteral("active_closed"), attrFlag(flags & eActiveWhenClosed));
-	if (!scriptName.isEmpty())
-		timer.attributes.insert(QStringLiteral("script"), scriptName);
-	applyTimerDefaults(timer);
-	resetTimerFields(timer);
+		    WorldRuntime::Timer timer;
+		    timer.attributes.insert(QStringLiteral("name"), name);
+		    timer.children.insert(QStringLiteral("send"), responseText);
+		    timer.attributes.insert(QStringLiteral("at_time"), attrFlag(flags & eAtTime));
+		    timer.attributes.insert(QStringLiteral("hour"), QString::number(hour));
+		    timer.attributes.insert(QStringLiteral("minute"), QString::number(minute));
+		    timer.attributes.insert(QStringLiteral("second"), QString::number(second, 'f', 4));
+		    timer.attributes.insert(QStringLiteral("offset_hour"), QStringLiteral("0"));
+		    timer.attributes.insert(QStringLiteral("offset_minute"), QStringLiteral("0"));
+		    timer.attributes.insert(QStringLiteral("offset_second"), QStringLiteral("0"));
+		    timer.attributes.insert(QStringLiteral("send_to"), QString::number(sendTo));
+		    timer.attributes.insert(QStringLiteral("enabled"), attrFlag(flags & eEnabled));
+		    timer.attributes.insert(QStringLiteral("one_shot"), attrFlag(flags & eOneShot));
+		    timer.attributes.insert(QStringLiteral("temporary"), attrFlag(flags & eTemporary));
+		    timer.attributes.insert(QStringLiteral("active_closed"), attrFlag(flags & eActiveWhenClosed));
+		    if (!scriptName.isEmpty())
+			    timer.attributes.insert(QStringLiteral("script"), scriptName);
+		    applyTimerDefaults(timer);
+		    resetTimerFields(timer);
 
-	timers.insert(insertIndex, timer);
-	commitTimerListMutation(runtime, plugin, true);
-	return eOK;
+		    timers.insert(insertIndex, timer);
+		    commitTimerListMutation(runtime, plugin, true);
+		    return eOK;
+	    },
+	    eWorldClosed);
 }
 
 static int luaAddTrigger(lua_State *L)
@@ -13255,116 +14746,127 @@ static int luaAddTimer(lua_State *L)
 static int luaDeleteTrigger(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	QString               name   = QString::fromUtf8(luaL_checkstring(L, 1)).trimmed();
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, errorCode);
-		return 1;
-	}
-	QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
-	const int                     index    = findTriggerIndex(triggers, name);
-	if (index < 0)
-	{
-		lua_pushnumber(L, eTriggerNotFound);
-		return 1;
-	}
-	triggers.removeAt(index);
-	commitTriggerListMutation(runtime, plugin);
-	lua_pushnumber(L, eOK);
+	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1)).trimmed();
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     result   = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return errorCode;
+            QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
+            const int                     index    = findTriggerIndex(triggers, name);
+            if (index < 0)
+                return eTriggerNotFound;
+            triggers.removeAt(index);
+            commitTriggerListMutation(runtime, plugin);
+            return eOK;
+        },
+        eWorldClosed);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaDeleteAlias(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	QString               name   = QString::fromUtf8(luaL_checkstring(L, 1)).trimmed();
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, errorCode);
-		return 1;
-	}
-	QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
-	const int                   index   = findAliasIndex(aliases, name);
-	if (index < 0)
-	{
-		lua_pushnumber(L, eAliasNotFound);
-		return 1;
-	}
-	aliases.removeAt(index);
-	commitAliasListMutation(runtime, plugin);
-	lua_pushnumber(L, eOK);
+	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1)).trimmed();
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     result   = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return errorCode;
+            QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
+            const int                   index   = findAliasIndex(aliases, name);
+            if (index < 0)
+                return eAliasNotFound;
+            aliases.removeAt(index);
+            commitAliasListMutation(runtime, plugin);
+            return eOK;
+        },
+        eWorldClosed);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaDeleteTimer(lua_State *L)
 {
 	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	QString               name   = QString::fromUtf8(luaL_checkstring(L, 1)).trimmed();
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, errorCode);
-		return 1;
-	}
-	QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
-	const int                   index  = findTimerIndex(timers, name);
-	if (index < 0)
-	{
-		lua_pushnumber(L, eTimerNotFound);
-		return 1;
-	}
-	timers.removeAt(index);
-	commitTimerListMutation(runtime, plugin, true);
-	lua_pushnumber(L, eOK);
+	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1)).trimmed();
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     result   = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return errorCode;
+            QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
+            const int                   index  = findTimerIndex(timers, name);
+            if (index < 0)
+                return eTimerNotFound;
+            timers.removeAt(index);
+            commitTimerListMutation(runtime, plugin, true);
+            return eOK;
+        },
+        eWorldClosed);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaDeleteTemporaryTriggers(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
-	int                           removed  = 0;
-	for (int i = sizeToInt(triggers.size()) - 1; i >= 0; --i)
-	{
-		if (isEnabledValue(triggers.at(i).attributes.value(QStringLiteral("temporary"))))
-		{
-			triggers.removeAt(i);
-			removed++;
-		}
-	}
-	commitTriggerListMutation(runtime, plugin);
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     removed  = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return 0;
+            QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
+            int                           count    = 0;
+            for (int i = sizeToInt(triggers.size()) - 1; i >= 0; --i)
+            {
+                if (isEnabledValue(triggers.at(i).attributes.value(QStringLiteral("temporary"))))
+                {
+                    triggers.removeAt(i);
+                    count++;
+                }
+            }
+            commitTriggerListMutation(runtime, plugin);
+            return count;
+        },
+        0);
 	lua_pushnumber(L, removed);
 	return 1;
 }
@@ -13372,29 +14874,34 @@ static int luaDeleteTemporaryTriggers(lua_State *L)
 static int luaDeleteTemporaryAliases(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
-	int                         removed = 0;
-	for (int i = sizeToInt(aliases.size()) - 1; i >= 0; --i)
-	{
-		if (isEnabledValue(aliases.at(i).attributes.value(QStringLiteral("temporary"))))
-		{
-			aliases.removeAt(i);
-			removed++;
-		}
-	}
-	commitAliasListMutation(runtime, plugin);
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     removed  = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return 0;
+            QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
+            int                         count   = 0;
+            for (int i = sizeToInt(aliases.size()) - 1; i >= 0; --i)
+            {
+                if (isEnabledValue(aliases.at(i).attributes.value(QStringLiteral("temporary"))))
+                {
+                    aliases.removeAt(i);
+                    count++;
+                }
+            }
+            commitAliasListMutation(runtime, plugin);
+            return count;
+        },
+        0);
 	lua_pushnumber(L, removed);
 	return 1;
 }
@@ -13402,29 +14909,34 @@ static int luaDeleteTemporaryAliases(lua_State *L)
 static int luaDeleteTemporaryTimers(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	QList<WorldRuntime::Timer> &timers  = mutableTimerList(runtime, plugin);
-	int                         removed = 0;
-	for (int i = sizeToInt(timers.size()) - 1; i >= 0; --i)
-	{
-		if (isEnabledValue(timers.at(i).attributes.value(QStringLiteral("temporary"))))
-		{
-			timers.removeAt(i);
-			removed++;
-		}
-	}
-	commitTimerListMutation(runtime, plugin, removed > 0);
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     removed  = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return 0;
+            QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
+            int                         count  = 0;
+            for (int i = sizeToInt(timers.size()) - 1; i >= 0; --i)
+            {
+                if (isEnabledValue(timers.at(i).attributes.value(QStringLiteral("temporary"))))
+                {
+                    timers.removeAt(i);
+                    count++;
+                }
+            }
+            commitTimerListMutation(runtime, plugin, count > 0);
+            return count;
+        },
+        0);
 	lua_pushnumber(L, removed);
 	return 1;
 }
@@ -13432,7 +14944,7 @@ static int luaDeleteTemporaryTimers(lua_State *L)
 static int luaDeleteTriggerGroup(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -13444,23 +14956,28 @@ static int luaDeleteTriggerGroup(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
-	int                           removed  = 0;
-	for (int i = sizeToInt(triggers.size()) - 1; i >= 0; --i)
-	{
-		if (groupMatches(triggers.at(i).attributes.value(QStringLiteral("group")), groupName))
-		{
-			triggers.removeAt(i);
-			removed++;
-		}
-	}
-	commitTriggerListMutation(runtime, plugin);
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     removed  = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return 0;
+            QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
+            int                           count    = 0;
+            for (int i = sizeToInt(triggers.size()) - 1; i >= 0; --i)
+            {
+                if (groupMatches(triggers.at(i).attributes.value(QStringLiteral("group")), groupName))
+                {
+                    triggers.removeAt(i);
+                    count++;
+                }
+            }
+            commitTriggerListMutation(runtime, plugin);
+            return count;
+        },
+        0);
 	lua_pushnumber(L, removed);
 	return 1;
 }
@@ -13468,7 +14985,7 @@ static int luaDeleteTriggerGroup(lua_State *L)
 static int luaDeleteAliasGroup(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -13480,23 +14997,28 @@ static int luaDeleteAliasGroup(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
-	int                         removed = 0;
-	for (int i = sizeToInt(aliases.size()) - 1; i >= 0; --i)
-	{
-		if (groupMatches(aliases.at(i).attributes.value(QStringLiteral("group")), groupName))
-		{
-			aliases.removeAt(i);
-			removed++;
-		}
-	}
-	commitAliasListMutation(runtime, plugin);
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     removed  = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return 0;
+            QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
+            int                         count   = 0;
+            for (int i = sizeToInt(aliases.size()) - 1; i >= 0; --i)
+            {
+                if (groupMatches(aliases.at(i).attributes.value(QStringLiteral("group")), groupName))
+                {
+                    aliases.removeAt(i);
+                    count++;
+                }
+            }
+            commitAliasListMutation(runtime, plugin);
+            return count;
+        },
+        0);
 	lua_pushnumber(L, removed);
 	return 1;
 }
@@ -13504,7 +15026,7 @@ static int luaDeleteAliasGroup(lua_State *L)
 static int luaDeleteTimerGroup(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -13516,23 +15038,28 @@ static int luaDeleteTimerGroup(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	QList<WorldRuntime::Timer> &timers  = mutableTimerList(runtime, plugin);
-	int                         removed = 0;
-	for (int i = sizeToInt(timers.size()) - 1; i >= 0; --i)
-	{
-		if (groupMatches(timers.at(i).attributes.value(QStringLiteral("group")), groupName))
-		{
-			timers.removeAt(i);
-			removed++;
-		}
-	}
-	commitTimerListMutation(runtime, plugin, removed > 0);
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     removed  = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return 0;
+            QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
+            int                         count  = 0;
+            for (int i = sizeToInt(timers.size()) - 1; i >= 0; --i)
+            {
+                if (groupMatches(timers.at(i).attributes.value(QStringLiteral("group")), groupName))
+                {
+                    timers.removeAt(i);
+                    count++;
+                }
+            }
+            commitTimerListMutation(runtime, plugin, count > 0);
+            return count;
+        },
+        0);
 	lua_pushnumber(L, removed);
 	return 1;
 }
@@ -13540,7 +15067,7 @@ static int luaDeleteTimerGroup(lua_State *L)
 static int luaDeleteGroup(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -13552,13 +15079,6 @@ static int luaDeleteGroup(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-
 	auto removeGroup = [&](auto &list)
 	{
 		int removed = 0;
@@ -13573,19 +15093,28 @@ static int luaDeleteGroup(lua_State *L)
 		return removed;
 	};
 
-	QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
-	QList<WorldRuntime::Alias>   &aliases  = mutableAliasList(runtime, plugin);
-	QList<WorldRuntime::Timer>   &timers   = mutableTimerList(runtime, plugin);
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     removed  = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return 0;
+            QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
+            QList<WorldRuntime::Alias>   &aliases  = mutableAliasList(runtime, plugin);
+            QList<WorldRuntime::Timer>   &timers   = mutableTimerList(runtime, plugin);
 
-	const int                     triggerRemoved = removeGroup(triggers);
-	const int                     aliasRemoved   = removeGroup(aliases);
-	const int                     timerRemoved   = removeGroup(timers);
-	const int                     removed        = triggerRemoved + aliasRemoved + timerRemoved;
+            const int                     triggerRemoved = removeGroup(triggers);
+            const int                     aliasRemoved   = removeGroup(aliases);
+            const int                     timerRemoved   = removeGroup(timers);
 
-	commitTriggerListMutation(runtime, plugin);
-	commitAliasListMutation(runtime, plugin);
-	commitTimerListMutation(runtime, plugin, timerRemoved > 0);
-
+            commitTriggerListMutation(runtime, plugin);
+            commitAliasListMutation(runtime, plugin);
+            commitTimerListMutation(runtime, plugin, timerRemoved > 0);
+            return triggerRemoved + aliasRemoved + timerRemoved;
+        },
+        0);
 	lua_pushnumber(L, removed);
 	return 1;
 }
@@ -13593,97 +15122,103 @@ static int luaDeleteGroup(lua_State *L)
 static int luaEnableTrigger(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString         name    = QString::fromUtf8(luaL_checkstring(L, 1));
-	const bool            enabled = optBool(L, 2, true);
-	WorldRuntime::Plugin *plugin  = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, errorCode);
-		return 1;
-	}
-	QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
-	const int                     index    = findTriggerIndex(triggers, name);
-	if (index < 0)
-	{
-		lua_pushnumber(L, eTriggerNotFound);
-		return 1;
-	}
-	triggers[index].attributes.insert(QStringLiteral("enabled"), attrFlag(enabled));
-	commitTriggerListMutation(runtime, plugin);
-	lua_pushnumber(L, eOK);
+	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const bool    enabled  = optBool(L, 2, true);
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     result   = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return errorCode;
+            QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
+            const int                     index    = findTriggerIndex(triggers, name);
+            if (index < 0)
+                return eTriggerNotFound;
+            triggers[index].attributes.insert(QStringLiteral("enabled"), attrFlag(enabled));
+            commitTriggerListMutation(runtime, plugin);
+            return eOK;
+        },
+        eWorldClosed);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaEnableAlias(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString         name    = QString::fromUtf8(luaL_checkstring(L, 1));
-	const bool            enabled = optBool(L, 2, true);
-	WorldRuntime::Plugin *plugin  = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, errorCode);
-		return 1;
-	}
-	QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
-	const int                   index   = findAliasIndex(aliases, name);
-	if (index < 0)
-	{
-		lua_pushnumber(L, eAliasNotFound);
-		return 1;
-	}
-	aliases[index].attributes.insert(QStringLiteral("enabled"), attrFlag(enabled));
-	commitAliasListMutation(runtime, plugin);
-	lua_pushnumber(L, eOK);
+	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const bool    enabled  = optBool(L, 2, true);
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     result   = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return errorCode;
+            QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
+            const int                   index   = findAliasIndex(aliases, name);
+            if (index < 0)
+                return eAliasNotFound;
+            aliases[index].attributes.insert(QStringLiteral("enabled"), attrFlag(enabled));
+            commitAliasListMutation(runtime, plugin);
+            return eOK;
+        },
+        eWorldClosed);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaEnableTimer(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString         name    = QString::fromUtf8(luaL_checkstring(L, 1));
-	const bool            enabled = optBool(L, 2, true);
-	WorldRuntime::Plugin *plugin  = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, errorCode);
-		return 1;
-	}
-	QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
-	const int                   index  = findTimerIndex(timers, name);
-	if (index < 0)
-	{
-		lua_pushnumber(L, eTimerNotFound);
-		return 1;
-	}
-	timers[index].attributes.insert(QStringLiteral("enabled"), attrFlag(enabled));
-	commitTimerListMutation(runtime, plugin);
-	lua_pushnumber(L, eOK);
+	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const bool    enabled  = optBool(L, 2, true);
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     result   = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return errorCode;
+            QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
+            const int                   index  = findTimerIndex(timers, name);
+            if (index < 0)
+                return eTimerNotFound;
+            timers[index].attributes.insert(QStringLiteral("enabled"), attrFlag(enabled));
+            commitTimerListMutation(runtime, plugin);
+            return eOK;
+        },
+        eWorldClosed);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaEnableTriggerGroup(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -13696,23 +15231,28 @@ static int luaEnableTriggerGroup(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
-	int                           count    = 0;
-	for (auto &trigger : triggers)
-	{
-		if (groupMatches(trigger.attributes.value(QStringLiteral("group")), groupName))
-		{
-			trigger.attributes.insert(QStringLiteral("enabled"), attrFlag(enabled));
-			count++;
-		}
-	}
-	commitTriggerListMutation(runtime, plugin);
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     count    = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return 0;
+            QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
+            int                           changed  = 0;
+            for (auto &trigger : triggers)
+            {
+                if (groupMatches(trigger.attributes.value(QStringLiteral("group")), groupName))
+                {
+                    trigger.attributes.insert(QStringLiteral("enabled"), attrFlag(enabled));
+                    changed++;
+                }
+            }
+            commitTriggerListMutation(runtime, plugin);
+            return changed;
+        },
+        0);
 	lua_pushnumber(L, count);
 	return 1;
 }
@@ -13720,7 +15260,7 @@ static int luaEnableTriggerGroup(lua_State *L)
 static int luaEnableAliasGroup(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -13733,23 +15273,28 @@ static int luaEnableAliasGroup(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
-	int                         count   = 0;
-	for (auto &alias : aliases)
-	{
-		if (groupMatches(alias.attributes.value(QStringLiteral("group")), groupName))
-		{
-			alias.attributes.insert(QStringLiteral("enabled"), attrFlag(enabled));
-			count++;
-		}
-	}
-	commitAliasListMutation(runtime, plugin);
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     count    = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return 0;
+            QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
+            int                         changed = 0;
+            for (auto &alias : aliases)
+            {
+                if (groupMatches(alias.attributes.value(QStringLiteral("group")), groupName))
+                {
+                    alias.attributes.insert(QStringLiteral("enabled"), attrFlag(enabled));
+                    changed++;
+                }
+            }
+            commitAliasListMutation(runtime, plugin);
+            return changed;
+        },
+        0);
 	lua_pushnumber(L, count);
 	return 1;
 }
@@ -13757,7 +15302,7 @@ static int luaEnableAliasGroup(lua_State *L)
 static int luaEnableTimerGroup(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -13770,23 +15315,28 @@ static int luaEnableTimerGroup(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, 0);
-		return 1;
-	}
-	QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
-	int                         count  = 0;
-	for (auto &timer : timers)
-	{
-		if (groupMatches(timer.attributes.value(QStringLiteral("group")), groupName))
-		{
-			timer.attributes.insert(QStringLiteral("enabled"), attrFlag(enabled));
-			count++;
-		}
-	}
-	commitTimerListMutation(runtime, plugin);
+	const QString pluginId = engine ? engine->pluginId() : QString();
+	const int     count    = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            WorldRuntime::Plugin *plugin = nullptr;
+            if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                return 0;
+            QList<WorldRuntime::Timer> &timers  = mutableTimerList(runtime, plugin);
+            int                         changed = 0;
+            for (auto &timer : timers)
+            {
+                if (groupMatches(timer.attributes.value(QStringLiteral("group")), groupName))
+                {
+                    timer.attributes.insert(QStringLiteral("enabled"), attrFlag(enabled));
+                    changed++;
+                }
+            }
+            commitTimerListMutation(runtime, plugin);
+            return changed;
+        },
+        0);
 	lua_pushnumber(L, count);
 	return 1;
 }
@@ -13794,7 +15344,7 @@ static int luaEnableTimerGroup(lua_State *L)
 static int luaGetTrigger(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -13802,25 +15352,17 @@ static int luaGetTrigger(lua_State *L)
 			lua_pushnil(L);
 		return 8;
 	}
-	const QString         name   = QString::fromUtf8(luaL_checkstring(L, 1));
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
+	const QString         name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString         pluginId = engine ? engine->pluginId() : QString();
+	bool                  pluginMissing{false};
+	WorldRuntime::Trigger trigger;
+	if (!fetchTriggerSnapshotForContext(runtime, pluginId, name, trigger, &pluginMissing))
 	{
-		lua_pushnumber(L, errorCode);
+		lua_pushnumber(L, pluginMissing ? eNoSuchPlugin : eTriggerNotFound);
 		for (int i = 0; i < 7; ++i)
 			lua_pushnil(L);
 		return 8;
 	}
-	const QList<WorldRuntime::Trigger> &triggers = plugin ? plugin->triggers : runtime->triggers();
-	const int                           index    = findTriggerIndex(triggers, name);
-	if (index < 0)
-	{
-		lua_pushnumber(L, eTriggerNotFound);
-		for (int i = 0; i < 7; ++i)
-			lua_pushnil(L);
-		return 8;
-	}
-	const WorldRuntime::Trigger &trigger = triggers.at(index);
 	lua_pushnumber(L, eOK);
 	lua_pushstring(L, trigger.attributes.value(QStringLiteral("match")).toLocal8Bit().constData());
 	lua_pushstring(L, trigger.children.value(QStringLiteral("send")).toLocal8Bit().constData());
@@ -13855,7 +15397,7 @@ static int luaGetTrigger(lua_State *L)
 static int luaGetAlias(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -13863,25 +15405,17 @@ static int luaGetAlias(lua_State *L)
 			lua_pushnil(L);
 		return 5;
 	}
-	const QString         name   = QString::fromUtf8(luaL_checkstring(L, 1));
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
+	const QString       name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString       pluginId = engine ? engine->pluginId() : QString();
+	bool                pluginMissing{false};
+	WorldRuntime::Alias alias;
+	if (!fetchAliasSnapshotForContext(runtime, pluginId, name, alias, &pluginMissing))
 	{
-		lua_pushnumber(L, errorCode);
+		lua_pushnumber(L, pluginMissing ? eNoSuchPlugin : eAliasNotFound);
 		for (int i = 0; i < 4; ++i)
 			lua_pushnil(L);
 		return 5;
 	}
-	const QList<WorldRuntime::Alias> &aliases = plugin ? plugin->aliases : runtime->aliases();
-	const int                         index   = findAliasIndex(aliases, name);
-	if (index < 0)
-	{
-		lua_pushnumber(L, eAliasNotFound);
-		for (int i = 0; i < 4; ++i)
-			lua_pushnil(L);
-		return 5;
-	}
-	const WorldRuntime::Alias &alias = aliases.at(index);
 	lua_pushnumber(L, eOK);
 	lua_pushstring(L, alias.attributes.value(QStringLiteral("match")).toLocal8Bit().constData());
 	lua_pushstring(L, alias.children.value(QStringLiteral("send")).toLocal8Bit().constData());
@@ -13919,7 +15453,7 @@ static int luaGetAlias(lua_State *L)
 static int luaGetTimer(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
@@ -13927,25 +15461,17 @@ static int luaGetTimer(lua_State *L)
 			lua_pushnil(L);
 		return 7;
 	}
-	const QString         name   = QString::fromUtf8(luaL_checkstring(L, 1));
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
+	const QString       name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString       pluginId = engine ? engine->pluginId() : QString();
+	bool                pluginMissing{false};
+	WorldRuntime::Timer timer;
+	if (!fetchTimerSnapshotForContext(runtime, pluginId, name, timer, &pluginMissing))
 	{
-		lua_pushnumber(L, errorCode);
+		lua_pushnumber(L, pluginMissing ? eNoSuchPlugin : eTimerNotFound);
 		for (int i = 0; i < 6; ++i)
 			lua_pushnil(L);
 		return 7;
 	}
-	const QList<WorldRuntime::Timer> &timers = plugin ? plugin->timers : runtime->timers();
-	const int                         index  = findTimerIndex(timers, name);
-	if (index < 0)
-	{
-		lua_pushnumber(L, eTimerNotFound);
-		for (int i = 0; i < 6; ++i)
-			lua_pushnil(L);
-		return 7;
-	}
-	const WorldRuntime::Timer &timer = timers.at(index);
 	lua_pushnumber(L, eOK);
 	lua_pushnumber(L, timer.attributes.value(QStringLiteral("hour")).toInt());
 	lua_pushnumber(L, timer.attributes.value(QStringLiteral("minute")).toInt());
@@ -13992,127 +15518,115 @@ template <typename Item> static int pushNamedAttributeList(lua_State *L, const Q
 static int luaGetTriggerList(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
+	QList<WorldRuntime::Trigger> triggers;
+	if (!fetchTriggerListForContext(runtime, engine ? engine->pluginId() : QString(), triggers))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QList<WorldRuntime::Trigger> &triggers = plugin ? plugin->triggers : runtime->triggers();
 	return pushNamedAttributeList(L, triggers);
 }
 
 static int luaGetAliasList(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
+	QList<WorldRuntime::Alias> aliases;
+	if (!fetchAliasListForContext(runtime, engine ? engine->pluginId() : QString(), aliases))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QList<WorldRuntime::Alias> &aliases = plugin ? plugin->aliases : runtime->aliases();
 	return pushNamedAttributeList(L, aliases);
 }
 
 static int luaGetTimerList(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
+	QList<WorldRuntime::Timer> timers;
+	if (!fetchTimerListForContext(runtime, engine ? engine->pluginId() : QString(), timers))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QList<WorldRuntime::Timer> &timers = plugin ? plugin->timers : runtime->timers();
 	return pushNamedAttributeList(L, timers);
 }
 
 static int luaIsTrigger(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString         name   = QString::fromUtf8(luaL_checkstring(L, 1));
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, errorCode);
-		return 1;
-	}
-	const QList<WorldRuntime::Trigger> &triggers = plugin ? plugin->triggers : runtime->triggers();
-	lua_pushnumber(L, findTriggerIndex(triggers, name) >= 0 ? eOK : eTriggerNotFound);
+	const QString         name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString         pluginId = engine ? engine->pluginId() : QString();
+	bool                  pluginMissing{false};
+	WorldRuntime::Trigger trigger;
+	const bool found = fetchTriggerSnapshotForContext(runtime, pluginId, name, trigger, &pluginMissing);
+	lua_pushnumber(L, found ? eOK : (pluginMissing ? eNoSuchPlugin : eTriggerNotFound));
 	return 1;
 }
 
 static int luaIsAlias(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString         name   = QString::fromUtf8(luaL_checkstring(L, 1));
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, errorCode);
-		return 1;
-	}
-	const QList<WorldRuntime::Alias> &aliases = plugin ? plugin->aliases : runtime->aliases();
-	lua_pushnumber(L, findAliasIndex(aliases, name) >= 0 ? eOK : eAliasNotFound);
+	const QString       name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString       pluginId = engine ? engine->pluginId() : QString();
+	bool                pluginMissing{false};
+	WorldRuntime::Alias alias;
+	const bool          found = fetchAliasSnapshotForContext(runtime, pluginId, name, alias, &pluginMissing);
+	lua_pushnumber(L, found ? eOK : (pluginMissing ? eNoSuchPlugin : eAliasNotFound));
 	return 1;
 }
 
 static int luaIsTimer(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString         name   = QString::fromUtf8(luaL_checkstring(L, 1));
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, errorCode);
-		return 1;
-	}
-	const QList<WorldRuntime::Timer> &timers = plugin ? plugin->timers : runtime->timers();
-	lua_pushnumber(L, findTimerIndex(timers, name) >= 0 ? eOK : eTimerNotFound);
+	const QString       name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString       pluginId = engine ? engine->pluginId() : QString();
+	bool                pluginMissing{false};
+	WorldRuntime::Timer timer;
+	const bool          found = fetchTimerSnapshotForContext(runtime, pluginId, name, timer, &pluginMissing);
+	lua_pushnumber(L, found ? eOK : (pluginMissing ? eNoSuchPlugin : eTimerNotFound));
 	return 1;
 }
 
 static int luaGetTriggerInfo(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -14120,21 +15634,14 @@ static int luaGetTriggerInfo(lua_State *L)
 	}
 	const QString         name     = QString::fromUtf8(luaL_checkstring(L, 1));
 	const int             infoType = static_cast<int>(luaL_checkinteger(L, 2));
-	WorldRuntime::Plugin *plugin   = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
+	const QString         pluginId = engine ? engine->pluginId() : QString();
+	WorldRuntime::Trigger trigger;
+	if (!fetchTriggerSnapshotForContext(runtime, pluginId, name, trigger))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QList<WorldRuntime::Trigger> &triggers = plugin ? plugin->triggers : runtime->triggers();
-	const int                           index    = findTriggerIndex(triggers, name);
-	if (index < 0)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const WorldRuntime::Trigger &trigger = triggers.at(index);
-	QVariant                     value;
+	QVariant value;
 	switch (infoType)
 	{
 	case 1:
@@ -14238,7 +15745,10 @@ static int luaGetTriggerInfo(lua_State *L)
 		value = trigger.executingScript;
 		break;
 	case 34:
-		value = engine->hasFunction(trigger.attributes.value(QStringLiteral("script")));
+		value = pluginId.isEmpty()
+		            ? engine->hasFunction(trigger.attributes.value(QStringLiteral("script")))
+		            : runtime->pluginSupports(pluginId, trigger.attributes.value(QStringLiteral("script"))) ==
+		                  eOK;
 		break;
 	case 35:
 		value = 0;
@@ -14256,30 +15766,31 @@ static int luaGetTriggerInfo(lua_State *L)
 static int luaGetAliasInfo(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString         name     = QString::fromUtf8(luaL_checkstring(L, 1));
-	const int             infoType = static_cast<int>(luaL_checkinteger(L, 2));
-	WorldRuntime::Plugin *plugin   = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
+	const QString       name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const int           infoType = static_cast<int>(luaL_checkinteger(L, 2));
+	const QString       pluginId = engine ? engine->pluginId() : QString();
+	WorldRuntime::Alias alias;
+	if (!fetchAliasSnapshotForContext(runtime, pluginId, name, alias))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QList<WorldRuntime::Alias> &aliases = plugin ? plugin->aliases : runtime->aliases();
-	const int                         index   = findAliasIndex(aliases, name);
-	if (index < 0)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const auto &[attributes, children, included, matched, invocationCount, matchAttempts, lastMatchTarget,
-	             lastMatched, executingScript] = aliases.at(index);
-	QVariant value;
+	const QMap<QString, QString> &attributes      = alias.attributes;
+	const QMap<QString, QString> &children        = alias.children;
+	const bool                    included        = alias.included;
+	const int                     matched         = alias.matched;
+	const int                     invocationCount = alias.invocationCount;
+	const int                     matchAttempts   = alias.matchAttempts;
+	const QString                &lastMatchTarget = alias.lastMatchTarget;
+	const QDateTime              &lastMatched     = alias.lastMatched;
+	const bool                    executingScript = alias.executingScript;
+	QVariant                      value;
 	switch (infoType)
 	{
 	case 1:
@@ -14362,7 +15873,9 @@ static int luaGetAliasInfo(lua_State *L)
 		value = executingScript;
 		break;
 	case 27:
-		value = engine->hasFunction(attributes.value(QStringLiteral("script")));
+		value = pluginId.isEmpty()
+		            ? engine->hasFunction(attributes.value(QStringLiteral("script")))
+		            : runtime->pluginSupports(pluginId, attributes.value(QStringLiteral("script"))) == eOK;
 		break;
 	case 28:
 		value = 0;
@@ -14380,31 +15893,31 @@ static int luaGetAliasInfo(lua_State *L)
 static int luaGetTimerInfo(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString         name     = QString::fromUtf8(luaL_checkstring(L, 1));
-	const int             infoType = static_cast<int>(luaL_checkinteger(L, 2));
-	WorldRuntime::Plugin *plugin   = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
+	const QString       name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const int           infoType = static_cast<int>(luaL_checkinteger(L, 2));
+	const QString       pluginId = engine ? engine->pluginId() : QString();
+	WorldRuntime::Timer timer;
+	if (!fetchTimerSnapshotForContext(runtime, pluginId, name, timer))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QList<WorldRuntime::Timer> &timers = plugin ? plugin->timers : runtime->timers();
-	const int                         index  = findTimerIndex(timers, name);
-	if (index < 0)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const auto &[attributes, children, included, lastFired, nextFireTime, firedCount, invocationCount,
-	             executingScript] = timers.at(index);
-	QVariant   value;
-	const bool atTime = isEnabledValue(attributes.value(QStringLiteral("at_time")));
+	const QMap<QString, QString> &attributes      = timer.attributes;
+	const QMap<QString, QString> &children        = timer.children;
+	const QDateTime              &lastFired       = timer.lastFired;
+	const QDateTime              &nextFireTime    = timer.nextFireTime;
+	const int                     firedCount      = timer.firedCount;
+	const int                     invocationCount = timer.invocationCount;
+	const bool                    included        = timer.included;
+	const bool                    executingScript = timer.executingScript;
+	QVariant                      value;
+	const bool                    atTime = isEnabledValue(attributes.value(QStringLiteral("at_time")));
 	switch (infoType)
 	{
 	case 1:
@@ -14489,7 +16002,9 @@ static int luaGetTimerInfo(lua_State *L)
 		value = executingScript;
 		break;
 	case 26:
-		value = engine->hasFunction(attributes.value(QStringLiteral("script")));
+		value = pluginId.isEmpty()
+		            ? engine->hasFunction(attributes.value(QStringLiteral("script")))
+		            : runtime->pluginSupports(pluginId, attributes.value(QStringLiteral("script"))) == eOK;
 		break;
 	default:
 		break;
@@ -14501,28 +16016,21 @@ static int luaGetTimerInfo(lua_State *L)
 static int luaGetTriggerOption(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString         name    = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString         optName = QString::fromUtf8(luaL_checkstring(L, 2)).trimmed().toLower();
-	WorldRuntime::Plugin *plugin  = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
+	const QString         name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString         optName  = QString::fromUtf8(luaL_checkstring(L, 2)).trimmed().toLower();
+	const QString         pluginId = engine ? engine->pluginId() : QString();
+	WorldRuntime::Trigger trigger;
+	if (!fetchTriggerSnapshotForContext(runtime, pluginId, name, trigger))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QList<WorldRuntime::Trigger> &triggers = plugin ? plugin->triggers : runtime->triggers();
-	const int                           index    = findTriggerIndex(triggers, name);
-	if (index < 0)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const WorldRuntime::Trigger &trigger = triggers.at(index);
 	if (optName == QStringLiteral("group") || optName == QStringLiteral("match") ||
 	    optName == QStringLiteral("script") || optName == QStringLiteral("sound") ||
 	    optName == QStringLiteral("variable"))
@@ -14578,34 +16086,15 @@ static int luaGetTriggerOption(lua_State *L)
 static int luaSetTriggerOption(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString         name    = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString         optName = QString::fromUtf8(luaL_checkstring(L, 2)).trimmed().toLower();
-	WorldRuntime::Plugin *plugin  = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, errorCode);
-		return 1;
-	}
-	QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
-	const int                     index    = findTriggerIndex(triggers, name);
-	if (index < 0)
-	{
-		lua_pushnumber(L, eTriggerNotFound);
-		return 1;
-	}
-	WorldRuntime::Trigger &trigger             = triggers[index];
-	const auto             commitTriggerChange = [&]
-	{
-		applyTriggerDefaults(trigger);
-		commitTriggerListMutation(runtime, plugin);
-	};
-
+	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString optName  = QString::fromUtf8(luaL_checkstring(L, 2)).trimmed().toLower();
+	const QString pluginId = engine ? engine->pluginId() : QString();
 	if (optName == QStringLiteral("ignore_case") || optName == QStringLiteral("regexp"))
 	{
 		lua_pushnumber(L, ePluginCannotSetOption);
@@ -14616,35 +16105,53 @@ static int luaSetTriggerOption(lua_State *L)
 	    optName == QStringLiteral("script") || optName == QStringLiteral("sound") ||
 	    optName == QStringLiteral("variable"))
 	{
-		trigger.attributes.insert(optName, QString::fromUtf8(luaL_checkstring(L, 3)));
-		commitTriggerChange();
-		lua_pushnumber(L, eOK);
+		const QString textValue = QString::fromUtf8(luaL_checkstring(L, 3));
+		const int     result    = runOnRuntimeThread(
+            runtime,
+            [&]() -> int
+            {
+                WorldRuntime::Plugin *plugin = nullptr;
+                if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                    return errorCode;
+                QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
+                const int                     index    = findTriggerIndex(triggers, name);
+                if (index < 0)
+                    return eTriggerNotFound;
+                WorldRuntime::Trigger &trigger = triggers[index];
+                trigger.attributes.insert(optName, textValue);
+                applyTriggerDefaults(trigger);
+                commitTriggerListMutation(runtime, plugin);
+                return eOK;
+            },
+            eWorldClosed);
+		lua_pushnumber(L, result);
 		return 1;
 	}
 
-	auto setMatchStyle = [&](const int match)
+	if (optName == QStringLiteral("send"))
 	{
-		trigger.attributes.insert(QStringLiteral("text_colour"), QString::number(match >> 4 & 0x0F));
-		trigger.attributes.insert(QStringLiteral("back_colour"), QString::number(match >> 8 & 0x0F));
-		trigger.attributes.insert(QStringLiteral("bold"), attrFlag(match & kStyleHilite));
-		trigger.attributes.insert(QStringLiteral("italic"), attrFlag(match & kStyleBlink));
-		trigger.attributes.insert(QStringLiteral("underline"), attrFlag(match & kStyleUnderline));
-		trigger.attributes.insert(QStringLiteral("inverse"), attrFlag(match & kStyleInverse));
-		trigger.attributes.insert(QStringLiteral("match_text_colour"), attrFlag(match & kTriggerMatchText));
-		trigger.attributes.insert(QStringLiteral("match_back_colour"), attrFlag(match & kTriggerMatchBack));
-		trigger.attributes.insert(QStringLiteral("match_bold"), attrFlag(match & kTriggerMatchHilite));
-		trigger.attributes.insert(QStringLiteral("match_italic"), attrFlag(match & kTriggerMatchBlink));
-		trigger.attributes.insert(QStringLiteral("match_inverse"), attrFlag(match & kTriggerMatchInverse));
-		trigger.attributes.insert(QStringLiteral("match_underline"),
-		                          attrFlag(match & kTriggerMatchUnderline));
-	};
-
-	auto setNewStyle = [&](const int style)
-	{
-		trigger.attributes.insert(QStringLiteral("make_bold"), attrFlag(style & kStyleHilite));
-		trigger.attributes.insert(QStringLiteral("make_italic"), attrFlag(style & kStyleBlink));
-		trigger.attributes.insert(QStringLiteral("make_underline"), attrFlag(style & kStyleUnderline));
-	};
+		const QString textValue = QString::fromUtf8(luaL_checkstring(L, 3));
+		const int     result    = runOnRuntimeThread(
+            runtime,
+            [&]() -> int
+            {
+                WorldRuntime::Plugin *plugin = nullptr;
+                if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                    return errorCode;
+                QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
+                const int                     index    = findTriggerIndex(triggers, name);
+                if (index < 0)
+                    return eTriggerNotFound;
+                WorldRuntime::Trigger &trigger = triggers[index];
+                trigger.children.insert(QStringLiteral("send"), textValue);
+                applyTriggerDefaults(trigger);
+                commitTriggerListMutation(runtime, plugin);
+                return eOK;
+            },
+            eWorldClosed);
+		lua_pushnumber(L, result);
+		return 1;
+	}
 
 	if (optName == QStringLiteral("match_style") || optName == QStringLiteral("new_style"))
 	{
@@ -14654,45 +16161,64 @@ static int luaSetTriggerOption(lua_State *L)
 			lua_pushnumber(L, eOptionOutOfRange);
 			return 1;
 		}
-		if (optName == QStringLiteral("match_style"))
-		{
-			if (number < 0 || number > 0xFFFF)
-			{
-				lua_pushnumber(L, eOptionOutOfRange);
-				return 1;
-			}
-			setMatchStyle(static_cast<int>(number));
-		}
-		else
-		{
-			if (number < 0 || number > 7)
-			{
-				lua_pushnumber(L, eOptionOutOfRange);
-				return 1;
-			}
-			setNewStyle(static_cast<int>(number));
-		}
+		const int result = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    WorldRuntime::Plugin *plugin = nullptr;
+			    if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+				    return errorCode;
+			    QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
+			    const int                     index    = findTriggerIndex(triggers, name);
+			    if (index < 0)
+				    return eTriggerNotFound;
+			    WorldRuntime::Trigger &trigger = triggers[index];
 
-		commitTriggerChange();
-		lua_pushnumber(L, eOK);
+			    if (optName == QStringLiteral("match_style"))
+			    {
+				    if (number < 0 || number > 0xFFFF)
+					    return eOptionOutOfRange;
+				    const int match = static_cast<int>(number);
+				    trigger.attributes.insert(QStringLiteral("text_colour"),
+				                              QString::number(match >> 4 & 0x0F));
+				    trigger.attributes.insert(QStringLiteral("back_colour"),
+				                              QString::number(match >> 8 & 0x0F));
+				    trigger.attributes.insert(QStringLiteral("bold"), attrFlag(match & kStyleHilite));
+				    trigger.attributes.insert(QStringLiteral("italic"), attrFlag(match & kStyleBlink));
+				    trigger.attributes.insert(QStringLiteral("underline"), attrFlag(match & kStyleUnderline));
+				    trigger.attributes.insert(QStringLiteral("inverse"), attrFlag(match & kStyleInverse));
+				    trigger.attributes.insert(QStringLiteral("match_text_colour"),
+				                              attrFlag(match & kTriggerMatchText));
+				    trigger.attributes.insert(QStringLiteral("match_back_colour"),
+				                              attrFlag(match & kTriggerMatchBack));
+				    trigger.attributes.insert(QStringLiteral("match_bold"),
+				                              attrFlag(match & kTriggerMatchHilite));
+				    trigger.attributes.insert(QStringLiteral("match_italic"),
+				                              attrFlag(match & kTriggerMatchBlink));
+				    trigger.attributes.insert(QStringLiteral("match_inverse"),
+				                              attrFlag(match & kTriggerMatchInverse));
+				    trigger.attributes.insert(QStringLiteral("match_underline"),
+				                              attrFlag(match & kTriggerMatchUnderline));
+			    }
+			    else
+			    {
+				    if (number < 0 || number > 7)
+					    return eOptionOutOfRange;
+				    const int style = static_cast<int>(number);
+				    trigger.attributes.insert(QStringLiteral("make_bold"), attrFlag(style & kStyleHilite));
+				    trigger.attributes.insert(QStringLiteral("make_italic"), attrFlag(style & kStyleBlink));
+				    trigger.attributes.insert(QStringLiteral("make_underline"),
+				                              attrFlag(style & kStyleUnderline));
+			    }
+
+			    applyTriggerDefaults(trigger);
+			    commitTriggerListMutation(runtime, plugin);
+			    return eOK;
+		    },
+		    eWorldClosed);
+		lua_pushnumber(L, result);
 		return 1;
 	}
-	if (optName == QStringLiteral("send"))
-	{
-		trigger.children.insert(QStringLiteral("send"), QString::fromUtf8(luaL_checkstring(L, 3)));
-		commitTriggerChange();
-		lua_pushnumber(L, eOK);
-		return 1;
-	}
-
-	auto setBool = [&](const QString &key) -> bool
-	{
-		bool value = false;
-		if (!parseBoolArg(L, value))
-			return false;
-		trigger.attributes.insert(key, attrFlag(value));
-		return true;
-	};
 
 	if (optName == QStringLiteral("enabled") || optName == QStringLiteral("expand_variables") ||
 	    optName == QStringLiteral("ignore_case") || optName == QStringLiteral("keep_evaluating") ||
@@ -14702,13 +16228,31 @@ static int luaSetTriggerOption(lua_State *L)
 	    optName == QStringLiteral("lowercase_wildcard") || optName == QStringLiteral("temporary") ||
 	    optName == QStringLiteral("one_shot"))
 	{
-		if (!setBool(optName))
+		bool boolValue = false;
+		if (!parseBoolArg(L, boolValue))
 		{
 			lua_pushnumber(L, eOptionOutOfRange);
 			return 1;
 		}
-		commitTriggerChange();
-		lua_pushnumber(L, eOK);
+		const int result = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    WorldRuntime::Plugin *plugin = nullptr;
+			    if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+				    return errorCode;
+			    QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
+			    const int                     index    = findTriggerIndex(triggers, name);
+			    if (index < 0)
+				    return eTriggerNotFound;
+			    WorldRuntime::Trigger &trigger = triggers[index];
+			    trigger.attributes.insert(optName, attrFlag(boolValue));
+			    applyTriggerDefaults(trigger);
+			    commitTriggerListMutation(runtime, plugin);
+			    return eOK;
+		    },
+		    eWorldClosed);
+		lua_pushnumber(L, result);
 		return 1;
 	}
 
@@ -14719,101 +16263,93 @@ static int luaSetTriggerOption(lua_State *L)
 		return 1;
 	}
 
-	if (optName == QStringLiteral("clipboard_arg"))
-	{
-		if (number < 0 || number > 10)
-		{
-			lua_pushnumber(L, eOptionOutOfRange);
-			return 1;
-		}
-		trigger.attributes.insert(optName, QString::number(static_cast<int>(number)));
-	}
-	else if (optName == QStringLiteral("colour_change_type"))
-	{
-		if (number < TRIGGER_COLOUR_CHANGE_BOTH || number > TRIGGER_COLOUR_CHANGE_BACKGROUND)
-		{
-			lua_pushnumber(L, eOptionOutOfRange);
-			return 1;
-		}
-		trigger.attributes.insert(optName, QString::number(static_cast<int>(number)));
-	}
-	else if (optName == QStringLiteral("custom_colour"))
-	{
-		if (number < 0 || number > MAX_CUSTOM + 1)
-		{
-			lua_pushnumber(L, eOptionOutOfRange);
-			return 1;
-		}
-		trigger.attributes.insert(optName, QString::number(static_cast<int>(number)));
-	}
-	else if (optName == QStringLiteral("lines_to_match") || optName == QStringLiteral("sequence"))
-	{
-		if (number < 0 || number > 10000)
-		{
-			lua_pushnumber(L, eOptionOutOfRange);
-			return 1;
-		}
-		trigger.attributes.insert(optName, QString::number(static_cast<int>(number)));
-	}
-	else if (optName == QStringLiteral("other_text_colour") || optName == QStringLiteral("other_back_colour"))
-	{
-		if (number < 0 || number > 0xFFFFFF)
-		{
-			lua_pushnumber(L, eOptionOutOfRange);
-			return 1;
-		}
-		trigger.attributes.insert(optName, QString::number(static_cast<long long>(number)));
-	}
-	else if (optName == QStringLiteral("send_to"))
-	{
-		const int sendTo = static_cast<int>(number);
-		if (sendTo < 0 || sendTo >= eSendToLast)
-		{
-			lua_pushnumber(L, eOptionOutOfRange);
-			return 1;
-		}
-		trigger.attributes.insert(optName, QString::number(sendTo));
-	}
-	else if (optName == QStringLiteral("user"))
-	{
-		trigger.attributes.insert(optName, QString::number(static_cast<long long>(number)));
-	}
-	else
-	{
-		lua_pushnumber(L, eUnknownOption);
-		return 1;
-	}
+	const int result = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    WorldRuntime::Plugin *plugin = nullptr;
+		    if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+			    return errorCode;
+		    QList<WorldRuntime::Trigger> &triggers = mutableTriggerList(runtime, plugin);
+		    const int                     index    = findTriggerIndex(triggers, name);
+		    if (index < 0)
+			    return eTriggerNotFound;
+		    WorldRuntime::Trigger &trigger = triggers[index];
 
-	commitTriggerChange();
-	lua_pushnumber(L, eOK);
+		    if (optName == QStringLiteral("clipboard_arg"))
+		    {
+			    if (number < 0 || number > 10)
+				    return eOptionOutOfRange;
+			    trigger.attributes.insert(optName, QString::number(static_cast<int>(number)));
+		    }
+		    else if (optName == QStringLiteral("colour_change_type"))
+		    {
+			    if (number < TRIGGER_COLOUR_CHANGE_BOTH || number > TRIGGER_COLOUR_CHANGE_BACKGROUND)
+				    return eOptionOutOfRange;
+			    trigger.attributes.insert(optName, QString::number(static_cast<int>(number)));
+		    }
+		    else if (optName == QStringLiteral("custom_colour"))
+		    {
+			    if (number < 0 || number > MAX_CUSTOM + 1)
+				    return eOptionOutOfRange;
+			    trigger.attributes.insert(optName, QString::number(static_cast<int>(number)));
+		    }
+		    else if (optName == QStringLiteral("lines_to_match") || optName == QStringLiteral("sequence"))
+		    {
+			    if (number < 0 || number > 10000)
+				    return eOptionOutOfRange;
+			    trigger.attributes.insert(optName, QString::number(static_cast<int>(number)));
+		    }
+		    else if (optName == QStringLiteral("other_text_colour") ||
+		             optName == QStringLiteral("other_back_colour"))
+		    {
+			    if (number < 0 || number > 0xFFFFFF)
+				    return eOptionOutOfRange;
+			    trigger.attributes.insert(optName, QString::number(static_cast<long long>(number)));
+		    }
+		    else if (optName == QStringLiteral("send_to"))
+		    {
+			    const int sendTo = static_cast<int>(number);
+			    if (sendTo < 0 || sendTo >= eSendToLast)
+				    return eOptionOutOfRange;
+			    trigger.attributes.insert(optName, QString::number(sendTo));
+		    }
+		    else if (optName == QStringLiteral("user"))
+		    {
+			    trigger.attributes.insert(optName, QString::number(static_cast<long long>(number)));
+		    }
+		    else
+		    {
+			    return eUnknownOption;
+		    }
+
+		    applyTriggerDefaults(trigger);
+		    commitTriggerListMutation(runtime, plugin);
+		    return eOK;
+	    },
+	    eWorldClosed);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaGetAliasOption(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString         name    = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString         optName = QString::fromUtf8(luaL_checkstring(L, 2)).trimmed().toLower();
-	WorldRuntime::Plugin *plugin  = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
+	const QString       name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString       optName  = QString::fromUtf8(luaL_checkstring(L, 2)).trimmed().toLower();
+	const QString       pluginId = engine ? engine->pluginId() : QString();
+	WorldRuntime::Alias alias;
+	if (!fetchAliasSnapshotForContext(runtime, pluginId, name, alias))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QList<WorldRuntime::Alias> &aliases = plugin ? plugin->aliases : runtime->aliases();
-	const int                         index   = findAliasIndex(aliases, name);
-	if (index < 0)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const WorldRuntime::Alias &alias = aliases.at(index);
 	if (optName == QStringLiteral("group") || optName == QStringLiteral("match") ||
 	    optName == QStringLiteral("script") || optName == QStringLiteral("variable"))
 	{
@@ -14855,34 +16391,15 @@ static int luaGetAliasOption(lua_State *L)
 static int luaSetAliasOption(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString         name    = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString         optName = QString::fromUtf8(luaL_checkstring(L, 2)).trimmed().toLower();
-	WorldRuntime::Plugin *plugin  = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, errorCode);
-		return 1;
-	}
-	QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
-	const int                   index   = findAliasIndex(aliases, name);
-	if (index < 0)
-	{
-		lua_pushnumber(L, eAliasNotFound);
-		return 1;
-	}
-	WorldRuntime::Alias &alias             = aliases[index];
-	const auto           commitAliasChange = [&]
-	{
-		applyAliasDefaults(alias);
-		commitAliasListMutation(runtime, plugin);
-	};
-
+	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString optName  = QString::fromUtf8(luaL_checkstring(L, 2)).trimmed().toLower();
+	const QString pluginId = engine ? engine->pluginId() : QString();
 	if (optName == QStringLiteral("ignore_case") || optName == QStringLiteral("regexp"))
 	{
 		lua_pushnumber(L, ePluginCannotSetOption);
@@ -14892,27 +16409,52 @@ static int luaSetAliasOption(lua_State *L)
 	if (optName == QStringLiteral("group") || optName == QStringLiteral("match") ||
 	    optName == QStringLiteral("script") || optName == QStringLiteral("variable"))
 	{
-		alias.attributes.insert(optName, QString::fromUtf8(luaL_checkstring(L, 3)));
-		commitAliasChange();
-		lua_pushnumber(L, eOK);
+		const QString textValue = QString::fromUtf8(luaL_checkstring(L, 3));
+		const int     result    = runOnRuntimeThread(
+            runtime,
+            [&]() -> int
+            {
+                WorldRuntime::Plugin *plugin = nullptr;
+                if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                    return errorCode;
+                QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
+                const int                   index   = findAliasIndex(aliases, name);
+                if (index < 0)
+                    return eAliasNotFound;
+                WorldRuntime::Alias &alias = aliases[index];
+                alias.attributes.insert(optName, textValue);
+                applyAliasDefaults(alias);
+                commitAliasListMutation(runtime, plugin);
+                return eOK;
+            },
+            eWorldClosed);
+		lua_pushnumber(L, result);
 		return 1;
 	}
 	if (optName == QStringLiteral("send"))
 	{
-		alias.children.insert(QStringLiteral("send"), QString::fromUtf8(luaL_checkstring(L, 3)));
-		commitAliasChange();
-		lua_pushnumber(L, eOK);
+		const QString textValue = QString::fromUtf8(luaL_checkstring(L, 3));
+		const int     result    = runOnRuntimeThread(
+            runtime,
+            [&]() -> int
+            {
+                WorldRuntime::Plugin *plugin = nullptr;
+                if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                    return errorCode;
+                QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
+                const int                   index   = findAliasIndex(aliases, name);
+                if (index < 0)
+                    return eAliasNotFound;
+                WorldRuntime::Alias &alias = aliases[index];
+                alias.children.insert(QStringLiteral("send"), textValue);
+                applyAliasDefaults(alias);
+                commitAliasListMutation(runtime, plugin);
+                return eOK;
+            },
+            eWorldClosed);
+		lua_pushnumber(L, result);
 		return 1;
 	}
-
-	auto setBool = [&](const QString &key) -> bool
-	{
-		bool value = false;
-		if (!parseBoolArg(L, value))
-			return false;
-		alias.attributes.insert(key, attrFlag(value));
-		return true;
-	};
 
 	if (optName == QStringLiteral("enabled") || optName == QStringLiteral("expand_variables") ||
 	    optName == QStringLiteral("ignore_case") || optName == QStringLiteral("omit_from_log") ||
@@ -14922,13 +16464,31 @@ static int luaSetAliasOption(lua_State *L)
 	    optName == QStringLiteral("echo_alias") || optName == QStringLiteral("temporary") ||
 	    optName == QStringLiteral("one_shot"))
 	{
-		if (!setBool(optName))
+		bool boolValue = false;
+		if (!parseBoolArg(L, boolValue))
 		{
 			lua_pushnumber(L, eOptionOutOfRange);
 			return 1;
 		}
-		commitAliasChange();
-		lua_pushnumber(L, eOK);
+		const int result = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    WorldRuntime::Plugin *plugin = nullptr;
+			    if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+				    return errorCode;
+			    QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
+			    const int                   index   = findAliasIndex(aliases, name);
+			    if (index < 0)
+				    return eAliasNotFound;
+			    WorldRuntime::Alias &alias = aliases[index];
+			    alias.attributes.insert(optName, attrFlag(boolValue));
+			    applyAliasDefaults(alias);
+			    commitAliasListMutation(runtime, plugin);
+			    return eOK;
+		    },
+		    eWorldClosed);
+		lua_pushnumber(L, result);
 		return 1;
 	}
 
@@ -14939,65 +16499,68 @@ static int luaSetAliasOption(lua_State *L)
 		return 1;
 	}
 
-	if (optName == QStringLiteral("send_to"))
-	{
-		const int sendTo = static_cast<int>(number);
-		if (sendTo < 0 || sendTo >= eSendToLast)
-		{
-			lua_pushnumber(L, eOptionOutOfRange);
-			return 1;
-		}
-		alias.attributes.insert(optName, QString::number(sendTo));
-	}
-	else if (optName == QStringLiteral("sequence"))
-	{
-		if (number < 0 || number > 10000)
-		{
-			lua_pushnumber(L, eOptionOutOfRange);
-			return 1;
-		}
-		alias.attributes.insert(optName, QString::number(static_cast<int>(number)));
-	}
-	else if (optName == QStringLiteral("user"))
-	{
-		alias.attributes.insert(optName, QString::number(static_cast<long long>(number)));
-	}
-	else
-	{
-		lua_pushnumber(L, eUnknownOption);
-		return 1;
-	}
+	const int result = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    WorldRuntime::Plugin *plugin = nullptr;
+		    if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+			    return errorCode;
+		    QList<WorldRuntime::Alias> &aliases = mutableAliasList(runtime, plugin);
+		    const int                   index   = findAliasIndex(aliases, name);
+		    if (index < 0)
+			    return eAliasNotFound;
+		    WorldRuntime::Alias &alias = aliases[index];
 
-	commitAliasChange();
-	lua_pushnumber(L, eOK);
+		    if (optName == QStringLiteral("send_to"))
+		    {
+			    const int sendTo = static_cast<int>(number);
+			    if (sendTo < 0 || sendTo >= eSendToLast)
+				    return eOptionOutOfRange;
+			    alias.attributes.insert(optName, QString::number(sendTo));
+		    }
+		    else if (optName == QStringLiteral("sequence"))
+		    {
+			    if (number < 0 || number > 10000)
+				    return eOptionOutOfRange;
+			    alias.attributes.insert(optName, QString::number(static_cast<int>(number)));
+		    }
+		    else if (optName == QStringLiteral("user"))
+		    {
+			    alias.attributes.insert(optName, QString::number(static_cast<long long>(number)));
+		    }
+		    else
+		    {
+			    return eUnknownOption;
+		    }
+
+		    applyAliasDefaults(alias);
+		    commitAliasListMutation(runtime, plugin);
+		    return eOK;
+	    },
+	    eWorldClosed);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaGetTimerOption(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString         name    = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString         optName = QString::fromUtf8(luaL_checkstring(L, 2)).trimmed().toLower();
-	WorldRuntime::Plugin *plugin  = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
+	const QString       name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString       optName  = QString::fromUtf8(luaL_checkstring(L, 2)).trimmed().toLower();
+	const QString       pluginId = engine ? engine->pluginId() : QString();
+	WorldRuntime::Timer timer;
+	if (!fetchTimerSnapshotForContext(runtime, pluginId, name, timer))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QList<WorldRuntime::Timer> &timers = plugin ? plugin->timers : runtime->timers();
-	const int                         index  = findTimerIndex(timers, name);
-	if (index < 0)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const WorldRuntime::Timer &timer = timers.at(index);
 	if (optName == QStringLiteral("group") || optName == QStringLiteral("script") ||
 	    optName == QStringLiteral("variable"))
 	{
@@ -15038,73 +16601,99 @@ static int luaGetTimerOption(lua_State *L)
 static int luaSetTimerOption(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString         name    = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString         optName = QString::fromUtf8(luaL_checkstring(L, 2)).trimmed().toLower();
-	WorldRuntime::Plugin *plugin  = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, errorCode);
-		return 1;
-	}
-	QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
-	const int                   index  = findTimerIndex(timers, name);
-	if (index < 0)
-	{
-		lua_pushnumber(L, eTimerNotFound);
-		return 1;
-	}
-	WorldRuntime::Timer &timer             = timers[index];
-	const auto           commitTimerChange = [&]
-	{
-		applyTimerDefaults(timer);
-		commitTimerListMutation(runtime, plugin);
-	};
+	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString optName  = QString::fromUtf8(luaL_checkstring(L, 2)).trimmed().toLower();
+	const QString pluginId = engine ? engine->pluginId() : QString();
 
 	if (optName == QStringLiteral("group") || optName == QStringLiteral("script") ||
 	    optName == QStringLiteral("variable"))
 	{
-		timer.attributes.insert(optName, QString::fromUtf8(luaL_checkstring(L, 3)));
-		commitTimerChange();
-		lua_pushnumber(L, eOK);
-		return 1;
-	}
-	if (optName == QStringLiteral("send"))
-	{
-		timer.children.insert(QStringLiteral("send"), QString::fromUtf8(luaL_checkstring(L, 3)));
-		commitTimerChange();
-		lua_pushnumber(L, eOK);
+		const QString textValue = QString::fromUtf8(luaL_checkstring(L, 3));
+		const int     result    = runOnRuntimeThread(
+            runtime,
+            [&]() -> int
+            {
+                WorldRuntime::Plugin *plugin = nullptr;
+                if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                    return errorCode;
+                QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
+                const int                   index  = findTimerIndex(timers, name);
+                if (index < 0)
+                    return eTimerNotFound;
+                WorldRuntime::Timer &timer = timers[index];
+                timer.attributes.insert(optName, textValue);
+                applyTimerDefaults(timer);
+                commitTimerListMutation(runtime, plugin);
+                return eOK;
+            },
+            eWorldClosed);
+		lua_pushnumber(L, result);
 		return 1;
 	}
 
-	auto setBool = [&](const QString &key) -> bool
+	if (optName == QStringLiteral("send"))
 	{
-		bool value = false;
-		if (!parseBoolArg(L, value))
-			return false;
-		timer.attributes.insert(key, attrFlag(value));
-		return true;
-	};
+		const QString textValue = QString::fromUtf8(luaL_checkstring(L, 3));
+		const int     result    = runOnRuntimeThread(
+            runtime,
+            [&]() -> int
+            {
+                WorldRuntime::Plugin *plugin = nullptr;
+                if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+                    return errorCode;
+                QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
+                const int                   index  = findTimerIndex(timers, name);
+                if (index < 0)
+                    return eTimerNotFound;
+                WorldRuntime::Timer &timer = timers[index];
+                timer.children.insert(QStringLiteral("send"), textValue);
+                applyTimerDefaults(timer);
+                commitTimerListMutation(runtime, plugin);
+                return eOK;
+            },
+            eWorldClosed);
+		lua_pushnumber(L, result);
+		return 1;
+	}
 
 	if (optName == QStringLiteral("enabled") || optName == QStringLiteral("at_time") ||
 	    optName == QStringLiteral("one_shot") || optName == QStringLiteral("omit_from_output") ||
 	    optName == QStringLiteral("omit_from_log") || optName == QStringLiteral("active_closed") ||
 	    optName == QStringLiteral("temporary"))
 	{
-		if (!setBool(optName))
+		bool boolValue = false;
+		if (!parseBoolArg(L, boolValue))
 		{
 			lua_pushnumber(L, eOptionOutOfRange);
 			return 1;
 		}
-		if (optName == QStringLiteral("at_time"))
-			resetTimerFields(timer);
-		commitTimerChange();
-		lua_pushnumber(L, eOK);
+		const int result = runOnRuntimeThread(
+		    runtime,
+		    [&]() -> int
+		    {
+			    WorldRuntime::Plugin *plugin = nullptr;
+			    if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+				    return errorCode;
+			    QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
+			    const int                   index  = findTimerIndex(timers, name);
+			    if (index < 0)
+				    return eTimerNotFound;
+			    WorldRuntime::Timer &timer = timers[index];
+			    timer.attributes.insert(optName, attrFlag(boolValue));
+			    if (optName == QStringLiteral("at_time"))
+				    resetTimerFields(timer);
+			    applyTimerDefaults(timer);
+			    commitTimerListMutation(runtime, plugin);
+			    return eOK;
+		    },
+		    eWorldClosed);
+		lua_pushnumber(L, result);
 		return 1;
 	}
 
@@ -15115,69 +16704,78 @@ static int luaSetTimerOption(lua_State *L)
 		return 1;
 	}
 
-	bool resetSchedule = false;
-	if (optName == QStringLiteral("hour") || optName == QStringLiteral("offset_hour"))
-	{
-		if (number < 0 || number > 23)
-		{
-			lua_pushnumber(L, eOptionOutOfRange);
-			return 1;
-		}
-		timer.attributes.insert(optName, QString::number(static_cast<int>(number)));
-		resetSchedule = true;
-	}
-	else if (optName == QStringLiteral("minute") || optName == QStringLiteral("offset_minute"))
-	{
-		if (number < 0 || number > 59)
-		{
-			lua_pushnumber(L, eOptionOutOfRange);
-			return 1;
-		}
-		timer.attributes.insert(optName, QString::number(static_cast<int>(number)));
-		resetSchedule = true;
-	}
-	else if (optName == QStringLiteral("second") || optName == QStringLiteral("offset_second"))
-	{
-		if (number < 0 || number > 59.9999)
-		{
-			lua_pushnumber(L, eOptionOutOfRange);
-			return 1;
-		}
-		timer.attributes.insert(optName, QString::number(number, 'f', 4));
-		resetSchedule = true;
-	}
-	else if (optName == QStringLiteral("send_to"))
-	{
-		const int sendTo = static_cast<int>(number);
-		if (sendTo < 0 || sendTo >= eSendToLast)
-		{
-			lua_pushnumber(L, eOptionOutOfRange);
-			return 1;
-		}
-		timer.attributes.insert(optName, QString::number(sendTo));
-	}
-	else if (optName == QStringLiteral("user"))
-	{
-		timer.attributes.insert(optName, QString::number(static_cast<long long>(number)));
-	}
-	else
-	{
-		lua_pushnumber(L, eUnknownOption);
-		return 1;
-	}
+	const int result = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> int
+	    {
+		    WorldRuntime::Plugin *plugin = nullptr;
+		    if (int errorCode = eOK; !resolvePluginContextById(runtime, pluginId, plugin, errorCode))
+			    return errorCode;
+		    QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
+		    const int                   index  = findTimerIndex(timers, name);
+		    if (index < 0)
+			    return eTimerNotFound;
+		    WorldRuntime::Timer &timer = timers[index];
 
-	if (resetSchedule)
-		resetTimerFields(timer);
+		    bool                 resetSchedule = false;
+		    if (optName == QStringLiteral("hour") || optName == QStringLiteral("offset_hour"))
+		    {
+			    if (number < 0 || number > 23)
+				    return eOptionOutOfRange;
+			    timer.attributes.insert(optName, QString::number(static_cast<int>(number)));
+			    resetSchedule = true;
+		    }
+		    else if (optName == QStringLiteral("minute") || optName == QStringLiteral("offset_minute"))
+		    {
+			    if (number < 0 || number > 59)
+				    return eOptionOutOfRange;
+			    timer.attributes.insert(optName, QString::number(static_cast<int>(number)));
+			    resetSchedule = true;
+		    }
+		    else if (optName == QStringLiteral("second") || optName == QStringLiteral("offset_second"))
+		    {
+			    if (number < 0 || number > 59.9999)
+				    return eOptionOutOfRange;
+			    timer.attributes.insert(optName, QString::number(number, 'f', 4));
+			    resetSchedule = true;
+		    }
+		    else if (optName == QStringLiteral("send_to"))
+		    {
+			    const int sendTo = static_cast<int>(number);
+			    if (sendTo < 0 || sendTo >= eSendToLast)
+				    return eOptionOutOfRange;
+			    timer.attributes.insert(optName, QString::number(sendTo));
+		    }
+		    else if (optName == QStringLiteral("user"))
+		    {
+			    timer.attributes.insert(optName, QString::number(static_cast<long long>(number)));
+		    }
+		    else
+		    {
+			    return eUnknownOption;
+		    }
 
-	commitTimerChange();
-	lua_pushnumber(L, eOK);
+		    if (resetSchedule)
+			    resetTimerFields(timer);
+		    applyTimerDefaults(timer);
+		    commitTimerListMutation(runtime, plugin);
+		    return eOK;
+	    },
+	    eWorldClosed);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaGetTriggerWildcard(lua_State *L)
 {
-	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	if (!engine)
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	const bool    pluginScoped = !engine->pluginId().isEmpty();
+	WorldRuntime *runtime      = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -15186,11 +16784,15 @@ static int luaGetTriggerWildcard(lua_State *L)
 	const QString name         = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString wildcardName = QString::fromUtf8(luaL_checkstring(L, 2));
 	QString       value;
-	bool          ok = false;
-	if (!engine->pluginId().isEmpty())
-		ok = runtime->pluginTriggerWildcard(engine->pluginId(), name, wildcardName, value);
-	else
-		ok = runtime->triggerWildcard(name, wildcardName, value);
+	const bool    ok = runOnRuntimeThread(
+        runtime,
+        [&]() -> bool
+        {
+            if (pluginScoped)
+                return runtime->pluginTriggerWildcard(engine->pluginId(), name, wildcardName, value);
+            return runtime->triggerWildcard(name, wildcardName, value);
+        },
+        false);
 	if (!ok)
 	{
 		// MUSHclient parity: missing wildcard lookup returns empty string for Lua callers.
@@ -15203,8 +16805,14 @@ static int luaGetTriggerWildcard(lua_State *L)
 
 static int luaGetAliasWildcard(lua_State *L)
 {
-	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	if (!engine)
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	const bool    pluginScoped = !engine->pluginId().isEmpty();
+	WorldRuntime *runtime      = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -15213,11 +16821,15 @@ static int luaGetAliasWildcard(lua_State *L)
 	const QString name         = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString wildcardName = QString::fromUtf8(luaL_checkstring(L, 2));
 	QString       value;
-	bool          ok = false;
-	if (!engine->pluginId().isEmpty())
-		ok = runtime->pluginAliasWildcard(engine->pluginId(), name, wildcardName, value);
-	else
-		ok = runtime->aliasWildcard(name, wildcardName, value);
+	const bool    ok = runOnRuntimeThread(
+        runtime,
+        [&]() -> bool
+        {
+            if (pluginScoped)
+                return runtime->pluginAliasWildcard(engine->pluginId(), name, wildcardName, value);
+            return runtime->aliasWildcard(name, wildcardName, value);
+        },
+        false);
 	if (!ok)
 	{
 		// MUSHclient parity: missing wildcard lookup returns empty string for Lua callers.
@@ -15231,55 +16843,31 @@ static int luaGetAliasWildcard(lua_State *L)
 static int luaResetTimer(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnumber(L, eWorldClosed);
 		return 1;
 	}
-	const QString         name   = QString::fromUtf8(luaL_checkstring(L, 1));
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-	{
-		lua_pushnumber(L, errorCode);
-		return 1;
-	}
-	QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin);
-	const int                   index  = findTimerIndex(timers, name);
-	if (index < 0)
-	{
-		lua_pushnumber(L, eTimerNotFound);
-		return 1;
-	}
-	applyTimerDefaults(timers[index]);
-	resetTimerFields(timers[index]);
-	commitTimerListMutation(runtime, plugin);
-	lua_pushnumber(L, eOK);
+	const QString name = QString::fromUtf8(luaL_checkstring(L, 1));
+	lua_pushnumber(L, resetTimerForContext(runtime, engine ? engine->pluginId() : QString(), name));
 	return 1;
 }
 
 static int luaResetTimers(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
-	WorldRuntime::Plugin *plugin = nullptr;
-	if (int errorCode = eOK; !resolvePluginContext(engine, runtime, plugin, errorCode))
-		return 0;
-	for (QList<WorldRuntime::Timer> &timers = mutableTimerList(runtime, plugin); auto &timer : timers)
-	{
-		applyTimerDefaults(timer);
-		resetTimerFields(timer);
-	}
-	commitTimerListMutation(runtime, plugin);
+	resetTimersForContext(runtime, engine ? engine->pluginId() : QString());
 	return 0;
 }
 
 static int luaStopEvaluatingTriggers(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 		return 0;
 	const bool allPlugins = optBool(L, 1, false);
@@ -15291,7 +16879,7 @@ static int luaStopEvaluatingTriggers(lua_State *L)
 static int luaGetPluginTriggerInfo(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -15300,20 +16888,13 @@ static int luaGetPluginTriggerInfo(lua_State *L)
 	const QString         pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString         name     = QString::fromUtf8(luaL_checkstring(L, 2));
 	const int             infoType = static_cast<int>(luaL_checkinteger(L, 3));
-	WorldRuntime::Plugin *plugin   = runtime->pluginForId(pluginId);
-	if (!plugin)
+	WorldRuntime::Trigger trigger;
+	if (!fetchPluginTriggerSnapshot(runtime, pluginId, name, trigger))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const int index = findTriggerIndex(plugin->triggers, name);
-	if (index < 0)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const WorldRuntime::Trigger &trigger = plugin->triggers.at(index);
-	QVariant                     value;
+	QVariant value;
 	switch (infoType)
 	{
 	case 1:
@@ -15411,8 +16992,7 @@ static int luaGetPluginTriggerInfo(lua_State *L)
 		value = trigger.executingScript;
 		break;
 	case 34:
-		value = plugin->lua ? plugin->lua->hasFunction(trigger.attributes.value(QStringLiteral("script")))
-		                    : false;
+		value = runtime->pluginSupports(pluginId, trigger.attributes.value(QStringLiteral("script"))) == eOK;
 		break;
 	case 35:
 		value = 0;
@@ -15430,30 +17010,31 @@ static int luaGetPluginTriggerInfo(lua_State *L)
 static int luaGetPluginAliasInfo(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString         pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString         name     = QString::fromUtf8(luaL_checkstring(L, 2));
-	const int             infoType = static_cast<int>(luaL_checkinteger(L, 3));
-	WorldRuntime::Plugin *plugin   = runtime->pluginForId(pluginId);
-	if (!plugin)
+	const QString       pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString       name     = QString::fromUtf8(luaL_checkstring(L, 2));
+	const int           infoType = static_cast<int>(luaL_checkinteger(L, 3));
+	WorldRuntime::Alias alias;
+	if (!fetchPluginAliasSnapshot(runtime, pluginId, name, alias))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const int index = findAliasIndex(plugin->aliases, name);
-	if (index < 0)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const auto &[attributes, children, included, matched, invocationCount, matchAttempts, lastMatchTarget,
-	             lastMatched, executingScript] = plugin->aliases.at(index);
-	QVariant value;
+	const QMap<QString, QString> &attributes      = alias.attributes;
+	const QMap<QString, QString> &children        = alias.children;
+	const bool                    included        = alias.included;
+	const int                     matched         = alias.matched;
+	const int                     invocationCount = alias.invocationCount;
+	const int                     matchAttempts   = alias.matchAttempts;
+	const QString                &lastMatchTarget = alias.lastMatchTarget;
+	const QDateTime              &lastMatched     = alias.lastMatched;
+	const bool                    executingScript = alias.executingScript;
+	QVariant                      value;
 	switch (infoType)
 	{
 	case 1:
@@ -15536,7 +17117,7 @@ static int luaGetPluginAliasInfo(lua_State *L)
 		value = executingScript;
 		break;
 	case 27:
-		value = plugin->lua ? plugin->lua->hasFunction(attributes.value(QStringLiteral("script"))) : false;
+		value = runtime->pluginSupports(pluginId, attributes.value(QStringLiteral("script"))) == eOK;
 		break;
 	case 28:
 		value = 0;
@@ -15554,31 +17135,31 @@ static int luaGetPluginAliasInfo(lua_State *L)
 static int luaGetPluginTimerInfo(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString         pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString         name     = QString::fromUtf8(luaL_checkstring(L, 2));
-	const int             infoType = static_cast<int>(luaL_checkinteger(L, 3));
-	WorldRuntime::Plugin *plugin   = runtime->pluginForId(pluginId);
-	if (!plugin)
+	const QString       pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString       name     = QString::fromUtf8(luaL_checkstring(L, 2));
+	const int           infoType = static_cast<int>(luaL_checkinteger(L, 3));
+	WorldRuntime::Timer timer;
+	if (!fetchPluginTimerSnapshot(runtime, pluginId, name, timer))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const int index = findTimerIndex(plugin->timers, name);
-	if (index < 0)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const auto &[attributes, children, included, lastFired, nextFireTime, firedCount, invocationCount,
-	             executingScript] = plugin->timers.at(index);
-	QVariant   value;
-	const bool atTime = isEnabledValue(attributes.value(QStringLiteral("at_time")));
+	const QMap<QString, QString> &attributes      = timer.attributes;
+	const QMap<QString, QString> &children        = timer.children;
+	const QDateTime              &lastFired       = timer.lastFired;
+	const QDateTime              &nextFireTime    = timer.nextFireTime;
+	const int                     firedCount      = timer.firedCount;
+	const int                     invocationCount = timer.invocationCount;
+	const bool                    included        = timer.included;
+	const bool                    executingScript = timer.executingScript;
+	QVariant                      value;
+	const bool                    atTime = isEnabledValue(attributes.value(QStringLiteral("at_time")));
 	switch (infoType)
 	{
 	case 1:
@@ -15663,7 +17244,7 @@ static int luaGetPluginTimerInfo(lua_State *L)
 		value = executingScript;
 		break;
 	case 26:
-		value = plugin->lua ? plugin->lua->hasFunction(attributes.value(QStringLiteral("script"))) : false;
+		value = runtime->pluginSupports(pluginId, attributes.value(QStringLiteral("script"))) == eOK;
 		break;
 	default:
 		break;
@@ -15675,7 +17256,7 @@ static int luaGetPluginTimerInfo(lua_State *L)
 static int luaGetPluginTriggerOption(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -15684,19 +17265,12 @@ static int luaGetPluginTriggerOption(lua_State *L)
 	const QString         pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString         name     = QString::fromUtf8(luaL_checkstring(L, 2));
 	const QString         optName  = QString::fromUtf8(luaL_checkstring(L, 3)).trimmed().toLower();
-	WorldRuntime::Plugin *plugin   = runtime->pluginForId(pluginId);
-	if (!plugin)
+	WorldRuntime::Trigger trigger;
+	if (!fetchPluginTriggerSnapshot(runtime, pluginId, name, trigger))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const int index = findTriggerIndex(plugin->triggers, name);
-	if (index < 0)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const WorldRuntime::Trigger &trigger = plugin->triggers.at(index);
 	if (optName == QStringLiteral("group") || optName == QStringLiteral("match") ||
 	    optName == QStringLiteral("script") || optName == QStringLiteral("sound") ||
 	    optName == QStringLiteral("variable"))
@@ -15746,28 +17320,21 @@ static int luaGetPluginTriggerOption(lua_State *L)
 static int luaGetPluginAliasOption(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString         pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString         name     = QString::fromUtf8(luaL_checkstring(L, 2));
-	const QString         optName  = QString::fromUtf8(luaL_checkstring(L, 3)).trimmed().toLower();
-	WorldRuntime::Plugin *plugin   = runtime->pluginForId(pluginId);
-	if (!plugin)
+	const QString       pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString       name     = QString::fromUtf8(luaL_checkstring(L, 2));
+	const QString       optName  = QString::fromUtf8(luaL_checkstring(L, 3)).trimmed().toLower();
+	WorldRuntime::Alias alias;
+	if (!fetchPluginAliasSnapshot(runtime, pluginId, name, alias))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const int index = findAliasIndex(plugin->aliases, name);
-	if (index < 0)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const WorldRuntime::Alias &alias = plugin->aliases.at(index);
 	if (optName == QStringLiteral("group") || optName == QStringLiteral("match") ||
 	    optName == QStringLiteral("script") || optName == QStringLiteral("variable"))
 	{
@@ -15803,28 +17370,21 @@ static int luaGetPluginAliasOption(lua_State *L)
 static int luaGetPluginTimerOption(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime = engine ? engine->worldRuntime() : nullptr;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString         pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString         name     = QString::fromUtf8(luaL_checkstring(L, 2));
-	const QString         optName  = QString::fromUtf8(luaL_checkstring(L, 3)).trimmed().toLower();
-	WorldRuntime::Plugin *plugin   = runtime->pluginForId(pluginId);
-	if (!plugin)
+	const QString       pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString       name     = QString::fromUtf8(luaL_checkstring(L, 2));
+	const QString       optName  = QString::fromUtf8(luaL_checkstring(L, 3)).trimmed().toLower();
+	WorldRuntime::Timer timer;
+	if (!fetchPluginTimerSnapshot(runtime, pluginId, name, timer))
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const int index = findTimerIndex(plugin->timers, name);
-	if (index < 0)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const WorldRuntime::Timer &timer = plugin->timers.at(index);
 	if (optName == QStringLiteral("group") || optName == QStringLiteral("script") ||
 	    optName == QStringLiteral("variable"))
 	{
@@ -15864,7 +17424,8 @@ static int luaGetVariable(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	const bool    pluginScoped = !engine->pluginId().isEmpty();
+	WorldRuntime *runtime      = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -15876,7 +17437,7 @@ static int luaGetVariable(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	if (!engine->pluginId().isEmpty())
+	if (pluginScoped)
 	{
 		QString value;
 		if (!runtime->findPluginVariable(engine->pluginId(), name, value))
@@ -15906,7 +17467,8 @@ static int luaSetVariable(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	const bool    pluginScoped = !engine->pluginId().isEmpty();
+	WorldRuntime *runtime      = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -15919,7 +17481,7 @@ static int luaSetVariable(lua_State *L)
 		return 1;
 	}
 	const QString value = QString::fromUtf8(luaL_checkstring(L, 2));
-	if (!engine->pluginId().isEmpty())
+	if (pluginScoped)
 		runtime->setPluginVariableValue(engine->pluginId(), name, value);
 	else
 		runtime->setVariable(name, value);
@@ -15935,7 +17497,8 @@ static int luaGetVariableList(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	const bool    pluginScoped = !engine->pluginId().isEmpty();
+	WorldRuntime *runtime      = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -15943,7 +17506,7 @@ static int luaGetVariableList(lua_State *L)
 	}
 
 	lua_newtable(L);
-	if (!engine->pluginId().isEmpty())
+	if (pluginScoped)
 	{
 		const QString pluginId = engine->pluginId();
 		for (const QStringList names = runtime->pluginVariableList(pluginId); const QString &name : names)
@@ -15957,14 +17520,14 @@ static int luaGetVariableList(lua_State *L)
 		}
 		return 1;
 	}
-	for (const auto &[attributes, content] : runtime->variables())
+	for (const QStringList names = runtime->variableList(); const QString &name : names)
 	{
-		if (const QString name = attributes.value(QStringLiteral("name")); !name.isEmpty())
-		{
-			lua_pushstring(L, name.toLocal8Bit().constData());
-			lua_pushstring(L, content.toLocal8Bit().constData());
-			lua_rawset(L, -3);
-		}
+		QString value;
+		if (!runtime->findVariable(name, value))
+			continue;
+		lua_pushstring(L, name.toLocal8Bit().constData());
+		lua_pushstring(L, value.toLocal8Bit().constData());
+		lua_rawset(L, -3);
 	}
 	return 1;
 }
@@ -15977,7 +17540,7 @@ static int luaArrayCreate(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -15996,7 +17559,7 @@ static int luaArrayDelete(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16015,7 +17578,7 @@ static int luaArrayClear(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16034,7 +17597,7 @@ static int luaArrayExists(lua_State *L)
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushboolean(L, 0);
@@ -16053,7 +17616,7 @@ static int luaArrayCount(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	lua_pushnumber(L, runtime ? runtime->arrayCount() : 0);
 	return 1;
 }
@@ -16066,7 +17629,7 @@ static int luaArraySize(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, 0);
@@ -16085,7 +17648,7 @@ static int luaArrayKeyExists(lua_State *L)
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushboolean(L, 0);
@@ -16105,7 +17668,7 @@ static int luaArrayGet(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16131,7 +17694,7 @@ static int luaArraySet(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16152,7 +17715,7 @@ static int luaArrayDeleteKey(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16172,7 +17735,7 @@ static int luaArrayGetFirstKey(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16197,7 +17760,7 @@ static int luaArrayGetLastKey(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16233,7 +17796,7 @@ static int luaArrayExport(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16286,7 +17849,7 @@ static int luaArrayExportKeys(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16332,7 +17895,7 @@ static int luaArrayImport(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16434,7 +17997,7 @@ static int luaArrayListAll(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16452,7 +18015,7 @@ static int luaArrayListKeys(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16471,7 +18034,7 @@ static int luaArrayListValues(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16487,7 +18050,7 @@ static int luaArrayList(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 		return 0;
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 		return 0;
 	const QString     name = QString::fromUtf8(luaL_checkstring(L, 1));
@@ -16515,7 +18078,7 @@ static int luaDatabaseOpen(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16536,7 +18099,7 @@ static int luaDatabaseClose(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16555,7 +18118,7 @@ static int luaDatabasePrepare(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16575,7 +18138,7 @@ static int luaDatabaseFinalize(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16594,7 +18157,7 @@ static int luaDatabaseReset(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16613,7 +18176,7 @@ static int luaDatabaseColumns(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16632,7 +18195,7 @@ static int luaDatabaseStep(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16651,7 +18214,7 @@ static int luaDatabaseError(lua_State *L)
 		lua_pushstring(L, "database id not found");
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushstring(L, "database id not found");
@@ -16671,7 +18234,7 @@ static int luaDatabaseColumnName(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16694,7 +18257,7 @@ static int luaDatabaseColumnText(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16741,7 +18304,7 @@ static int luaDatabaseColumnValue(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16764,7 +18327,7 @@ static int luaDatabaseColumnType(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16784,7 +18347,7 @@ static int luaDatabaseTotalChanges(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16803,7 +18366,7 @@ static int luaDatabaseChanges(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16822,7 +18385,7 @@ static int luaDatabaseLastInsertRowid(lua_State *L)
 		lua_pushstring(L, "");
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushstring(L, "");
@@ -16842,7 +18405,7 @@ static int luaDatabaseList(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16860,7 +18423,7 @@ static int luaDatabaseInfo(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16881,7 +18444,7 @@ static int luaDatabaseExec(lua_State *L)
 		lua_pushnumber(L, eBadParameter);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eBadParameter);
@@ -16901,7 +18464,7 @@ static int luaDatabaseColumnNames(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16920,7 +18483,7 @@ static int luaDatabaseColumnValues(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16956,7 +18519,7 @@ static int luaDatabaseGetField(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -16992,7 +18555,7 @@ static int luaGetPluginVariable(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -17023,13 +18586,13 @@ static int luaGetPluginVariableList(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	const QString pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
+	WorldRuntime *runtime  = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
 	if (!pluginId.isEmpty() && !runtime->isPluginInstalled(pluginId))
 	{
 		return 0;
@@ -17037,14 +18600,14 @@ static int luaGetPluginVariableList(lua_State *L)
 	lua_newtable(L);
 	if (pluginId.isEmpty())
 	{
-		for (const auto &[attributes, content] : runtime->variables())
+		for (const QStringList names = runtime->variableList(); const QString &name : names)
 		{
-			if (const QString name = attributes.value(QStringLiteral("name")); !name.isEmpty())
-			{
-				lua_pushstring(L, name.toLocal8Bit().constData());
-				lua_pushstring(L, content.toLocal8Bit().constData());
-				lua_rawset(L, -3);
-			}
+			QString value;
+			if (!runtime->findVariable(name, value))
+				continue;
+			lua_pushstring(L, name.toLocal8Bit().constData());
+			lua_pushstring(L, value.toLocal8Bit().constData());
+			lua_rawset(L, -3);
 		}
 		return 1;
 	}
@@ -17068,7 +18631,7 @@ static int luaGetPluginTriggerList(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -17092,7 +18655,7 @@ static int luaGetPluginAliasList(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -17116,7 +18679,7 @@ static int luaGetPluginTimerList(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -17166,7 +18729,7 @@ static int luaGetPluginList(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -17184,7 +18747,7 @@ static int luaGetPluginInfo(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -17205,7 +18768,7 @@ static int luaIsPluginInstalled(lua_State *L)
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushboolean(L, 0);
@@ -17224,14 +18787,17 @@ static int luaEnablePlugin(lua_State *L)
 		lua_pushnumber(L, eNoSuchPlugin);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchPlugin);
 		return 1;
 	}
 	const QString pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
-	if (const bool enable = optBool(L, 2, true); !runtime->enablePlugin(pluginId, enable))
+	const bool    enable   = optBool(L, 2, true);
+	const bool    enabled  = runOnRuntimeThreadAllowNestedEvents(
+        runtime, [&]() -> bool { return runtime->enablePlugin(pluginId, enable); }, false);
+	if (!enabled)
 	{
 		lua_pushnumber(L, eNoSuchPlugin);
 		return 1;
@@ -17248,17 +18814,31 @@ static int luaLoadPlugin(lua_State *L)
 		lua_pushnumber(L, eProblemsLoadingPlugin);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eProblemsLoadingPlugin);
 		return 1;
 	}
 	const QString fileName = QString::fromUtf8(luaL_checkstring(L, 1));
-	QString       error;
-	if (!runtime->loadPluginFile(fileName, &error, false))
+	struct PluginLoadResult
 	{
-		if (error.contains(QStringLiteral("not found"), Qt::CaseInsensitive))
+			bool    ok{false};
+			QString error;
+	};
+	const PluginLoadResult loadResult =
+	    runOnRuntimeThreadAllowNestedEvents(runtime,
+	                                        [&]() -> PluginLoadResult
+	                                        {
+		                                        PluginLoadResult result;
+		                                        result.ok =
+		                                            runtime->loadPluginFile(fileName, &result.error, false);
+		                                        return result;
+	                                        },
+	                                        {});
+	if (!loadResult.ok)
+	{
+		if (loadResult.error.contains(QStringLiteral("not found"), Qt::CaseInsensitive))
 			lua_pushnumber(L, ePluginFileNotFound);
 		else
 			lua_pushnumber(L, eProblemsLoadingPlugin);
@@ -17276,13 +18856,15 @@ static int luaUnloadPlugin(lua_State *L)
 		lua_pushnumber(L, eNoSuchPlugin);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchPlugin);
 		return 1;
 	}
-	if (const QString pluginId = QString::fromUtf8(luaL_checkstring(L, 1)); !runtime->unloadPlugin(pluginId))
+	if (const QString pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
+	    !runOnRuntimeThreadAllowNestedEvents(
+	        runtime, [&]() -> bool { return runtime->unloadPlugin(pluginId); }, false))
 	{
 		lua_pushnumber(L, eNoSuchPlugin);
 		return 1;
@@ -17299,14 +18881,15 @@ static int luaReloadPlugin(lua_State *L)
 		lua_pushnumber(L, eNoSuchPlugin);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchPlugin);
 		return 1;
 	}
 	const QString pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
-	const int     result   = runtime->reloadPlugin(pluginId);
+	const int     result   = runOnRuntimeThreadAllowNestedEvents(
+        runtime, [&]() -> int { return runtime->reloadPlugin(pluginId); }, eNoSuchPlugin);
 	lua_pushnumber(L, result);
 	return 1;
 }
@@ -17319,7 +18902,7 @@ static int luaPluginSupports(lua_State *L)
 		lua_pushnumber(L, eNoSuchPlugin);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchPlugin);
@@ -17339,7 +18922,7 @@ static int luaCallPlugin(lua_State *L)
 		lua_pushnumber(L, eNoSuchPlugin);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchPlugin);
@@ -17360,7 +18943,7 @@ static int luaSaveState(lua_State *L)
 		lua_pushnumber(L, eNotAPlugin);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, ePluginCouldNotSaveState);
@@ -17372,7 +18955,8 @@ static int luaSaveState(lua_State *L)
 		lua_pushnumber(L, eNotAPlugin);
 		return 1;
 	}
-	const int result = runtime->savePluginState(pluginId, true);
+	const int result = runOnRuntimeThreadAllowNestedEvents(
+	    runtime, [&]() -> int { return runtime->savePluginState(pluginId, true); }, ePluginCouldNotSaveState);
 	lua_pushnumber(L, result);
 	return 1;
 }
@@ -17385,7 +18969,8 @@ static int luaGetOption(lua_State *L)
 		lua_pushnumber(L, -1);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	const QString pluginId = pluginIdFromLua(L);
+	WorldRuntime *runtime  = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, -1);
@@ -17398,14 +18983,13 @@ static int luaGetOption(lua_State *L)
 		lua_pushnumber(L, -1);
 		return 1;
 	}
-	if (const QString pluginId = pluginIdFromLua(L);
-	    !pluginId.isEmpty() && option->flags & OPT_PLUGIN_CANNOT_READ)
+	if (!pluginId.isEmpty() && option->flags & OPT_PLUGIN_CANNOT_READ)
 	{
 		lua_pushnumber(L, -1);
 		return 1;
 	}
 	const QString canonical       = QString::fromLatin1(option->name);
-	const QString value           = runtime->worldAttributes().value(canonical);
+	const QString value           = runtime->worldAttributeValue(canonical);
 	const QString trimmed         = value.trimmed();
 	const bool    isBooleanOption = option->minValue == 0 && option->maxValue == 0;
 	if (option->flags & OPT_RGB_COLOUR)
@@ -17449,7 +19033,8 @@ static int luaSetOption(lua_State *L)
 		lua_pushnumber(L, eUnknownOption);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	const QString pluginId = pluginIdFromLua(L);
+	WorldRuntime *runtime  = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eUnknownOption);
@@ -17462,8 +19047,7 @@ static int luaSetOption(lua_State *L)
 		lua_pushnumber(L, eUnknownOption);
 		return 1;
 	}
-	if (const QString pluginId = pluginIdFromLua(L);
-	    !pluginId.isEmpty() && option->flags & OPT_PLUGIN_CANNOT_WRITE)
+	if (!pluginId.isEmpty() && option->flags & OPT_PLUGIN_CANNOT_WRITE)
 	{
 		lua_pushnumber(L, ePluginCannotSetOption);
 		return 1;
@@ -17504,7 +19088,8 @@ static int luaGetAlphaOption(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	const QString pluginId = pluginIdFromLua(L);
+	WorldRuntime *runtime  = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnil(L);
@@ -17517,8 +19102,7 @@ static int luaGetAlphaOption(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	if (const QString pluginId = pluginIdFromLua(L);
-	    !pluginId.isEmpty() && option->flags & OPT_PLUGIN_CANNOT_READ)
+	if (!pluginId.isEmpty() && option->flags & OPT_PLUGIN_CANNOT_READ)
 	{
 		lua_pushnil(L);
 		return 1;
@@ -17526,8 +19110,8 @@ static int luaGetAlphaOption(lua_State *L)
 	constexpr int kOptMultiline = 0x000001;
 	const QString canonical     = QString::fromLatin1(option->name);
 	const bool    isMultiline   = (option->flags & kOptMultiline) != 0;
-	const QString value         = isMultiline ? runtime->worldMultilineAttributes().value(canonical)
-	                                          : runtime->worldAttributes().value(canonical);
+	const QString value         = isMultiline ? runtime->worldMultilineAttributeValue(canonical)
+	                                          : runtime->worldAttributeValue(canonical);
 	lua_pushstring(L, value.toLocal8Bit().constData());
 	return 1;
 }
@@ -17540,7 +19124,8 @@ static int luaSetAlphaOption(lua_State *L)
 		lua_pushnumber(L, eUnknownOption);
 		return 1;
 	}
-	WorldRuntime *runtime = engine->worldRuntime();
+	const QString pluginId = pluginIdFromLua(L);
+	WorldRuntime *runtime  = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
 		lua_pushnumber(L, eUnknownOption);
@@ -17553,8 +19138,7 @@ static int luaSetAlphaOption(lua_State *L)
 		lua_pushnumber(L, eUnknownOption);
 		return 1;
 	}
-	if (const QString pluginId = pluginIdFromLua(L);
-	    !pluginId.isEmpty() && option->flags & OPT_PLUGIN_CANNOT_WRITE)
+	if (!pluginId.isEmpty() && option->flags & OPT_PLUGIN_CANNOT_WRITE)
 	{
 		lua_pushnumber(L, ePluginCannotSetOption);
 		return 1;
@@ -17631,7 +19215,7 @@ static int luaSetAlphaOption(lua_State *L)
 
 static int luaWindowCreate(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -17646,15 +19230,22 @@ static int luaWindowCreate(lua_State *L)
 	const int     flags           = luaToInt(L, 7);
 	const long    backgroundValue = luaToLong(L, 8);
 	const QColor  background      = colorFromValue(backgroundValue);
-	const int     result = runtime->windowCreate(name, left, top, width, height, position, flags, background,
-	                                             pluginIdFromLua(L));
+	const QString pluginId        = pluginIdFromLua(L);
+	const int     result          = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            return runtime->windowCreate(name, left, top, width, height, position, flags, background,
+		                                              pluginId);
+        },
+        eNoSuchWindow);
 	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaWindowCreateImage(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -17670,27 +19261,31 @@ static int luaWindowCreateImage(lua_State *L)
 	const long    row6    = static_cast<long>(luaL_checknumber(L, 8));
 	const long    row7    = static_cast<long>(luaL_checknumber(L, 9));
 	const long    row8    = static_cast<long>(luaL_checknumber(L, 10));
-	lua_pushnumber(L,
-	               runtime->windowCreateImage(name, imageId, row1, row2, row3, row4, row5, row6, row7, row8));
+	const int     result  = runOnRuntimeThread(
+        runtime, [&]() -> int
+        { return runtime->windowCreateImage(name, imageId, row1, row2, row3, row4, row5, row6, row7, row8); },
+        eNoSuchWindow);
+	lua_pushnumber(L, result);
 	return 1;
 }
 
 static int luaWindowDelete(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
 		return 1;
 	}
 	const QString name = QString::fromUtf8(luaL_checkstring(L, 1));
-	lua_pushnumber(L, runtime->windowDelete(name));
+	lua_pushnumber(
+	    L, runOnRuntimeThread(runtime, [&]() -> int { return runtime->windowDelete(name); }, eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowShow(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -17698,39 +19293,43 @@ static int luaWindowShow(lua_State *L)
 	}
 	const QString name = QString::fromUtf8(luaL_checkstring(L, 1));
 	const bool    show = optBool(L, 2, true);
-	lua_pushnumber(L, runtime->windowShow(name, show));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime, [&]() -> int { return runtime->windowShow(name, show); }, eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowList(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QStringList names = runtime->windowList();
+	const QStringList names =
+	    runOnRuntimeThread(runtime, [&]() -> QStringList { return runtime->windowList(); }, QStringList());
 	return pushOptionalStringList(L, names);
 }
 
 static int luaWindowInfo(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
-	const int     infoType = luaToInt(L, 2);
-	pushVariant(L, runtime->windowInfo(name, infoType));
+	const QString  name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const int      infoType = luaToInt(L, 2);
+	const QVariant value    = runOnRuntimeThread(
+        runtime, [&]() -> QVariant { return runtime->windowInfo(name, infoType); }, QVariant());
+	pushVariant(L, value);
 	return 1;
 }
 
 static int luaWindowRectOp(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -17744,13 +19343,17 @@ static int luaWindowRectOp(lua_State *L)
 	const int     bottom  = luaToInt(L, 6);
 	const long    colour1 = luaToLong(L, 7);
 	const long    colour2 = luaToLongOpt(L, 8, 0);
-	lua_pushnumber(L, runtime->windowRectOp(name, action, left, top, right, bottom, colour1, colour2));
+	lua_pushnumber(
+	    L, runOnRuntimeThread(
+	           runtime, [&]() -> int
+	           { return runtime->windowRectOp(name, action, left, top, right, bottom, colour1, colour2); },
+	           eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowCircleOp(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -17771,15 +19374,21 @@ static int luaWindowCircleOp(lua_State *L)
 	const int     extra2      = luaToIntOpt(L, 13);
 	const int     extra3      = luaToIntOpt(L, 14);
 	const int     extra4      = luaToIntOpt(L, 15);
-	lua_pushnumber(L, runtime->windowCircleOp(name, action, left, top, right, bottom, penColour, penStyle,
-	                                          penWidth, brushColour, brushStyle, extra1, extra2, extra3,
-	                                          extra4));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime,
+	                      [&]() -> int
+	                      {
+		                      return runtime->windowCircleOp(name, action, left, top, right, bottom,
+		                                                     penColour, penStyle, penWidth, brushColour,
+		                                                     brushStyle, extra1, extra2, extra3, extra4);
+	                      },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowLine(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -17793,13 +19402,17 @@ static int luaWindowLine(lua_State *L)
 	const long    penColour = luaToLong(L, 6);
 	const long    penStyle  = luaToLong(L, 7);
 	const int     penWidth  = luaToInt(L, 8);
-	lua_pushnumber(L, runtime->windowLine(name, x1, y1, x2, y2, penColour, penStyle, penWidth));
+	lua_pushnumber(L,
+	               runOnRuntimeThread(
+	                   runtime, [&]() -> int
+	                   { return runtime->windowLine(name, x1, y1, x2, y2, penColour, penStyle, penWidth); },
+	                   eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowArc(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -17817,14 +19430,20 @@ static int luaWindowArc(lua_State *L)
 	const long    penColour = luaToLong(L, 10);
 	const long    penStyle  = luaToLong(L, 11);
 	const int     penWidth  = luaToInt(L, 12);
-	lua_pushnumber(
-	    L, runtime->windowArc(name, left, top, right, bottom, x1, y1, x2, y2, penColour, penStyle, penWidth));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime,
+	                      [&]() -> int
+	                      {
+		                      return runtime->windowArc(name, left, top, right, bottom, x1, y1, x2, y2,
+		                                                penColour, penStyle, penWidth);
+	                      },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowBezier(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -17835,13 +19454,16 @@ static int luaWindowBezier(lua_State *L)
 	const long    penColour = luaToLong(L, 3);
 	const long    penStyle  = luaToLong(L, 4);
 	const int     penWidth  = luaToInt(L, 5);
-	lua_pushnumber(L, runtime->windowBezier(name, points, penColour, penStyle, penWidth));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime, [&]() -> int
+	                      { return runtime->windowBezier(name, points, penColour, penStyle, penWidth); },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowPolygon(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -17856,14 +19478,20 @@ static int luaWindowPolygon(lua_State *L)
 	const long    brushStyle   = luaToLongOpt(L, 7, 0);
 	const bool    closePolygon = optBool(L, 8, false);
 	const bool    winding      = optBool(L, 9, false);
-	lua_pushnumber(L, runtime->windowPolygon(name, points, penColour, penStyle, penWidth, brushColour,
-	                                         brushStyle, closePolygon, winding));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime,
+	                      [&]() -> int
+	                      {
+		                      return runtime->windowPolygon(name, points, penColour, penStyle, penWidth,
+		                                                    brushColour, brushStyle, closePolygon, winding);
+	                      },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowGradient(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -17877,13 +19505,18 @@ static int luaWindowGradient(lua_State *L)
 	const long    startColour = luaToLong(L, 6);
 	const long    endColour   = luaToLong(L, 7);
 	const int     mode        = luaToInt(L, 8);
-	lua_pushnumber(L, runtime->windowGradient(name, left, top, right, bottom, startColour, endColour, mode));
+	lua_pushnumber(
+	    L,
+	    runOnRuntimeThread(
+	        runtime, [&]() -> int
+	        { return runtime->windowGradient(name, left, top, right, bottom, startColour, endColour, mode); },
+	        eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowFont(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -17899,36 +19532,45 @@ static int luaWindowFont(lua_State *L)
 	const bool    strikeout = optBool(L, 8, false);
 	const int     charset   = static_cast<int>(luaL_optinteger(L, 9, DEFAULT_CHARSET));
 	const int     pitch     = static_cast<int>(luaL_optinteger(L, 10, kFontFamilyDontCare));
-	lua_pushnumber(L, runtime->windowFont(name, fontId, fontName, size, bold, italic, underline, strikeout,
-	                                      charset, pitch));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime,
+	                      [&]() -> int
+	                      {
+		                      return runtime->windowFont(name, fontId, fontName, size, bold, italic,
+		                                                 underline, strikeout, charset, pitch);
+	                      },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowFontInfo(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString fontId   = QString::fromUtf8(luaL_checkstring(L, 2));
-	const int     infoType = luaToInt(L, 3);
-	pushVariant(L, runtime->windowFontInfo(name, fontId, infoType));
+	const QString  name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString  fontId   = QString::fromUtf8(luaL_checkstring(L, 2));
+	const int      infoType = luaToInt(L, 3);
+	const QVariant value    = runOnRuntimeThread(
+        runtime, [&]() -> QVariant { return runtime->windowFontInfo(name, fontId, infoType); }, QVariant());
+	pushVariant(L, value);
 	return 1;
 }
 
 static int luaWindowFontList(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
 	const QString     name  = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QStringList fonts = runtime->windowFontList(name);
+	const QStringList fonts = runOnRuntimeThread(
+	    runtime, [&]() -> QStringList { return runtime->windowFontList(name); }, QStringList());
 	return pushOptionalStringList(L, fonts);
 }
 
@@ -17948,7 +19590,7 @@ static bool decodeMiniWindowTextArg(lua_State *L, const int argumentIndex, const
 
 static int luaWindowText(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -17968,13 +19610,17 @@ static int luaWindowText(lua_State *L)
 	const int  right  = luaToInt(L, 6);
 	const int  bottom = luaToInt(L, 7);
 	const long colour = luaToLong(L, 8);
-	lua_pushnumber(L, runtime->windowText(name, fontId, text, left, top, right, bottom, colour));
+	lua_pushnumber(L,
+	               runOnRuntimeThread(
+	                   runtime, [&]() -> int
+	                   { return runtime->windowText(name, fontId, text, left, top, right, bottom, colour); },
+	                   eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowTextWidth(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -17989,7 +19635,9 @@ static int luaWindowTextWidth(lua_State *L)
 		lua_pushnumber(L, -3);
 		return 1;
 	}
-	lua_pushnumber(L, runtime->windowTextWidth(name, fontId, text));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime, [&]() -> int { return runtime->windowTextWidth(name, fontId, text); },
+	                      eNoSuchWindow));
 	return 1;
 }
 
@@ -18018,7 +19666,7 @@ static int luaWindowOutputText(lua_State *L)
 		lua_setfield(L, -2, "has_output");
 	};
 
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		constexpr WorldRuntime::WindowOutputMetrics metrics;
@@ -18045,8 +19693,15 @@ static int luaWindowOutputText(lua_State *L)
 	const int                         bottom = luaToInt(L, 7);
 	const long                        colour = luaToLong(L, 8);
 	WorldRuntime::WindowOutputMetrics metrics;
-	const int result = runtime->windowOutputText(name, fontId, text, left, top, right, bottom, colour,
-	                                             mouseUp, hotspotPrefix, pluginIdFromLua(L), &metrics);
+	const QString                     pluginId = pluginIdFromLua(L);
+	const int                         result   = runOnRuntimeThread(
+        runtime,
+        [&]() -> int
+        {
+            return runtime->windowOutputText(name, fontId, text, left, top, right, bottom, colour, mouseUp,
+		                                                               hotspotPrefix, pluginId, &metrics);
+        },
+        eNoSuchWindow);
 	lua_pushnumber(L, result);
 	pushWindowOutputMetrics(metrics);
 	return 2;
@@ -18054,7 +19709,7 @@ static int luaWindowOutputText(lua_State *L)
 
 static int luaWindowOutputActivate(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18062,13 +19717,15 @@ static int luaWindowOutputActivate(lua_State *L)
 	}
 	const QString name      = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString hotspotId = QString::fromUtf8(luaL_checkstring(L, 2));
-	lua_pushnumber(L, runtime->windowOutputActivate(name, hotspotId));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime, [&]() -> int
+	                      { return runtime->windowOutputActivate(name, hotspotId, true); }, eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowSetPixel(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18078,28 +19735,32 @@ static int luaWindowSetPixel(lua_State *L)
 	const int     x      = luaToInt(L, 2);
 	const int     y      = luaToInt(L, 3);
 	const long    colour = luaToLong(L, 4);
-	lua_pushnumber(L, runtime->windowSetPixel(name, x, y, colour));
+	lua_pushnumber(
+	    L, runOnRuntimeThread(
+	           runtime, [&]() -> int { return runtime->windowSetPixel(name, x, y, colour); }, eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowGetPixel(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
 		return 1;
 	}
-	const QString name = QString::fromUtf8(luaL_checkstring(L, 1));
-	const int     x    = luaToInt(L, 2);
-	const int     y    = luaToInt(L, 3);
-	pushVariant(L, runtime->windowGetPixel(name, x, y));
+	const QString  name  = QString::fromUtf8(luaL_checkstring(L, 1));
+	const int      x     = luaToInt(L, 2);
+	const int      y     = luaToInt(L, 3);
+	const QVariant value = runOnRuntimeThread(
+	    runtime, [&]() -> QVariant { return runtime->windowGetPixel(name, x, y); }, QVariant());
+	pushVariant(L, value);
 	return 1;
 }
 
 static int luaWindowLoadImage(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18108,59 +19769,67 @@ static int luaWindowLoadImage(lua_State *L)
 	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString imageId  = QString::fromUtf8(luaL_checkstring(L, 2));
 	const QString filename = QString::fromUtf8(luaL_checkstring(L, 3));
-	lua_pushnumber(L, runtime->windowLoadImage(name, imageId, filename));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime, [&]() -> int { return runtime->windowLoadImage(name, imageId, filename); },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowLoadImageMemory(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
 		return 1;
 	}
-	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString imageId  = QString::fromUtf8(luaL_checkstring(L, 2));
-	size_t        length   = 0;
-	const char   *buffer   = luaL_checklstring(L, 3, &length);
-	const bool    hasAlpha = optBool(L, 4, false);
-	lua_pushnumber(L, runtime->windowLoadImageMemory(name, imageId,
-	                                                 QByteArray(buffer, static_cast<int>(length)), hasAlpha));
+	const QString    name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString    imageId  = QString::fromUtf8(luaL_checkstring(L, 2));
+	size_t           length   = 0;
+	const char      *buffer   = luaL_checklstring(L, 3, &length);
+	const bool       hasAlpha = optBool(L, 4, false);
+	const QByteArray bytes(buffer, static_cast<int>(length));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime, [&]() -> int
+	                      { return runtime->windowLoadImageMemory(name, imageId, bytes, hasAlpha); },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowImageList(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
 	const QString     name   = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QStringList images = runtime->windowImageList(name);
+	const QStringList images = runOnRuntimeThread(
+	    runtime, [&]() -> QStringList { return runtime->windowImageList(name); }, QStringList());
 	return pushOptionalStringList(L, images);
 }
 
 static int luaWindowImageInfo(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString imageId  = QString::fromUtf8(luaL_checkstring(L, 2));
-	const int     infoType = static_cast<int>(luaL_checkinteger(L, 3));
-	pushVariant(L, runtime->windowImageInfo(name, imageId, infoType));
+	const QString  name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString  imageId  = QString::fromUtf8(luaL_checkstring(L, 2));
+	const int      infoType = static_cast<int>(luaL_checkinteger(L, 3));
+	const QVariant value    = runOnRuntimeThread(
+        runtime, [&]() -> QVariant { return runtime->windowImageInfo(name, imageId, infoType); }, QVariant());
+	pushVariant(L, value);
 	return 1;
 }
 
 static int luaWindowImageFromWindow(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18169,13 +19838,16 @@ static int luaWindowImageFromWindow(lua_State *L)
 	const QString name         = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString imageId      = QString::fromUtf8(luaL_checkstring(L, 2));
 	const QString sourceWindow = QString::fromUtf8(luaL_checkstring(L, 3));
-	lua_pushnumber(L, runtime->windowImageFromWindow(name, imageId, sourceWindow));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime, [&]() -> int
+	                      { return runtime->windowImageFromWindow(name, imageId, sourceWindow); },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowDrawImage(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18192,14 +19864,20 @@ static int luaWindowDrawImage(lua_State *L)
 	const int     srcTop    = luaToIntOpt(L, 9);
 	const int     srcRight  = luaToIntOpt(L, 10);
 	const int     srcBottom = luaToIntOpt(L, 11);
-	lua_pushnumber(L, runtime->windowDrawImage(name, imageId, left, top, right, bottom, mode, srcLeft, srcTop,
-	                                           srcRight, srcBottom));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime,
+	                      [&]() -> int
+	                      {
+		                      return runtime->windowDrawImage(name, imageId, left, top, right, bottom, mode,
+		                                                      srcLeft, srcTop, srcRight, srcBottom);
+	                      },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowDrawImageAlpha(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18214,14 +19892,20 @@ static int luaWindowDrawImageAlpha(lua_State *L)
 	const double  opacity = luaL_optnumber(L, 7, 1.0);
 	const int     srcLeft = luaToIntOpt(L, 8);
 	const int     srcTop  = luaToIntOpt(L, 9);
-	lua_pushnumber(
-	    L, runtime->windowDrawImageAlpha(name, imageId, left, top, right, bottom, opacity, srcLeft, srcTop));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime,
+	                      [&]() -> int
+	                      {
+		                      return runtime->windowDrawImageAlpha(name, imageId, left, top, right, bottom,
+		                                                           opacity, srcLeft, srcTop);
+	                      },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowImageOp(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18240,14 +19924,21 @@ static int luaWindowImageOp(lua_State *L)
 	const QString imageId       = QString::fromUtf8(luaL_checkstring(L, 11));
 	const int     ellipseWidth  = luaToIntOpt(L, 12);
 	const int     ellipseHeight = luaToIntOpt(L, 13);
-	lua_pushnumber(L, runtime->windowImageOp(name, action, left, top, right, bottom, penColour, penStyle,
-	                                         penWidth, brushColour, imageId, ellipseWidth, ellipseHeight));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime,
+	                      [&]() -> int
+	                      {
+		                      return runtime->windowImageOp(name, action, left, top, right, bottom, penColour,
+		                                                    penStyle, penWidth, brushColour, imageId,
+		                                                    ellipseWidth, ellipseHeight);
+	                      },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowMergeImageAlpha(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18266,14 +19957,21 @@ static int luaWindowMergeImageAlpha(lua_State *L)
 	const int     srcTop    = luaToIntOpt(L, 11);
 	const int     srcRight  = luaToIntOpt(L, 12);
 	const int     srcBottom = luaToIntOpt(L, 13);
-	lua_pushnumber(L, runtime->windowMergeImageAlpha(name, imageId, maskId, left, top, right, bottom, mode,
-	                                                 opacity, srcLeft, srcTop, srcRight, srcBottom));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime,
+	                      [&]() -> int
+	                      {
+		                      return runtime->windowMergeImageAlpha(name, imageId, maskId, left, top, right,
+		                                                            bottom, mode, opacity, srcLeft, srcTop,
+		                                                            srcRight, srcBottom);
+	                      },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowGetImageAlpha(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18287,13 +19985,20 @@ static int luaWindowGetImageAlpha(lua_State *L)
 	const int     bottom  = luaToInt(L, 6);
 	const int     srcLeft = luaToIntOpt(L, 7);
 	const int     srcTop  = luaToIntOpt(L, 8);
-	lua_pushnumber(L, runtime->windowGetImageAlpha(name, imageId, left, top, right, bottom, srcLeft, srcTop));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime,
+	                      [&]() -> int
+	                      {
+		                      return runtime->windowGetImageAlpha(name, imageId, left, top, right, bottom,
+		                                                          srcLeft, srcTop);
+	                      },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowBlendImage(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18311,14 +20016,20 @@ static int luaWindowBlendImage(lua_State *L)
 	const int     srcTop    = luaToIntOpt(L, 10);
 	const int     srcRight  = luaToIntOpt(L, 11);
 	const int     srcBottom = luaToIntOpt(L, 12);
-	lua_pushnumber(L, runtime->windowBlendImage(name, imageId, left, top, right, bottom, mode, opacity,
-	                                            srcLeft, srcTop, srcRight, srcBottom));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime,
+	                      [&]() -> int
+	                      {
+		                      return runtime->windowBlendImage(name, imageId, left, top, right, bottom, mode,
+		                                                       opacity, srcLeft, srcTop, srcRight, srcBottom);
+	                      },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowFilter(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18332,13 +20043,17 @@ static int luaWindowFilter(lua_State *L)
 	const int     operation = luaToInt(L, 6);
 	const double  options   = luaL_checknumber(L, 7);
 	const int     extra     = luaToIntOpt(L, 8);
-	lua_pushnumber(L, runtime->windowFilter(name, left, top, right, bottom, operation, options, extra));
+	lua_pushnumber(
+	    L, runOnRuntimeThread(
+	           runtime, [&]() -> int
+	           { return runtime->windowFilter(name, left, top, right, bottom, operation, options, extra); },
+	           eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowTransformImage(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18353,13 +20068,17 @@ static int luaWindowTransformImage(lua_State *L)
 	const auto    mxy     = static_cast<float>(luaL_checknumber(L, 7));
 	const auto    myx     = static_cast<float>(luaL_checknumber(L, 8));
 	const auto    myy     = static_cast<float>(luaL_checknumber(L, 9));
-	lua_pushnumber(L, runtime->windowTransformImage(name, imageId, left, top, mode, mxx, mxy, myx, myy));
+	lua_pushnumber(
+	    L, runOnRuntimeThread(
+	           runtime, [&]() -> int
+	           { return runtime->windowTransformImage(name, imageId, left, top, mode, mxx, mxy, myx, myy); },
+	           eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowWrite(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18367,13 +20086,15 @@ static int luaWindowWrite(lua_State *L)
 	}
 	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString fileName = QString::fromUtf8(luaL_checkstring(L, 2));
-	lua_pushnumber(L, runtime->windowWrite(name, fileName));
+	lua_pushnumber(
+	    L, runOnRuntimeThread(
+	           runtime, [&]() -> int { return runtime->windowWrite(name, fileName); }, eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowPosition(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18384,13 +20105,16 @@ static int luaWindowPosition(lua_State *L)
 	const int     top      = luaToInt(L, 3);
 	const int     position = luaToInt(L, 4);
 	const int     flags    = luaToInt(L, 5);
-	lua_pushnumber(L, runtime->windowPosition(name, left, top, position, flags));
+	lua_pushnumber(L,
+	               runOnRuntimeThread(
+	                   runtime, [&]() -> int
+	                   { return runtime->windowPosition(name, left, top, position, flags); }, eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowResize(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18400,13 +20124,15 @@ static int luaWindowResize(lua_State *L)
 	const int     width  = luaToInt(L, 2);
 	const int     height = luaToInt(L, 3);
 	const long    colour = luaToLongOpt(L, 4, -1);
-	lua_pushnumber(L, runtime->windowResize(name, width, height, colour));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime, [&]() -> int
+	                      { return runtime->windowResize(name, width, height, colour); }, eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowSetZOrder(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18414,13 +20140,15 @@ static int luaWindowSetZOrder(lua_State *L)
 	}
 	const QString name   = QString::fromUtf8(luaL_checkstring(L, 1));
 	const int     zOrder = luaToInt(L, 2);
-	lua_pushnumber(L, runtime->windowSetZOrder(name, zOrder));
+	lua_pushnumber(
+	    L, runOnRuntimeThread(
+	           runtime, [&]() -> int { return runtime->windowSetZOrder(name, zOrder); }, eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowAddHotspot(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18440,15 +20168,22 @@ static int luaWindowAddHotspot(lua_State *L)
 	const QString tooltip         = QString::fromUtf8(luaL_optstring(L, 12, ""));
 	const int     cursor          = luaToIntOpt(L, 13);
 	const int     flags           = luaToIntOpt(L, 14);
-	lua_pushnumber(L, runtime->windowAddHotspot(name, hotspotId, left, top, right, bottom, mouseOver,
-	                                            cancelMouseOver, mouseDown, cancelMouseDown, mouseUp, tooltip,
-	                                            cursor, flags, pluginIdFromLua(L)));
+	const QString pluginId        = pluginIdFromLua(L);
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime,
+	                      [&]() -> int
+	                      {
+		                      return runtime->windowAddHotspot(
+		                          name, hotspotId, left, top, right, bottom, mouseOver, cancelMouseOver,
+		                          mouseDown, cancelMouseDown, mouseUp, tooltip, cursor, flags, pluginId);
+	                      },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowDeleteHotspot(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18456,54 +20191,62 @@ static int luaWindowDeleteHotspot(lua_State *L)
 	}
 	const QString name      = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString hotspotId = QString::fromUtf8(luaL_checkstring(L, 2));
-	lua_pushnumber(L, runtime->windowDeleteHotspot(name, hotspotId));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime, [&]() -> int { return runtime->windowDeleteHotspot(name, hotspotId); },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowDeleteAllHotspots(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
 		return 1;
 	}
 	const QString name = QString::fromUtf8(luaL_checkstring(L, 1));
-	lua_pushnumber(L, runtime->windowDeleteAllHotspots(name));
+	lua_pushnumber(
+	    L, runOnRuntimeThread(
+	           runtime, [&]() -> int { return runtime->windowDeleteAllHotspots(name); }, eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowHotspotList(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
 	const QString     name     = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QStringList hotspots = runtime->windowHotspotList(name);
+	const QStringList hotspots = runOnRuntimeThread(
+	    runtime, [&]() -> QStringList { return runtime->windowHotspotList(name); }, QStringList());
 	return pushOptionalStringList(L, hotspots);
 }
 
 static int luaWindowHotspotInfo(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString name      = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QString hotspotId = QString::fromUtf8(luaL_checkstring(L, 2));
-	const int     infoType  = luaToInt(L, 3);
-	pushVariant(L, runtime->windowHotspotInfo(name, hotspotId, infoType));
+	const QString  name      = QString::fromUtf8(luaL_checkstring(L, 1));
+	const QString  hotspotId = QString::fromUtf8(luaL_checkstring(L, 2));
+	const int      infoType  = luaToInt(L, 3);
+	const QVariant value     = runOnRuntimeThread(
+        runtime, [&]() -> QVariant { return runtime->windowHotspotInfo(name, hotspotId, infoType); },
+        QVariant());
+	pushVariant(L, value);
 	return 1;
 }
 
 static int luaWindowHotspotTooltip(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18512,13 +20255,16 @@ static int luaWindowHotspotTooltip(lua_State *L)
 	const QString name      = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString hotspotId = QString::fromUtf8(luaL_checkstring(L, 2));
 	const QString tooltip   = QString::fromUtf8(luaL_checkstring(L, 3));
-	lua_pushnumber(L, runtime->windowHotspotTooltip(name, hotspotId, tooltip));
+	lua_pushnumber(L,
+	               runOnRuntimeThread(
+	                   runtime, [&]() -> int
+	                   { return runtime->windowHotspotTooltip(name, hotspotId, tooltip); }, eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowMoveHotspot(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18530,13 +20276,16 @@ static int luaWindowMoveHotspot(lua_State *L)
 	const int     top       = luaToInt(L, 4);
 	const int     right     = luaToInt(L, 5);
 	const int     bottom    = luaToInt(L, 6);
-	lua_pushnumber(L, runtime->windowMoveHotspot(name, hotspotId, left, top, right, bottom));
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime, [&]() -> int
+	                      { return runtime->windowMoveHotspot(name, hotspotId, left, top, right, bottom); },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowDragHandler(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18547,14 +20296,21 @@ static int luaWindowDragHandler(lua_State *L)
 	const QString moveCallback    = QString::fromUtf8(luaL_checkstring(L, 3));
 	const QString releaseCallback = QString::fromUtf8(luaL_checkstring(L, 4));
 	const int     flags           = luaToInt(L, 5);
-	lua_pushnumber(L, runtime->windowDragHandler(name, hotspotId, moveCallback, releaseCallback, flags,
-	                                             pluginIdFromLua(L)));
+	const QString pluginId        = pluginIdFromLua(L);
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime,
+	                      [&]() -> int
+	                      {
+		                      return runtime->windowDragHandler(name, hotspotId, moveCallback,
+		                                                        releaseCallback, flags, pluginId);
+	                      },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowScrollwheelHandler(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnumber(L, eNoSuchWindow);
@@ -18563,23 +20319,30 @@ static int luaWindowScrollwheelHandler(lua_State *L)
 	const QString name      = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString hotspotId = QString::fromUtf8(luaL_checkstring(L, 2));
 	const QString callback  = QString::fromUtf8(luaL_checkstring(L, 3));
-	lua_pushnumber(L, runtime->windowScrollwheelHandler(name, hotspotId, callback, pluginIdFromLua(L)));
+	const QString pluginId  = pluginIdFromLua(L);
+	lua_pushnumber(L, runOnRuntimeThread(
+	                      runtime, [&]() -> int
+	                      { return runtime->windowScrollwheelHandler(name, hotspotId, callback, pluginId); },
+	                      eNoSuchWindow));
 	return 1;
 }
 
 static int luaWindowMenu(lua_State *L)
 {
-	WorldRuntime *runtime = runtimeFromLua(L);
+	WorldRuntime *runtime = runtimeFromLuaUpvalue(L);
 	if (!runtime)
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	const QString name   = QString::fromUtf8(luaL_checkstring(L, 1));
-	const int     left   = luaToInt(L, 2);
-	const int     top    = luaToInt(L, 3);
-	const QString items  = QString::fromUtf8(luaL_checkstring(L, 4));
-	const QString result = runtime->windowMenu(name, left, top, items, pluginIdFromLua(L));
+	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
+	const int     left     = luaToInt(L, 2);
+	const int     top      = luaToInt(L, 3);
+	const QString items    = QString::fromUtf8(luaL_checkstring(L, 4));
+	const QString pluginId = pluginIdFromLua(L);
+	const QString result   = runOnRuntimeThreadAllowNestedEvents(
+        runtime, [&]() -> QString { return runtime->windowMenu(name, left, top, items, pluginId); },
+        QString());
 	lua_pushstring(L, result.toLocal8Bit().constData());
 	return 1;
 }
@@ -18587,6 +20350,7 @@ static int luaWindowMenu(lua_State *L)
 
 bool LuaCallbackEngine::ensureState()
 {
+	bindOrAssertExecutionThread("LuaCallbackEngine::ensureState");
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	if (!m_state)
 	{

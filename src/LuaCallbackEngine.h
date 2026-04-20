@@ -16,6 +16,7 @@
 #include <QHash>
 #include <QSet>
 #include <QString>
+#include <QThread>
 #include <QVector>
 #include <functional>
 #include <memory>
@@ -80,6 +81,11 @@ class LuaCallbackEngine
 		 * @return Bound runtime pointer, or `nullptr`.
 		 */
 		[[nodiscard]] class WorldRuntime *worldRuntime() const;
+		/**
+		 * @brief Returns bound runtime pointer for APIs that perform their own runtime-thread bridging.
+		 * @return Bound runtime pointer, or `nullptr`.
+		 */
+		[[nodiscard]] class WorldRuntime *worldRuntimeForBridgedCall() const;
 		/**
 		 * @brief Sets plugin identity metadata used by callback context.
 		 * @param id Plugin id.
@@ -355,6 +361,15 @@ class LuaCallbackEngine
 		 * @brief Refreshes monitored callback-presence map and notifies observer on changes.
 		 */
 		void                               refreshLuaCallbackCatalogNow();
+		/**
+		 * @brief Binds execution to current thread on first call and asserts affinity afterwards.
+		 * @param context Diagnostic context label used in affinity violations.
+		 */
+		void                               bindOrAssertExecutionThread(const char *context) const;
+		/**
+		 * @brief Clears execution-thread affinity marker after coordinated teardown.
+		 */
+		void                               clearExecutionThreadAffinity() const;
 
 	private:
 		/**
@@ -375,6 +390,8 @@ class LuaCallbackEngine
 		QString             m_pluginId;
 		QString             m_pluginName;
 		int                 m_scriptExecutionDepth{0};
+		mutable QThread    *m_executionThread{nullptr};
+		mutable bool        m_reportedRuntimeThreadMismatch{false};
 
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 		std::unique_ptr<lua_State, LuaStateDeleter> m_ownedState;
