@@ -99,6 +99,16 @@ class tst_PluginCallbackCatalogUtils : public QObject
 		}
 
 		/**
+		 * @brief Verifies recipient filtering keeps stable order and duplicate recipients.
+		 */
+		static void filtersRecipientIndicesPreservesStableOrderAndDuplicates()
+		{
+			const QVector<int> cached{1, 1, 0, 2, 1, -3, 2};
+			const QVector<int> filtered = qmudFilterValidPluginRecipientIndices(cached, 3);
+			QCOMPARE(filtered, QVector<int>({1, 1, 0, 2, 1, 2}));
+		}
+
+		/**
 		 * @brief Verifies recipient filtering returns empty list for non-positive plugin count.
 		 */
 		static void filtersRecipientIndicesHandlesNonPositivePluginCount()

@@ -20,6 +20,7 @@
 #include "FontUtils.h"
 #include "ImportMergeUtils.h"
 #include "LuaCallbackEngine.h"
+#include "LuaExecutor.h"
 #include "LuaFunctionTypes.h"
 #include "MainFrame.h"
 #include "MainWindowHost.h"
@@ -4714,9 +4715,9 @@ bool AppController::recoverReloadStartupState()
 		const QString filePath = worldSessionStateFilePath(runtime);
 		if (filePath.trimmed().isEmpty())
 			return false;
-		const QMap<QString, QString> attrs = runtime->worldAttributes();
-		const bool persistOutputBuffer = isEnabledFlag(attrs.value(QStringLiteral("persist_output_buffer")));
-		const bool persistCommandHistory =
+		const auto &attrs               = runtime->worldAttributes();
+		const bool  persistOutputBuffer = isEnabledFlag(attrs.value(QStringLiteral("persist_output_buffer")));
+		const bool  persistCommandHistory =
 		    isEnabledFlag(attrs.value(QStringLiteral("persist_command_history")));
 		const bool stateFileExists = QFileInfo::exists(filePath);
 		const auto loadPlan        = stateFileExists
@@ -8927,14 +8928,19 @@ void AppController::onCommandTriggered(const QString &cmdName)
 
 		if (cmdName == QStringLiteral("SendToScript"))
 		{
-			if (!runtime || !runtime->luaCallbacks())
+			LuaCallbackEngine  *lua      = runtime ? runtime->luaCallbacks() : nullptr;
+			const ILuaExecutor *executor = runtime ? runtime->luaExecutor() : nullptr;
+			if (!runtime || !lua)
 			{
 				QMessageBox::information(m_mainWindow, QStringLiteral("Send To Script"),
 				                         QStringLiteral("No active world with Lua scripting available."));
 				return;
 			}
 			runtime->setLastImmediateExpression(payload);
-			if (!runtime->luaCallbacks()->executeScript(payload, QStringLiteral("Immediate")))
+			const bool executed =
+			    executor ? executor->executeScript(lua, payload, QStringLiteral("Immediate"), nullptr)
+			             : lua->executeScript(payload, QStringLiteral("Immediate"));
+			if (!executed)
 				QMessageBox::warning(m_mainWindow, QStringLiteral("Send To Script"),
 				                     QStringLiteral("Script execution failed."));
 			return;
@@ -9009,12 +9015,17 @@ void AppController::onCommandTriggered(const QString &cmdName)
 		runtime->setScriptFileChanged(false);
 		if (LuaCallbackEngine *lua = runtime->luaCallbacks())
 		{
-			lua->resetState();
+			const ILuaExecutor *executor = runtime->luaExecutor();
+			if (executor)
+				executor->resetState(lua);
+			else
+				lua->resetState();
 			int allowPackage = 1;
 			if (AppController *app = instance())
 				allowPackage = app->getGlobalOption(QStringLiteral("AllowLoadingDlls")).toInt();
 			runtime->applyPackageRestrictions(allowPackage != 0);
-			if (!lua->loadScript())
+			const bool loaded = executor ? executor->loadScript(lua) : lua->loadScript();
+			if (!loaded)
 			{
 				QMessageBox::warning(m_mainWindow, QStringLiteral("Reload Script File"),
 				                     QStringLiteral("Failed to reload the script."));
@@ -10163,8 +10174,9 @@ void AppController::onCommandTriggered(const QString &cmdName)
 		auto *lua = runtime->luaCallbacks();
 		if (!lua)
 			return;
+		const ILuaExecutor *executor = runtime->luaExecutor();
 
-		QDialog dlg(m_mainWindow);
+		QDialog             dlg(m_mainWindow);
 		dlg.setWindowTitle(QStringLiteral("Immediate"));
 		QVBoxLayout      layout(&dlg);
 		QPlainTextEdit   edit(&dlg);
@@ -10200,7 +10212,7 @@ void AppController::onCommandTriggered(const QString &cmdName)
 			        edit.setPlainText(editor.toPlainText());
 		        });
 		connect(&runButton, &QPushButton::clicked, &dlg,
-		        [this, runtime, lua, &edit]
+		        [this, runtime, lua, executor, &edit]
 		        {
 			        const auto code = edit.toPlainText();
 			        runtime->setLastImmediateExpression(code);
@@ -10208,7 +10220,10 @@ void AppController::onCommandTriggered(const QString &cmdName)
 				        return;
 			        if (m_mainWindow)
 				        m_mainWindow->setStatusMessageNow(QStringLiteral("Executing immediate script"));
-			        if (!lua->executeScript(code, QStringLiteral("Immediate")))
+			        const bool executed =
+			            executor ? executor->executeScript(lua, code, QStringLiteral("Immediate"), nullptr)
+			                     : lua->executeScript(code, QStringLiteral("Immediate"));
+			        if (!executed)
 				        QMessageBox::warning(m_mainWindow, QStringLiteral("QMud"),
 				                             QStringLiteral("Immediate execution failed."));
 			        if (m_mainWindow)
