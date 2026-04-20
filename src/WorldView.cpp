@@ -6628,6 +6628,10 @@ void WorldView::paintMiniWindows(QPainter *painter, bool underneath, const QRect
 
 	painter->save();
 	painter->setClipRect(clippedUpdateRect);
+	painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
+
+	const auto drawImageToRect = [painter](const QRect &targetRect, const QImage &image)
+	{ painter->drawImage(targetRect, image); };
 
 	if (underneath)
 	{
@@ -6685,7 +6689,7 @@ void WorldView::paintMiniWindows(QPainter *painter, bool underneath, const QRect
 			{
 				const QRect rect = positionImageRect(image.size(), clientSize, ownerSize, mode);
 				if (rect.intersects(clippedUpdateRect))
-					painter->drawImage(rect, image);
+					drawImageToRect(rect, image);
 			}
 		}
 	}
@@ -6703,7 +6707,7 @@ void WorldView::paintMiniWindows(QPainter *painter, bool underneath, const QRect
 			{
 				const QRect rect = positionImageRect(image.size(), clientSize, ownerSize, mode);
 				if (rect.intersects(clippedUpdateRect))
-					painter->drawImage(rect, image);
+					drawImageToRect(rect, image);
 			}
 		}
 	}
@@ -6748,7 +6752,7 @@ void WorldView::paintMiniWindows(QPainter *painter, bool underneath, const QRect
 			    window->position <= 3)
 			{
 				if (window->rect.intersects(clippedUpdateRect))
-					painter->drawImage(window->rect, image);
+					drawImageToRect(window->rect, image);
 			}
 			else
 			{
@@ -6756,10 +6760,7 @@ void WorldView::paintMiniWindows(QPainter *painter, bool underneath, const QRect
 				{
 					if (!window->rect.intersects(clippedUpdateRect))
 						continue;
-					const bool smooth = painter->testRenderHint(QPainter::SmoothPixmapTransform);
-					painter->setRenderHint(QPainter::SmoothPixmapTransform, false);
-					painter->drawImage(window->rect, image);
-					painter->setRenderHint(QPainter::SmoothPixmapTransform, smooth);
+					drawImageToRect(window->rect, image);
 				}
 				else
 				{
@@ -9999,6 +10000,7 @@ void InputTextEdit::keyPressEvent(QKeyEvent *event)
 	if (m_view && (event->key() == Qt::Key_Up || event->key() == Qt::Key_Down))
 	{
 		const int direction = (event->key() == Qt::Key_Up) ? -1 : 1;
+		bool      handled   = false;
 		if (event->modifiers() == Qt::NoModifier)
 		{
 			if (m_view->m_arrowsChangeHistory)
@@ -10008,13 +10010,19 @@ void InputTextEdit::keyPressEvent(QKeyEvent *event)
 					m_view->recallPartialHistory(direction);
 				else
 					m_view->recallHistory(direction);
+				handled = true;
 			}
-			return;
 		}
-		if (event->modifiers() == Qt::AltModifier)
+		else if (event->modifiers() == Qt::AltModifier)
 		{
 			if (m_view->m_altArrowRecallsPartial || m_view->m_arrowRecallsPartial)
+			{
 				m_view->recallPartialHistory(direction);
+				handled = true;
+			}
+		}
+		if (handled)
+		{
 			return;
 		}
 	}

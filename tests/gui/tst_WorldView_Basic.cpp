@@ -4767,6 +4767,45 @@ class tst_WorldView_Basic : public QObject
 			resetTestState();
 		}
 
+		void arrowKeysNavigateInputCursorWhenHistoryTraversalDisabled()
+		{
+			resetTestState();
+			g_worldAttrs.insert(QStringLiteral("arrows_change_history"), QStringLiteral("0"));
+			g_worldAttrs.insert(QStringLiteral("history_lines"), QStringLiteral("50"));
+
+			WorldView view;
+			view.resize(760, 460);
+			view.show();
+			view.setRuntimeObserver(fakeRuntimePointer());
+			view.applyRuntimeSettings();
+			view.addToHistoryForced(QStringLiteral("north"));
+			view.addToHistoryForced(QStringLiteral("south"));
+			QCoreApplication::processEvents();
+
+			QPlainTextEdit *input = view.inputEditor();
+			QVERIFY(input);
+			input->setFocus();
+			view.setInputText(QStringLiteral("line1\nline2"), true);
+
+			QTextCursor cursor = input->textCursor();
+			cursor.movePosition(QTextCursor::End);
+			input->setTextCursor(cursor);
+			QCoreApplication::processEvents();
+
+			QCOMPARE(view.inputText(), QStringLiteral("line1\nline2"));
+			QCOMPARE(input->textCursor().blockNumber(), 1);
+
+			QTest::keyClick(input, Qt::Key_Up);
+			QCOMPARE(view.inputText(), QStringLiteral("line1\nline2"));
+			QCOMPARE(input->textCursor().blockNumber(), 0);
+
+			QTest::keyClick(input, Qt::Key_Down);
+			QCOMPARE(view.inputText(), QStringLiteral("line1\nline2"));
+			QCOMPARE(input->textCursor().blockNumber(), 1);
+
+			resetTestState();
+		}
+
 		void partialHistoryRecallUsesPrefixAndNewestFirst()
 		{
 			resetTestState();
