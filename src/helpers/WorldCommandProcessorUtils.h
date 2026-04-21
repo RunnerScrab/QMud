@@ -119,6 +119,17 @@ namespace QMudCommandText
 	QString buildTriggerMultilineTarget(const QStringList &recentLines, bool preserveTrailingWhitespace);
 } // namespace QMudCommandText
 
+namespace QMudTriggerSound
+{
+	/**
+	 * @brief Determines whether trigger sound playback should be enabled for a trigger context.
+	 * @param pluginScoped `true` when the trigger belongs to a plugin.
+	 * @param worldTriggerSoundsEnabled `true` when world trigger sounds option is enabled.
+	 * @return `true` when trigger sound playback should be allowed.
+	 */
+	bool shouldPlayTriggerSound(bool pluginScoped, bool worldTriggerSoundsEnabled);
+} // namespace QMudTriggerSound
+
 namespace QMudScriptErrorRouting
 {
 	/**

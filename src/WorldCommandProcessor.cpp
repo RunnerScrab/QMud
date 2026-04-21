@@ -3151,11 +3151,14 @@ WorldCommandProcessor::processTriggersForLine(const QString                     
 			trigger.matched++;
 			trigger.lastMatched = QDateTime::currentDateTime();
 			m_runtime->incrementTriggersMatched();
-			const quint64 triggerRuntimeId = ensureTriggerRuntimeId(m_runtime, &trigger);
+			const quint64 triggerRuntimeId    = ensureTriggerRuntimeId(m_runtime, &trigger);
+			const bool    triggerSoundEnabled = QMudTriggerSound::shouldPlayTriggerSound(
+                plugin != nullptr,
+                attrTrue(m_runtime->worldAttributes().value(QStringLiteral("enable_trigger_sounds"))));
 			if (const QString triggerSound = trigger.attributes.value(QStringLiteral("sound")).trimmed();
 			    !triggerSound.isEmpty() &&
 			    triggerSound.compare(QStringLiteral("(No sound)"), Qt::CaseInsensitive) != 0 &&
-			    attrTrue(m_runtime->worldAttributes().value(QStringLiteral("enable_trigger_sounds"))))
+			    triggerSoundEnabled)
 			{
 				const bool soundIfInactive =
 				    attrTrue(trigger.attributes.value(QStringLiteral("sound_if_inactive")));
