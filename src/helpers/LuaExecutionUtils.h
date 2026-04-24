@@ -13,6 +13,7 @@
 // ReSharper disable once CppUnusedIncludeDirective
 #include <QByteArray>
 #include <QString>
+#include <functional>
 
 class QObject;
 struct lua_State;
@@ -72,6 +73,28 @@ enum class LuaExecutorOperation
 	ExecuteScript,
 	RefreshLuaCallbackCatalogNow,
 	LuaState
+};
+
+/**
+ * @brief Last status classification for Lua bridge invocation on the current thread.
+ */
+enum class LuaBridgeInvokeStatus
+{
+	Success,
+	InvalidTargetOrCallback,
+	NoOwningThread,
+	MissingTargetBridgeContext,
+	NoQCoreApplication,
+	TargetThreadNotRunning,
+	TargetThreadNoEventDispatcher,
+	BridgeInvokerUnavailable,
+	BridgeEndpointNotReadyTimeout,
+	MissingCallerBridgeContext,
+	EnqueueFailed,
+	RequestCanceledBeforeDispatch,
+	RequestCanceledTargetThreadStopped,
+	TimedOutInFlight,
+	UnknownFailure
 };
 
 /**
@@ -139,5 +162,28 @@ CallPluginLuaMarshallingResult qmudCallPluginLuaWithMarshalling(lua_State     *c
  * @param context Assertion context label.
  */
 void                           qmudAssertObjectThreadAffinity(const QObject *object, const char *context);
+/**
+ * @brief Ensures a target object's bridge endpoint is in Running state.
+ * @param target Target QObject.
+ * @return `true` when target thread bridge endpoint is ready to accept bridge calls.
+ */
+bool                           qmudLuaBridgeEnsureObjectThreadReady(const QObject *target);
+/**
+ * @brief Synchronously executes a callback on `target` object's thread via dedicated Lua bridge channel.
+ * @param target Target QObject whose owning thread should execute the callback.
+ * @param fn Callback to execute on target thread.
+ * @return `true` when callback was executed, `false` when target/context is invalid.
+ */
+bool    qmudLuaBridgeInvokeOnObjectThread(const QObject *target, const std::function<void()> &fn);
+/**
+ * @brief Returns last bridge failure reason for current thread.
+ * @return Human-readable failure reason, or empty string when no error was recorded.
+ */
+QString qmudLuaBridgeLastError();
+/**
+ * @brief Returns last bridge status classification for current thread.
+ * @return Last bridge status.
+ */
+LuaBridgeInvokeStatus qmudLuaBridgeLastStatus();
 
 #endif // QMUD_LUAEXECUTIONUTILS_H

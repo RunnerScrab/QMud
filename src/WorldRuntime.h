@@ -34,6 +34,7 @@
 // ReSharper disable once CppUnusedIncludeDirective
 #include <QVector>
 #include <QtSql/QSqlQuery>
+#include <atomic>
 #include <functional>
 #include <memory>
 
@@ -4355,7 +4356,7 @@ class WorldRuntime : public QObject
 
 		QMap<QString, QString>                   m_worldAttributes;
 		QMap<QString, QString>                   m_worldMultilineAttributes;
-		qint64                                   m_scriptTimeNanos{0};
+		std::atomic<qint64>                      m_scriptTimeNanos{0};
 		unsigned short                           m_noteStyle{0};
 		QMap<long, long>                         m_colourTranslationMap;
 		bool                                     m_notesInRgb{false};

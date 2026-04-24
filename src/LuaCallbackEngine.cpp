@@ -53,7 +53,6 @@
 #include <QDialogButtonBox>
 #include <QDockWidget>
 #include <QElapsedTimer>
-#include <QEventLoop>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -99,6 +98,7 @@
 #include <array>
 #include <limits>
 #include <memory>
+#include <tuple>
 #include <type_traits>
 #ifdef Q_OS_WIN
 #include <winnls.h>
@@ -275,6 +275,228 @@ static auto runOnRuntimeThreadAllowNestedEvents(WorldRuntime *runtime, Func &&fu
 
 namespace
 {
+	enum class CallbackWildcardDomain
+	{
+		None,
+		Trigger,
+		Alias,
+	};
+
+	struct LuaCallbackExecutionContext
+	{
+			CallbackWildcardDomain              wildcardDomain{CallbackWildcardDomain::None};
+			QString                             callbackLabelKey;
+			QStringList                         wildcards;
+			QMap<QString, QString>              namedWildcards;
+			QHash<int, WorldRuntime::LineEntry> lineEntries;
+			QSet<int>                           missingLineEntries;
+			QPointer<WorldRuntime>              deferredRuntimeTarget;
+			QVector<std::function<void()>>      deferredRuntimeMutations;
+			bool                                flushingDeferredRuntimeMutations{false};
+	};
+
+	thread_local QHash<const LuaCallbackEngine *, QVector<LuaCallbackExecutionContext>>
+	        g_luaCallbackExecutionContexts;
+
+	QString normalizeCallbackLabel(const QString &name)
+	{
+		return name.trimmed().toLower();
+	}
+
+	bool resolveCallbackWildcardValue(const QStringList            &wildcards,
+	                                  const QMap<QString, QString> &namedWildcards,
+	                                  const QString &wildcardName, QString &value)
+	{
+		if (wildcardName.isEmpty())
+			return false;
+		bool      okNumber = false;
+		const int index    = wildcardName.toInt(&okNumber);
+		if (okNumber)
+		{
+			if (index >= 0 && index < wildcards.size())
+			{
+				value = wildcards.at(index);
+				return true;
+			}
+			return false;
+		}
+		if (namedWildcards.contains(wildcardName))
+		{
+			value = namedWildcards.value(wildcardName);
+			return true;
+		}
+		return false;
+	}
+
+	CallbackWildcardDomain inferCallbackWildcardDomain(const QStringList            &args,
+	                                                   const QVector<LuaStyleRun>   *styleRuns,
+	                                                   const QStringList            &wildcards,
+	                                                   const QMap<QString, QString> &namedWildcards)
+	{
+		if (args.size() < 2 || (wildcards.isEmpty() && namedWildcards.isEmpty()))
+			return CallbackWildcardDomain::None;
+		return styleRuns ? CallbackWildcardDomain::Trigger : CallbackWildcardDomain::Alias;
+	}
+
+	LuaCallbackExecutionContext *activeCallbackContext(const LuaCallbackEngine *engine)
+	{
+		if (!engine)
+			return nullptr;
+		auto it = g_luaCallbackExecutionContexts.find(engine);
+		if (it == g_luaCallbackExecutionContexts.end() || it->isEmpty())
+			return nullptr;
+		return &it->last();
+	}
+
+	const LuaCallbackExecutionContext *activeCallbackContextConst(const LuaCallbackEngine *engine)
+	{
+		if (!engine)
+			return nullptr;
+		const auto it = g_luaCallbackExecutionContexts.constFind(engine);
+		if (it == g_luaCallbackExecutionContexts.constEnd() || it->isEmpty())
+			return nullptr;
+		return &it->last();
+	}
+
+	class ScopedLuaCallbackExecutionContext
+	{
+		public:
+			ScopedLuaCallbackExecutionContext(const LuaCallbackEngine *engine,
+			                                  CallbackWildcardDomain   wildcardDomain,
+			                                  const QString &callbackLabel, const QStringList &wildcards,
+			                                  const QMap<QString, QString> &namedWildcards)
+			    : m_engine(engine)
+			{
+				if (!m_engine)
+					return;
+				LuaCallbackExecutionContext context;
+				context.wildcardDomain   = wildcardDomain;
+				context.callbackLabelKey = normalizeCallbackLabel(callbackLabel);
+				context.wildcards        = wildcards;
+				context.namedWildcards   = namedWildcards;
+				g_luaCallbackExecutionContexts[m_engine].push_back(std::move(context));
+				m_active = true;
+			}
+
+			~ScopedLuaCallbackExecutionContext()
+			{
+				if (!m_active || !m_engine)
+					return;
+				auto it = g_luaCallbackExecutionContexts.find(m_engine);
+				if (it == g_luaCallbackExecutionContexts.end() || it->isEmpty())
+					return;
+				it->removeLast();
+				if (it->isEmpty())
+					g_luaCallbackExecutionContexts.erase(it);
+			}
+
+			Q_DISABLE_COPY_MOVE(ScopedLuaCallbackExecutionContext)
+
+		private:
+			const LuaCallbackEngine *m_engine{nullptr};
+			bool                     m_active{false};
+	};
+
+	bool tryResolveCallbackWildcard(const LuaCallbackEngine *engine, CallbackWildcardDomain domain,
+	                                const QString &callbackLabel, const QString &wildcardName, QString &value,
+	                                bool &handled)
+	{
+		handled             = false;
+		const auto *context = activeCallbackContextConst(engine);
+		if (!context || context->wildcardDomain != domain)
+			return false;
+		if (const QString normalizedCallbackLabel = normalizeCallbackLabel(callbackLabel);
+		    normalizedCallbackLabel.isEmpty() || normalizedCallbackLabel != context->callbackLabelKey)
+		{
+			return false;
+		}
+
+		handled = true;
+		return resolveCallbackWildcardValue(context->wildcards, context->namedWildcards, wildcardName, value);
+	}
+
+	bool tryResolveCallbackLineEntryFromCache(const LuaCallbackEngine *engine, const int lineNumber,
+	                                          WorldRuntime::LineEntry &entry, bool &cacheHit)
+	{
+		cacheHit      = false;
+		auto *context = activeCallbackContext(engine);
+		if (!context)
+			return false;
+		if (context->lineEntries.contains(lineNumber))
+		{
+			entry    = context->lineEntries.value(lineNumber);
+			cacheHit = true;
+			return true;
+		}
+		if (context->missingLineEntries.contains(lineNumber))
+		{
+			cacheHit = true;
+			return false;
+		}
+		return false;
+	}
+
+	void cacheCallbackLineEntry(const LuaCallbackEngine *engine, const int lineNumber, const bool hasLine,
+	                            const WorldRuntime::LineEntry &entry)
+	{
+		auto *context = activeCallbackContext(engine);
+		if (!context)
+			return;
+		if (hasLine)
+		{
+			context->missingLineEntries.remove(lineNumber);
+			context->lineEntries.insert(lineNumber, entry);
+			return;
+		}
+		context->lineEntries.remove(lineNumber);
+		context->missingLineEntries.insert(lineNumber);
+	}
+
+	bool flushDeferredRuntimeMutations(const LuaCallbackEngine *engine, WorldRuntime *runtime)
+	{
+		auto *context = activeCallbackContext(engine);
+		if (!context || context->deferredRuntimeMutations.isEmpty())
+			return true;
+
+		WorldRuntime *targetRuntime = runtime;
+		if (!targetRuntime)
+			targetRuntime = context->deferredRuntimeTarget.data();
+		if (!targetRuntime)
+		{
+			context->deferredRuntimeMutations.clear();
+			context->deferredRuntimeTarget.clear();
+			return false;
+		}
+		if (context->deferredRuntimeTarget && context->deferredRuntimeTarget.data() != targetRuntime)
+			return true;
+		if (context->flushingDeferredRuntimeMutations)
+			return true;
+
+		context->flushingDeferredRuntimeMutations = true;
+		QVector<std::function<void()>> pendingMutations;
+		pendingMutations.swap(context->deferredRuntimeMutations);
+
+		const bool flushed = runOnRuntimeThread(
+		    targetRuntime,
+		    [&]() -> bool
+		    {
+			    for (auto &mutation : pendingMutations)
+				    mutation();
+			    return true;
+		    },
+		    false);
+
+		context->flushingDeferredRuntimeMutations = false;
+		if (!flushed)
+		{
+			context->deferredRuntimeMutations = std::move(pendingMutations);
+			return false;
+		}
+
+		context->deferredRuntimeTarget.clear();
+		return true;
+	}
+
 	long colorValue(const QColor &color)
 	{
 		return static_cast<long>(color.red()) | static_cast<long>(color.green()) << 8 |
@@ -671,6 +893,8 @@ static MainWindow *resolveMainWindow()
 	return dynamic_cast<MainWindow *>(host);
 }
 
+template <typename Func> static bool invokeOnRuntimeThreadNested(WorldRuntime *runtime, Func &&func);
+
 template <typename Func>
 static auto runOnMainWindowThread(Func &&func, std::invoke_result_t<Func, MainWindow *> fallbackValue)
     -> std::invoke_result_t<Func, MainWindow *>
@@ -685,16 +909,24 @@ static auto runOnMainWindowThread(Func &&func, std::invoke_result_t<Func, MainWi
 	if (QThread::currentThread() == frameThread.data())
 		return func(frame.data());
 
-	ReturnType result   = fallbackValue;
-	const bool resolved = QMetaObject::invokeMethod(
-	    frame.data(),
-	    [&]()
-	    {
-		    if (frame)
-			    result = func(frame.data());
-	    },
-	    Qt::BlockingQueuedConnection);
-	return resolved ? result : fallbackValue;
+	ReturnType result    = fallbackValue;
+	bool       completed = false;
+	const bool bridged   = qmudLuaBridgeInvokeOnObjectThread(frame.data(),
+	                                                         [&]
+	                                                         {
+                                                               if (frame)
+                                                               {
+                                                                   result    = func(frame.data());
+                                                                   completed = true;
+                                                               }
+                                                           });
+	if (!bridged)
+	{
+		qWarning().noquote() << QStringLiteral("[QMud][LuaBridge] runOnMainWindowThread failed: %1")
+		                            .arg(qmudLuaBridgeLastError());
+		return fallbackValue;
+	}
+	return completed ? result : fallbackValue;
 }
 
 template <typename Func>
@@ -714,62 +946,40 @@ static auto runOnMainWindowThreadAllowNestedEvents(Func                         
 
 	ReturnType result    = fallbackValue;
 	bool       completed = false;
-	QEventLoop loop;
-	QObject::connect(frame.data(), &QObject::destroyed, &loop, &QEventLoop::quit, Qt::QueuedConnection);
-	QObject::connect(frameThread.data(), &QThread::finished, &loop, &QEventLoop::quit, Qt::QueuedConnection);
-	const bool queued = QMetaObject::invokeMethod(
-	    frame.data(),
-	    [&]()
-	    {
-		    if (frame)
-		    {
-			    result    = func(frame.data());
-			    completed = true;
-		    }
-		    QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection);
-	    },
-	    Qt::QueuedConnection);
-	if (!queued)
+	const bool bridged   = qmudLuaBridgeInvokeOnObjectThread(frame.data(),
+	                                                         [&]
+	                                                         {
+                                                               if (frame)
+                                                               {
+                                                                   result    = func(frame.data());
+                                                                   completed = true;
+                                                               }
+                                                           });
+	if (!bridged)
+	{
+		qWarning().noquote() << QStringLiteral(
+		                            "[QMud][LuaBridge] runOnMainWindowThreadAllowNestedEvents failed: %1")
+		                            .arg(qmudLuaBridgeLastError());
 		return fallbackValue;
-	loop.exec();
+	}
 	return completed ? result : fallbackValue;
 }
 
 template <typename MatchFn> static WorldRuntime *findWorldRuntimeWhere(MatchFn &&matches)
 {
-	MainWindow *frame = resolveMainWindow();
-	if (!frame)
-		return nullptr;
-
-	auto findMatching = [&]() -> WorldRuntime *
-	{
-		for (const WorldWindowDescriptor &entry : frame->worldWindowDescriptors())
-		{
-			if (!entry.runtime)
-				continue;
-			if (matches(entry.runtime))
-				return entry.runtime;
-		}
-		return nullptr;
-	};
-
-	if (QThread::currentThread() == frame->thread())
-		return findMatching();
-
-	WorldRuntime *result = nullptr;
-	QEventLoop    loop;
-	const bool    queued = QMetaObject::invokeMethod(
-        frame,
-        [&]()
-        {
-            result = findMatching();
-            QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection);
-        },
-        Qt::QueuedConnection);
-	if (!queued)
-		return nullptr;
-	loop.exec();
-	return result;
+	return runOnMainWindowThread(
+	    [&matches](const MainWindow *frame) -> WorldRuntime *
+	    {
+		    for (const WorldWindowDescriptor &entry : frame->worldWindowDescriptors())
+		    {
+			    if (!entry.runtime)
+				    continue;
+			    if (matches(entry.runtime))
+				    return entry.runtime;
+		    }
+		    return nullptr;
+	    },
+	    nullptr);
 }
 
 static WorldChildWindow *findWorldWindowByOrdinal(const MainWindowHost &host, const WorldRuntime &runtime,
@@ -793,14 +1003,7 @@ static void addScriptTimeForRuntime(WorldRuntime *runtime, const qint64 nanos)
 {
 	if (!runtime || nanos <= 0)
 		return;
-	runOnRuntimeThread(
-	    runtime,
-	    [&]() -> int
-	    {
-		    runtime->addScriptTime(nanos);
-		    return 0;
-	    },
-	    0);
+	runtime->addScriptTime(nanos);
 }
 
 static void addScriptTimeForEngine(const LuaCallbackEngine &engine, const qint64 nanos)
@@ -1903,14 +2106,12 @@ static int luaDeleteCommandHistory(lua_State *L)
 			view->clearCommandHistory();
 		return 0;
 	}
-	QMetaObject::invokeMethod(
-	    runtime,
-	    [runtime]
-	    {
-		    if (WorldView *view = runtime->view())
-			    view->clearCommandHistory();
-	    },
-	    Qt::BlockingQueuedConnection);
+	static_cast<void>(invokeOnRuntimeThreadNested(runtime,
+	                                              [runtime]
+	                                              {
+		                                              if (WorldView *view = runtime->view())
+			                                              view->clearCommandHistory();
+	                                              }));
 	return 0;
 }
 
@@ -1991,16 +2192,24 @@ static auto runOnRuntimeThread(WorldRuntime *runtime, Func &&func, std::invoke_r
 	if (QThread::currentThread() == runtimeThread.data())
 		return func();
 
-	ReturnType result   = fallbackValue;
-	const bool resolved = QMetaObject::invokeMethod(
-	    runtimeGuard.data(),
-	    [&]()
-	    {
-		    if (runtimeGuard)
-			    result = func();
-	    },
-	    Qt::BlockingQueuedConnection);
-	return resolved ? result : fallbackValue;
+	ReturnType result    = fallbackValue;
+	bool       completed = false;
+	const bool bridged   = qmudLuaBridgeInvokeOnObjectThread(runtimeGuard.data(),
+	                                                         [&]
+	                                                         {
+                                                               if (runtimeGuard)
+                                                               {
+                                                                   result    = func();
+                                                                   completed = true;
+                                                               }
+                                                           });
+	if (!bridged)
+	{
+		qWarning().noquote() << QStringLiteral("[QMud][LuaBridge] runOnRuntimeThread failed: %1")
+		                            .arg(qmudLuaBridgeLastError());
+		return fallbackValue;
+	}
+	return completed ? result : fallbackValue;
 }
 
 template <typename Func>
@@ -2020,28 +2229,116 @@ static auto runOnRuntimeThreadAllowNestedEvents(WorldRuntime *runtime, Func &&fu
 
 	ReturnType result    = fallbackValue;
 	bool       completed = false;
-	QEventLoop loop;
-	QObject::connect(runtimeGuard.data(), &QObject::destroyed, &loop, &QEventLoop::quit,
-	                 Qt::QueuedConnection);
-	QObject::connect(runtimeThread.data(), &QThread::finished, &loop, &QEventLoop::quit,
-	                 Qt::QueuedConnection);
-	const bool queued = QMetaObject::invokeMethod(
-	    runtimeGuard.data(),
-	    [&]()
-	    {
-		    if (runtimeGuard)
-		    {
-			    result    = func();
-			    completed = true;
-		    }
-		    QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection);
-	    },
-	    Qt::QueuedConnection);
-	if (!queued)
+	const bool bridged   = qmudLuaBridgeInvokeOnObjectThread(runtimeGuard.data(),
+	                                                         [&]
+	                                                         {
+                                                               if (runtimeGuard)
+                                                               {
+                                                                   result    = func();
+                                                                   completed = true;
+                                                               }
+                                                           });
+	if (!bridged)
+	{
+		qWarning().noquote() << QStringLiteral(
+		                            "[QMud][LuaBridge] runOnRuntimeThreadAllowNestedEvents failed: %1")
+		                            .arg(qmudLuaBridgeLastError());
 		return fallbackValue;
-
-	loop.exec();
+	}
 	return completed ? result : fallbackValue;
+}
+
+template <typename Func>
+static int runOnRuntimeThreadDeferredMutation(const LuaCallbackEngine *engine, WorldRuntime *runtime,
+                                              Func &&func, const int fallbackValue)
+{
+	Q_UNUSED(engine);
+	using DecayedFunc = std::decay_t<Func>;
+	static_assert(
+	    std::is_invocable_r_v<int, DecayedFunc> || std::is_invocable_r_v<int, DecayedFunc, WorldRuntime &>,
+	    "Deferred mutation callable must return int and be invocable with WorldRuntime& or no args");
+	constexpr bool kInvokesWithRuntime = std::is_invocable_r_v<int, DecayedFunc, WorldRuntime &>;
+
+	if (!runtime)
+		return fallbackValue;
+	auto fnCopy = DecayedFunc(std::forward<Func>(func));
+	auto invoke = [fnCopy = std::move(fnCopy)](WorldRuntime &targetRuntime) mutable -> int
+	{
+		if constexpr (kInvokesWithRuntime)
+			return fnCopy(targetRuntime);
+		else
+			return fnCopy();
+	};
+	return runOnRuntimeThread(
+	    runtime, [runtime, invoke]() mutable -> int { return invoke(*runtime); }, fallbackValue);
+}
+
+template <typename Method, typename... Args>
+static int runOnRuntimeThreadDeferredMutationCall(const LuaCallbackEngine *engine, WorldRuntime *runtime,
+                                                  Method method, const int fallbackValue, Args &&...args)
+{
+	using MethodType = std::decay_t<Method>;
+	static_assert(std::is_member_function_pointer_v<MethodType>,
+	              "Deferred mutation call helper expects a WorldRuntime member function pointer");
+	auto argsTuple = std::tuple<std::decay_t<Args>...>(std::forward<Args>(args)...);
+	return runOnRuntimeThreadDeferredMutation(
+	    engine, runtime,
+	    [method = MethodType(method), argsTuple = std::move(argsTuple)](WorldRuntime &targetRuntime) mutable
+	    {
+		    return std::apply([&](auto &...boundArgs) -> int
+		                      { return std::invoke(method, &targetRuntime, boundArgs...); }, argsTuple);
+	    },
+	    fallbackValue);
+}
+
+template <typename Func>
+static auto runOnRuntimeThreadFlushingDeferred(lua_State *L, WorldRuntime *runtime, Func &&func,
+                                               std::invoke_result_t<Func> fallbackValue)
+    -> std::invoke_result_t<Func>
+{
+	if (const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))); engine)
+	{
+		if (!flushDeferredRuntimeMutations(engine, runtime))
+		{
+			qWarning().noquote() << QStringLiteral(
+			    "[QMud][LuaBridge] runOnRuntimeThreadFlushingDeferred failed to flush deferred mutations");
+			return fallbackValue;
+		}
+	}
+	return runOnRuntimeThread(runtime, std::forward<Func>(func), fallbackValue);
+}
+
+template <typename Func>
+static auto runOnRuntimeThreadAllowNestedEventsFlushingDeferred(lua_State *L, WorldRuntime *runtime,
+                                                                Func                     &&func,
+                                                                std::invoke_result_t<Func> fallbackValue)
+    -> std::invoke_result_t<Func>
+{
+	if (const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))); engine)
+	{
+		if (!flushDeferredRuntimeMutations(engine, runtime))
+		{
+			qWarning().noquote() << QStringLiteral(
+			    "[QMud][LuaBridge] "
+			    "runOnRuntimeThreadAllowNestedEventsFlushingDeferred failed "
+			    "to flush deferred mutations");
+			return fallbackValue;
+		}
+	}
+	return runOnRuntimeThreadAllowNestedEvents(runtime, std::forward<Func>(func), fallbackValue);
+}
+
+static bool resolveLuaContextLineEntryForApi(const LuaCallbackEngine *engine, WorldRuntime *runtime,
+                                             const int lineNumber, WorldRuntime::LineEntry &entry)
+{
+	bool       cacheHit    = false;
+	const bool cachedValue = tryResolveCallbackLineEntryFromCache(engine, lineNumber, entry, cacheHit);
+	if (cacheHit)
+		return cachedValue;
+	const bool hasLine = runOnRuntimeThread(
+	    runtime, [&]() -> bool { return runtime->luaContextLineEntry(lineNumber, entry); }, false);
+	cacheCallbackLineEntry(engine, lineNumber, hasLine, entry);
+	return hasLine;
 }
 
 static int addTempTimer(const LuaCallbackEngine *engine, double seconds, const QString &text,
@@ -3161,8 +3458,7 @@ static int luaGetLineInfo(lua_State *L)
 	const int               lineNumber = static_cast<int>(luaL_checkinteger(L, 1));
 	const int               infoType   = static_cast<int>(luaL_optinteger(L, 2, 0));
 	WorldRuntime::LineEntry entry;
-	const bool              hasLine = runOnRuntimeThread(
-        runtime, [&]() -> bool { return runtime->luaContextLineEntry(lineNumber, entry); }, false);
+	const bool              hasLine = resolveLuaContextLineEntryForApi(engine, runtime, lineNumber, entry);
 	if (infoType == 0)
 	{
 		if (!hasLine)
@@ -3772,8 +4068,7 @@ static int luaGetStyleInfo(lua_State *L)
 	const int               styleNumber = static_cast<int>(luaL_optinteger(L, 2, 0));
 	const int               infoType    = static_cast<int>(luaL_optinteger(L, 3, 0));
 	WorldRuntime::LineEntry entry;
-	const bool              hasLine = runOnRuntimeThread(
-        runtime, [&]() -> bool { return runtime->luaContextLineEntry(lineNumber, entry); }, false);
+	const bool              hasLine = resolveLuaContextLineEntryForApi(engine, runtime, lineNumber, entry);
 	if (styleNumber == 0 || infoType == 0)
 	{
 		if (!hasLine)
@@ -12480,13 +12775,13 @@ static int luaSend(lua_State *L)
 		return 1;
 	}
 	const QString text   = concatLuaArgs(L, 1);
-	const int     result = runOnRuntimeThreadAllowNestedEvents(
-        runtime,
-        [&]() -> int
+	const int     result = runOnRuntimeThreadDeferredMutation(
+        engine, runtime,
+        [text](const WorldRuntime &targetRuntime) -> int
         {
             const bool echo =
-                isEnabledValue(runtime->worldAttributeValue(QStringLiteral("display_my_input")));
-            return runtime->sendCommand(text, echo, false, false, false, false);
+                isEnabledValue(targetRuntime.worldAttributeValue(QStringLiteral("display_my_input")));
+            return targetRuntime.sendCommand(text, echo, false, false, false, false);
         },
         eWorldClosed);
 	lua_pushnumber(L, result);
@@ -12508,9 +12803,8 @@ static int luaSendNoEcho(lua_State *L)
 		return 1;
 	}
 	const QString text   = concatLuaArgs(L, 1);
-	const int     result = runOnRuntimeThreadAllowNestedEvents(
-        runtime, [&]() -> int { return runtime->sendCommand(text, false, false, false, false, false); },
-        eWorldClosed);
+	const int     result = runOnRuntimeThreadDeferredMutationCall(
+        engine, runtime, &WorldRuntime::sendCommand, eWorldClosed, text, false, false, false, false, false);
 	lua_pushnumber(L, result);
 	return 1;
 }
@@ -12530,14 +12824,15 @@ static int luaSendImmediate(lua_State *L)
 		return 1;
 	}
 	const QString text   = concatLuaArgs(L, 1);
-	const int     result = runOnRuntimeThreadAllowNestedEvents(
-        runtime,
-        [&]() -> int
+	const int     result = runOnRuntimeThreadDeferredMutation(
+        engine, runtime,
+        [text](const WorldRuntime &targetRuntime) -> int
         {
             const bool echo =
-                isEnabledValue(runtime->worldAttributeValue(QStringLiteral("display_my_input")));
-            const bool logInput = isEnabledValue(runtime->worldAttributeValue(QStringLiteral("log_input")));
-            return runtime->sendCommand(text, echo, false, logInput, false, true);
+                isEnabledValue(targetRuntime.worldAttributeValue(QStringLiteral("display_my_input")));
+            const bool logInput =
+                isEnabledValue(targetRuntime.worldAttributeValue(QStringLiteral("log_input")));
+            return targetRuntime.sendCommand(text, echo, false, logInput, false, true);
         },
         eWorldClosed);
 	lua_pushnumber(L, result);
@@ -12559,13 +12854,13 @@ static int luaSendPush(lua_State *L)
 		return 1;
 	}
 	const QString text   = concatLuaArgs(L, 1);
-	const int     result = runOnRuntimeThreadAllowNestedEvents(
-        runtime,
-        [&]() -> int
+	const int     result = runOnRuntimeThreadDeferredMutation(
+        engine, runtime,
+        [text](const WorldRuntime &targetRuntime) -> int
         {
             const bool echo =
-                isEnabledValue(runtime->worldAttributeValue(QStringLiteral("display_my_input")));
-            return runtime->sendCommand(text, echo, false, false, true, false);
+                isEnabledValue(targetRuntime.worldAttributeValue(QStringLiteral("display_my_input")));
+            return targetRuntime.sendCommand(text, echo, false, false, true, false);
         },
         eWorldClosed);
 	lua_pushnumber(L, result);
@@ -12592,9 +12887,8 @@ static int luaSendSpecial(lua_State *L)
 	const bool    log     = optBool(L, 4, false);
 	const bool    history = optBool(L, 5, false);
 	const QString text    = QString::fromUtf8(message);
-	const int     result  = runOnRuntimeThreadAllowNestedEvents(
-        runtime, [&]() -> int { return runtime->sendCommand(text, echo, queue, log, history, false); },
-        eWorldClosed);
+	const int     result  = runOnRuntimeThreadDeferredMutationCall(
+        engine, runtime, &WorldRuntime::sendCommand, eWorldClosed, text, echo, queue, log, history, false);
 	lua_pushnumber(L, result);
 	return 1;
 }
@@ -12975,7 +13269,14 @@ static int luaGetLineCount(lua_State *L)
 		return 1;
 	}
 	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
-	lua_pushnumber(L, runtime ? runtime->totalLinesReceived() : 0);
+	if (!runtime)
+	{
+		lua_pushnumber(L, 0);
+		return 1;
+	}
+	const int lineCount =
+	    runOnRuntimeThread(runtime, [&]() -> int { return runtime->totalLinesReceived(); }, 0);
+	lua_pushnumber(L, lineCount);
 	return 1;
 }
 
@@ -12988,7 +13289,14 @@ static int luaGetLinesInBufferCount(lua_State *L)
 		return 1;
 	}
 	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
-	lua_pushnumber(L, runtime ? runtime->luaContextLinesInBufferCount() : 0);
+	if (!runtime)
+	{
+		lua_pushnumber(L, 0);
+		return 1;
+	}
+	const int lineCount =
+	    runOnRuntimeThread(runtime, [&]() -> int { return runtime->luaContextLinesInBufferCount(); }, 0);
+	lua_pushnumber(L, lineCount);
 	return 1;
 }
 
@@ -13984,6 +14292,39 @@ static int findTimerIndex(const QList<WorldRuntime::Timer> &timers, const QStrin
 	return -1;
 }
 
+template <typename Func> static bool invokeOnRuntimeThreadNested(WorldRuntime *runtime, Func &&func)
+{
+	QPointer<WorldRuntime> runtimeGuard(runtime);
+	if (!runtimeGuard)
+		return false;
+	QPointer<QThread> runtimeThread = runtimeGuard->thread();
+	if (!runtimeThread)
+		return false;
+	if (QThread::currentThread() == runtimeThread.data())
+	{
+		func();
+		return true;
+	}
+
+	bool       completed = false;
+	const bool bridged   = qmudLuaBridgeInvokeOnObjectThread(runtimeGuard.data(),
+	                                                         [&]
+	                                                         {
+                                                               if (runtimeGuard)
+                                                               {
+                                                                   func();
+                                                                   completed = true;
+                                                               }
+                                                           });
+	if (!bridged)
+	{
+		qWarning().noquote() << QStringLiteral("[QMud][LuaBridge] invokeOnRuntimeThreadNested failed: %1")
+		                            .arg(qmudLuaBridgeLastError());
+		return false;
+	}
+	return completed;
+}
+
 static bool fetchPluginTriggerSnapshot(WorldRuntime *runtime, const QString &pluginId, const QString &name,
                                        WorldRuntime::Trigger &trigger)
 {
@@ -14004,8 +14345,8 @@ static bool fetchPluginTriggerSnapshot(WorldRuntime *runtime, const QString &plu
 		return resolveOnRuntimeThread();
 
 	bool found = false;
-	QMetaObject::invokeMethod(
-	    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	if (!invokeOnRuntimeThreadNested(runtime, [&] { found = resolveOnRuntimeThread(); }))
+		return false;
 	return found;
 }
 
@@ -14029,8 +14370,8 @@ static bool fetchPluginAliasSnapshot(WorldRuntime *runtime, const QString &plugi
 		return resolveOnRuntimeThread();
 
 	bool found = false;
-	QMetaObject::invokeMethod(
-	    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	if (!invokeOnRuntimeThreadNested(runtime, [&] { found = resolveOnRuntimeThread(); }))
+		return false;
 	return found;
 }
 
@@ -14054,8 +14395,8 @@ static bool fetchPluginTimerSnapshot(WorldRuntime *runtime, const QString &plugi
 		return resolveOnRuntimeThread();
 
 	bool found = false;
-	QMetaObject::invokeMethod(
-	    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	if (!invokeOnRuntimeThreadNested(runtime, [&] { found = resolveOnRuntimeThread(); }))
+		return false;
 	return found;
 }
 
@@ -14100,8 +14441,8 @@ static bool fetchTriggerSnapshotForContext(WorldRuntime *runtime, const QString 
 	}
 	else
 	{
-		QMetaObject::invokeMethod(
-		    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+		if (!invokeOnRuntimeThreadNested(runtime, [&] { found = resolveOnRuntimeThread(); }))
+			return false;
 	}
 
 	if (pluginMissing)
@@ -14149,8 +14490,8 @@ static bool fetchAliasSnapshotForContext(WorldRuntime *runtime, const QString &p
 	}
 	else
 	{
-		QMetaObject::invokeMethod(
-		    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+		if (!invokeOnRuntimeThreadNested(runtime, [&] { found = resolveOnRuntimeThread(); }))
+			return false;
 	}
 
 	if (pluginMissing)
@@ -14198,8 +14539,8 @@ static bool fetchTimerSnapshotForContext(WorldRuntime *runtime, const QString &p
 	}
 	else
 	{
-		QMetaObject::invokeMethod(
-		    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+		if (!invokeOnRuntimeThreadNested(runtime, [&] { found = resolveOnRuntimeThread(); }))
+			return false;
 	}
 
 	if (pluginMissing)
@@ -14240,8 +14581,8 @@ static bool fetchTriggerListForContext(WorldRuntime *runtime, const QString &plu
 	}
 	else
 	{
-		QMetaObject::invokeMethod(
-		    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+		if (!invokeOnRuntimeThreadNested(runtime, [&] { found = resolveOnRuntimeThread(); }))
+			return false;
 	}
 
 	if (pluginMissing)
@@ -14282,8 +14623,8 @@ static bool fetchAliasListForContext(WorldRuntime *runtime, const QString &plugi
 	}
 	else
 	{
-		QMetaObject::invokeMethod(
-		    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+		if (!invokeOnRuntimeThreadNested(runtime, [&] { found = resolveOnRuntimeThread(); }))
+			return false;
 	}
 
 	if (pluginMissing)
@@ -14324,8 +14665,8 @@ static bool fetchTimerListForContext(WorldRuntime *runtime, const QString &plugi
 	}
 	else
 	{
-		QMetaObject::invokeMethod(
-		    runtime, [&] { found = resolveOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+		if (!invokeOnRuntimeThreadNested(runtime, [&] { found = resolveOnRuntimeThread(); }))
+			return false;
 	}
 
 	if (pluginMissing)
@@ -14399,8 +14740,7 @@ static int resetTimerForContext(WorldRuntime *runtime, const QString &pluginId, 
 		return resetOnRuntimeThread();
 
 	int        result  = eWorldClosed;
-	const bool invoked = QMetaObject::invokeMethod(
-	    runtime, [&] { result = resetOnRuntimeThread(); }, Qt::BlockingQueuedConnection);
+	const bool invoked = invokeOnRuntimeThreadNested(runtime, [&] { result = resetOnRuntimeThread(); });
 	return invoked ? result : eWorldClosed;
 }
 
@@ -14432,7 +14772,7 @@ static void resetTimersForContext(WorldRuntime *runtime, const QString &pluginId
 		return;
 	}
 
-	QMetaObject::invokeMethod(runtime, resetOnRuntimeThread, Qt::BlockingQueuedConnection);
+	static_cast<void>(invokeOnRuntimeThreadNested(runtime, resetOnRuntimeThread));
 }
 
 static bool resolvePluginContextById(WorldRuntime *runtime, const QString &pluginId,
@@ -16784,15 +17124,26 @@ static int luaGetTriggerWildcard(lua_State *L)
 	const QString name         = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString wildcardName = QString::fromUtf8(luaL_checkstring(L, 2));
 	QString       value;
-	const bool    ok = runOnRuntimeThread(
-        runtime,
-        [&]() -> bool
-        {
-            if (pluginScoped)
-                return runtime->pluginTriggerWildcard(engine->pluginId(), name, wildcardName, value);
-            return runtime->triggerWildcard(name, wildcardName, value);
-        },
-        false);
+	bool          handledByContext = false;
+	const bool    foundInContext   = tryResolveCallbackWildcard(engine, CallbackWildcardDomain::Trigger, name,
+	                                                            wildcardName, value, handledByContext);
+	if (handledByContext)
+	{
+		if (foundInContext)
+			lua_pushstring(L, value.toLocal8Bit().constData());
+		else
+			lua_pushstring(L, "");
+		return 1;
+	}
+	const bool ok = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> bool
+	    {
+		    if (pluginScoped)
+			    return runtime->pluginTriggerWildcard(engine->pluginId(), name, wildcardName, value);
+		    return runtime->triggerWildcard(name, wildcardName, value);
+	    },
+	    false);
 	if (!ok)
 	{
 		// MUSHclient parity: missing wildcard lookup returns empty string for Lua callers.
@@ -16821,15 +17172,26 @@ static int luaGetAliasWildcard(lua_State *L)
 	const QString name         = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString wildcardName = QString::fromUtf8(luaL_checkstring(L, 2));
 	QString       value;
-	const bool    ok = runOnRuntimeThread(
-        runtime,
-        [&]() -> bool
-        {
-            if (pluginScoped)
-                return runtime->pluginAliasWildcard(engine->pluginId(), name, wildcardName, value);
-            return runtime->aliasWildcard(name, wildcardName, value);
-        },
-        false);
+	bool          handledByContext = false;
+	const bool    foundInContext   = tryResolveCallbackWildcard(engine, CallbackWildcardDomain::Alias, name,
+	                                                            wildcardName, value, handledByContext);
+	if (handledByContext)
+	{
+		if (foundInContext)
+			lua_pushstring(L, value.toLocal8Bit().constData());
+		else
+			lua_pushstring(L, "");
+		return 1;
+	}
+	const bool ok = runOnRuntimeThread(
+	    runtime,
+	    [&]() -> bool
+	    {
+		    if (pluginScoped)
+			    return runtime->pluginAliasWildcard(engine->pluginId(), name, wildcardName, value);
+		    return runtime->aliasWildcard(name, wildcardName, value);
+	    },
+	    false);
 	if (!ok)
 	{
 		// MUSHclient parity: missing wildcard lookup returns empty string for Lua callers.
@@ -19306,8 +19668,8 @@ static int luaWindowList(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	const QStringList names =
-	    runOnRuntimeThread(runtime, [&]() -> QStringList { return runtime->windowList(); }, QStringList());
+	const QStringList names = runOnRuntimeThreadFlushingDeferred(
+	    L, runtime, [&]() -> QStringList { return runtime->windowList(); }, QStringList());
 	return pushOptionalStringList(L, names);
 }
 
@@ -19321,8 +19683,8 @@ static int luaWindowInfo(lua_State *L)
 	}
 	const QString  name     = QString::fromUtf8(luaL_checkstring(L, 1));
 	const int      infoType = luaToInt(L, 2);
-	const QVariant value    = runOnRuntimeThread(
-        runtime, [&]() -> QVariant { return runtime->windowInfo(name, infoType); }, QVariant());
+	const QVariant value    = runOnRuntimeThreadFlushingDeferred(
+        L, runtime, [&]() -> QVariant { return runtime->windowInfo(name, infoType); }, QVariant());
 	pushVariant(L, value);
 	return 1;
 }
@@ -19344,8 +19706,8 @@ static int luaWindowRectOp(lua_State *L)
 	const long    colour1 = luaToLong(L, 7);
 	const long    colour2 = luaToLongOpt(L, 8, 0);
 	lua_pushnumber(
-	    L, runOnRuntimeThread(
-	           runtime, [&]() -> int
+	    L, runOnRuntimeThreadDeferredMutation(
+	           static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime, [=]() -> int
 	           { return runtime->windowRectOp(name, action, left, top, right, bottom, colour1, colour2); },
 	           eNoSuchWindow));
 	return 1;
@@ -19374,9 +19736,9 @@ static int luaWindowCircleOp(lua_State *L)
 	const int     extra2      = luaToIntOpt(L, 13);
 	const int     extra3      = luaToIntOpt(L, 14);
 	const int     extra4      = luaToIntOpt(L, 15);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime,
-	                      [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      {
 		                      return runtime->windowCircleOp(name, action, left, top, right, bottom,
 		                                                     penColour, penStyle, penWidth, brushColour,
@@ -19402,11 +19764,11 @@ static int luaWindowLine(lua_State *L)
 	const long    penColour = luaToLong(L, 6);
 	const long    penStyle  = luaToLong(L, 7);
 	const int     penWidth  = luaToInt(L, 8);
-	lua_pushnumber(L,
-	               runOnRuntimeThread(
-	                   runtime, [&]() -> int
-	                   { return runtime->windowLine(name, x1, y1, x2, y2, penColour, penStyle, penWidth); },
-	                   eNoSuchWindow));
+	lua_pushnumber(
+	    L, runOnRuntimeThreadDeferredMutation(
+	           static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime, [=]() -> int
+	           { return runtime->windowLine(name, x1, y1, x2, y2, penColour, penStyle, penWidth); },
+	           eNoSuchWindow));
 	return 1;
 }
 
@@ -19430,9 +19792,9 @@ static int luaWindowArc(lua_State *L)
 	const long    penColour = luaToLong(L, 10);
 	const long    penStyle  = luaToLong(L, 11);
 	const int     penWidth  = luaToInt(L, 12);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime,
-	                      [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      {
 		                      return runtime->windowArc(name, left, top, right, bottom, x1, y1, x2, y2,
 		                                                penColour, penStyle, penWidth);
@@ -19454,8 +19816,9 @@ static int luaWindowBezier(lua_State *L)
 	const long    penColour = luaToLong(L, 3);
 	const long    penStyle  = luaToLong(L, 4);
 	const int     penWidth  = luaToInt(L, 5);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime, [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      { return runtime->windowBezier(name, points, penColour, penStyle, penWidth); },
 	                      eNoSuchWindow));
 	return 1;
@@ -19478,9 +19841,9 @@ static int luaWindowPolygon(lua_State *L)
 	const long    brushStyle   = luaToLongOpt(L, 7, 0);
 	const bool    closePolygon = optBool(L, 8, false);
 	const bool    winding      = optBool(L, 9, false);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime,
-	                      [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      {
 		                      return runtime->windowPolygon(name, points, penColour, penStyle, penWidth,
 		                                                    brushColour, brushStyle, closePolygon, winding);
@@ -19507,8 +19870,8 @@ static int luaWindowGradient(lua_State *L)
 	const int     mode        = luaToInt(L, 8);
 	lua_pushnumber(
 	    L,
-	    runOnRuntimeThread(
-	        runtime, [&]() -> int
+	    runOnRuntimeThreadDeferredMutation(
+	        static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime, [=]() -> int
 	        { return runtime->windowGradient(name, left, top, right, bottom, startColour, endColour, mode); },
 	        eNoSuchWindow));
 	return 1;
@@ -19532,9 +19895,9 @@ static int luaWindowFont(lua_State *L)
 	const bool    strikeout = optBool(L, 8, false);
 	const int     charset   = static_cast<int>(luaL_optinteger(L, 9, DEFAULT_CHARSET));
 	const int     pitch     = static_cast<int>(luaL_optinteger(L, 10, kFontFamilyDontCare));
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime,
-	                      [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      {
 		                      return runtime->windowFont(name, fontId, fontName, size, bold, italic,
 		                                                 underline, strikeout, charset, pitch);
@@ -19554,8 +19917,9 @@ static int luaWindowFontInfo(lua_State *L)
 	const QString  name     = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString  fontId   = QString::fromUtf8(luaL_checkstring(L, 2));
 	const int      infoType = luaToInt(L, 3);
-	const QVariant value    = runOnRuntimeThread(
-        runtime, [&]() -> QVariant { return runtime->windowFontInfo(name, fontId, infoType); }, QVariant());
+	const QVariant value    = runOnRuntimeThreadFlushingDeferred(
+        L, runtime, [&]() -> QVariant { return runtime->windowFontInfo(name, fontId, infoType); },
+        QVariant());
 	pushVariant(L, value);
 	return 1;
 }
@@ -19569,8 +19933,8 @@ static int luaWindowFontList(lua_State *L)
 		return 1;
 	}
 	const QString     name  = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QStringList fonts = runOnRuntimeThread(
-	    runtime, [&]() -> QStringList { return runtime->windowFontList(name); }, QStringList());
+	const QStringList fonts = runOnRuntimeThreadFlushingDeferred(
+	    L, runtime, [&]() -> QStringList { return runtime->windowFontList(name); }, QStringList());
 	return pushOptionalStringList(L, fonts);
 }
 
@@ -19610,11 +19974,11 @@ static int luaWindowText(lua_State *L)
 	const int  right  = luaToInt(L, 6);
 	const int  bottom = luaToInt(L, 7);
 	const long colour = luaToLong(L, 8);
-	lua_pushnumber(L,
-	               runOnRuntimeThread(
-	                   runtime, [&]() -> int
-	                   { return runtime->windowText(name, fontId, text, left, top, right, bottom, colour); },
-	                   eNoSuchWindow));
+	lua_pushnumber(
+	    L, runOnRuntimeThreadDeferredMutation(
+	           static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime, [=]() -> int
+	           { return runtime->windowText(name, fontId, text, left, top, right, bottom, colour); },
+	           eNoSuchWindow));
 	return 1;
 }
 
@@ -19635,8 +19999,8 @@ static int luaWindowTextWidth(lua_State *L)
 		lua_pushnumber(L, -3);
 		return 1;
 	}
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime, [&]() -> int { return runtime->windowTextWidth(name, fontId, text); },
+	lua_pushnumber(L, runOnRuntimeThreadFlushingDeferred(
+	                      L, runtime, [&]() -> int { return runtime->windowTextWidth(name, fontId, text); },
 	                      eNoSuchWindow));
 	return 1;
 }
@@ -19696,7 +20060,7 @@ static int luaWindowOutputText(lua_State *L)
 	const QString                     pluginId = pluginIdFromLua(L);
 	const int                         result   = runOnRuntimeThread(
         runtime,
-        [&]() -> int
+        [=, &metrics]() -> int
         {
             return runtime->windowOutputText(name, fontId, text, left, top, right, bottom, colour, mouseUp,
 		                                                               hotspotPrefix, pluginId, &metrics);
@@ -19717,9 +20081,10 @@ static int luaWindowOutputActivate(lua_State *L)
 	}
 	const QString name      = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString hotspotId = QString::fromUtf8(luaL_checkstring(L, 2));
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime, [&]() -> int
-	                      { return runtime->windowOutputActivate(name, hotspotId, true); }, eNoSuchWindow));
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int { return runtime->windowOutputActivate(name, hotspotId, true); },
+	                      eNoSuchWindow));
 	return 1;
 }
 
@@ -19735,9 +20100,10 @@ static int luaWindowSetPixel(lua_State *L)
 	const int     x      = luaToInt(L, 2);
 	const int     y      = luaToInt(L, 3);
 	const long    colour = luaToLong(L, 4);
-	lua_pushnumber(
-	    L, runOnRuntimeThread(
-	           runtime, [&]() -> int { return runtime->windowSetPixel(name, x, y, colour); }, eNoSuchWindow));
+	lua_pushnumber(L,
+	               runOnRuntimeThreadDeferredMutation(
+	                   static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                   [=]() -> int { return runtime->windowSetPixel(name, x, y, colour); }, eNoSuchWindow));
 	return 1;
 }
 
@@ -19752,8 +20118,8 @@ static int luaWindowGetPixel(lua_State *L)
 	const QString  name  = QString::fromUtf8(luaL_checkstring(L, 1));
 	const int      x     = luaToInt(L, 2);
 	const int      y     = luaToInt(L, 3);
-	const QVariant value = runOnRuntimeThread(
-	    runtime, [&]() -> QVariant { return runtime->windowGetPixel(name, x, y); }, QVariant());
+	const QVariant value = runOnRuntimeThreadFlushingDeferred(
+	    L, runtime, [&]() -> QVariant { return runtime->windowGetPixel(name, x, y); }, QVariant());
 	pushVariant(L, value);
 	return 1;
 }
@@ -19769,8 +20135,9 @@ static int luaWindowLoadImage(lua_State *L)
 	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString imageId  = QString::fromUtf8(luaL_checkstring(L, 2));
 	const QString filename = QString::fromUtf8(luaL_checkstring(L, 3));
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime, [&]() -> int { return runtime->windowLoadImage(name, imageId, filename); },
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int { return runtime->windowLoadImage(name, imageId, filename); },
 	                      eNoSuchWindow));
 	return 1;
 }
@@ -19789,10 +20156,10 @@ static int luaWindowLoadImageMemory(lua_State *L)
 	const char      *buffer   = luaL_checklstring(L, 3, &length);
 	const bool       hasAlpha = optBool(L, 4, false);
 	const QByteArray bytes(buffer, static_cast<int>(length));
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime, [&]() -> int
-	                      { return runtime->windowLoadImageMemory(name, imageId, bytes, hasAlpha); },
-	                      eNoSuchWindow));
+	lua_pushnumber(
+	    L, runOnRuntimeThreadDeferredMutation(
+	           static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime, [=]() -> int
+	           { return runtime->windowLoadImageMemory(name, imageId, bytes, hasAlpha); }, eNoSuchWindow));
 	return 1;
 }
 
@@ -19805,8 +20172,8 @@ static int luaWindowImageList(lua_State *L)
 		return 1;
 	}
 	const QString     name   = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QStringList images = runOnRuntimeThread(
-	    runtime, [&]() -> QStringList { return runtime->windowImageList(name); }, QStringList());
+	const QStringList images = runOnRuntimeThreadFlushingDeferred(
+	    L, runtime, [&]() -> QStringList { return runtime->windowImageList(name); }, QStringList());
 	return pushOptionalStringList(L, images);
 }
 
@@ -19821,8 +20188,9 @@ static int luaWindowImageInfo(lua_State *L)
 	const QString  name     = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString  imageId  = QString::fromUtf8(luaL_checkstring(L, 2));
 	const int      infoType = static_cast<int>(luaL_checkinteger(L, 3));
-	const QVariant value    = runOnRuntimeThread(
-        runtime, [&]() -> QVariant { return runtime->windowImageInfo(name, imageId, infoType); }, QVariant());
+	const QVariant value    = runOnRuntimeThreadFlushingDeferred(
+        L, runtime, [&]() -> QVariant { return runtime->windowImageInfo(name, imageId, infoType); },
+        QVariant());
 	pushVariant(L, value);
 	return 1;
 }
@@ -19838,10 +20206,10 @@ static int luaWindowImageFromWindow(lua_State *L)
 	const QString name         = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString imageId      = QString::fromUtf8(luaL_checkstring(L, 2));
 	const QString sourceWindow = QString::fromUtf8(luaL_checkstring(L, 3));
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime, [&]() -> int
-	                      { return runtime->windowImageFromWindow(name, imageId, sourceWindow); },
-	                      eNoSuchWindow));
+	lua_pushnumber(
+	    L, runOnRuntimeThreadDeferredMutation(
+	           static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime, [=]() -> int
+	           { return runtime->windowImageFromWindow(name, imageId, sourceWindow); }, eNoSuchWindow));
 	return 1;
 }
 
@@ -19864,9 +20232,9 @@ static int luaWindowDrawImage(lua_State *L)
 	const int     srcTop    = luaToIntOpt(L, 9);
 	const int     srcRight  = luaToIntOpt(L, 10);
 	const int     srcBottom = luaToIntOpt(L, 11);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime,
-	                      [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      {
 		                      return runtime->windowDrawImage(name, imageId, left, top, right, bottom, mode,
 		                                                      srcLeft, srcTop, srcRight, srcBottom);
@@ -19892,9 +20260,9 @@ static int luaWindowDrawImageAlpha(lua_State *L)
 	const double  opacity = luaL_optnumber(L, 7, 1.0);
 	const int     srcLeft = luaToIntOpt(L, 8);
 	const int     srcTop  = luaToIntOpt(L, 9);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime,
-	                      [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      {
 		                      return runtime->windowDrawImageAlpha(name, imageId, left, top, right, bottom,
 		                                                           opacity, srcLeft, srcTop);
@@ -19924,9 +20292,9 @@ static int luaWindowImageOp(lua_State *L)
 	const QString imageId       = QString::fromUtf8(luaL_checkstring(L, 11));
 	const int     ellipseWidth  = luaToIntOpt(L, 12);
 	const int     ellipseHeight = luaToIntOpt(L, 13);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime,
-	                      [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      {
 		                      return runtime->windowImageOp(name, action, left, top, right, bottom, penColour,
 		                                                    penStyle, penWidth, brushColour, imageId,
@@ -19957,9 +20325,9 @@ static int luaWindowMergeImageAlpha(lua_State *L)
 	const int     srcTop    = luaToIntOpt(L, 11);
 	const int     srcRight  = luaToIntOpt(L, 12);
 	const int     srcBottom = luaToIntOpt(L, 13);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime,
-	                      [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      {
 		                      return runtime->windowMergeImageAlpha(name, imageId, maskId, left, top, right,
 		                                                            bottom, mode, opacity, srcLeft, srcTop,
@@ -19985,8 +20353,8 @@ static int luaWindowGetImageAlpha(lua_State *L)
 	const int     bottom  = luaToInt(L, 6);
 	const int     srcLeft = luaToIntOpt(L, 7);
 	const int     srcTop  = luaToIntOpt(L, 8);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime,
+	lua_pushnumber(L, runOnRuntimeThreadFlushingDeferred(
+	                      L, runtime,
 	                      [&]() -> int
 	                      {
 		                      return runtime->windowGetImageAlpha(name, imageId, left, top, right, bottom,
@@ -20016,9 +20384,9 @@ static int luaWindowBlendImage(lua_State *L)
 	const int     srcTop    = luaToIntOpt(L, 10);
 	const int     srcRight  = luaToIntOpt(L, 11);
 	const int     srcBottom = luaToIntOpt(L, 12);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime,
-	                      [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      {
 		                      return runtime->windowBlendImage(name, imageId, left, top, right, bottom, mode,
 		                                                       opacity, srcLeft, srcTop, srcRight, srcBottom);
@@ -20044,8 +20412,8 @@ static int luaWindowFilter(lua_State *L)
 	const double  options   = luaL_checknumber(L, 7);
 	const int     extra     = luaToIntOpt(L, 8);
 	lua_pushnumber(
-	    L, runOnRuntimeThread(
-	           runtime, [&]() -> int
+	    L, runOnRuntimeThreadDeferredMutation(
+	           static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime, [=]() -> int
 	           { return runtime->windowFilter(name, left, top, right, bottom, operation, options, extra); },
 	           eNoSuchWindow));
 	return 1;
@@ -20069,8 +20437,8 @@ static int luaWindowTransformImage(lua_State *L)
 	const auto    myx     = static_cast<float>(luaL_checknumber(L, 8));
 	const auto    myy     = static_cast<float>(luaL_checknumber(L, 9));
 	lua_pushnumber(
-	    L, runOnRuntimeThread(
-	           runtime, [&]() -> int
+	    L, runOnRuntimeThreadDeferredMutation(
+	           static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime, [=]() -> int
 	           { return runtime->windowTransformImage(name, imageId, left, top, mode, mxx, mxy, myx, myy); },
 	           eNoSuchWindow));
 	return 1;
@@ -20086,9 +20454,9 @@ static int luaWindowWrite(lua_State *L)
 	}
 	const QString name     = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString fileName = QString::fromUtf8(luaL_checkstring(L, 2));
-	lua_pushnumber(
-	    L, runOnRuntimeThread(
-	           runtime, [&]() -> int { return runtime->windowWrite(name, fileName); }, eNoSuchWindow));
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int { return runtime->windowWrite(name, fileName); }, eNoSuchWindow));
 	return 1;
 }
 
@@ -20105,10 +20473,10 @@ static int luaWindowPosition(lua_State *L)
 	const int     top      = luaToInt(L, 3);
 	const int     position = luaToInt(L, 4);
 	const int     flags    = luaToInt(L, 5);
-	lua_pushnumber(L,
-	               runOnRuntimeThread(
-	                   runtime, [&]() -> int
-	                   { return runtime->windowPosition(name, left, top, position, flags); }, eNoSuchWindow));
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int { return runtime->windowPosition(name, left, top, position, flags); },
+	                      eNoSuchWindow));
 	return 1;
 }
 
@@ -20124,9 +20492,10 @@ static int luaWindowResize(lua_State *L)
 	const int     width  = luaToInt(L, 2);
 	const int     height = luaToInt(L, 3);
 	const long    colour = luaToLongOpt(L, 4, -1);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime, [&]() -> int
-	                      { return runtime->windowResize(name, width, height, colour); }, eNoSuchWindow));
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int { return runtime->windowResize(name, width, height, colour); },
+	                      eNoSuchWindow));
 	return 1;
 }
 
@@ -20140,9 +20509,9 @@ static int luaWindowSetZOrder(lua_State *L)
 	}
 	const QString name   = QString::fromUtf8(luaL_checkstring(L, 1));
 	const int     zOrder = luaToInt(L, 2);
-	lua_pushnumber(
-	    L, runOnRuntimeThread(
-	           runtime, [&]() -> int { return runtime->windowSetZOrder(name, zOrder); }, eNoSuchWindow));
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int { return runtime->windowSetZOrder(name, zOrder); }, eNoSuchWindow));
 	return 1;
 }
 
@@ -20169,9 +20538,9 @@ static int luaWindowAddHotspot(lua_State *L)
 	const int     cursor          = luaToIntOpt(L, 13);
 	const int     flags           = luaToIntOpt(L, 14);
 	const QString pluginId        = pluginIdFromLua(L);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime,
-	                      [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      {
 		                      return runtime->windowAddHotspot(
 		                          name, hotspotId, left, top, right, bottom, mouseOver, cancelMouseOver,
@@ -20191,8 +20560,9 @@ static int luaWindowDeleteHotspot(lua_State *L)
 	}
 	const QString name      = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString hotspotId = QString::fromUtf8(luaL_checkstring(L, 2));
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime, [&]() -> int { return runtime->windowDeleteHotspot(name, hotspotId); },
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int { return runtime->windowDeleteHotspot(name, hotspotId); },
 	                      eNoSuchWindow));
 	return 1;
 }
@@ -20206,9 +20576,9 @@ static int luaWindowDeleteAllHotspots(lua_State *L)
 		return 1;
 	}
 	const QString name = QString::fromUtf8(luaL_checkstring(L, 1));
-	lua_pushnumber(
-	    L, runOnRuntimeThread(
-	           runtime, [&]() -> int { return runtime->windowDeleteAllHotspots(name); }, eNoSuchWindow));
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int { return runtime->windowDeleteAllHotspots(name); }, eNoSuchWindow));
 	return 1;
 }
 
@@ -20221,8 +20591,8 @@ static int luaWindowHotspotList(lua_State *L)
 		return 1;
 	}
 	const QString     name     = QString::fromUtf8(luaL_checkstring(L, 1));
-	const QStringList hotspots = runOnRuntimeThread(
-	    runtime, [&]() -> QStringList { return runtime->windowHotspotList(name); }, QStringList());
+	const QStringList hotspots = runOnRuntimeThreadFlushingDeferred(
+	    L, runtime, [&]() -> QStringList { return runtime->windowHotspotList(name); }, QStringList());
 	return pushOptionalStringList(L, hotspots);
 }
 
@@ -20237,8 +20607,8 @@ static int luaWindowHotspotInfo(lua_State *L)
 	const QString  name      = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString  hotspotId = QString::fromUtf8(luaL_checkstring(L, 2));
 	const int      infoType  = luaToInt(L, 3);
-	const QVariant value     = runOnRuntimeThread(
-        runtime, [&]() -> QVariant { return runtime->windowHotspotInfo(name, hotspotId, infoType); },
+	const QVariant value     = runOnRuntimeThreadFlushingDeferred(
+        L, runtime, [&]() -> QVariant { return runtime->windowHotspotInfo(name, hotspotId, infoType); },
         QVariant());
 	pushVariant(L, value);
 	return 1;
@@ -20255,10 +20625,10 @@ static int luaWindowHotspotTooltip(lua_State *L)
 	const QString name      = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString hotspotId = QString::fromUtf8(luaL_checkstring(L, 2));
 	const QString tooltip   = QString::fromUtf8(luaL_checkstring(L, 3));
-	lua_pushnumber(L,
-	               runOnRuntimeThread(
-	                   runtime, [&]() -> int
-	                   { return runtime->windowHotspotTooltip(name, hotspotId, tooltip); }, eNoSuchWindow));
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int { return runtime->windowHotspotTooltip(name, hotspotId, tooltip); },
+	                      eNoSuchWindow));
 	return 1;
 }
 
@@ -20276,8 +20646,9 @@ static int luaWindowMoveHotspot(lua_State *L)
 	const int     top       = luaToInt(L, 4);
 	const int     right     = luaToInt(L, 5);
 	const int     bottom    = luaToInt(L, 6);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime, [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      { return runtime->windowMoveHotspot(name, hotspotId, left, top, right, bottom); },
 	                      eNoSuchWindow));
 	return 1;
@@ -20297,9 +20668,9 @@ static int luaWindowDragHandler(lua_State *L)
 	const QString releaseCallback = QString::fromUtf8(luaL_checkstring(L, 4));
 	const int     flags           = luaToInt(L, 5);
 	const QString pluginId        = pluginIdFromLua(L);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime,
-	                      [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      {
 		                      return runtime->windowDragHandler(name, hotspotId, moveCallback,
 		                                                        releaseCallback, flags, pluginId);
@@ -20320,8 +20691,9 @@ static int luaWindowScrollwheelHandler(lua_State *L)
 	const QString hotspotId = QString::fromUtf8(luaL_checkstring(L, 2));
 	const QString callback  = QString::fromUtf8(luaL_checkstring(L, 3));
 	const QString pluginId  = pluginIdFromLua(L);
-	lua_pushnumber(L, runOnRuntimeThread(
-	                      runtime, [&]() -> int
+	lua_pushnumber(L, runOnRuntimeThreadDeferredMutation(
+	                      static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1))), runtime,
+	                      [=]() -> int
 	                      { return runtime->windowScrollwheelHandler(name, hotspotId, callback, pluginId); },
 	                      eNoSuchWindow));
 	return 1;
@@ -20340,8 +20712,8 @@ static int luaWindowMenu(lua_State *L)
 	const int     top      = luaToInt(L, 3);
 	const QString items    = QString::fromUtf8(luaL_checkstring(L, 4));
 	const QString pluginId = pluginIdFromLua(L);
-	const QString result   = runOnRuntimeThreadAllowNestedEvents(
-        runtime, [&]() -> QString { return runtime->windowMenu(name, left, top, items, pluginId); },
+	const QString result   = runOnRuntimeThreadAllowNestedEventsFlushingDeferred(
+        L, runtime, [&]() -> QString { return runtime->windowMenu(name, left, top, items, pluginId); },
         QString());
 	lua_pushstring(L, result.toLocal8Bit().constData());
 	return 1;
@@ -21873,6 +22245,11 @@ bool LuaCallbackEngine::callFunctionWithStringsAndWildcards(
 		return false;
 	if (hasFunction)
 		*hasFunction = true;
+	const ScopedLuaCallbackExecutionContext callbackContextGuard(
+	    this, inferCallbackWildcardDomain(args, styleRuns, wildcards, namedWildcards),
+	    args.isEmpty() ? QString() : args.first(), wildcards, namedWildcards);
+	const auto flushDeferredCallbackRuntimeMutations = [this]() -> bool
+	{ return flushDeferredRuntimeMutations(this, nullptr); };
 
 	int paramCount = 0;
 	for (const QString &arg : args)
@@ -21935,10 +22312,21 @@ bool LuaCallbackEngine::callFunctionWithStringsAndWildcards(
 	ScriptExecutionDepthGuard depthGuard(this);
 	if (lua_pcall(m_state, paramCount, 0, 0) != 0)
 	{
+		if (!flushDeferredCallbackRuntimeMutations())
+		{
+			qWarning().noquote() << QStringLiteral(
+			    "[QMud][LuaBridge] callback teardown failed to flush deferred runtime mutations");
+		}
 		const char *err = lua_tostring(m_state, -1);
 		reportLuaError(
 		    *this, QStringLiteral("Lua callback failed: %1").arg(QString::fromUtf8(err ? err : "unknown")));
 		lua_pop(m_state, 1);
+		return false;
+	}
+	if (!flushDeferredCallbackRuntimeMutations())
+	{
+		qWarning().noquote() << QStringLiteral(
+		    "[QMud][LuaBridge] callback completion failed to flush deferred runtime mutations");
 		return false;
 	}
 	addScriptTimeForEngine(*this, timer.nsecsElapsed());

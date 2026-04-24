@@ -9,9 +9,20 @@
 #include "LuaSupport.h"
 #include "helpers/LuaExecutionUtils.h"
 
+// ReSharper disable once CppUnusedIncludeDirective
+#include <QScopeGuard>
+// ReSharper disable once CppUnusedIncludeDirective
+#include <QPointer>
+// ReSharper disable once CppUnusedIncludeDirective
+#include <QThread>
 #include <QtTest/QTest>
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 Q_DECLARE_METATYPE(LuaExecutorBackendMode)
 
@@ -275,6 +286,347 @@ class tst_LuaExecution : public QObject
 			};
 			for (const LuaExecutorOperation operation : uiSyncOperations)
 				QCOMPARE(qmudLuaExecutorBridgePolicy(operation), LuaExecutorBridgePolicy::UiSync);
+		}
+
+		void luaBridgeRejectsInvalidInputs()
+		{
+			QVERIFY(!qmudLuaBridgeEnsureObjectThreadReady(nullptr));
+			QVERIFY(qmudLuaBridgeLastError().contains(QStringLiteral("target object is null")));
+
+			QVERIFY(!qmudLuaBridgeInvokeOnObjectThread(nullptr, [] {}));
+			QVERIFY(qmudLuaBridgeLastError().contains(QStringLiteral("invalid target or callback")));
+
+			QObject                     target;
+			const std::function<void()> emptyFn;
+			QVERIFY(!qmudLuaBridgeInvokeOnObjectThread(&target, emptyFn));
+			QVERIFY(qmudLuaBridgeLastError().contains(QStringLiteral("invalid target or callback")));
+		}
+
+		void luaBridgeClearsErrorAfterSuccessfulInvoke()
+		{
+			QVERIFY(!qmudLuaBridgeInvokeOnObjectThread(nullptr, [] {}));
+			QVERIFY(!qmudLuaBridgeLastError().isEmpty());
+
+			QObject target;
+			bool    invoked = false;
+			QVERIFY(qmudLuaBridgeInvokeOnObjectThread(&target, [&invoked] { invoked = true; }));
+			QVERIFY(invoked);
+			QVERIFY(qmudLuaBridgeLastError().isEmpty());
+		}
+
+		void luaBridgeInvokesOnWorkerThread()
+		{
+			QThread workerThread;
+			workerThread.setObjectName(QStringLiteral("tst_LuaBridgeWorker"));
+			QObject target;
+			target.moveToThread(&workerThread);
+			workerThread.start();
+			const auto stopWorker = qScopeGuard(
+			    [&]()
+			    {
+				    if (target.thread() == &workerThread)
+				    {
+					    QThread *const mainThread = QThread::currentThread();
+					    static_cast<void>(qmudLuaBridgeInvokeOnObjectThread(
+					        &target, [&target, mainThread] { target.moveToThread(mainThread); }));
+				    }
+				    workerThread.quit();
+				    static_cast<void>(workerThread.wait());
+			    });
+
+			QVERIFY(qmudLuaBridgeEnsureObjectThreadReady(&target));
+
+			std::atomic_bool invokedOnWorker{false};
+			std::atomic_int  invokeCount{0};
+			QVERIFY(qmudLuaBridgeInvokeOnObjectThread(&target,
+			                                          [&workerThread, &invokedOnWorker, &invokeCount]
+			                                          {
+				                                          invokeCount.fetch_add(1);
+				                                          invokedOnWorker.store(QThread::currentThread() ==
+				                                                                &workerThread);
+			                                          }));
+
+			QCOMPARE(invokeCount.load(), 1);
+			QVERIFY(invokedOnWorker.load());
+		}
+
+		void luaBridgeSupportsNestedWorkerToMainInvoke()
+		{
+			QObject  mainTarget;
+			QThread *mainThread = QThread::currentThread();
+
+			QThread  workerThread;
+			workerThread.setObjectName(QStringLiteral("tst_LuaBridgeNestedWorker"));
+			QObject workerTarget;
+			workerTarget.moveToThread(&workerThread);
+			workerThread.start();
+			const auto stopWorker = qScopeGuard(
+			    [&]()
+			    {
+				    if (workerTarget.thread() == &workerThread)
+				    {
+					    static_cast<void>(
+					        qmudLuaBridgeInvokeOnObjectThread(&workerTarget, [&workerTarget, mainThread]
+					                                          { workerTarget.moveToThread(mainThread); }));
+				    }
+				    workerThread.quit();
+				    static_cast<void>(workerThread.wait());
+			    });
+
+			QVERIFY(qmudLuaBridgeEnsureObjectThreadReady(&workerTarget));
+
+			std::atomic_bool outerInvoked{false};
+			std::atomic_bool nestedInvokeOk{false};
+			std::atomic_bool outerOnWorker{false};
+			std::atomic_bool innerInvoked{false};
+			std::atomic_bool innerOnMain{false};
+
+			const bool       invokeOk = qmudLuaBridgeInvokeOnObjectThread(
+                &workerTarget,
+                [&]()
+                {
+                    outerInvoked.store(true);
+                    outerOnWorker.store(QThread::currentThread() == &workerThread);
+                    const bool innerOk = qmudLuaBridgeInvokeOnObjectThread(
+                        &mainTarget,
+                        [&]()
+                        {
+                            innerInvoked.store(true);
+                            innerOnMain.store(QThread::currentThread() == mainThread);
+                        });
+                    nestedInvokeOk.store(innerOk);
+                });
+
+			QVERIFY(invokeOk);
+			QVERIFY(outerInvoked.load());
+			QVERIFY(outerOnWorker.load());
+			QVERIFY(innerInvoked.load());
+			QVERIFY(innerOnMain.load());
+			QVERIFY(nestedInvokeOk.load());
+		}
+
+		void luaBridgeEnsureReadyFailsForNonRunningThread()
+		{
+			QThread  workerThread;
+			QObject *target     = new QObject();
+			QThread *mainThread = QThread::currentThread();
+			target->moveToThread(&workerThread);
+
+			QVERIFY(!qmudLuaBridgeEnsureObjectThreadReady(target));
+			QVERIFY(qmudLuaBridgeLastError().contains(QStringLiteral("not running")));
+
+			workerThread.start();
+			const auto stopWorker = qScopeGuard(
+			    [&]()
+			    {
+				    workerThread.quit();
+				    static_cast<void>(workerThread.wait());
+			    });
+			QVERIFY(qmudLuaBridgeInvokeOnObjectThread(target, [target, mainThread]
+			                                          { target->moveToThread(mainThread); }));
+			delete target;
+		}
+
+		void luaBridgeCompletesWhenTargetDestroyedBeforeDispatch()
+		{
+			QThread workerThread;
+			workerThread.setObjectName(QStringLiteral("tst_LuaBridgeDestroyedTarget"));
+			workerThread.start();
+			const auto stopWorker = qScopeGuard(
+			    [&]()
+			    {
+				    workerThread.quit();
+				    static_cast<void>(workerThread.wait());
+			    });
+
+			QPointer<QObject> target = new QObject();
+			target->moveToThread(&workerThread);
+
+			std::mutex              gateMutex;
+			std::condition_variable gateCv;
+			bool                    firstEntered = false;
+
+			std::atomic_bool        firstInvokeOk{false};
+			std::thread             firstCaller(
+                [&]()
+                {
+                    firstInvokeOk.store(qmudLuaBridgeInvokeOnObjectThread(target.data(),
+				                                                                      [&]()
+				                                                                      {
+                                                                              {
+                                                                                  std::lock_guard lock(
+                                                                                      gateMutex);
+                                                                                  firstEntered = true;
+                                                                              }
+                                                                              gateCv.notify_all();
+                                                                              QThread::msleep(100);
+                                                                              if (target)
+                                                                              {
+                                                                                  delete target.data();
+                                                                                  target.clear();
+                                                                              }
+                                                                          }));
+                });
+
+			{
+				std::unique_lock lock(gateMutex);
+				gateCv.wait(lock, [&] { return firstEntered; });
+			}
+
+			std::atomic_bool secondCallbackInvoked{false};
+			const bool       secondInvokeOk = qmudLuaBridgeInvokeOnObjectThread(
+                target.data(), [&]() { secondCallbackInvoked.store(true); });
+
+			firstCaller.join();
+
+			QVERIFY(firstInvokeOk.load());
+			QVERIFY(secondInvokeOk);
+			QVERIFY(!secondCallbackInvoked.load());
+		}
+
+		void luaBridgeHandlesConcurrentCallersWithoutLoss()
+		{
+			constexpr int callerCount      = 4;
+			constexpr int invokesPerCaller = 25;
+
+			QThread       workerThread;
+			workerThread.setObjectName(QStringLiteral("tst_LuaBridgeConcurrentWorker"));
+			QObject  target;
+			QThread *mainThread = QThread::currentThread();
+			target.moveToThread(&workerThread);
+			workerThread.start();
+			const auto stopWorker = qScopeGuard(
+			    [&]()
+			    {
+				    if (target.thread() == &workerThread)
+				    {
+					    static_cast<void>(qmudLuaBridgeInvokeOnObjectThread(
+					        &target, [&target, mainThread] { target.moveToThread(mainThread); }));
+				    }
+				    workerThread.quit();
+				    static_cast<void>(workerThread.wait());
+			    });
+
+			QVERIFY(qmudLuaBridgeEnsureObjectThreadReady(&target));
+
+			std::atomic_bool             invokeFailure{false};
+			std::atomic_bool             wrongThread{false};
+			std::atomic_int              totalInvokes{0};
+			std::mutex                   orderMutex;
+			std::array<int, callerCount> lastSeenByCaller;
+			lastSeenByCaller.fill(-1);
+			bool                     orderOk = true;
+
+			std::vector<std::thread> callers;
+			callers.reserve(callerCount);
+			for (int callerIndex = 0; callerIndex < callerCount; ++callerIndex)
+			{
+				callers.emplace_back(
+				    [&, callerIndex]
+				    {
+					    for (int callIndex = 0; callIndex < invokesPerCaller; ++callIndex)
+					    {
+						    const bool ok = qmudLuaBridgeInvokeOnObjectThread(
+						        &target,
+						        [&, callerIndex, callIndex]
+						        {
+							        if (QThread::currentThread() != &workerThread)
+								        wrongThread.store(true);
+							        {
+								        std::lock_guard lock(orderMutex);
+								        if (lastSeenByCaller[callerIndex] + 1 != callIndex)
+									        orderOk = false;
+								        lastSeenByCaller[callerIndex] = callIndex;
+							        }
+							        totalInvokes.fetch_add(1);
+						        });
+						    if (!ok)
+						    {
+							    invokeFailure.store(true);
+							    break;
+						    }
+					    }
+				    });
+			}
+			for (auto &caller : callers)
+				caller.join();
+
+			QVERIFY(!invokeFailure.load());
+			QVERIFY(!wrongThread.load());
+			QVERIFY(orderOk);
+			QCOMPARE(totalInvokes.load(), callerCount * invokesPerCaller);
+			for (int i = 0; i < callerCount; ++i)
+				QCOMPARE(lastSeenByCaller[i], invokesPerCaller - 1);
+		}
+
+		void luaBridgeLastErrorIsThreadLocal()
+		{
+			QThread workerThread;
+			workerThread.setObjectName(QStringLiteral("tst_LuaBridgeThreadLocalWorker"));
+			QObject  target;
+			QThread *mainThread = QThread::currentThread();
+			target.moveToThread(&workerThread);
+			workerThread.start();
+			const auto stopWorker = qScopeGuard(
+			    [&]()
+			    {
+				    if (target.thread() == &workerThread)
+				    {
+					    static_cast<void>(qmudLuaBridgeInvokeOnObjectThread(
+					        &target, [&target, mainThread] { target.moveToThread(mainThread); }));
+				    }
+				    workerThread.quit();
+				    static_cast<void>(workerThread.wait());
+			    });
+
+			QVERIFY(qmudLuaBridgeEnsureObjectThreadReady(&target));
+
+			std::mutex              gateMutex;
+			std::condition_variable gateCv;
+			bool                    aFailed = false;
+			bool                    bDone   = false;
+			QString                 errorA1;
+			QString                 errorA2;
+			QString                 errorB;
+			std::atomic_bool        invokeBSuccess{false};
+
+			std::thread             callerA(
+                [&]()
+                {
+                    static_cast<void>(qmudLuaBridgeInvokeOnObjectThread(nullptr, [] {}));
+                    errorA1 = qmudLuaBridgeLastError();
+                    {
+                        std::lock_guard lock(gateMutex);
+                        aFailed = true;
+                    }
+                    gateCv.notify_all();
+                    std::unique_lock lock(gateMutex);
+                    gateCv.wait(lock, [&] { return bDone; });
+                    errorA2 = qmudLuaBridgeLastError();
+                });
+
+			std::thread callerB(
+			    [&]()
+			    {
+				    std::unique_lock lock(gateMutex);
+				    gateCv.wait(lock, [&] { return aFailed; });
+				    lock.unlock();
+				    invokeBSuccess.store(qmudLuaBridgeInvokeOnObjectThread(&target, [] {}));
+				    errorB = qmudLuaBridgeLastError();
+				    {
+					    std::lock_guard doneLock(gateMutex);
+					    bDone = true;
+				    }
+				    gateCv.notify_all();
+			    });
+
+			callerA.join();
+			callerB.join();
+
+			QVERIFY(invokeBSuccess.load());
+			QVERIFY(!errorA1.isEmpty());
+			QCOMPARE(errorA2, errorA1);
+			QVERIFY(errorB.isEmpty());
 		}
 
 		void crossStateMarshalsSupportedTypes()

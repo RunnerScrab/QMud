@@ -11,17 +11,16 @@
 #include "LuaCallbackEngine.h"
 #include "helpers/LuaExecutionUtils.h"
 
-#include <QCoreApplication>
-#include <QEvent>
-#include <QMetaObject>
-// ReSharper disable once CppUnusedIncludeDirective
-#include <QMutex>
-#include <QMutexLocker>
-#include <QWaitCondition>
+#include <QDebug>
+
+#include <type_traits>
 #include <utility>
 
 namespace
 {
+	const QString kWorkerBridgeFailurePrefix =
+	    QStringLiteral("[QMud][LuaExecutor] worker bridge invoke failed");
+
 	bool ensureWorkerReady(const QObject *invoker, QThread *workerThread)
 	{
 		if (!invoker || !workerThread)
@@ -31,64 +30,117 @@ namespace
 		return workerThread->isRunning();
 	}
 
+	bool ensureWorkerBridgeReady(const QObject *invoker, QThread *workerThread)
+	{
+		if (!ensureWorkerReady(invoker, workerThread))
+			return false;
+		if (qmudLuaBridgeEnsureObjectThreadReady(invoker))
+			return true;
+		qWarning().noquote() << QStringLiteral("[QMud][LuaExecutor] worker bridge readiness failed: %1")
+		                            .arg(qmudLuaBridgeLastError());
+		return false;
+	}
+
+	const char *bridgeStatusName(const LuaBridgeInvokeStatus status)
+	{
+		switch (status)
+		{
+		case LuaBridgeInvokeStatus::Success:
+			return "Success";
+		case LuaBridgeInvokeStatus::InvalidTargetOrCallback:
+			return "InvalidTargetOrCallback";
+		case LuaBridgeInvokeStatus::NoOwningThread:
+			return "NoOwningThread";
+		case LuaBridgeInvokeStatus::MissingTargetBridgeContext:
+			return "MissingTargetBridgeContext";
+		case LuaBridgeInvokeStatus::NoQCoreApplication:
+			return "NoQCoreApplication";
+		case LuaBridgeInvokeStatus::TargetThreadNotRunning:
+			return "TargetThreadNotRunning";
+		case LuaBridgeInvokeStatus::TargetThreadNoEventDispatcher:
+			return "TargetThreadNoEventDispatcher";
+		case LuaBridgeInvokeStatus::BridgeInvokerUnavailable:
+			return "BridgeInvokerUnavailable";
+		case LuaBridgeInvokeStatus::BridgeEndpointNotReadyTimeout:
+			return "BridgeEndpointNotReadyTimeout";
+		case LuaBridgeInvokeStatus::MissingCallerBridgeContext:
+			return "MissingCallerBridgeContext";
+		case LuaBridgeInvokeStatus::EnqueueFailed:
+			return "EnqueueFailed";
+		case LuaBridgeInvokeStatus::RequestCanceledBeforeDispatch:
+			return "RequestCanceledBeforeDispatch";
+		case LuaBridgeInvokeStatus::RequestCanceledTargetThreadStopped:
+			return "RequestCanceledTargetThreadStopped";
+		case LuaBridgeInvokeStatus::TimedOutInFlight:
+			return "TimedOutInFlight";
+		case LuaBridgeInvokeStatus::UnknownFailure:
+			return "UnknownFailure";
+		}
+		Q_UNREACHABLE_RETURN("UnknownFailure");
+	}
+
+	bool shouldRetryWorkerBridgeInvoke(const LuaBridgeInvokeStatus status)
+	{
+		switch (status)
+		{
+		case LuaBridgeInvokeStatus::MissingTargetBridgeContext:
+		case LuaBridgeInvokeStatus::TargetThreadNotRunning:
+		case LuaBridgeInvokeStatus::TargetThreadNoEventDispatcher:
+		case LuaBridgeInvokeStatus::BridgeInvokerUnavailable:
+		case LuaBridgeInvokeStatus::BridgeEndpointNotReadyTimeout:
+		case LuaBridgeInvokeStatus::EnqueueFailed:
+		case LuaBridgeInvokeStatus::RequestCanceledBeforeDispatch:
+		case LuaBridgeInvokeStatus::RequestCanceledTargetThreadStopped:
+			return true;
+
+		case LuaBridgeInvokeStatus::Success:
+		case LuaBridgeInvokeStatus::InvalidTargetOrCallback:
+		case LuaBridgeInvokeStatus::NoOwningThread:
+		case LuaBridgeInvokeStatus::NoQCoreApplication:
+		case LuaBridgeInvokeStatus::MissingCallerBridgeContext:
+		case LuaBridgeInvokeStatus::TimedOutInFlight:
+		case LuaBridgeInvokeStatus::UnknownFailure:
+			return false;
+		}
+		Q_UNREACHABLE_RETURN(false);
+	}
+
 	template <typename ResultType, typename Fn>
 	ResultType invokeBlockingResult(const QObject *invoker, QThread *workerThread, Fn &&fn,
 	                                ResultType fallback)
 	{
 		if (QThread::currentThread() == workerThread)
-		{
 			return fn();
-		}
-		if (!ensureWorkerReady(invoker, workerThread))
+		if (!ensureWorkerBridgeReady(invoker, workerThread))
 			return fallback;
 
-		ResultType     result    = fallback;
-		bool           completed = false;
-		QMutex         lock;
-		QWaitCondition done;
-		auto           enqueue = [&]() -> bool
+		const auto            fnCopy       = std::decay_t<Fn>(std::forward<Fn>(fn));
+		ResultType            result       = fallback;
+		LuaBridgeInvokeStatus failedStatus = LuaBridgeInvokeStatus::Success;
+		QString               failedError;
+		auto                  invokeOnce = [&]() -> bool
 		{
-			return QMetaObject::invokeMethod(
-			    const_cast<QObject *>(invoker),
-			    [&]
-			    {
-				    const ResultType computed = fn();
-				    {
-					    QMutexLocker locker(&lock);
-					    result    = computed;
-					    completed = true;
-				    }
-				    done.wakeOne();
-			    },
-			    Qt::QueuedConnection);
+			if (qmudLuaBridgeInvokeOnObjectThread(invoker, [&]() { result = fnCopy(); }))
+				return true;
+			failedStatus = qmudLuaBridgeLastStatus();
+			failedError  = qmudLuaBridgeLastError();
+			return false;
 		};
-		bool queued = enqueue();
-		if (!queued && ensureWorkerReady(invoker, workerThread))
-			queued = enqueue();
-		if (!queued)
-			return fallback;
 
-		QMutexLocker locker(&lock);
-		while (!completed)
+		bool bridged = invokeOnce();
+		if (!bridged && shouldRetryWorkerBridgeInvoke(failedStatus) &&
+		    ensureWorkerBridgeReady(invoker, workerThread))
 		{
-			locker.unlock();
-			if (QCoreApplication::instance())
-				QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
-			const bool workerRunning = workerThread->isRunning();
-			locker.relock();
-			if (!workerRunning && !completed)
-			{
-				locker.unlock();
-				const bool recovered = ensureWorkerReady(invoker, workerThread);
-				const bool requeued  = recovered ? enqueue() : false;
-				locker.relock();
-				if ((!recovered || !requeued) && !completed)
-					return fallback;
-			}
-			if (!completed)
-				done.wait(&lock, 10);
+			bridged = invokeOnce();
 		}
-		return result;
+		if (!bridged)
+		{
+			qWarning().noquote() << QStringLiteral("%1 (%2): %3")
+			                            .arg(kWorkerBridgeFailurePrefix,
+			                                 QString::fromLatin1(bridgeStatusName(failedStatus)),
+			                                 failedError);
+		}
+		return bridged ? result : fallback;
 	}
 
 	template <typename Fn> void invokeBlockingVoid(const QObject *invoker, QThread *workerThread, Fn &&fn)
@@ -98,52 +150,32 @@ namespace
 			fn();
 			return;
 		}
-		if (!ensureWorkerReady(invoker, workerThread))
+		if (!ensureWorkerBridgeReady(invoker, workerThread))
 			return;
 
-		bool           completed = false;
-		QMutex         lock;
-		QWaitCondition done;
-		auto           enqueue = [&]() -> bool
+		const auto            fnCopy       = std::decay_t<Fn>(std::forward<Fn>(fn));
+		LuaBridgeInvokeStatus failedStatus = LuaBridgeInvokeStatus::Success;
+		QString               failedError;
+		auto                  invokeOnce = [&]() -> bool
 		{
-			return QMetaObject::invokeMethod(
-			    const_cast<QObject *>(invoker),
-			    [&]
-			    {
-				    fn();
-				    {
-					    QMutexLocker locker(&lock);
-					    completed = true;
-				    }
-				    done.wakeOne();
-			    },
-			    Qt::QueuedConnection);
+			if (qmudLuaBridgeInvokeOnObjectThread(invoker, [&]() { fnCopy(); }))
+				return true;
+			failedStatus = qmudLuaBridgeLastStatus();
+			failedError  = qmudLuaBridgeLastError();
+			return false;
 		};
-		bool queued = enqueue();
-		if (!queued && ensureWorkerReady(invoker, workerThread))
-			queued = enqueue();
-		if (!queued)
-			return;
-
-		QMutexLocker locker(&lock);
-		while (!completed)
+		bool bridged = invokeOnce();
+		if (!bridged && shouldRetryWorkerBridgeInvoke(failedStatus) &&
+		    ensureWorkerBridgeReady(invoker, workerThread))
 		{
-			locker.unlock();
-			if (QCoreApplication::instance())
-				QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
-			const bool workerRunning = workerThread->isRunning();
-			locker.relock();
-			if (!workerRunning && !completed)
-			{
-				locker.unlock();
-				const bool recovered = ensureWorkerReady(invoker, workerThread);
-				const bool requeued  = recovered ? enqueue() : false;
-				locker.relock();
-				if ((!recovered || !requeued) && !completed)
-					return;
-			}
-			if (!completed)
-				done.wait(&lock, 10);
+			bridged = invokeOnce();
+		}
+		if (!bridged)
+		{
+			qWarning().noquote() << QStringLiteral("%1 (%2): %3")
+			                            .arg(kWorkerBridgeFailurePrefix,
+			                                 QString::fromLatin1(bridgeStatusName(failedStatus)),
+			                                 failedError);
 		}
 	}
 } // namespace
@@ -155,6 +187,7 @@ LuaExecutorThreaded::LuaExecutorThreaded()
 	m_workerInvoker = std::make_unique<QObject>();
 	m_workerInvoker->moveToThread(m_workerThread.get());
 	m_workerThread->start();
+	static_cast<void>(ensureWorkerBridgeReady(m_workerInvoker.get(), m_workerThread.get()));
 }
 
 LuaExecutorThreaded::~LuaExecutorThreaded()
@@ -556,16 +589,15 @@ void LuaExecutorThreaded::shutdownWorker()
 	if (m_workerInvoker)
 	{
 		QObject *workerObject = m_workerInvoker.release();
-		if (workerObject->thread() == QThread::currentThread())
+		QThread *ownerThread  = workerObject ? workerObject->thread() : nullptr;
+		if (workerObject &&
+		    (!ownerThread || ownerThread == QThread::currentThread() || !ownerThread->isRunning()))
 		{
 			delete workerObject;
 		}
-		else
+		else if (workerObject)
 		{
-			const bool invoked = QMetaObject::invokeMethod(
-			    workerObject, [workerObject] { delete workerObject; }, Qt::BlockingQueuedConnection);
-			if (!invoked)
-				delete workerObject;
+			workerObject->deleteLater();
 		}
 	}
 

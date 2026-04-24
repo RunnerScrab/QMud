@@ -103,6 +103,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <utility>
 #include <zlib.h>
 
 static long        colorToLong(const QColor &color);
@@ -142,6 +143,21 @@ namespace
 			return 0;
 		constexpr qsizetype kMaxInt = std::numeric_limits<int>::max();
 		return size > kMaxInt ? std::numeric_limits<int>::max() : static_cast<int>(size);
+	}
+
+	template <typename Func>
+	bool qmudInvokeMethod(QObject *target, Func &&fn, Qt::ConnectionType connectionType)
+	{
+		if (!target)
+			return false;
+		if (connectionType != Qt::BlockingQueuedConnection)
+			return QMetaObject::invokeMethod(target, std::forward<Func>(fn), connectionType);
+		if (target->thread() == QThread::currentThread())
+		{
+			std::forward<Func>(fn)();
+			return true;
+		}
+		return qmudLuaBridgeInvokeOnObjectThread(target, std::forward<Func>(fn));
 	}
 
 	void flashTaskbarForView(QWidget *view)
@@ -4522,7 +4538,7 @@ void WorldRuntime::addScriptTime(qint64 nanos)
 {
 	if (nanos <= 0)
 		return;
-	m_scriptTimeNanos += nanos;
+	m_scriptTimeNanos.fetch_add(nanos, std::memory_order_relaxed);
 }
 
 double WorldRuntime::scriptTimeSeconds() const
@@ -4530,14 +4546,14 @@ double WorldRuntime::scriptTimeSeconds() const
 	if (QThread::currentThread() != thread())
 	{
 		double     result  = 0.0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = scriptTimeSeconds(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0.0;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::scriptTimeSeconds");
-	return static_cast<double>(m_scriptTimeNanos) / 1000000000.0;
+	return static_cast<double>(m_scriptTimeNanos.load(std::memory_order_relaxed)) / 1000000000.0;
 }
 
 void WorldRuntime::resetAnsiRenderState()
@@ -6771,7 +6787,7 @@ bool WorldRuntime::connectToWorld(const QString &host, quint16 port)
 	if (QThread::currentThread() != thread())
 	{
 		bool       result  = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, host, port] { result = connectToWorld(host, port); },
 		    Qt::BlockingQueuedConnection);
 		return invoked && result;
@@ -6928,7 +6944,7 @@ void WorldRuntime::disconnectFromWorld()
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(this, [this] { disconnectFromWorld(); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this] { disconnectFromWorld(); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -7342,7 +7358,7 @@ int WorldRuntime::totalLinesReceived() const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = totalLinesReceived(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -7361,7 +7377,7 @@ void WorldRuntime::setNewLines(int value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(this, [this, value] { setNewLines(value); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this, value] { setNewLines(value); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -7556,7 +7572,7 @@ bool WorldRuntime::isConnected() const
 	if (QThread::currentThread() != thread())
 	{
 		bool       result  = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = isConnected(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked && result;
@@ -7581,7 +7597,7 @@ int WorldRuntime::connectPhase() const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eConnectNotConnected;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = connectPhase(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eConnectNotConnected;
@@ -7636,7 +7652,7 @@ QDateTime WorldRuntime::connectTime() const
 	if (QThread::currentThread() != thread())
 	{
 		QDateTime  result;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = connectTime(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : QDateTime();
@@ -7671,7 +7687,7 @@ QDateTime WorldRuntime::statusTime() const
 	if (QThread::currentThread() != thread())
 	{
 		QDateTime  result;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = statusTime(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : QDateTime();
@@ -7685,7 +7701,7 @@ void WorldRuntime::resetStatusTime()
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(this, [this] { resetStatusTime(); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this] { resetStatusTime(); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -7976,7 +7992,7 @@ void WorldRuntime::saveWorldFileAsync(const QString                             
 	    {
 		    QString    saveError;
 		    const bool ok = writeSaveSnapshot(*snapshot, &saveError);
-		    QMetaObject::invokeMethod(
+		    qmudInvokeMethod(
 		        qApp,
 		        [guard, snapshot, completionFn, ok, saveError]
 		        {
@@ -8805,8 +8821,7 @@ void WorldRuntime::setStatusMessage(const QString &value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
-		    this, [this, value] { setStatusMessage(value); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this, value] { setStatusMessage(value); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -8882,7 +8897,7 @@ QStringList WorldRuntime::recentLines(int maxCount) const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList result;
-		const bool  invoked = QMetaObject::invokeMethod(
+		const bool  invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &result, maxCount] { result = recentLines(maxCount); },
             Qt::BlockingQueuedConnection);
 		return invoked ? result : QStringList();
@@ -8903,7 +8918,7 @@ void WorldRuntime::bookmarkLine(int lineNumber, bool set)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
+		qmudInvokeMethod(
 		    this, [this, lineNumber, set] { bookmarkLine(lineNumber, set); }, Qt::BlockingQueuedConnection);
 		return;
 	}
@@ -8923,7 +8938,7 @@ void WorldRuntime::setStopTriggerEvaluation(StopTriggerEvaluation mode)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
+		qmudInvokeMethod(
 		    this, [this, mode] { setStopTriggerEvaluation(mode); }, Qt::BlockingQueuedConnection);
 		return;
 	}
@@ -8970,8 +8985,7 @@ void WorldRuntime::setTraceEnabled(bool enabled)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
-		    this, [this, enabled] { setTraceEnabled(enabled); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this, enabled] { setTraceEnabled(enabled); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -8984,7 +8998,7 @@ bool WorldRuntime::traceEnabled() const
 	if (QThread::currentThread() != thread())
 	{
 		bool       result  = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = traceEnabled(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked && result;
@@ -8998,7 +9012,7 @@ void WorldRuntime::setWorldFileModified(bool modified)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
+		qmudInvokeMethod(
 		    this, [this, modified] { setWorldFileModified(modified); }, Qt::BlockingQueuedConnection);
 		return;
 	}
@@ -9198,7 +9212,7 @@ int WorldRuntime::playSound(int buffer, const QString &fileName, bool loop, doub
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eCannotPlaySound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, buffer, fileName, loop, volume, pan]
 		    { result = playSound(buffer, fileName, loop, volume, pan); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eCannotPlaySound;
@@ -9327,7 +9341,7 @@ int WorldRuntime::playSoundMemory(int buffer, const QByteArray &data, bool loop,
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eCannotPlaySound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, buffer, data, loop, volume, pan]
 		    { result = playSoundMemory(buffer, data, loop, volume, pan); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eCannotPlaySound;
@@ -9412,7 +9426,7 @@ int WorldRuntime::stopSound(int buffer)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eCannotPlaySound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, buffer] { result = stopSound(buffer); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eCannotPlaySound;
 	}
@@ -9471,7 +9485,7 @@ int WorldRuntime::soundStatus(int buffer) const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = -3;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, buffer] { result = soundStatus(buffer); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : -3;
@@ -9493,7 +9507,7 @@ int WorldRuntime::playSound(int, const QString &, bool, double, double)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eCannotPlaySound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result] { result = playSound(0, QString(), false, 0.0, 0.0); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eCannotPlaySound;
@@ -9508,7 +9522,7 @@ int WorldRuntime::playSoundMemory(int, const QByteArray &, bool, double, double)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eCannotPlaySound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result] { result = playSoundMemory(0, QByteArray(), false, 0.0, 0.0); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eCannotPlaySound;
@@ -9522,9 +9536,9 @@ int WorldRuntime::stopSound(int)
 {
 	if (QThread::currentThread() != thread())
 	{
-		int        result  = eCannotPlaySound;
-		const bool invoked = QMetaObject::invokeMethod(
-		    this, [this, &result] { result = stopSound(0); }, Qt::BlockingQueuedConnection);
+		int        result = eCannotPlaySound;
+		const bool invoked =
+		    qmudInvokeMethod(this, [this, &result] { result = stopSound(0); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eCannotPlaySound;
 	}
 
@@ -9537,7 +9551,7 @@ int WorldRuntime::soundStatus(int) const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = -3;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = soundStatus(0); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : -3;
@@ -10039,7 +10053,7 @@ int WorldRuntime::setCustomColourText(int index, const QColor &color)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eBadParameter;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, index, color] { result = setCustomColourText(index, color); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eBadParameter;
@@ -10095,7 +10109,7 @@ int WorldRuntime::setCustomColourBackground(int index, const QColor &color)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eBadParameter;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, index, color] { result = setCustomColourBackground(index, color); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eBadParameter;
@@ -10151,7 +10165,7 @@ int WorldRuntime::setCustomColourName(int index, const QString &name)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eOptionOutOfRange;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, index, name] { result = setCustomColourName(index, name); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eOptionOutOfRange;
@@ -10201,7 +10215,7 @@ long WorldRuntime::customColourText(int index) const
 	if (QThread::currentThread() != thread())
 	{
 		long       result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, index] { result = customColourText(index); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -10222,7 +10236,7 @@ long WorldRuntime::customColourBackground(int index) const
 	if (QThread::currentThread() != thread())
 	{
 		long       result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this),
 		    [this, &result, index] { result = customColourBackground(index); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -10343,7 +10357,7 @@ bool WorldRuntime::closeNotepad(const QString &title, bool querySave)
 	if (QThread::currentThread() != thread())
 	{
 		bool       result  = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, title, querySave] { result = closeNotepad(title, querySave); },
 		    Qt::BlockingQueuedConnection);
 		return invoked && result;
@@ -10568,7 +10582,7 @@ qint64 WorldRuntime::bytesIn() const
 	if (QThread::currentThread() != thread())
 	{
 		qint64     result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = bytesIn(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -10583,7 +10597,7 @@ qint64 WorldRuntime::bytesOut() const
 	if (QThread::currentThread() != thread())
 	{
 		qint64     result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = bytesOut(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -10719,7 +10733,7 @@ bool WorldRuntime::isMapping() const
 	if (QThread::currentThread() != thread())
 	{
 		bool       result  = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = isMapping(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked && result;
@@ -10734,7 +10748,7 @@ int WorldRuntime::mappingCount() const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = mappingCount(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -10749,7 +10763,7 @@ QString WorldRuntime::mappingItem(int index) const
 	if (QThread::currentThread() != thread())
 	{
 		QString    result;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, index] { result = mappingItem(index); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : QString();
@@ -10766,7 +10780,7 @@ QString WorldRuntime::mappingString(bool omitComments) const
 	if (QThread::currentThread() != thread())
 	{
 		QString    result;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, omitComments]
 		    { result = mappingString(omitComments); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : QString();
@@ -10827,7 +10841,7 @@ unsigned short WorldRuntime::noteStyle() const
 	if (QThread::currentThread() != thread())
 	{
 		unsigned short result  = 0;
-		const bool     invoked = QMetaObject::invokeMethod(
+		const bool     invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &result] { result = noteStyle(); },
             Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -10841,7 +10855,7 @@ void WorldRuntime::setNoteStyle(unsigned short style)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(this, [this, style] { setNoteStyle(style); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this, style] { setNoteStyle(style); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -10984,7 +10998,7 @@ bool          WorldRuntime::notesInRgb() const
 	if (QThread::currentThread() != thread())
 	{
 		bool       result  = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = notesInRgb(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked && result;
@@ -10999,7 +11013,7 @@ int WorldRuntime::noteTextColour() const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = -1;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = noteTextColour(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : -1;
@@ -11013,8 +11027,7 @@ void WorldRuntime::setNoteTextColour(int value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
-		    this, [this, value] { setNoteTextColour(value); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this, value] { setNoteTextColour(value); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -11030,7 +11043,7 @@ long WorldRuntime::noteColourFore() const
 	if (QThread::currentThread() != thread())
 	{
 		long       result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = noteColourFore(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -11059,7 +11072,7 @@ long WorldRuntime::noteColourBack() const
 	if (QThread::currentThread() != thread())
 	{
 		long       result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = noteColourBack(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -11087,8 +11100,7 @@ void WorldRuntime::setNoteColourFore(long value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
-		    this, [this, value] { setNoteColourFore(value); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this, value] { setNoteColourFore(value); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -11116,8 +11128,7 @@ void WorldRuntime::setNoteColourBack(long value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
-		    this, [this, value] { setNoteColourBack(value); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this, value] { setNoteColourBack(value); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -11154,7 +11165,7 @@ long WorldRuntime::getMapColour(long value) const
 	if (QThread::currentThread() != thread())
 	{
 		long       result  = value;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, value] { result = getMapColour(value); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : value;
@@ -11300,7 +11311,7 @@ void WorldRuntime::mapColour(long original, long replacement)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
+		qmudInvokeMethod(
 		    this, [this, original, replacement] { mapColour(original, replacement); },
 		    Qt::BlockingQueuedConnection);
 		return;
@@ -11315,7 +11326,7 @@ QMap<long, long> WorldRuntime::mapColourList() const
 	if (QThread::currentThread() != thread())
 	{
 		QMap<long, long> result;
-		const bool       invoked = QMetaObject::invokeMethod(
+		const bool       invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &result] { result = mapColourList(); },
             Qt::BlockingQueuedConnection);
 		return invoked ? result : QMap<long, long>();
@@ -11330,7 +11341,7 @@ long WorldRuntime::normalColour(int index) const
 	if (QThread::currentThread() != thread())
 	{
 		long       result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, index] { result = normalColour(index); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -11364,7 +11375,7 @@ void WorldRuntime::setNormalColour(int index, long value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
+		qmudInvokeMethod(
 		    this, [this, index, value] { setNormalColour(index, value); }, Qt::BlockingQueuedConnection);
 		return;
 	}
@@ -11396,7 +11407,7 @@ int WorldRuntime::addToMapper(const QString &direction, const QString &reverse)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eBadMapItem;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, direction, reverse] { result = addToMapper(direction, reverse); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eBadMapItem;
@@ -11420,7 +11431,7 @@ int WorldRuntime::addMapperComment(const QString &comment)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eBadMapItem;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, comment] { result = addMapperComment(comment); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eBadMapItem;
@@ -11441,7 +11452,7 @@ int WorldRuntime::shiftTabCompleteItem(const QString &item)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eBadParameter;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, item] { result = shiftTabCompleteItem(item); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eBadParameter;
@@ -11492,7 +11503,7 @@ int WorldRuntime::deleteLastMapItem()
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eNoMapItems;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result] { result = deleteLastMapItem(); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eNoMapItems;
 	}
@@ -11509,7 +11520,7 @@ int WorldRuntime::deleteAllMapItems()
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eNoMapItems;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result] { result = deleteAllMapItems(); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eNoMapItems;
 	}
@@ -11525,7 +11536,7 @@ void WorldRuntime::deleteLines(int count)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(this, [this, count] { deleteLines(count); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this, count] { deleteLines(count); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -11544,7 +11555,7 @@ void WorldRuntime::deleteOutput()
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(this, [this] { deleteOutput(); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this] { deleteOutput(); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -11559,7 +11570,7 @@ int WorldRuntime::deleteVariable(const QString &name)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eVariableNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, name] { result = deleteVariable(name); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eVariableNotFound;
 	}
@@ -11584,7 +11595,7 @@ int WorldRuntime::discardQueuedCommands() const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = discardQueuedCommands(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -11600,8 +11611,7 @@ void WorldRuntime::setMappingEnabled(bool enabled)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
-		    this, [this, enabled] { setMappingEnabled(enabled); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this, enabled] { setMappingEnabled(enabled); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -11614,7 +11624,7 @@ QString WorldRuntime::evaluateSpeedwalk(const QString &speedWalkString) const
 	if (QThread::currentThread() != thread())
 	{
 		QString    result;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, speedWalkString]
 		    { result = evaluateSpeedwalk(speedWalkString); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : QString();
@@ -11631,7 +11641,7 @@ int WorldRuntime::executeCommand(const QString &text) const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eWorldClosed;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, text] { result = executeCommand(text); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eWorldClosed;
@@ -11911,7 +11921,7 @@ void WorldRuntime::resetIpCache()
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(this, [this] { resetIpCache(); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this] { resetIpCache(); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -11950,7 +11960,7 @@ int WorldRuntime::openLog(const QString &logFileName, bool append)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eCouldNotOpenFile;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, logFileName, append] { result = openLog(logFileName, append); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eCouldNotOpenFile;
@@ -12015,9 +12025,9 @@ int WorldRuntime::closeLog()
 {
 	if (QThread::currentThread() != thread())
 	{
-		int        result  = eLogFileNotOpen;
-		const bool invoked = QMetaObject::invokeMethod(
-		    this, [this, &result] { result = closeLog(); }, Qt::BlockingQueuedConnection);
+		int        result = eLogFileNotOpen;
+		const bool invoked =
+		    qmudInvokeMethod(this, [this, &result] { result = closeLog(); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eLogFileNotOpen;
 	}
 
@@ -12139,7 +12149,7 @@ int WorldRuntime::writeLog(const QByteArray &bytes)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eLogFileNotOpen;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, bytes] { result = writeLog(bytes); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eLogFileNotOpen;
 	}
@@ -12171,7 +12181,7 @@ int WorldRuntime::writeLog(const QString &text)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eLogFileNotOpen;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, text] { result = writeLog(text); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eLogFileNotOpen;
 	}
@@ -12184,9 +12194,9 @@ int WorldRuntime::flushLog()
 {
 	if (QThread::currentThread() != thread())
 	{
-		int        result  = eLogFileNotOpen;
-		const bool invoked = QMetaObject::invokeMethod(
-		    this, [this, &result] { result = flushLog(); }, Qt::BlockingQueuedConnection);
+		int        result = eLogFileNotOpen;
+		const bool invoked =
+		    qmudInvokeMethod(this, [this, &result] { result = flushLog(); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eLogFileNotOpen;
 	}
 
@@ -12201,7 +12211,7 @@ bool WorldRuntime::isLogOpen() const
 	if (QThread::currentThread() != thread())
 	{
 		bool       result  = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = isLogOpen(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked && result;
@@ -13112,7 +13122,7 @@ int WorldRuntime::sendCommand(const QString &text, bool echo, bool queue, bool l
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eWorldClosed;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, text, echo, queue, log, history, immediate]
 		    { result = sendCommand(text, echo, queue, log, history, immediate); },
 		    Qt::BlockingQueuedConnection);
@@ -13138,7 +13148,7 @@ void WorldRuntime::logInputCommand(const QString &text) const
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
+		qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, text] { logInputCommand(text); },
 		    Qt::BlockingQueuedConnection);
 		return;
@@ -13232,7 +13242,7 @@ QStringList WorldRuntime::queuedCommands() const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList result;
-		const bool  invoked = QMetaObject::invokeMethod(
+		const bool  invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &result] { result = queuedCommands(); },
             Qt::BlockingQueuedConnection);
 		return invoked ? result : QStringList();
@@ -13249,7 +13259,7 @@ QString WorldRuntime::commandInputText() const
 	if (QThread::currentThread() != thread())
 	{
 		QString    result;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = commandInputText(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : QString();
@@ -13264,7 +13274,7 @@ QStringList WorldRuntime::commandHistorySnapshot() const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList result;
-		const bool  invoked = QMetaObject::invokeMethod(
+		const bool  invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &result] { result = commandHistorySnapshot(); },
             Qt::BlockingQueuedConnection);
 		return invoked ? result : QStringList();
@@ -13279,7 +13289,7 @@ int WorldRuntime::outputSelectionEndColumn() const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = outputSelectionEndColumn(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -13294,7 +13304,7 @@ int WorldRuntime::outputSelectionEndLine() const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = outputSelectionEndLine(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -13309,7 +13319,7 @@ int WorldRuntime::outputSelectionStartColumn() const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = outputSelectionStartColumn(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -13324,7 +13334,7 @@ int WorldRuntime::outputSelectionStartLine() const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = outputSelectionStartLine(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -13339,7 +13349,7 @@ int WorldRuntime::allocateAcceleratorCommand()
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = -1;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result] { result = allocateAcceleratorCommand(); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : -1;
 	}
@@ -13354,7 +13364,7 @@ void WorldRuntime::registerAccelerator(qint64 key, int commandId, const Accelera
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
+		qmudInvokeMethod(
 		    this, [this, key, commandId, entry] { registerAccelerator(key, commandId, entry); },
 		    Qt::BlockingQueuedConnection);
 		return;
@@ -13369,8 +13379,7 @@ void WorldRuntime::removeAccelerator(qint64 key)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
-		    this, [this, key] { removeAccelerator(key); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethod(this, [this, key] { removeAccelerator(key); }, Qt::BlockingQueuedConnection);
 		return;
 	}
 
@@ -13387,7 +13396,7 @@ int WorldRuntime::acceleratorCommandForKey(qint64 key) const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = -1;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this),
 		    [this, &result, key] { result = acceleratorCommandForKey(key); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : -1;
@@ -13416,7 +13425,7 @@ QVector<qint64> WorldRuntime::acceleratorKeys() const
 	if (QThread::currentThread() != thread())
 	{
 		QVector<qint64> keys;
-		const bool      invoked = QMetaObject::invokeMethod(
+		const bool      invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &keys] { keys = acceleratorKeys(); },
             Qt::BlockingQueuedConnection);
 		return invoked ? keys : QVector<qint64>();
@@ -13435,7 +13444,7 @@ QString WorldRuntime::acceleratorCommandText(int commandId) const
 	if (QThread::currentThread() != thread())
 	{
 		QString    text;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &text, commandId]
 		    { text = acceleratorCommandText(commandId); }, Qt::BlockingQueuedConnection);
 		return invoked ? text : QString();
@@ -13452,7 +13461,7 @@ int WorldRuntime::acceleratorSendTarget(int commandId) const
 	if (QThread::currentThread() != thread())
 	{
 		int        sendTo  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &sendTo, commandId]
 		    { sendTo = acceleratorSendTarget(commandId); }, Qt::BlockingQueuedConnection);
 		return invoked ? sendTo : 0;
@@ -14165,7 +14174,7 @@ QString WorldRuntime::worldAttributeValue(const QString &key) const
 	if (QThread::currentThread() != thread())
 	{
 		QString    value;
-		const bool resolved = QMetaObject::invokeMethod(
+		const bool resolved = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &value, key] { value = worldAttributeValue(key); },
 		    Qt::BlockingQueuedConnection);
 		return resolved ? value : QString();
@@ -14179,7 +14188,7 @@ void WorldRuntime::setWorldAttribute(const QString &key, const QString &value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
+		qmudInvokeMethod(
 		    this, [this, key, value] { setWorldAttribute(key, value); }, Qt::BlockingQueuedConnection);
 		return;
 	}
@@ -14234,7 +14243,7 @@ QString WorldRuntime::worldMultilineAttributeValue(const QString &key) const
 	if (QThread::currentThread() != thread())
 	{
 		QString    value;
-		const bool resolved = QMetaObject::invokeMethod(
+		const bool resolved = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this),
 		    [this, &value, key] { value = worldMultilineAttributeValue(key); }, Qt::BlockingQueuedConnection);
 		return resolved ? value : QString();
@@ -14248,7 +14257,7 @@ void WorldRuntime::setWorldMultilineAttribute(const QString &key, const QString 
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
+		qmudInvokeMethod(
 		    this, [this, key, value] { setWorldMultilineAttribute(key, value); },
 		    Qt::BlockingQueuedConnection);
 		return;
@@ -14454,7 +14463,7 @@ bool WorldRuntime::findVariable(const QString &name, QString &value) const
 	{
 		bool       found = false;
 		QString    resolvedValue;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &found, &resolvedValue, name]
 		    { found = findVariable(name, resolvedValue); }, Qt::BlockingQueuedConnection);
 		if (invoked && found)
@@ -14480,7 +14489,7 @@ QStringList WorldRuntime::variableList() const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList result;
-		const bool  invoked = QMetaObject::invokeMethod(
+		const bool  invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &result] { result = variableList(); },
             Qt::BlockingQueuedConnection);
 		return invoked ? result : QStringList();
@@ -14502,7 +14511,7 @@ void WorldRuntime::setVariable(const QString &name, const QString &value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
+		qmudInvokeMethod(
 		    this, [this, name, value] { setVariable(name, value); }, Qt::BlockingQueuedConnection);
 		return;
 	}
@@ -14540,7 +14549,7 @@ int WorldRuntime::arrayCreate(const QString &name)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eArrayDoesNotExist;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, name] { result = arrayCreate(name); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eArrayDoesNotExist;
 	}
@@ -14558,7 +14567,7 @@ int WorldRuntime::arrayDelete(const QString &name)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eArrayDoesNotExist;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, name] { result = arrayDelete(name); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eArrayDoesNotExist;
 	}
@@ -14576,7 +14585,7 @@ int WorldRuntime::arrayClear(const QString &name)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eArrayDoesNotExist;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, name] { result = arrayClear(name); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eArrayDoesNotExist;
 	}
@@ -14594,7 +14603,7 @@ bool WorldRuntime::arrayExists(const QString &name) const
 	if (QThread::currentThread() != thread())
 	{
 		bool       result  = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, name] { result = arrayExists(name); },
 		    Qt::BlockingQueuedConnection);
 		return invoked && result;
@@ -14609,7 +14618,7 @@ int WorldRuntime::arrayCount() const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = arrayCount(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -14624,7 +14633,7 @@ int WorldRuntime::arraySize(const QString &name) const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, name] { result = arraySize(name); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -14642,7 +14651,7 @@ bool WorldRuntime::arrayKeyExists(const QString &name, const QString &key) const
 	if (QThread::currentThread() != thread())
 	{
 		bool       result  = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this),
 		    [this, &result, name, key] { result = arrayKeyExists(name, key); }, Qt::BlockingQueuedConnection);
 		return invoked && result;
@@ -14661,7 +14670,7 @@ bool WorldRuntime::arrayGet(const QString &name, const QString &key, QString &va
 	{
 		QString    localValue;
 		bool       result  = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, &localValue, name, key]
 		    { result = arrayGet(name, key, localValue); }, Qt::BlockingQueuedConnection);
 		if (invoked && result)
@@ -14685,7 +14694,7 @@ int WorldRuntime::arraySet(const QString &name, const QString &key, const QStrin
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eArrayDoesNotExist;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, name, key, value] { result = arraySet(name, key, value); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eArrayDoesNotExist;
@@ -14709,7 +14718,7 @@ int WorldRuntime::arrayDeleteKey(const QString &name, const QString &key)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eArrayDoesNotExist;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, name, key] { result = arrayDeleteKey(name, key); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eArrayDoesNotExist;
@@ -14732,7 +14741,7 @@ bool WorldRuntime::arrayFirstKey(const QString &name, QString &key) const
 	{
 		QString    localKey;
 		bool       result  = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, &localKey, name]
 		    { result = arrayFirstKey(name, localKey); }, Qt::BlockingQueuedConnection);
 		if (invoked && result)
@@ -14754,7 +14763,7 @@ bool WorldRuntime::arrayLastKey(const QString &name, QString &key) const
 	{
 		QString    localKey;
 		bool       result  = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, &localKey, name]
 		    { result = arrayLastKey(name, localKey); }, Qt::BlockingQueuedConnection);
 		if (invoked && result)
@@ -14775,7 +14784,7 @@ QStringList WorldRuntime::arrayListAll() const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList result;
-		const bool  invoked = QMetaObject::invokeMethod(
+		const bool  invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &result] { result = arrayListAll(); },
             Qt::BlockingQueuedConnection);
 		return invoked ? result : QStringList{};
@@ -14790,7 +14799,7 @@ QStringList WorldRuntime::arrayListKeys(const QString &name) const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList result;
-		const bool  invoked = QMetaObject::invokeMethod(
+		const bool  invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &result, name] { result = arrayListKeys(name); },
             Qt::BlockingQueuedConnection);
 		return invoked ? result : QStringList{};
@@ -14808,7 +14817,7 @@ QStringList WorldRuntime::arrayListValues(const QString &name) const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList result;
-		const bool  invoked = QMetaObject::invokeMethod(
+		const bool  invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &result, name] { result = arrayListValues(name); },
             Qt::BlockingQueuedConnection);
 		return invoked ? result : QStringList{};
@@ -14897,7 +14906,7 @@ int WorldRuntime::databaseOpen(const QString &name, const QString &filename, int
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = SQLITE_ERROR;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, name, filename, flags] { result = databaseOpen(name, filename, flags); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : SQLITE_ERROR;
@@ -14954,7 +14963,7 @@ int WorldRuntime::databaseClose(const QString &name)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = kDbErrorIdNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, name] { result = databaseClose(name); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : kDbErrorIdNotFound;
 	}
@@ -14983,7 +14992,7 @@ int WorldRuntime::databasePrepare(const QString &name, const QString &sql)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = kDbErrorIdNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, name, sql] { result = databasePrepare(name, sql); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : kDbErrorIdNotFound;
@@ -15020,7 +15029,7 @@ int WorldRuntime::databaseFinalize(const QString &name)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = kDbErrorIdNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, name] { result = databaseFinalize(name); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : kDbErrorIdNotFound;
 	}
@@ -15048,7 +15057,7 @@ int WorldRuntime::databaseReset(const QString &name)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = kDbErrorIdNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, name] { result = databaseReset(name); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : kDbErrorIdNotFound;
 	}
@@ -15073,7 +15082,7 @@ int WorldRuntime::databaseColumns(const QString &name) const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = kDbErrorIdNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, name] { result = databaseColumns(name); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : kDbErrorIdNotFound;
@@ -15095,7 +15104,7 @@ int WorldRuntime::databaseStep(const QString &name)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = kDbErrorIdNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, name] { result = databaseStep(name); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : kDbErrorIdNotFound;
 	}
@@ -15139,7 +15148,7 @@ QString WorldRuntime::databaseError(const QString &name) const
 	if (QThread::currentThread() != thread())
 	{
 		QString    result;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, name] { result = databaseError(name); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : QStringLiteral("database error");
@@ -15182,7 +15191,7 @@ QString WorldRuntime::databaseColumnName(const QString &name, int column) const
 	if (QThread::currentThread() != thread())
 	{
 		QString    result;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, name, column]
 		    { result = databaseColumnName(name, column); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : QString();
@@ -15204,7 +15213,7 @@ QString WorldRuntime::databaseColumnText(const QString &name, int column, bool *
 	{
 		QString    value;
 		bool       localOk = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &value, &localOk, name, column]
 		    { value = databaseColumnText(name, column, &localOk); }, Qt::BlockingQueuedConnection);
 		if (invoked && ok)
@@ -15231,7 +15240,7 @@ bool WorldRuntime::databaseColumnValue(const QString &name, int column, QVariant
 	{
 		QVariant   localValue;
 		bool       result  = false;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, &localValue, name, column]
 		    { result = databaseColumnValue(name, column, localValue); }, Qt::BlockingQueuedConnection);
 		if (invoked && result)
@@ -15254,7 +15263,7 @@ int WorldRuntime::databaseColumnType(const QString &name, int column) const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = kDbErrorIdNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, name, column]
 		    { result = databaseColumnType(name, column); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : kDbErrorIdNotFound;
@@ -15280,7 +15289,7 @@ int WorldRuntime::databaseTotalChanges(const QString &name) const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = kDbErrorIdNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, name] { result = databaseTotalChanges(name); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : kDbErrorIdNotFound;
@@ -15303,7 +15312,7 @@ int WorldRuntime::databaseChanges(const QString &name) const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = kDbErrorIdNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, name] { result = databaseChanges(name); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : kDbErrorIdNotFound;
@@ -15326,7 +15335,7 @@ QString WorldRuntime::databaseLastInsertRowid(const QString &name) const
 	if (QThread::currentThread() != thread())
 	{
 		QString    result;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this),
 		    [this, &result, name] { result = databaseLastInsertRowid(name); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : QString();
@@ -15347,7 +15356,7 @@ QStringList WorldRuntime::databaseList() const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList result;
-		const bool  invoked = QMetaObject::invokeMethod(
+		const bool  invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &result] { result = databaseList(); },
             Qt::BlockingQueuedConnection);
 		return invoked ? result : QStringList{};
@@ -15362,7 +15371,7 @@ QVariant WorldRuntime::databaseInfo(const QString &name, int infoType) const
 	if (QThread::currentThread() != thread())
 	{
 		QVariant   result;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, name, infoType]
 		    { result = databaseInfo(name, infoType); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : QVariant();
@@ -15393,7 +15402,7 @@ int WorldRuntime::databaseExec(const QString &name, const QString &sql)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = kDbErrorIdNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, name, sql] { result = databaseExec(name, sql); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : kDbErrorIdNotFound;
@@ -15434,7 +15443,7 @@ QStringList WorldRuntime::databaseColumnNames(const QString &name) const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList result;
-		const bool  invoked = QMetaObject::invokeMethod(
+		const bool  invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &result, name] { result = databaseColumnNames(name); },
             Qt::BlockingQueuedConnection);
 		return invoked ? result : QStringList{};
@@ -15458,7 +15467,7 @@ bool WorldRuntime::databaseColumnValues(const QString &name, QVector<QVariant> &
 	{
 		QVector<QVariant> localValues;
 		bool              result  = false;
-		const bool        invoked = QMetaObject::invokeMethod(
+		const bool        invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &result, &localValues, name]
             { result = databaseColumnValues(name, localValues); }, Qt::BlockingQueuedConnection);
 		if (invoked && result)
@@ -15634,7 +15643,7 @@ bool WorldRuntime::loadPluginFile(const QString &fileName, QString *error, bool 
 	{
 		bool       loaded = false;
 		QString    localError;
-		const bool resolved = QMetaObject::invokeMethod(
+		const bool resolved = qmudInvokeMethod(
 		    this,
 		    [this, &loaded, &localError, fileName, markGlobal, needsError = (error != nullptr)]
 		    {
@@ -15884,7 +15893,7 @@ bool WorldRuntime::unloadPlugin(const QString &pluginId, QString *error)
 	{
 		bool       unloaded = false;
 		QString    localError;
-		const bool resolved = QMetaObject::invokeMethod(
+		const bool resolved = qmudInvokeMethod(
 		    this,
 		    [this, &unloaded, &localError, pluginId, needsError = (error != nullptr)]
 		    {
@@ -15928,7 +15937,7 @@ bool WorldRuntime::enablePlugin(const QString &pluginId, bool enable)
 	if (QThread::currentThread() != thread())
 	{
 		bool       enabled  = false;
-		const bool resolved = QMetaObject::invokeMethod(
+		const bool resolved = qmudInvokeMethod(
 		    this, [this, &enabled, pluginId, enable] { enabled = enablePlugin(pluginId, enable); },
 		    Qt::BlockingQueuedConnection);
 		return resolved && enabled;
@@ -15982,7 +15991,7 @@ int WorldRuntime::reloadPlugin(const QString &pluginId, QString *error)
 	{
 		int        result = eNoSuchPlugin;
 		QString    localError;
-		const bool resolved = QMetaObject::invokeMethod(
+		const bool resolved = qmudInvokeMethod(
 		    this,
 		    [this, &result, &localError, pluginId, needsError = (error != nullptr)]
 		    {
@@ -16037,7 +16046,7 @@ bool WorldRuntime::isPluginInstalled(const QString &pluginId) const
 	if (QThread::currentThread() != thread())
 	{
 		bool       installed = false;
-		const bool resolved  = QMetaObject::invokeMethod(
+		const bool resolved  = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &installed, pluginId]
             { installed = isPluginInstalled(pluginId); }, Qt::BlockingQueuedConnection);
 		return resolved && installed;
@@ -16058,7 +16067,7 @@ int WorldRuntime::pluginSupports(const QString &pluginId, const QString &routine
 		};
 
 		WorkerSupportsContext context;
-		const bool            resolved = QMetaObject::invokeMethod(
+		const bool            resolved = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this),
             [this, &context, &pluginId]
             {
@@ -16111,7 +16120,7 @@ int WorldRuntime::callPlugin(const QString &pluginId, const QString &routine, co
 		};
 
 		WorkerCallContext context;
-		const bool        resolved = QMetaObject::invokeMethod(
+		const bool        resolved = qmudInvokeMethod(
             this,
             [&]
             {
@@ -16157,7 +16166,7 @@ int WorldRuntime::callPlugin(const QString &pluginId, const QString &routine, co
 		    {
 			    if (!shouldRestore)
 				    return;
-			    QMetaObject::invokeMethod(
+			    qmudInvokeMethod(
 			        this,
 			        [this, pluginId, savedCallingPluginId]
 			        {
@@ -16233,7 +16242,7 @@ int WorldRuntime::callPluginLua(const QString &pluginId, const QString &routine,
 		};
 
 		WorkerCallContext context;
-		const bool        resolved = QMetaObject::invokeMethod(
+		const bool        resolved = qmudInvokeMethod(
             this,
             [&]
             {
@@ -16283,7 +16292,7 @@ int WorldRuntime::callPluginLua(const QString &pluginId, const QString &routine,
 		    {
 			    if (!shouldRestore)
 				    return;
-			    const bool restored = QMetaObject::invokeMethod(
+			    const bool restored = qmudInvokeMethod(
 			        this,
 			        [this, pluginId, savedCallingPluginId]
 			        {
@@ -16490,7 +16499,7 @@ int WorldRuntime::broadcastPlugin(long message, const QString &text, const QStri
 		};
 
 		WorkerBroadcastContext context;
-		const bool             resolved = QMetaObject::invokeMethod(
+		const bool             resolved = qmudInvokeMethod(
             this,
             [&]
             {
@@ -16771,7 +16780,7 @@ int WorldRuntime::chatAcceptCalls(short port)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eCannotCreateChatSocket;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, port] { result = chatAcceptCalls(port); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eCannotCreateChatSocket;
 	}
@@ -16833,7 +16842,7 @@ int WorldRuntime::chatCall(const QString &server, long port, bool zChat)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eCannotCreateChatSocket;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, server, port, zChat] { result = chatCall(server, port, zChat); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eCannotCreateChatSocket;
@@ -16859,7 +16868,7 @@ int WorldRuntime::chatDisconnect(long id)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eChatIDNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, id] { result = chatDisconnect(id); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eChatIDNotFound;
 	}
@@ -16879,7 +16888,7 @@ int WorldRuntime::chatDisconnectAll()
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eOK;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result] { result = chatDisconnectAll(); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eOK;
 	}
@@ -16904,7 +16913,7 @@ int WorldRuntime::chatEverybody(const QString &message, bool emote)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eNoChatConnections;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, message, emote] { result = chatEverybody(message, emote); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eNoChatConnections;
@@ -16944,7 +16953,7 @@ long WorldRuntime::chatGetId(const QString &who) const
 	if (QThread::currentThread() != thread())
 	{
 		long       result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, who] { result = chatGetId(who); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -16984,7 +16993,7 @@ int WorldRuntime::chatGroup(const QString &group, const QString &message, bool e
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eNoChatConnections;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, group, message, emote] { result = chatGroup(group, message, emote); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eNoChatConnections;
@@ -17030,7 +17039,7 @@ int WorldRuntime::chatId(long id, const QString &message, bool emote)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eChatIDNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, id, message, emote] { result = chatId(id, message, emote); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eChatIDNotFound;
@@ -17075,7 +17084,7 @@ int WorldRuntime::chatMessage(long id, short message, const QString &text) const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eChatIDNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, id, message, text]
 		    { result = chatMessage(id, message, text); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eChatIDNotFound;
@@ -17094,7 +17103,7 @@ int WorldRuntime::chatNameChange(const QString &newName)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eBadParameter;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, newName] { result = chatNameChange(newName); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eBadParameter;
@@ -17120,7 +17129,7 @@ void WorldRuntime::chatNote(short noteType, const QString &message)
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
+		qmudInvokeMethod(
 		    this, [this, noteType, message] { chatNote(noteType, message); }, Qt::BlockingQueuedConnection);
 		return;
 	}
@@ -17201,7 +17210,7 @@ int WorldRuntime::chatPasteEverybody()
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eNoChatConnections;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result] { result = chatPasteEverybody(); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eNoChatConnections;
 	}
@@ -17234,7 +17243,7 @@ int WorldRuntime::chatPasteText(long id)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eChatIDNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, id] { result = chatPasteText(id); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eChatIDNotFound;
 	}
@@ -17271,7 +17280,7 @@ int WorldRuntime::chatPeekConnections(long id) const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eChatIDNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, id] { result = chatPeekConnections(id); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eChatIDNotFound;
@@ -17290,7 +17299,7 @@ int WorldRuntime::chatPersonal(const QString &who, const QString &message, bool 
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eChatPersonNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, who, message, emote] { result = chatPersonal(who, message, emote); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eChatPersonNotFound;
@@ -17327,7 +17336,7 @@ int WorldRuntime::chatPing(long id) const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eChatIDNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, id] { result = chatPing(id); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eChatIDNotFound;
@@ -17350,7 +17359,7 @@ int WorldRuntime::chatRequestConnections(long id) const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eChatIDNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, id] { result = chatRequestConnections(id); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eChatIDNotFound;
@@ -17369,7 +17378,7 @@ int WorldRuntime::chatSendFile(long id, const QString &path)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eChatIDNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, id, path] { result = chatSendFile(id, path); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eChatIDNotFound;
@@ -17447,7 +17456,7 @@ int WorldRuntime::chatStopAcceptingCalls()
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eOK;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result] { result = chatStopAcceptingCalls(); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eOK;
 	}
@@ -17469,7 +17478,7 @@ int WorldRuntime::chatStopFileTransfer(long id)
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eChatIDNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, id] { result = chatStopFileTransfer(id); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : eChatIDNotFound;
 	}
@@ -17497,7 +17506,7 @@ QVariant WorldRuntime::chatInfo(long id, int infoType) const
 	if (QThread::currentThread() != thread())
 	{
 		QVariant   result;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this),
 		    [this, &result, id, infoType] { result = chatInfo(id, infoType); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : QVariant();
@@ -17618,7 +17627,7 @@ QList<long> WorldRuntime::chatList() const
 	if (QThread::currentThread() != thread())
 	{
 		QList<long> result;
-		const bool  invoked = QMetaObject::invokeMethod(
+		const bool  invoked = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &result] { result = chatList(); },
             Qt::BlockingQueuedConnection);
 		return invoked ? result : QList<long>{};
@@ -17639,7 +17648,7 @@ QVariant WorldRuntime::chatOption(long id, const QString &optionName) const
 	if (QThread::currentThread() != thread())
 	{
 		QVariant   result;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, id, optionName]
 		    { result = chatOption(id, optionName); }, Qt::BlockingQueuedConnection);
 		return invoked ? result : QVariant();
@@ -17683,7 +17692,7 @@ int WorldRuntime::chatSetOption(long id, const QString &optionName, const QStrin
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = eChatIDNotFound;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    this, [this, &result, id, optionName, value] { result = chatSetOption(id, optionName, value); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : eChatIDNotFound;
@@ -17824,7 +17833,7 @@ QVariant WorldRuntime::pluginInfo(const QString &pluginId, int infoType) const
 	if (QThread::currentThread() != thread())
 	{
 		QVariant   result;
-		const bool resolved = QMetaObject::invokeMethod(
+		const bool resolved = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result, pluginId, infoType]
 		    { result = pluginInfo(pluginId, infoType); }, Qt::BlockingQueuedConnection);
 		return resolved ? result : QVariant();
@@ -17909,7 +17918,7 @@ QStringList WorldRuntime::pluginIdList() const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList ids;
-		const bool  resolved = QMetaObject::invokeMethod(
+		const bool  resolved = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &ids] { ids = pluginIdList(); },
             Qt::BlockingQueuedConnection);
 		return resolved ? ids : QStringList{};
@@ -17931,7 +17940,7 @@ QString WorldRuntime::pluginVariableValue(const QString &pluginId, const QString
 	if (QThread::currentThread() != thread())
 	{
 		QString    value;
-		const bool resolved = QMetaObject::invokeMethod(
+		const bool resolved = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &value, pluginId, name]
 		    { value = pluginVariableValue(pluginId, name); }, Qt::BlockingQueuedConnection);
 		return resolved ? value : QString();
@@ -17950,7 +17959,7 @@ bool WorldRuntime::findPluginVariable(const QString &pluginId, const QString &na
 	{
 		QString    localValue;
 		bool       found    = false;
-		const bool resolved = QMetaObject::invokeMethod(
+		const bool resolved = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &found, &localValue, pluginId, name]
 		    { found = findPluginVariable(pluginId, name, localValue); }, Qt::BlockingQueuedConnection);
 		if (resolved && found)
@@ -17978,7 +17987,7 @@ void WorldRuntime::setPluginVariableValue(const QString &pluginId, const QString
 {
 	if (QThread::currentThread() != thread())
 	{
-		QMetaObject::invokeMethod(
+		qmudInvokeMethod(
 		    this, [this, pluginId, name, value] { setPluginVariableValue(pluginId, name, value); },
 		    Qt::BlockingQueuedConnection);
 		return;
@@ -18005,7 +18014,7 @@ QStringList WorldRuntime::pluginVariableList(const QString &pluginId) const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList names;
-		const bool  resolved = QMetaObject::invokeMethod(
+		const bool  resolved = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this),
             [this, &names, pluginId] { names = pluginVariableList(pluginId); }, Qt::BlockingQueuedConnection);
 		return resolved ? names : QStringList{};
@@ -18024,7 +18033,7 @@ QStringList WorldRuntime::pluginTriggerList(const QString &pluginId) const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList names;
-		const bool  resolved = QMetaObject::invokeMethod(
+		const bool  resolved = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this),
             [this, &names, pluginId] { names = pluginTriggerList(pluginId); }, Qt::BlockingQueuedConnection);
 		return resolved ? names : QStringList{};
@@ -18049,7 +18058,7 @@ QStringList WorldRuntime::pluginAliasList(const QString &pluginId) const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList names;
-		const bool  resolved = QMetaObject::invokeMethod(
+		const bool  resolved = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &names, pluginId] { names = pluginAliasList(pluginId); },
             Qt::BlockingQueuedConnection);
 		return resolved ? names : QStringList{};
@@ -18074,7 +18083,7 @@ QStringList WorldRuntime::pluginTimerList(const QString &pluginId) const
 	if (QThread::currentThread() != thread())
 	{
 		QStringList names;
-		const bool  resolved = QMetaObject::invokeMethod(
+		const bool  resolved = qmudInvokeMethod(
             const_cast<WorldRuntime *>(this), [this, &names, pluginId] { names = pluginTimerList(pluginId); },
             Qt::BlockingQueuedConnection);
 		return resolved ? names : QStringList{};
@@ -18219,7 +18228,7 @@ bool WorldRuntime::pluginTriggerWildcard(const QString &pluginId, const QString 
 	{
 		QString    resolvedValue;
 		bool       found    = false;
-		const bool resolved = QMetaObject::invokeMethod(
+		const bool resolved = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this),
 		    [this, &found, &resolvedValue, pluginId, triggerName, wildcardName]
 		    { found = pluginTriggerWildcard(pluginId, triggerName, wildcardName, resolvedValue); },
@@ -18249,7 +18258,7 @@ bool WorldRuntime::pluginAliasWildcard(const QString &pluginId, const QString &a
 	{
 		QString    resolvedValue;
 		bool       found    = false;
-		const bool resolved = QMetaObject::invokeMethod(
+		const bool resolved = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this),
 		    [this, &found, &resolvedValue, pluginId, aliasName, wildcardName]
 		    { found = pluginAliasWildcard(pluginId, aliasName, wildcardName, resolvedValue); },
@@ -18294,7 +18303,7 @@ int WorldRuntime::savePluginState(const QString &pluginId, bool scripted, QStrin
 	{
 		int        result = ePluginCouldNotSaveState;
 		QString    localError;
-		const bool resolved = QMetaObject::invokeMethod(
+		const bool resolved = qmudInvokeMethod(
 		    this,
 		    [this, &result, &localError, pluginId, scripted, needsError = (error != nullptr)]
 		    {
@@ -18648,7 +18657,7 @@ int WorldRuntime::luaContextLinesInBufferCount() const
 	if (QThread::currentThread() != thread())
 	{
 		int        result  = 0;
-		const bool invoked = QMetaObject::invokeMethod(
+		const bool invoked = qmudInvokeMethod(
 		    const_cast<WorldRuntime *>(this), [this, &result] { result = luaContextLinesInBufferCount(); },
 		    Qt::BlockingQueuedConnection);
 		return invoked ? result : 0;
@@ -21758,7 +21767,7 @@ int WorldRuntime::windowOutputActivate(const QString &name, const QString &hotsp
 	const QString action     = hotspot.outputAction;
 	if (deferDispatch)
 	{
-		QMetaObject::invokeMethod(
+		qmudInvokeMethod(
 		    this, [this, actionType, action] { emit miniWindowOutputActionActivated(actionType, action); },
 		    Qt::QueuedConnection);
 	}

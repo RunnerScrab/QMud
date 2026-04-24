@@ -436,6 +436,15 @@ qmud_add_qtest(tst_ReloadIntegration
         TIMEOUT
         20)
 
+qmud_add_qtest(tst_LuaBridgeDispatcherIntegration
+        SOURCES
+        integration/tst_LuaBridgeDispatcherIntegration.cpp
+        "${CMAKE_SOURCE_DIR}/src/helpers/LuaExecutionUtils.cpp"
+        LABELS
+        integration
+        TIMEOUT
+        90)
+
 qmud_add_qtest(tst_WorldSocket_KeepAlive
         SOURCES
         integration/tst_WorldSocket_KeepAlive.cpp
