@@ -66,7 +66,7 @@
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QStyleOptionGroupBox>
-// ReSharper disable once CppUnusedIncludeDirective
+// ReSharper disable  once CppUnusedIncludeDirective
 #include <QStyleOptionSpinBox>
 #include <QTableWidget>
 #include <QTemporaryFile>
@@ -827,7 +827,7 @@ class LuaFilterRunner
 			QMudLuaSupport::applyLua51Compat(m_state.get());
 			qmudLogLua51CompatState(m_state.get(), "WorldPreferencesDialog filter state");
 			if (luaL_loadstring(m_state.get(), script.toUtf8().constData()) != 0 ||
-			    lua_pcall(m_state.get(), 0, 0, 0) != 0)
+			    QMudLuaSupport::callLuaProtected(m_state.get(), 0, 0, 0) != 0)
 			{
 				const char *error = lua_tostring(m_state.get(), -1);
 				showError(QStringLiteral("Filter error: %1")
@@ -862,7 +862,7 @@ class LuaFilterRunner
 				return true;
 			lua_pushstring(m_state.get(), name.toUtf8().constData());
 			pushInfo(m_state.get());
-			if (lua_pcall(m_state.get(), 2, 1, 0) != 0)
+			if (QMudLuaSupport::callLuaProtected(m_state.get(), 2, 1, 0) != 0)
 			{
 				const char *error = lua_tostring(m_state.get(), -1);
 				showError(QStringLiteral("Filter error: %1")

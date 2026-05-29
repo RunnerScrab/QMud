@@ -1488,6 +1488,21 @@ void MainWindow::closeEvent(QCloseEvent *event)
 		}
 	}
 
+	if (app)
+	{
+		QString closeStateError;
+		if (!QMudMainFrameMdiUtils::prepareOpenWorldStateBeforeChildClose(
+		        [app](QString *errorMessage) { return app->saveOpenWorldStateBeforeShutdown(errorMessage); },
+		        &closeStateError))
+		{
+			QMessageBox::warning(
+			    this, QStringLiteral("QMud"),
+			    QStringLiteral("Failed to save open-world state before closing.\n%1").arg(closeStateError));
+			event->ignore();
+			return;
+		}
+	}
+
 	// Close child windows first while the frame is still visible, so any world
 	// confirmation dialogs can cancel shutdown reliably.
 	if (m_mdiArea)
@@ -2004,7 +2019,7 @@ void MainWindow::setStatusMessage(const QString &msg) const
 {
 	if (m_hyperlinkStatusLocked)
 		return;
-	if (m_statusMessage)
+	if (m_statusMessage && m_statusMessage->text() != msg)
 		m_statusMessage->setText(msg);
 	m_statusTipOwnsMessage = false;
 	if (m_statusMessageTimer)
@@ -2061,11 +2076,8 @@ void MainWindow::setStatusMessageNow(const QString &msg)
 {
 	if (m_hyperlinkStatusLocked)
 		return;
-	if (m_statusMessage)
-	{
+	if (m_statusMessage && m_statusMessage->text() != msg)
 		m_statusMessage->setText(msg);
-		m_statusMessage->repaint(); // draw now
-	}
 	m_statusTipOwnsMessage = false;
 	if (m_statusMessageTimer)
 		m_statusMessageTimer->stop();
@@ -2308,21 +2320,20 @@ void MainWindow::updateStatusBar()
 			freezeText = isFrozen ? QStringLiteral("Unfreeze") : QStringLiteral("Freeze");
 	}
 
-	if (m_statusMushName)
-		m_statusMushName->setText(mushName);
-	if (m_statusTime)
-		m_statusTime->setText(timeText);
-	if (m_statusLines)
-		m_statusLines->setText(linesText);
-	if (m_statusLog)
-		m_statusLog->setText(logText);
-	if (m_statusCaps)
-		m_statusCaps->setText(m_capsLockOn ? QStringLiteral("CAP") : QString());
+	const auto setPaneTextIfChanged = [](StatusPaneLabel *pane, const QString &text)
+	{
+		if (pane && pane->text() != text)
+			pane->setText(text);
+	};
+
+	setPaneTextIfChanged(m_statusMushName, mushName);
+	setPaneTextIfChanged(m_statusTime, timeText);
+	setPaneTextIfChanged(m_statusLines, linesText);
+	setPaneTextIfChanged(m_statusLog, logText);
+	setPaneTextIfChanged(m_statusCaps, m_capsLockOn ? QStringLiteral("CAP") : QString());
 	if (m_statusFreeze)
 	{
-		m_statusFreeze->setText(freezeText);
-		m_statusFreeze->setStyleSheet(
-		    QStringLiteral("border: 1px solid black; padding-left: 3px; padding-right: 3px;"));
+		setPaneTextIfChanged(m_statusFreeze, freezeText);
 	}
 }
 
@@ -2479,8 +2490,8 @@ void MainWindow::refreshActionState()
 		{
 			const QString enabled   = runtime->worldAttributes().value(QStringLiteral("enable_auto_say"));
 			const bool    isEnabled = enabled == QStringLiteral("1") ||
-			                       enabled.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
-			                       enabled.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
+			                          enabled.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
+			                          enabled.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
 			autoSayAction->setCheckable(true);
 			autoSayAction->setChecked(isEnabled);
 		}
@@ -2627,6 +2638,19 @@ QVector<WorldWindowDescriptor> MainWindow::worldWindowDescriptors() const
 	return entries;
 }
 
+QList<TextChildWindow *> MainWindow::notepadWindows() const
+{
+	QList<TextChildWindow *> entries;
+	if (!m_mdiArea)
+		return entries;
+
+	for (QMdiSubWindow *sub : m_mdiArea->subWindowList(QMdiArea::CreationOrder))
+		if (auto *text = qobject_cast<TextChildWindow *>(sub); text)
+			entries.push_back(text);
+
+	return entries;
+}
+
 void MainWindow::infoBarClear() const
 {
 	if (!m_infoText)
@@ -2690,7 +2714,7 @@ bool                 MainWindow::switchToNotepad()
 	WorldRuntime    *owner      = resolveRelatedRuntime(this, nullptr);
 	const qulonglong ownerToken = runtimeOwnerToken(owner);
 	const QString    ownerWorldId =
-        owner ? owner->worldAttributes().value(QStringLiteral("id")).trimmed() : QString();
+	    owner ? owner->worldAttributes().value(QStringLiteral("id")).trimmed() : QString();
 
 	QList<TextChildWindow *> notepads;
 	for (QMdiSubWindow *sub : m_mdiArea->subWindowList(QMdiArea::CreationOrder))
@@ -2757,7 +2781,7 @@ bool MainWindow::activateNotepad(const QString &title, WorldRuntime *relatedRunt
 	WorldRuntime    *owner      = resolveRelatedRuntime(this, relatedRuntime);
 	const qulonglong ownerToken = runtimeOwnerToken(owner);
 	const QString    ownerWorldId =
-        owner ? owner->worldAttributes().value(QStringLiteral("id")).trimmed() : QString();
+	    owner ? owner->worldAttributes().value(QStringLiteral("id")).trimmed() : QString();
 	for (QMdiSubWindow *sub : m_mdiArea->subWindowList(QMdiArea::CreationOrder))
 	{
 		auto *text = qobject_cast<TextChildWindow *>(sub);
@@ -2833,7 +2857,7 @@ bool MainWindow::appendToNotepad(const QString &title, const QString &text, cons
 	WorldRuntime    *owner      = resolveRelatedRuntime(this, relatedRuntime);
 	const qulonglong ownerToken = runtimeOwnerToken(owner);
 	const QString    ownerWorldId =
-        owner ? owner->worldAttributes().value(QStringLiteral("id")).trimmed() : QString();
+	    owner ? owner->worldAttributes().value(QStringLiteral("id")).trimmed() : QString();
 	TextChildWindow *target       = nullptr;
 	TextChildWindow *unnamedMatch = nullptr;
 	for (QMdiSubWindow *sub : m_mdiArea->subWindowList(QMdiArea::CreationOrder))
@@ -3150,10 +3174,10 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 	if (!keyEvent)
 		return QMainWindow::eventFilter(watched, event);
 	const Qt::KeyboardModifiers mods = keyEvent->modifiers();
-	const bool hasOnlyAlt = mods.testFlag(Qt::AltModifier) && !mods.testFlag(Qt::ControlModifier) &&
-	                        !mods.testFlag(Qt::ShiftModifier) && !mods.testFlag(Qt::MetaModifier);
-	const bool hasOnlyCtrl = mods.testFlag(Qt::ControlModifier) && !mods.testFlag(Qt::AltModifier) &&
-	                         !mods.testFlag(Qt::ShiftModifier) && !mods.testFlag(Qt::MetaModifier);
+	const bool hasOnlyAlt   = mods.testFlag(Qt::AltModifier) && !mods.testFlag(Qt::ControlModifier) &&
+	                          !mods.testFlag(Qt::ShiftModifier) && !mods.testFlag(Qt::MetaModifier);
+	const bool hasOnlyCtrl  = mods.testFlag(Qt::ControlModifier) && !mods.testFlag(Qt::AltModifier) &&
+	                          !mods.testFlag(Qt::ShiftModifier) && !mods.testFlag(Qt::MetaModifier);
 	const bool hasOnlyShift = mods.testFlag(Qt::ShiftModifier) && !mods.testFlag(Qt::ControlModifier) &&
 	                          !mods.testFlag(Qt::AltModifier) && !mods.testFlag(Qt::MetaModifier);
 	const bool altEnter =
@@ -3219,7 +3243,7 @@ void MainWindow::refreshWorldMiniWindows() const
 		if (!world)
 			return;
 		if (WorldView *view = world->view())
-			view->refreshMiniWindows();
+			view->refreshMiniWindows(true);
 	};
 
 	if (auto *activeWorld = qobject_cast<WorldChildWindow *>(m_mdiArea->activeSubWindow());

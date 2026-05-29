@@ -63,6 +63,51 @@ class tst_MainFrameMdiUtils : public QObject
 			    QMudMainFrameMdiUtils::resolveBackgroundAddRestoreTarget(&added, &added, windows, &added),
 			    nullptr);
 		}
+
+		void prepareOpenWorldStateBeforeChildCloseAllowsCloseWithoutController()
+		{
+			QString error = QStringLiteral("stale");
+			QVERIFY(QMudMainFrameMdiUtils::prepareOpenWorldStateBeforeChildClose({}, &error));
+			QVERIFY(error.isEmpty());
+		}
+
+		void prepareOpenWorldStateBeforeChildCloseRunsSaveBeforeAllowingClose()
+		{
+			QString    error   = QStringLiteral("stale");
+			bool       saved   = false;
+			const bool proceed = QMudMainFrameMdiUtils::prepareOpenWorldStateBeforeChildClose(
+			    [&saved](QString *errorMessage)
+			    {
+				    saved = true;
+				    if (errorMessage)
+					    errorMessage->clear();
+				    return true;
+			    },
+			    &error);
+
+			QVERIFY(proceed);
+			QVERIFY(saved);
+			QVERIFY(error.isEmpty());
+		}
+
+		void prepareOpenWorldStateBeforeChildCloseStopsCloseOnSaveFailure()
+		{
+			QString    error;
+			bool       saved   = false;
+			const bool proceed = QMudMainFrameMdiUtils::prepareOpenWorldStateBeforeChildClose(
+			    [&saved](QString *errorMessage)
+			    {
+				    saved = true;
+				    if (errorMessage)
+					    *errorMessage = QStringLiteral("session write failed");
+				    return false;
+			    },
+			    &error);
+
+			QVERIFY(!proceed);
+			QVERIFY(saved);
+			QCOMPARE(error, QStringLiteral("session write failed"));
+		}
 		// NOLINTEND(readability-convert-member-functions-to-static)
 };
 

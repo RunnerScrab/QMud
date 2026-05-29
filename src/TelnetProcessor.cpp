@@ -678,6 +678,11 @@ bool TelnetProcessor::getCustomEntityValue(const QByteArray &name, QByteArray &v
 	return true;
 }
 
+QMap<QByteArray, QByteArray> TelnetProcessor::customEntitySnapshot() const
+{
+	return m_customEntities;
+}
+
 void TelnetProcessor::setCustomEntity(const QByteArray &name, const QByteArray &value)
 {
 	const QByteArray key = name.toLower();
@@ -2579,16 +2584,6 @@ QMap<QByteArray, QByteArray> TelnetProcessor::parseTagArguments(QByteArray input
 	}
 
 	return result;
-}
-
-void TelnetProcessor::emitMxpDiagnostic(const int level, const long messageNumber,
-                                        const QString &message) const
-{
-	if (!m_callbacks.onMxpDiagnostic)
-		return;
-	if (m_callbacks.onMxpDiagnosticNeeded && !m_callbacks.onMxpDiagnosticNeeded(level))
-		return;
-	m_callbacks.onMxpDiagnostic(level, messageNumber, message);
 }
 
 // mxpDefs.cpp - MXP definitions (partial)

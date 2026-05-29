@@ -11,6 +11,7 @@
 
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 #include "LuaHeaders.h"
+#include "LuaSupport.h"
 #endif
 
 // ReSharper disable once CppUnusedIncludeDirective
@@ -30,12 +31,16 @@
 #include <QWaitCondition>
 #include <QtGlobal>
 
+#include <atomic>
+#include <exception>
 #include <memory>
+#include <new>
 
 namespace
 {
-	constexpr qint64 kLuaBridgeReadyTimeoutMs  = 5000;
-	constexpr qint64 kLuaBridgeInvokeTimeoutMs = 30000;
+	constexpr qint64    kLuaBridgeReadyTimeoutMs         = 5000;
+	constexpr qint64    kLuaBridgeInvokeTimeoutDefaultMs = 30000;
+	std::atomic<qint64> g_luaBridgeInvokeTimeoutMs{kLuaBridgeInvokeTimeoutDefaultMs};
 
 	enum class LuaBridgeContextState
 	{
@@ -49,6 +54,8 @@ namespace
 
 	thread_local QString t_luaBridgeLastError;
 	thread_local LuaBridgeInvokeStatus t_luaBridgeLastStatus{LuaBridgeInvokeStatus::Success};
+	thread_local int                   t_luaBridgeRequestExecutionDepth{0};
+	thread_local std::function<bool()> t_luaBridgeWaitWorkPump;
 
 	QString                            threadLabel(const QThread *thread)
 	{
@@ -114,6 +121,79 @@ namespace
 			quint64                                  wakeSerial{0};
 	};
 
+	void completeBridgeRequest(const std::shared_ptr<LuaBridgeRequest> &request, const bool canceled,
+	                           const LuaBridgeInvokeStatus status, const QString &reason)
+	{
+		if (!request)
+			return;
+
+		std::shared_ptr<LuaBridgeThreadContext> waiterContext;
+		{
+			QMutexLocker requestLocker(&request->mutex);
+			if (request->done)
+				return;
+			request->done = true;
+			if (canceled)
+			{
+				request->canceled     = true;
+				request->cancelStatus = status;
+				request->cancelReason = reason;
+			}
+			request->wake.wakeAll();
+			waiterContext = request->waiterContext;
+		}
+		if (waiterContext)
+		{
+			QMutexLocker waiterLocker(&waiterContext->mutex);
+			++waiterContext->wakeSerial;
+			waiterContext->wake.wakeAll();
+		}
+	}
+
+	void executeBridgeRequest(const std::shared_ptr<LuaBridgeRequest> &request)
+	{
+		if (!request)
+			return;
+
+		try
+		{
+			struct BridgeRequestExecutionScope
+			{
+					BridgeRequestExecutionScope()
+					{
+						++t_luaBridgeRequestExecutionDepth;
+					}
+
+					~BridgeRequestExecutionScope()
+					{
+						--t_luaBridgeRequestExecutionDepth;
+					}
+			};
+			const BridgeRequestExecutionScope executionScope;
+			Q_UNUSED(executionScope);
+			if (request->fn)
+				request->fn();
+			completeBridgeRequest(request, false, LuaBridgeInvokeStatus::Success, QString());
+		}
+		catch (const std::bad_alloc &)
+		{
+			completeBridgeRequest(request, true, LuaBridgeInvokeStatus::UnknownFailure,
+			                      QStringLiteral("[QMud][LuaBridge] Invoke callback threw std::bad_alloc"));
+		}
+		catch (const std::exception &ex)
+		{
+			completeBridgeRequest(request, true, LuaBridgeInvokeStatus::UnknownFailure,
+			                      QStringLiteral("[QMud][LuaBridge] Invoke callback threw exception: %1")
+			                          .arg(QString::fromLocal8Bit(ex.what())));
+		}
+		catch (...)
+		{
+			completeBridgeRequest(
+			    request, true, LuaBridgeInvokeStatus::UnknownFailure,
+			    QStringLiteral("[QMud][LuaBridge] Invoke callback threw unknown exception"));
+		}
+	}
+
 	class LuaBridgePumpInvoker final : public QObject
 	{
 		public:
@@ -121,6 +201,8 @@ namespace
 			    : m_context(context)
 			{
 			}
+
+		public:
 			bool event(QEvent *event) override
 			{
 				if (event->type() == luaBridgePumpEventType())
@@ -141,19 +223,7 @@ namespace
 							}
 							if (!request)
 								continue;
-							if (request->fn)
-								request->fn();
-							{
-								QMutexLocker requestLocker(&request->mutex);
-								request->done = true;
-								request->wake.wakeAll();
-							}
-							if (const auto waiterContext = request->waiterContext)
-							{
-								QMutexLocker waiterLocker(&waiterContext->mutex);
-								++waiterContext->wakeSerial;
-								waiterContext->wake.wakeAll();
-							}
+							executeBridgeRequest(request);
 						}
 					}
 					return true;
@@ -165,16 +235,31 @@ namespace
 			std::weak_ptr<LuaBridgeThreadContext> m_context;
 	};
 
-	QMutex                                                    g_luaBridgeContextsMutex;
-	QHash<QThread *, std::shared_ptr<LuaBridgeThreadContext>> g_luaBridgeContexts;
+	QMutex                                                               g_luaBridgeContextsMutex;
+	QHash<QThread *, std::shared_ptr<LuaBridgeThreadContext>>            g_luaBridgeContexts;
+	thread_local QHash<QThread *, std::weak_ptr<LuaBridgeThreadContext>> t_luaBridgeContextCache;
 
-	void                                                      purgeDeadLuaBridgeContextsLocked()
+	void                                                                 pruneLuaBridgeContextCache()
+	{
+		auto it = t_luaBridgeContextCache.begin();
+		while (it != t_luaBridgeContextCache.end())
+		{
+			const std::shared_ptr<LuaBridgeThreadContext> context = it.value().lock();
+			if (!context || context->thread.isNull())
+				it = t_luaBridgeContextCache.erase(it);
+			else
+				++it;
+		}
+	}
+
+	void purgeDeadLuaBridgeContextsLocked()
 	{
 		auto it = g_luaBridgeContexts.begin();
 		while (it != g_luaBridgeContexts.end())
 		{
-			const std::shared_ptr<LuaBridgeThreadContext> &ctx = it.value();
-			if (!ctx || ctx->thread.isNull() || !ctx->thread->isRunning())
+			const std::shared_ptr<LuaBridgeThreadContext> &ctx           = it.value();
+			QThread *const                                 contextThread = ctx ? ctx->thread.data() : nullptr;
+			if (!ctx || !contextThread || (contextThread->isFinished() && !contextThread->isRunning()))
 				it = g_luaBridgeContexts.erase(it);
 			else
 				++it;
@@ -223,8 +308,22 @@ namespace
 	{
 		if (!thread)
 			return nullptr;
-		QMutexLocker locker(&g_luaBridgeContextsMutex);
-		return contextForThreadLocked(thread);
+		if (t_luaBridgeContextCache.size() > 8)
+			pruneLuaBridgeContextCache();
+		if (const auto cachedIt = t_luaBridgeContextCache.find(thread);
+		    cachedIt != t_luaBridgeContextCache.end())
+		{
+			if (const std::shared_ptr<LuaBridgeThreadContext> cached = cachedIt.value().lock();
+			    cached && cached->thread.data() == thread)
+			{
+				return cached;
+			}
+			t_luaBridgeContextCache.erase(cachedIt);
+		}
+		QMutexLocker                                  locker(&g_luaBridgeContextsMutex);
+		const std::shared_ptr<LuaBridgeThreadContext> context = contextForThreadLocked(thread);
+		t_luaBridgeContextCache.insert(thread, context);
+		return context;
 	}
 
 	QObject *ensureLuaBridgePumpInvoker(const std::shared_ptr<LuaBridgeThreadContext> &context)
@@ -243,7 +342,7 @@ namespace
 			    QList<std::shared_ptr<LuaBridgeRequest>> pendingRequests;
 			    QObject                                 *invokerToDelete = nullptr;
 			    const QString                            stopReason      = QStringLiteral(
-                    "[QMud][LuaBridge] Invoke failed: target bridge thread stopped before request dispatch");
+			        "[QMud][LuaBridge] Invoke failed: target bridge thread stopped before request dispatch");
 			    if (const auto locked = weakContext.lock())
 			    {
 				    QMutexLocker finishedLocker(&locked->mutex);
@@ -292,71 +391,6 @@ namespace
 		return invoker;
 	}
 
-	QMutex                                              g_luaBridgeWaitGraphMutex;
-	QHash<const QThread *, QHash<const QThread *, int>> g_luaBridgeWaitGraph;
-
-	bool waitGraphEnter(const QThread *waiterThread, const QThread *targetThread)
-	{
-		Q_ASSERT(waiterThread);
-		Q_ASSERT(targetThread);
-		if (waiterThread == targetThread)
-		{
-			return setLuaBridgeError(LuaBridgeInvokeStatus::UnknownFailure,
-			                         QStringLiteral("[QMud][LuaBridge] unexpected self-wait edge %1 -> %2")
-			                             .arg(threadLabel(waiterThread), threadLabel(targetThread)));
-		}
-		QMutexLocker locker(&g_luaBridgeWaitGraphMutex);
-		auto        &targetRefs  = g_luaBridgeWaitGraph[waiterThread];
-		targetRefs[targetThread] = targetRefs.value(targetThread) + 1;
-		return true;
-	}
-
-	void waitGraphLeave(const QThread *waiterThread, const QThread *targetThread)
-	{
-		Q_ASSERT(waiterThread);
-		Q_ASSERT(targetThread);
-		QMutexLocker locker(&g_luaBridgeWaitGraphMutex);
-		auto         waiterIt = g_luaBridgeWaitGraph.find(waiterThread);
-		if (waiterIt == g_luaBridgeWaitGraph.end())
-			return;
-		auto targetIt = waiterIt->find(targetThread);
-		if (targetIt == waiterIt->end())
-			return;
-		if (targetIt.value() <= 1)
-			waiterIt->erase(targetIt);
-		else
-			targetIt.value() -= 1;
-		if (waiterIt->isEmpty())
-			g_luaBridgeWaitGraph.erase(waiterIt);
-	}
-
-	class LuaBridgeWaitGraphGuard
-	{
-		public:
-			explicit LuaBridgeWaitGraphGuard(const QThread *waiterThread) : m_waiterThread(waiterThread)
-			{
-			}
-			~LuaBridgeWaitGraphGuard()
-			{
-				if (m_armed && m_waiterThread && m_targetThread)
-					waitGraphLeave(m_waiterThread, m_targetThread);
-			}
-			[[nodiscard]] bool enter(const QThread *targetThread)
-			{
-				Q_ASSERT(m_waiterThread);
-				Q_ASSERT(targetThread);
-				m_armed = waitGraphEnter(m_waiterThread, targetThread);
-				if (m_armed)
-					m_targetThread = targetThread;
-				return m_armed;
-			}
-
-		private:
-			const QThread *m_waiterThread{nullptr};
-			const QThread *m_targetThread{nullptr};
-			bool           m_armed{false};
-	};
-
 	bool ensureBridgeContextReady(const std::shared_ptr<LuaBridgeThreadContext> &context,
 	                              const QString                                 &operationLabel)
 	{
@@ -381,6 +415,16 @@ namespace
 			    LuaBridgeInvokeStatus::TargetThreadNotRunning,
 			    QStringLiteral("[QMud][LuaBridge] %1 failed for thread %2: target thread is not running")
 			        .arg(operationLabel, threadLabel(targetThread)));
+		}
+		{
+			QMutexLocker          locker(&context->mutex);
+			QString               runnableReason;
+			LuaBridgeInvokeStatus runnableStatus = LuaBridgeInvokeStatus::UnknownFailure;
+			if (context->state == LuaBridgeContextState::Running && context->pumpInvoker &&
+			    targetThreadRunnable(targetThread, runnableReason, runnableStatus))
+			{
+				return true;
+			}
 		}
 
 		QObject *const invoker = ensureLuaBridgePumpInvoker(context);
@@ -478,19 +522,7 @@ namespace
 		if (!request)
 			return false;
 
-		if (request->fn)
-			request->fn();
-		{
-			QMutexLocker requestLocker(&request->mutex);
-			request->done = true;
-			request->wake.wakeAll();
-		}
-		if (const auto waiterContext = request->waiterContext)
-		{
-			QMutexLocker waiterLocker(&waiterContext->mutex);
-			++waiterContext->wakeSerial;
-			waiterContext->wake.wakeAll();
-		}
+		executeBridgeRequest(request);
 		return true;
 	}
 
@@ -582,6 +614,61 @@ bool qmudLuaBridgeEnsureObjectThreadReady(const QObject *target)
 	return ensureBridgeContextReady(context, QStringLiteral("EnsureReady"));
 }
 
+bool qmudLuaBridgePumpCurrentThreadOnce()
+{
+	QThread *const currentThread = QThread::currentThread();
+	if (!currentThread)
+		return false;
+	const std::shared_ptr<LuaBridgeThreadContext> context = contextForThread(currentThread);
+	if (!context)
+		return false;
+	return pumpLuaBridgeRequestForContext(context);
+}
+
+void qmudLuaBridgeSetCurrentThreadWaitWorkPump(std::function<bool()> pump)
+{
+	t_luaBridgeWaitWorkPump = std::move(pump);
+}
+
+void qmudLuaBridgeClearCurrentThreadWaitWorkPump()
+{
+	t_luaBridgeWaitWorkPump = {};
+}
+
+bool qmudLuaBridgeWaitForCurrentThreadWake(const int timeoutMs)
+{
+	QThread *const currentThread = QThread::currentThread();
+	if (!currentThread)
+		return false;
+	const std::shared_ptr<LuaBridgeThreadContext> context = contextForThread(currentThread);
+	if (!context)
+		return false;
+
+	const unsigned long waitMs = static_cast<unsigned long>(qMax(1, timeoutMs));
+	QMutexLocker        locker(&context->mutex);
+	const quint64       wakeSerial = context->wakeSerial;
+	context->wake.wait(&context->mutex, waitMs);
+	return context->wakeSerial != wakeSerial;
+}
+
+void qmudLuaBridgeNotifyThreadWake(QThread *thread)
+{
+	if (!thread)
+		return;
+	const std::shared_ptr<LuaBridgeThreadContext> context = contextForThread(thread);
+	if (!context)
+		return;
+
+	QMutexLocker locker(&context->mutex);
+	++context->wakeSerial;
+	context->wake.wakeAll();
+}
+
+bool qmudLuaBridgeIsExecutingRequestOnCurrentThread()
+{
+	return t_luaBridgeRequestExecutionDepth > 0;
+}
+
 bool qmudLuaBridgeInvokeOnObjectThread(const QObject *target, const std::function<void()> &fn)
 {
 	clearLuaBridgeError();
@@ -602,8 +689,29 @@ bool qmudLuaBridgeInvokeOnObjectThread(const QObject *target, const std::functio
 	QThread *const currentThread = QThread::currentThread();
 	if (currentThread == targetThread)
 	{
-		fn();
-		return true;
+		try
+		{
+			fn();
+			return true;
+		}
+		catch (const std::bad_alloc &)
+		{
+			return setLuaBridgeError(
+			    LuaBridgeInvokeStatus::UnknownFailure,
+			    QStringLiteral("[QMud][LuaBridge] Invoke callback threw std::bad_alloc"));
+		}
+		catch (const std::exception &ex)
+		{
+			return setLuaBridgeError(LuaBridgeInvokeStatus::UnknownFailure,
+			                         QStringLiteral("[QMud][LuaBridge] Invoke callback threw exception: %1")
+			                             .arg(QString::fromLocal8Bit(ex.what())));
+		}
+		catch (...)
+		{
+			return setLuaBridgeError(
+			    LuaBridgeInvokeStatus::UnknownFailure,
+			    QStringLiteral("[QMud][LuaBridge] Invoke callback threw unknown exception"));
+		}
 	}
 
 	const std::shared_ptr<LuaBridgeThreadContext> targetContext = contextForThread(targetThread);
@@ -617,10 +725,6 @@ bool qmudLuaBridgeInvokeOnObjectThread(const QObject *target, const std::functio
 		    QStringLiteral("[QMud][LuaBridge] Invoke failed for edge %1 -> %2: missing caller bridge context")
 		        .arg(threadLabel(currentThread), threadLabel(targetThread)));
 	}
-
-	LuaBridgeWaitGraphGuard waitGraphGuard(currentThread);
-	if (!waitGraphGuard.enter(targetThread))
-		return false;
 
 	const QPointer<const QObject>           targetGuard(target);
 	const std::shared_ptr<LuaBridgeRequest> request = std::make_shared<LuaBridgeRequest>();
@@ -644,29 +748,76 @@ bool qmudLuaBridgeInvokeOnObjectThread(const QObject *target, const std::functio
 		        .arg(threadLabel(currentThread), threadLabel(targetThread)));
 	}
 
-	QDeadlineTimer deadline(kLuaBridgeInvokeTimeoutMs);
+	const qint64 invokeTimeoutMs =
+	    qMax<qint64>(1, g_luaBridgeInvokeTimeoutMs.load(std::memory_order_relaxed));
+	QDeadlineTimer deadline(invokeTimeoutMs);
+	auto isRequestCompleted = [&](bool &canceled, LuaBridgeInvokeStatus &status, QString &reason) -> bool
+	{
+		QMutexLocker requestLocker(&request->mutex);
+		if (!request->done)
+			return false;
+		canceled = request->canceled;
+		status   = request->cancelStatus;
+		reason   = request->cancelReason;
+		return true;
+	};
+	auto completeStatusOrSuccess = [&](const bool canceled, const LuaBridgeInvokeStatus status,
+	                                   const QString &reason) -> bool
+	{
+		if (!canceled)
+			return true;
+		const QString fallbackReason =
+		    QStringLiteral("[QMud][LuaBridge] Invoke failed for edge %1 -> %2: request canceled")
+		        .arg(threadLabel(currentThread), threadLabel(targetThread));
+		return setLuaBridgeError(status, reason.isEmpty() ? fallbackReason : reason);
+	};
+	const QString targetThreadStoppedReason =
+	    QStringLiteral("[QMud][LuaBridge] Invoke failed for edge %1 -> %2: target thread stopped while "
+	                   "request was executing")
+	        .arg(threadLabel(currentThread), threadLabel(targetThread));
+	bool                  requestCanceled = false;
+	LuaBridgeInvokeStatus cancelStatus    = LuaBridgeInvokeStatus::Success;
+	QString               cancelReason;
 	for (;;)
 	{
+		if (isRequestCompleted(requestCanceled, cancelStatus, cancelReason))
+			return completeStatusOrSuccess(requestCanceled, cancelStatus, cancelReason);
+		if (!targetThread->isRunning())
+			return setLuaBridgeError(LuaBridgeInvokeStatus::RequestCanceledTargetThreadStopped,
+			                         targetThreadStoppedReason);
 		if (pumpLuaBridgeRequestForContext(currentContext))
 			continue;
-
+		if (t_luaBridgeWaitWorkPump)
 		{
-			QMutexLocker requestLocker(&request->mutex);
-			if (request->done)
+			bool pumpedWaitWork = false;
+			try
 			{
-				if (request->canceled)
-				{
-					const QString reason =
-					    request->cancelReason.isEmpty()
-					        ? QStringLiteral(
-					              "[QMud][LuaBridge] Invoke failed for edge %1 -> %2: request canceled")
-					              .arg(threadLabel(currentThread), threadLabel(targetThread))
-					        : request->cancelReason;
-					return setLuaBridgeError(request->cancelStatus, reason);
-				}
-				return true;
+				pumpedWaitWork = t_luaBridgeWaitWorkPump();
 			}
+			catch (const std::bad_alloc &)
+			{
+				qWarning().noquote() << QStringLiteral(
+				    "[QMud][LuaBridge] wait-work pump threw std::bad_alloc");
+				t_luaBridgeWaitWorkPump = {};
+			}
+			catch (const std::exception &ex)
+			{
+				qWarning().noquote() << QStringLiteral("[QMud][LuaBridge] wait-work pump threw exception: %1")
+				                            .arg(QString::fromLocal8Bit(ex.what()));
+				t_luaBridgeWaitWorkPump = {};
+			}
+			catch (...)
+			{
+				qWarning().noquote() << QStringLiteral(
+				    "[QMud][LuaBridge] wait-work pump threw unknown exception");
+				t_luaBridgeWaitWorkPump = {};
+			}
+			if (pumpedWaitWork)
+				continue;
 		}
+
+		if (isRequestCompleted(requestCanceled, cancelStatus, cancelReason))
+			return completeStatusOrSuccess(requestCanceled, cancelStatus, cancelReason);
 		if (deadline.hasExpired())
 			break;
 
@@ -675,26 +826,11 @@ bool qmudLuaBridgeInvokeOnObjectThread(const QObject *target, const std::functio
 			QMutexLocker waiterLocker(&currentContext->mutex);
 			wakeSerial = currentContext->wakeSerial;
 		}
-		{
-			QMutexLocker requestLocker(&request->mutex);
-			if (request->done)
-			{
-				if (request->canceled)
-				{
-					const QString reason =
-					    request->cancelReason.isEmpty()
-					        ? QStringLiteral(
-					              "[QMud][LuaBridge] Invoke failed for edge %1 -> %2: request canceled")
-					              .arg(threadLabel(currentThread), threadLabel(targetThread))
-					        : request->cancelReason;
-					return setLuaBridgeError(request->cancelStatus, reason);
-				}
-				return true;
-			}
-		}
+		if (isRequestCompleted(requestCanceled, cancelStatus, cancelReason))
+			return completeStatusOrSuccess(requestCanceled, cancelStatus, cancelReason);
 		{
 			QMutexLocker waiterLocker(&currentContext->mutex);
-			const qint64 waitMs = qMax<qint64>(1, deadline.remainingTime());
+			const qint64 waitMs = qMax<qint64>(1, qMin<qint64>(deadline.remainingTime(), 10));
 			if (currentContext->wakeSerial == wakeSerial)
 				currentContext->wake.wait(&currentContext->mutex, static_cast<unsigned long>(waitMs));
 		}
@@ -728,29 +864,84 @@ bool qmudLuaBridgeInvokeOnObjectThread(const QObject *target, const std::functio
 		return setLuaBridgeError(request->cancelStatus, reason);
 	}
 
+	if (isRequestCompleted(requestCanceled, cancelStatus, cancelReason))
+		return completeStatusOrSuccess(requestCanceled, cancelStatus, cancelReason);
+
+	// Preserve legacy blocking correctness: once dispatch has started, keep waiting
+	// cooperatively instead of failing with an in-flight timeout.
+	qWarning().noquote() << QStringLiteral(
+	                            "[QMud][LuaBridge] Invoke exceeded %1 ms while request was already executing "
+	                            "for edge %2 -> %3; waiting for completion")
+	                            .arg(invokeTimeoutMs)
+	                            .arg(threadLabel(currentThread), threadLabel(targetThread));
+
+	for (;;)
 	{
-		QMutexLocker requestLocker(&request->mutex);
-		if (request->done)
+		if (isRequestCompleted(requestCanceled, cancelStatus, cancelReason))
+			return completeStatusOrSuccess(requestCanceled, cancelStatus, cancelReason);
+		if (!targetThread->isRunning())
+			return setLuaBridgeError(LuaBridgeInvokeStatus::RequestCanceledTargetThreadStopped,
+			                         targetThreadStoppedReason);
+		if (pumpLuaBridgeRequestForContext(currentContext))
+			continue;
+		if (t_luaBridgeWaitWorkPump)
 		{
-			if (request->canceled)
+			bool pumpedWaitWork = false;
+			try
 			{
-				const QString reason =
-				    request->cancelReason.isEmpty()
-				        ? QStringLiteral(
-				              "[QMud][LuaBridge] Invoke failed for edge %1 -> %2: request canceled")
-				              .arg(threadLabel(currentThread), threadLabel(targetThread))
-				        : request->cancelReason;
-				return setLuaBridgeError(request->cancelStatus, reason);
+				pumpedWaitWork = t_luaBridgeWaitWorkPump();
 			}
-			return true;
+			catch (const std::bad_alloc &)
+			{
+				qWarning().noquote() << QStringLiteral(
+				    "[QMud][LuaBridge] wait-work pump threw std::bad_alloc");
+				t_luaBridgeWaitWorkPump = {};
+			}
+			catch (const std::exception &ex)
+			{
+				qWarning().noquote() << QStringLiteral("[QMud][LuaBridge] wait-work pump threw exception: %1")
+				                            .arg(QString::fromLocal8Bit(ex.what()));
+				t_luaBridgeWaitWorkPump = {};
+			}
+			catch (...)
+			{
+				qWarning().noquote() << QStringLiteral(
+				    "[QMud][LuaBridge] wait-work pump threw unknown exception");
+				t_luaBridgeWaitWorkPump = {};
+			}
+			if (pumpedWaitWork)
+				continue;
+		}
+
+		if (isRequestCompleted(requestCanceled, cancelStatus, cancelReason))
+			return completeStatusOrSuccess(requestCanceled, cancelStatus, cancelReason);
+
+		quint64 wakeSerial = 0;
+		{
+			QMutexLocker waiterLocker(&currentContext->mutex);
+			wakeSerial = currentContext->wakeSerial;
+		}
+		if (isRequestCompleted(requestCanceled, cancelStatus, cancelReason))
+			return completeStatusOrSuccess(requestCanceled, cancelStatus, cancelReason);
+
+		{
+			QMutexLocker waiterLocker(&currentContext->mutex);
+			if (currentContext->wakeSerial == wakeSerial)
+				currentContext->wake.wait(&currentContext->mutex, 100UL);
 		}
 	}
+	Q_UNREACHABLE_RETURN(false);
+}
 
-	const QString timeoutMessage = QStringLiteral("[QMud][LuaBridge] Invoke timed out after %1 ms while "
-	                                              "request was already executing for edge %2 -> %3")
-	                                   .arg(kLuaBridgeInvokeTimeoutMs)
-	                                   .arg(threadLabel(currentThread), threadLabel(targetThread));
-	return setLuaBridgeError(LuaBridgeInvokeStatus::TimedOutInFlight, timeoutMessage);
+int qmudLuaBridgeInvokeTimeoutMs()
+{
+	return static_cast<int>(qMax<qint64>(1, g_luaBridgeInvokeTimeoutMs.load(std::memory_order_relaxed)));
+}
+
+void qmudSetLuaBridgeInvokeTimeoutMs(const int timeoutMs)
+{
+	const qint64 clamped = timeoutMs > 0 ? static_cast<qint64>(timeoutMs) : kLuaBridgeInvokeTimeoutDefaultMs;
+	g_luaBridgeInvokeTimeoutMs.store(qMax<qint64>(1, clamped), std::memory_order_relaxed);
 }
 
 QString qmudLuaBridgeLastError()
@@ -761,62 +952,6 @@ QString qmudLuaBridgeLastError()
 LuaBridgeInvokeStatus qmudLuaBridgeLastStatus()
 {
 	return t_luaBridgeLastStatus;
-}
-
-bool qmudIsThreadedLuaExecutorRequested(const QByteArray &envValue)
-{
-	const QByteArray normalized = envValue.trimmed().toLower();
-	return normalized == "threaded" || normalized == "worker";
-}
-
-LuaExecutorBackendMode qmudResolveLuaExecutorBackendMode(const QByteArray &envValue,
-                                                         const bool        threadedBackendAvailable)
-{
-	if (threadedBackendAvailable && qmudIsThreadedLuaExecutorRequested(envValue))
-		return LuaExecutorBackendMode::Threaded;
-	return LuaExecutorBackendMode::Direct;
-}
-
-LuaExecutorBridgePolicy qmudLuaExecutorBridgePolicy(const LuaExecutorOperation operation)
-{
-	switch (operation)
-	{
-	case LuaExecutorOperation::SetWorldRuntime:
-	case LuaExecutorOperation::SetPluginInfo:
-	case LuaExecutorOperation::SetScriptText:
-	case LuaExecutorOperation::ResetState:
-	case LuaExecutorOperation::TeardownEngine:
-	case LuaExecutorOperation::ApplyPackageRestrictions:
-	case LuaExecutorOperation::SetObservedPluginCallbacks:
-	case LuaExecutorOperation::HasObservedPluginCallback:
-	case LuaExecutorOperation::SetCallbackCatalogObserver:
-	case LuaExecutorOperation::LoadScript:
-	case LuaExecutorOperation::HasFunction:
-	case LuaExecutorOperation::RefreshLuaCallbackCatalogNow:
-	case LuaExecutorOperation::LuaState:
-		return LuaExecutorBridgePolicy::WorkerLocal;
-
-	case LuaExecutorOperation::CallFunctionNoArgs:
-	case LuaExecutorOperation::CallFunctionWithString:
-	case LuaExecutorOperation::CallFunctionWithBytes:
-	case LuaExecutorOperation::CallFunctionWithBytesInOut:
-	case LuaExecutorOperation::CallFunctionWithStringInOut:
-	case LuaExecutorOperation::CallFunctionWithNumberAndString:
-	case LuaExecutorOperation::CallFunctionWithTwoNumbersAndString:
-	case LuaExecutorOperation::CallFunctionWithNumberAndBytes:
-	case LuaExecutorOperation::CallFunctionWithNumberAndUtf8Strings:
-	case LuaExecutorOperation::CallProcedureWithString:
-	case LuaExecutorOperation::CallMxpError:
-	case LuaExecutorOperation::CallMxpStartUp:
-	case LuaExecutorOperation::CallMxpShutDown:
-	case LuaExecutorOperation::CallMxpStartTag:
-	case LuaExecutorOperation::CallMxpEndTag:
-	case LuaExecutorOperation::CallMxpSetVariable:
-	case LuaExecutorOperation::CallFunctionWithStringsAndWildcards:
-	case LuaExecutorOperation::ExecuteScript:
-		return LuaExecutorBridgePolicy::UiSync;
-	}
-	Q_UNREACHABLE_RETURN(LuaExecutorBridgePolicy::UiSync);
 }
 
 CallPluginLuaMarshallingResult qmudCallPluginLuaWithMarshalling(lua_State     *callerState,
@@ -842,7 +977,7 @@ CallPluginLuaMarshallingResult qmudCallPluginLuaWithMarshalling(lua_State     *c
 		}
 
 		lua_insert(targetState, firstArg);
-		if (lua_pcall(targetState, argCount, LUA_MULTRET, 0) != 0)
+		if (QMudLuaSupport::callLuaProtected(targetState, argCount, LUA_MULTRET, 0) != 0)
 		{
 			const char *err     = lua_tostring(targetState, -1);
 			result.error        = CallPluginLuaMarshallingError::RuntimeError;
@@ -894,7 +1029,7 @@ CallPluginLuaMarshallingResult qmudCallPluginLuaWithMarshalling(lua_State     *c
 		}
 	}
 
-	if (lua_pcall(targetState, argCount, LUA_MULTRET, 0) != 0)
+	if (QMudLuaSupport::callLuaProtected(targetState, argCount, LUA_MULTRET, 0) != 0)
 	{
 		const char *err     = lua_tostring(targetState, -1);
 		result.error        = CallPluginLuaMarshallingError::RuntimeError;

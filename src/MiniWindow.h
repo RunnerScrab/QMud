@@ -53,6 +53,8 @@ struct MiniWindowFont
 {
 		QFont        font;
 		QFontMetrics metrics{QFont()};
+		int          charset{1};
+		int          pitchAndFamily{0};
 };
 
 /**
@@ -64,6 +66,10 @@ struct MiniWindowImage
 		QString source;
 		bool    hasAlpha{false};
 		bool    monochrome{false};
+		int     bitmapType{0};
+		int     bitmapWidthBytes{0};
+		int     bitmapPlanes{1};
+		int     bitmapBitsPixel{0};
 };
 
 /**
@@ -102,6 +108,24 @@ struct MiniWindow
 		QMap<QString, MiniWindowHotspot> hotspots;
 		QSet<QString>                    outputGeneratedHotspots;
 		quint64                          outputHotspotSerial{0};
+
+		/**
+		 * @brief Returns a copy with independent image backing stores.
+		 *
+		 * Miniwindow callback snapshots can be painted on the Lua executor thread, so image data must not
+		 * share implicit Qt backing storage with the runtime-side miniwindow.
+		 *
+		 * @return Miniwindow copy with detached surface/cache/image resources.
+		 */
+		[[nodiscard]] MiniWindow         detachedImageCopy() const
+		{
+			MiniWindow copy              = *this;
+			copy.surface                 = surface.copy();
+			copy.transparentSurfaceCache = transparentSurfaceCache.copy();
+			for (MiniWindowImage &image : copy.images)
+				image.image = image.image.copy();
+			return copy;
+		}
 
 		/**
 		 * @brief Initializes miniwindow geometry, flags, and backing surface.

@@ -40,6 +40,8 @@
 //   bc.version
 
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -56,12 +58,58 @@
 	       "based on GNU bc-1.06"
 #define MYTYPE MYNAME " bignumber"
 
-static int        DIGITS = 0;
-static lua_State *LL     = NULL;
+#ifndef QMUD_BC_THREAD_LOCAL
+#if defined(_MSC_VER)
+#define QMUD_BC_THREAD_LOCAL __declspec(thread)
+#else
+#define QMUD_BC_THREAD_LOCAL __thread
+#endif
+#endif
 
-void              bc_error(const char *mesg)
+static QMUD_BC_THREAD_LOCAL lua_State *g_bcCurrentLuaState   = nullptr;
+static constexpr char                  g_bcDigitsRegistryKey = 0;
+
+static int                             bcDigits(lua_State *L)
 {
-	luaL_error(LL, "(bc) %s", mesg ? mesg : "not enough memory");
+	int digits = 0;
+	lua_pushlightuserdata(L, (void *)&g_bcDigitsRegistryKey);
+	lua_gettable(L, LUA_REGISTRYINDEX);
+	if (lua_isnumber(L, -1))
+		digits = (int)lua_tointeger(L, -1);
+	lua_pop(L, 1);
+	return digits;
+}
+
+static void bcSetDigits(lua_State *L, int digits)
+{
+	lua_pushlightuserdata(L, (void *)&g_bcDigitsRegistryKey);
+	lua_pushinteger(L, digits);
+	lua_settable(L, LUA_REGISTRYINDEX);
+}
+
+static int bcParseExponentOrZero(const char *text)
+{
+	if (text == nullptr || *text == '\0')
+		return 0;
+
+	errno            = 0;
+	char      *end   = nullptr;
+	const long value = strtol(text, &end, 10);
+	if (end == text || (end != nullptr && *end != '\0'))
+		return 0;
+	if ((errno == ERANGE && value == LONG_MAX) || value > INT_MAX)
+		return INT_MAX;
+	if ((errno == ERANGE && value == LONG_MIN) || value < INT_MIN)
+		return INT_MIN;
+	return (int)value;
+}
+
+void bc_error(const char *mesg)
+{
+	lua_State *L = g_bcCurrentLuaState;
+	if (L == nullptr)
+		abort();
+	luaL_error(L, "(bc) %s", mesg ? mesg : "not enough memory");
 }
 
 static void Bnew(lua_State *L, bc_num x)
@@ -73,33 +121,41 @@ static void Bnew(lua_State *L, bc_num x)
 
 static bc_num Bget(lua_State *L, int i)
 {
-	LL = L;
+	g_bcCurrentLuaState = L;
+	const int digits    = bcDigits(L);
 	switch (lua_type(L, i))
 	{
 	case LUA_TNUMBER:
 	case LUA_TSTRING:
 	{
-		bc_num      x = NULL;
-		const char *s = lua_tostring(L, i);
+		bc_num      x = nullptr;
+		const char *s = luaL_checkstring(L, i);
 		for (; isspace(*s); s++)
 			; /* bc_str2num chokes on spaces */
-		bc_str2num(&x, (char *)s, DIGITS);
+		bc_str2num(&x, (char *)s, digits);
 		if (bc_is_zero(x)) /* bc_str2num chokes on sci notation */
 		{
-			char *t = strchr(s, 'e');
-			if (t == NULL)
+			const char *t = strchr(s, 'e');
+			if (t == nullptr)
 				t = strchr(s, 'E');
-			if (t != NULL)
+			if (t != nullptr)
 			{
-				bc_num y = NULL, n = NULL;
-				int    c = *t;
-				*t       = 0; /* harmless const violation! */
-				bc_str2num(&x, (char *)s, DIGITS);
-				*t = (char)c;
+				bc_num       y = nullptr, n = nullptr;
+				const size_t mantissaLength = (size_t)(t - s);
+				char        *mantissa       = (char *)malloc(mantissaLength + 1);
+				if (mantissa == nullptr)
+				{
+					bc_out_of_memory();
+					return x;
+				}
+				memcpy(mantissa, s, mantissaLength);
+				mantissa[mantissaLength] = '\0';
+				bc_str2num(&x, mantissa, digits);
+				free(mantissa);
 				bc_int2num(&y, 10);
-				bc_int2num(&n, atoi(t + 1));
-				bc_raise(y, n, &y, DIGITS);
-				bc_multiply(x, y, &x, DIGITS);
+				bc_int2num(&n, bcParseExponentOrZero(t + 1));
+				bc_raise(y, n, &y, digits);
+				bc_multiply(x, y, &x, digits);
 				bc_free_num(&y);
 				bc_free_num(&n);
 			}
@@ -111,23 +167,27 @@ static bc_num Bget(lua_State *L, int i)
 	default:
 		return *((void **)luaL_checkudata(L, i, MYTYPE));
 	}
-	// return NULL;
+	// return nullptr;
 }
 
 static int Bdo1(lua_State *L, void (*f)(bc_num a, bc_num b, bc_num *c, int n))
 {
-	bc_num a = Bget(L, 1);
-	bc_num b = Bget(L, 2);
-	bc_num c = NULL;
-	f(a, b, &c, DIGITS);
+	const int digits = bcDigits(L);
+	bc_num    a      = Bget(L, 1);
+	bc_num    b      = Bget(L, 2);
+	bc_num    c      = nullptr;
+	f(a, b, &c, digits);
+	if (c == nullptr)
+		return luaL_error(L, "(bc) operation failed to produce a numeric result");
 	Bnew(L, c);
 	return 1;
 }
 
 static int Bdigits(lua_State *L) /** digits([n]) */
 {
-	lua_pushinteger(L, DIGITS);
-	DIGITS = (int)luaL_optinteger(L, 1, DIGITS);
+	const int digits = bcDigits(L);
+	lua_pushinteger(L, digits);
+	bcSetDigits(L, (int)luaL_optinteger(L, 1, digits));
 	return 1;
 }
 
@@ -225,10 +285,11 @@ static int Bpow(lua_State *L) /** pow(x,y) */
 
 static int Bdiv(lua_State *L) /** div(x,y) */
 {
-	bc_num a = Bget(L, 1);
-	bc_num b = Bget(L, 2);
-	bc_num c = NULL;
-	if (bc_divide(a, b, &c, DIGITS) != 0)
+	const int digits = bcDigits(L);
+	bc_num    a      = Bget(L, 1);
+	bc_num    b      = Bget(L, 2);
+	bc_num    c      = nullptr;
+	if (bc_divide(a, b, &c, digits) != 0)
 		return 0;
 	Bnew(L, c);
 	return 1;
@@ -238,7 +299,7 @@ static int Bmod(lua_State *L) /** mod(x,y) */
 {
 	bc_num a = Bget(L, 1);
 	bc_num b = Bget(L, 2);
-	bc_num c = NULL;
+	bc_num c = nullptr;
 	if (bc_modulo(a, b, &c, 0) != 0)
 		return 0;
 	Bnew(L, c);
@@ -249,8 +310,8 @@ static int Bdivmod(lua_State *L) /** divmod(x,y) */
 {
 	bc_num a = Bget(L, 1);
 	bc_num b = Bget(L, 2);
-	bc_num q = NULL;
-	bc_num r = NULL;
+	bc_num q = nullptr;
+	bc_num r = nullptr;
 	if (bc_divmod(a, b, &q, &r, 0) != 0)
 		return 0;
 	Bnew(L, q);
@@ -269,10 +330,11 @@ static int Bgc(lua_State *L)
 
 static int Bneg(lua_State *L) /** neg(x) */
 {
-	bc_num a = bc_zero;
-	bc_num b = Bget(L, 1);
-	bc_num c = NULL;
-	bc_sub(a, b, &c, DIGITS);
+	const int digits = bcDigits(L);
+	bc_num    a      = bc_zero;
+	bc_num    b      = Bget(L, 1);
+	bc_num    c      = nullptr;
+	bc_sub(a, b, &c, digits);
 	Bnew(L, c);
 	return 1;
 }
@@ -280,7 +342,7 @@ static int Bneg(lua_State *L) /** neg(x) */
 static int Btrunc(lua_State *L) /** trunc(x,[n]) */
 {
 	bc_num a = Bget(L, 1);
-	bc_num c = NULL;
+	bc_num c = nullptr;
 	bc_divide(a, bc_one, &c, (int)luaL_optinteger(L, 2, 0));
 	Bnew(L, c);
 	return 1;
@@ -291,7 +353,7 @@ static int Bpowmod(lua_State *L) /** powmod(x,y,m) */
 	bc_num a = Bget(L, 1);
 	bc_num k = Bget(L, 2);
 	bc_num m = Bget(L, 3);
-	bc_num c = NULL;
+	bc_num c = nullptr;
 	if (bc_raisemod(a, k, m, &c, 0) != 0)
 		return 0;
 	Bnew(L, c);
@@ -300,11 +362,12 @@ static int Bpowmod(lua_State *L) /** powmod(x,y,m) */
 
 static int Bsqrt(lua_State *L) /** sqrt(x) */
 {
-	bc_num a = Bget(L, 1);
-	bc_num b = bc_zero;
-	bc_num c = NULL;
-	bc_add(a, b, &c, DIGITS); /* bc_sqrt works inplace! */
-	if (bc_sqrt(&c, DIGITS) == 0)
+	const int digits = bcDigits(L);
+	bc_num    a      = Bget(L, 1);
+	bc_num    b      = bc_zero;
+	bc_num    c      = nullptr;
+	bc_add(a, b, &c, digits); /* bc_sqrt works inplace! */
+	if (bc_sqrt(&c, digits) == 0)
 		return 0;
 	Bnew(L, c);
 	return 1;
@@ -340,7 +403,7 @@ static const luaL_Reg R[] = {
     {"tonumber",   Btonumber},
     {"tostring",   Btostring},
     {"trunc",      Btrunc   },
-    {NULL,         NULL     }
+    {nullptr,      nullptr  }
 };
 
 LUALIB_API int luaopen_bc(lua_State *L)

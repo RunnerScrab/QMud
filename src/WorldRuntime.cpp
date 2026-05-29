@@ -17,16 +17,18 @@
 #include "DoubleMetaphone.h"
 #include "EncodingUtils.h"
 #include "ErrorDescriptions.h"
-#include "FontUtils.h"
+#include "GuiSystemUtils.h"
 #include "LogCompressionUtils.h"
 #include "LuaCallbackEngine.h"
 #include "LuaExecutor.h"
 #include "LuaHeaders.h"
 #include "MainFrame.h"
 #include "MainFrameActionUtils.h"
+#include "MainWindowHostResolver.h"
 #include "MiniWindowUtils.h"
 #include "MxpDiagnostics.h"
 #include "NameGeneration.h"
+#include "PluginBroadcastSelectionUtils.h"
 #include "PluginCallbackCatalogUtils.h"
 #include "ReloadUtils.h"
 #include "SqliteCompat.h"
@@ -43,6 +45,7 @@
 #include "WorldSocket.h"
 #include "WorldView.h"
 #include "helpers/LuaExecutionUtils.h"
+#include "helpers/OutputWrapUtils.h"
 #include "scripting/ScriptingErrors.h"
 
 #include <QApplication>
@@ -53,6 +56,7 @@
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QElapsedTimer>
+#include <QEvent>
 #include <QEventLoop>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -63,29 +67,30 @@
 #include <QHash>
 #include <QHostInfo>
 #include <QImageReader>
+#include <QLibrary>
 #include <QLocale>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMetaType>
 #include <QNetworkInterface>
 #include <QPainter>
-#include <QPainterPath>
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QScopeGuard>
-#include <QScreen>
 #include <QStack>
 #include <QStringConverter>
+// ReSharper disable once CppUnusedIncludeDirective
+#include <QStringList>
 #include <QTcpServer>
 #include <QTcpSocket>
-#include <QTextBoundaryFinder>
 #include <QTextStream>
 #include <QThread>
 #include <QThreadPool>
 #include <QTimeZone>
 #include <QTimer>
 #include <QUdpSocket>
+#include <QtSql/QSqlDriver>
 #include <QtSql/QSqlError>
 #include <QtSql/QSqlRecord>
 #if QMUD_ENABLE_SOUND
@@ -103,10 +108,14 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <type_traits>
 #include <utility>
 #include <zlib.h>
 
+Q_DECLARE_OPAQUE_POINTER(sqlite3 *)
+
 static long        colorToLong(const QColor &color);
+static int         colourSeqFromAttributes(const QMap<QString, QString> &attributes);
 static QString     convertToRegularExpression(const QString &text);
 static void        buildCustomColours(const QList<WorldRuntime::Colour> &colours, QVector<QColor> &normalAnsi,
                                       QVector<QColor> &customText, QVector<QColor> &customBack);
@@ -127,6 +136,14 @@ constexpr qint64   kMemoryImageDecodeCacheMaxBytes   = 64LL * 1024LL * 1024LL;
 
 namespace
 {
+	using QMudOutputWrapUtils::FixedColumnWrapConfig;
+	using QMudOutputWrapUtils::localOutputWrapConfig;
+	using QMudOutputWrapUtils::OutputLineSegment;
+	using QMudOutputWrapUtils::splitOutputTextAtLineBreaks;
+	using QMudOutputWrapUtils::trailingLineColumnWidthForWrap;
+	using QMudOutputWrapUtils::wrapPlainLineForColumn;
+	using QMudOutputWrapUtils::wrapStyledLineForColumn;
+
 	bool isAsciiPrintableByte(const unsigned char c)
 	{
 		return c >= 0x20 && c < 0x7F;
@@ -146,7 +163,8 @@ namespace
 	}
 
 	template <typename Func>
-	bool qmudInvokeMethod(QObject *target, Func &&fn, Qt::ConnectionType connectionType)
+	bool qmudInvokeMethod(QObject *target, Func &&fn,
+	                      Qt::ConnectionType connectionType = Qt::BlockingQueuedConnection)
 	{
 		if (!target)
 			return false;
@@ -158,6 +176,200 @@ namespace
 			return true;
 		}
 		return qmudLuaBridgeInvokeOnObjectThread(target, std::forward<Func>(fn));
+	}
+
+	template <typename Fallback, typename Func>
+	auto qmudInvokeMethodOr(QObject *target, const Fallback &fallback, Func &&fn) -> std::decay_t<Fallback>
+	{
+		using Result       = std::decay_t<Fallback>;
+		Result     result  = fallback;
+		const bool invoked = qmudInvokeMethod(target, [&result, fn = std::forward<Func>(fn)]() mutable
+		                                      { result = static_cast<Result>(std::move(fn)()); });
+		return invoked ? result : fallback;
+	}
+
+	QRect validWindowGeometry(const QRect &preferred, const QRect &fallback)
+	{
+		return preferred.isValid() && !preferred.isNull() ? preferred : fallback;
+	}
+
+	QRect screenWindowGeometry(const QWidget *window, const QRect &geometry)
+	{
+		if (!window)
+			return geometry;
+		QRect screenGeometry = geometry;
+		screenGeometry.moveTopLeft(window->mapToGlobal(screenGeometry.topLeft()));
+		return screenGeometry;
+	}
+
+	bool closeNotepadWindowOnMainThread(const QString &title, const bool querySave,
+	                                    const qulonglong ownerToken, const QString &worldId)
+	{
+		QCoreApplication *app = QCoreApplication::instance();
+		if (!app)
+			return false;
+		const QString trimmedTitle = title.trimmed();
+		if (trimmedTitle.isEmpty())
+			return false;
+
+		return qmudInvokeMethodOr(
+		    app, false,
+		    [&trimmedTitle, querySave, ownerToken, worldId]() -> bool
+		    {
+			    AppController const *controller = AppController::instance();
+			    MainWindow          *main       = controller ? controller->mainWindow() : nullptr;
+			    if (!main)
+				    return false;
+
+			    TextChildWindow               *target          = nullptr;
+			    TextChildWindow               *unnamedFallback = nullptr;
+			    const QList<TextChildWindow *> notepads        = main->findChildren<TextChildWindow *>();
+			    for (TextChildWindow *text : notepads)
+			    {
+				    if (!text || text->windowTitle().compare(trimmedTitle, Qt::CaseInsensitive) != 0)
+					    continue;
+
+				    const qulonglong relatedToken = text->property("worldRuntimeToken").toULongLong();
+				    if (relatedToken == ownerToken)
+				    {
+					    target = text;
+					    break;
+				    }
+				    if (relatedToken != 0)
+					    continue;
+
+				    if (worldId.isEmpty())
+				    {
+					    target = text;
+					    break;
+				    }
+				    const QString related = text->property("worldId").toString().trimmed();
+				    if (related.compare(worldId, Qt::CaseInsensitive) == 0)
+				    {
+					    target = text;
+					    break;
+				    }
+				    if (related.isEmpty() && !unnamedFallback)
+					    unnamedFallback = text;
+			    }
+			    if (!target)
+				    target = unnamedFallback;
+
+			    if (!target)
+				    return false;
+
+			    const QPointer<TextChildWindow> guard(target);
+			    target->setQuerySaveOnClose(querySave);
+			    target->close();
+			    return guard.isNull() || !guard->isVisible();
+		    });
+	}
+
+	void captureMainWindowSnapshotForLuaDispatch(LuaCallbackMiniWindowSnapshot &snapshot,
+	                                             const WorldRuntime            *ownerRuntime)
+	{
+		auto *app = QCoreApplication::instance();
+		if (!app)
+			return;
+
+		const bool collected = qmudInvokeMethod(
+		    app,
+		    [&snapshot, ownerRuntime]
+		    {
+			    snapshot.hasUiSnapshot = true;
+			    MainWindowHost *host =
+			        ownerRuntime ? resolveMainWindowHostForRuntime(const_cast<WorldRuntime *>(ownerRuntime))
+			                     : resolveMainWindowHost(nullptr);
+			    auto *frame = dynamic_cast<MainWindow *>(host);
+			    if (!frame)
+				    return;
+			    snapshot.framePointer    = frame;
+			    snapshot.hasFramePointer = true;
+
+			    snapshot.mainWindowPositionsByMode.insert(
+			        0, validWindowGeometry(frame->normalGeometry(), frame->geometry()));
+			    snapshot.mainWindowPositionsByMode.insert(
+			        1, validWindowGeometry(frame->frameGeometry(), frame->geometry()));
+
+			    QHash<WorldRuntime *, int> worldOrdinals;
+			    for (const WorldWindowDescriptor &entry : frame->worldWindowDescriptors())
+			    {
+				    if (!entry.runtime)
+					    continue;
+
+				    LuaCallbackWorldRuntimeSnapshot world;
+				    world.runtime = entry.runtime;
+				    snapshot.worldRuntimeSnapshot.push_back(world);
+
+				    if (!entry.window)
+					    continue;
+				    const int                              ordinal = ++worldOrdinals[entry.runtime];
+				    LuaCallbackWorldWindowPositionSnapshot position;
+				    position.runtime = entry.runtime;
+				    position.ordinal = ordinal;
+				    position.normalGeometry =
+				        validWindowGeometry(entry.window->normalGeometry(), entry.window->geometry());
+				    position.frameGeometry =
+				        validWindowGeometry(entry.window->frameGeometry(), entry.window->geometry());
+				    position.screenNormalGeometry =
+				        screenWindowGeometry(entry.window, position.normalGeometry);
+				    position.screenFrameGeometry = screenWindowGeometry(entry.window, position.frameGeometry);
+				    snapshot.worldWindowPositionSnapshot.push_back(position);
+			    }
+
+			    for (TextChildWindow *text : frame->notepadWindows())
+			    {
+				    if (!text)
+					    continue;
+				    LuaCallbackNotepadSnapshot notepad;
+				    const qulonglong runtimeToken = text->property("worldRuntimeToken").toULongLong();
+				    notepad.runtime =
+				        runtimeToken == 0
+				            ? nullptr
+				            : reinterpret_cast<WorldRuntime *>(static_cast<quintptr>(runtimeToken));
+				    notepad.worldId  = text->property("worldId").toString().trimmed();
+				    notepad.title    = text->windowTitle();
+				    notepad.geometry = validWindowGeometry(text->normalGeometry(), text->geometry());
+				    if (QPlainTextEdit *editor = text->editor())
+				    {
+					    notepad.text      = editor->toPlainText();
+					    notepad.hasEditor = true;
+				    }
+				    snapshot.notepadSnapshot.push_back(notepad);
+			    }
+		    });
+		if (!collected)
+			return;
+
+		for (LuaCallbackWorldRuntimeSnapshot &world : snapshot.worldRuntimeSnapshot)
+		{
+			if (!world.runtime)
+				continue;
+			world.id =
+			    qmudInvokeMethodOr(world.runtime, QString(), [&world]
+			                       { return world.runtime->worldAttributeValue(QStringLiteral("id")); });
+			world.name =
+			    qmudInvokeMethodOr(world.runtime, QString(), [&world]
+			                       { return world.runtime->worldAttributeValue(QStringLiteral("name")); });
+		}
+	}
+
+	template <typename Func> bool qmudInvokeMethodTrueOnSuccess(QObject *target, Func &&fn)
+	{
+		bool       result  = false;
+		const bool invoked = qmudInvokeMethod(target, [&result, fn = std::forward<Func>(fn)]() mutable
+		                                      { result = std::move(fn)(); });
+		return invoked && result;
+	}
+
+	template <typename Func> void qmudInvokeMethodChecked(QObject *target, Func &&fn)
+	{
+		(void)qmudInvokeMethod(target, std::forward<Func>(fn));
+	}
+
+	template <typename Func> bool qmudInvokeMethodQueued(QObject *target, Func &&fn)
+	{
+		return qmudInvokeMethod(target, std::forward<Func>(fn), Qt::QueuedConnection);
 	}
 
 	void flashTaskbarForView(QWidget *view)
@@ -189,6 +401,109 @@ namespace
 		return static_cast<int>(size);
 	}
 
+	QSharedPointer<LuaCallbackMiniWindowSnapshot>
+	captureMiniWindowSnapshotForLuaDispatch(const QMap<QString, MiniWindow> &miniWindows)
+	{
+		const auto toRef = [](const QColor &color) -> qlonglong
+		{
+			return static_cast<qlonglong>(static_cast<long>(color.red()) |
+			                              (static_cast<long>(color.green()) << 8) |
+			                              (static_cast<long>(color.blue()) << 16));
+		};
+		const auto toLuaSystemTimeSnapshot = [](const QDateTime &time) -> double
+		{
+			if (!time.isValid())
+				return 0.0;
+			return static_cast<double>(time.toSecsSinceEpoch());
+		};
+
+		auto snapshot         = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+		snapshot->windowNames = miniWindows.keys();
+		for (auto windowIt = miniWindows.constBegin(); windowIt != miniWindows.constEnd(); ++windowIt)
+		{
+			const QString windowKey = windowIt.key().trimmed().toLower();
+			if (windowKey.isEmpty())
+				continue;
+			const MiniWindow &window = windowIt.value();
+			snapshot->miniWindowsByWindow.insert(windowKey, QSharedPointer<MiniWindow>::create(window));
+			snapshot->fontIdsByWindow.insert(windowKey, window.fonts.keys());
+			snapshot->imageIdsByWindow.insert(windowKey, window.images.keys());
+			snapshot->hotspotIdsByWindow.insert(windowKey, window.hotspots.keys());
+			for (auto imageIt = window.images.constBegin(); imageIt != window.images.constEnd(); ++imageIt)
+			{
+				const QString imageKey = imageIt.key().trimmed().toLower();
+				if (imageKey.isEmpty())
+					continue;
+				snapshot->imageHasAlphaByKey.insert(QStringLiteral("%1|%2").arg(windowKey, imageKey),
+				                                    imageIt.value().hasAlpha);
+			}
+
+			LuaCallbackMiniWindowSnapshot::WindowInfoSnapshot infoSnapshot;
+			infoSnapshot.locationX       = window.location.x();
+			infoSnapshot.locationY       = window.location.y();
+			infoSnapshot.width           = window.width;
+			infoSnapshot.height          = window.height;
+			infoSnapshot.show            = window.show;
+			infoSnapshot.temporarilyHide = window.temporarilyHide;
+			infoSnapshot.position        = window.position;
+			infoSnapshot.flags           = window.flags;
+			infoSnapshot.backgroundRef =
+			    window.background.isValid() ? toRef(window.background) : static_cast<qlonglong>(0);
+			infoSnapshot.rectLeft         = window.rect.left();
+			infoSnapshot.rectTop          = window.rect.top();
+			infoSnapshot.rectRight        = window.rect.right();
+			infoSnapshot.rectBottom       = window.rect.bottom();
+			infoSnapshot.lastMouseX       = window.lastMousePosition.x();
+			infoSnapshot.lastMouseY       = window.lastMousePosition.y();
+			infoSnapshot.lastMouseUpdate  = window.lastMouseUpdate;
+			infoSnapshot.clientMouseX     = window.clientMousePosition.x();
+			infoSnapshot.clientMouseY     = window.clientMousePosition.y();
+			infoSnapshot.mouseOverHotspot = window.mouseOverHotspot;
+			infoSnapshot.mouseDownHotspot = window.mouseDownHotspot;
+			infoSnapshot.installedAt      = toLuaSystemTimeSnapshot(window.installedAt);
+			infoSnapshot.zOrder           = window.zOrder;
+			infoSnapshot.creatingPlugin   = window.creatingPlugin;
+			snapshot->windowInfoByWindow.insert(windowKey, infoSnapshot);
+		}
+		snapshot->rebuildMiniWindowLookupCaches();
+		return snapshot;
+	}
+
+	void refreshMiniWindowMouseStateForLuaDispatch(LuaCallbackMiniWindowSnapshot   &snapshot,
+	                                               const QMap<QString, MiniWindow> &miniWindows)
+	{
+		for (auto windowIt = miniWindows.constBegin(); windowIt != miniWindows.constEnd(); ++windowIt)
+		{
+			const QString windowKey = windowIt.key().trimmed().toLower();
+			if (windowKey.isEmpty())
+				continue;
+
+			const MiniWindow &window = windowIt.value();
+			if (auto snapshotWindowIt = snapshot.miniWindowsByWindow.find(windowKey);
+			    snapshotWindowIt != snapshot.miniWindowsByWindow.end() && snapshotWindowIt.value())
+			{
+				MiniWindow &snapshotWindow         = *snapshotWindowIt.value();
+				snapshotWindow.lastMousePosition   = window.lastMousePosition;
+				snapshotWindow.lastMouseUpdate     = window.lastMouseUpdate;
+				snapshotWindow.clientMousePosition = window.clientMousePosition;
+				snapshotWindow.mouseOverHotspot    = window.mouseOverHotspot;
+				snapshotWindow.mouseDownHotspot    = window.mouseDownHotspot;
+			}
+
+			if (auto infoIt = snapshot.windowInfoByWindow.find(windowKey);
+			    infoIt != snapshot.windowInfoByWindow.end())
+			{
+				infoIt->lastMouseX       = window.lastMousePosition.x();
+				infoIt->lastMouseY       = window.lastMousePosition.y();
+				infoIt->lastMouseUpdate  = window.lastMouseUpdate;
+				infoIt->clientMouseX     = window.clientMousePosition.x();
+				infoIt->clientMouseY     = window.clientMousePosition.y();
+				infoIt->mouseOverHotspot = window.mouseOverHotspot;
+				infoIt->mouseDownHotspot = window.mouseDownHotspot;
+			}
+		}
+	}
+
 	bool worldAttributeAffectsCommandProcessor(const QString &key)
 	{
 		return key.compare(QStringLiteral("speed_walk_delay"), Qt::CaseInsensitive) == 0 ||
@@ -211,6 +526,185 @@ namespace
 		return static_cast<int>(value > kMaxInt ? kMaxInt : value);
 	}
 
+	qint64 pluginCallbackDispatchNowNs()
+	{
+		static QElapsedTimer timer;
+		static bool          started = []()
+		{
+			timer.start();
+			return true;
+		}();
+		Q_UNUSED(started);
+		return timer.nsecsElapsed();
+	}
+
+	qint64 pluginCallbackDispatchElapsedMs(const qint64 startNs)
+	{
+		if (startNs <= 0)
+			return 0;
+		const qint64 elapsedNs = pluginCallbackDispatchNowNs() - startNs;
+		if (elapsedNs <= 0)
+			return 0;
+		return elapsedNs / 1000000;
+	}
+
+	QString pluginCallbackDispatchKindLabel(const LuaBatchDispatchKind kind)
+	{
+		switch (kind)
+		{
+		case LuaBatchDispatchKind::NoArgs:
+			return QStringLiteral("NoArgs");
+		case LuaBatchDispatchKind::String:
+			return QStringLiteral("String");
+		case LuaBatchDispatchKind::StringStopOnFalse:
+			return QStringLiteral("StringStopOnFalse");
+		case LuaBatchDispatchKind::StringHandled:
+			return QStringLiteral("StringHandled");
+		case LuaBatchDispatchKind::StringInOut:
+			return QStringLiteral("StringInOut");
+		case LuaBatchDispatchKind::BytesInOut:
+			return QStringLiteral("BytesInOut");
+		case LuaBatchDispatchKind::ProcedureWithString:
+			return QStringLiteral("ProcedureWithString");
+		default:
+			return QStringLiteral("Kind(%1)").arg(static_cast<int>(kind));
+		}
+	}
+
+	bool pluginCallbackDispatchIsCommandPath(const QString &functionName)
+	{
+		return functionName == QStringLiteral("OnPluginSent") ||
+		       functionName == QStringLiteral("OnPluginSend") ||
+		       functionName == QStringLiteral("OnPluginCommandEntered");
+	}
+
+	bool pluginCallbackDispatchIsInputCritical(const LuaBatchDispatchRequest &request)
+	{
+		if (request.inputCritical)
+			return true;
+		if (request.kind == LuaBatchDispatchKind::ExecuteScript && request.executeScriptHasTriggerContext)
+			return true;
+		if (request.kind == LuaBatchDispatchKind::StringsAndWildcards &&
+		    request.triggerMatchedLineAbsoluteNumber > 0)
+			return true;
+
+		static const QSet<QString> kInputCriticalCallbacks{
+		    QStringLiteral("OnPluginTelnetRequest"), QStringLiteral("OnPluginTelnetSubnegotiation"),
+		    QStringLiteral("OnPluginTelnetOption"),  QStringLiteral("OnPluginPacketReceived"),
+		    QStringLiteral("OnPluginMXPopenTag"),    QStringLiteral("OnPluginMXPcloseTag"),
+		    QStringLiteral("OnPluginMXPsetEntity"),  QStringLiteral("OnPluginMXPsetVariable"),
+		    QStringLiteral("OnPluginSaveState"),
+		};
+		return kInputCriticalCallbacks.contains(request.functionName);
+	}
+
+	bool pluginCallbackDispatchShouldLog(const bool diagnosticsEnabled, const QString &functionName,
+	                                     const qint64 elapsedMs)
+	{
+		return diagnosticsEnabled && (pluginCallbackDispatchIsCommandPath(functionName) || elapsedMs >= 25);
+	}
+
+	LuaBatchDispatchResult pluginCallbackDispatchFallback(const LuaBatchDispatchRequest &request)
+	{
+		LuaBatchDispatchResult fallback;
+		if (request.kind == LuaBatchDispatchKind::StringStopOnFalse ||
+		    request.kind == LuaBatchDispatchKind::NumberAndStringStopOnFalse ||
+		    request.kind == LuaBatchDispatchKind::TwoNumbersAndStringStopOnFalse)
+		{
+			fallback.boolResult      = true;
+			fallback.boolResultValid = true;
+		}
+		else if (request.kind == LuaBatchDispatchKind::StringHandled ||
+		         request.kind == LuaBatchDispatchKind::NumberAndStringStopOnTrue ||
+		         request.kind == LuaBatchDispatchKind::NumberAndBytesStopOnTrue ||
+		         request.kind == LuaBatchDispatchKind::ProcedureWithString)
+		{
+			fallback.boolResult      = false;
+			fallback.boolResultValid = true;
+		}
+		if (request.kind == LuaBatchDispatchKind::StringsAndWildcards)
+		{
+			fallback.hasFunction      = false;
+			fallback.hasFunctionValid = true;
+		}
+		if (request.kind == LuaBatchDispatchKind::NumberAndUtf8StringsCount)
+		{
+			fallback.countResult      = 0;
+			fallback.countResultValid = true;
+		}
+		if (request.kind == LuaBatchDispatchKind::ExecuteScript)
+		{
+			fallback.boolResult      = false;
+			fallback.boolResultValid = true;
+		}
+		if (request.kind == LuaBatchDispatchKind::BytesInOut)
+			fallback.bytesResult = request.bytesArg;
+		if (request.kind == LuaBatchDispatchKind::StringInOut)
+			fallback.stringResult = request.stringArg;
+		return fallback;
+	}
+
+	void applyLuaDeferredRuntimeMutationBatch(LuaDeferredRuntimeMutationBatch &&batch)
+	{
+		if (!batch.runtime || batch.mutations.isEmpty())
+			return;
+
+		WorldRuntime *runtime = batch.runtime;
+		if (QThread::currentThread() != runtime->thread() &&
+		    LuaCallbackEngine::appendDeferredRuntimeMutationBatchToActiveCallback(batch))
+		{
+			return;
+		}
+
+		QPointer<WorldRuntime>         runtimeGuard(runtime);
+		QVector<std::function<void()>> mutations  = std::move(batch.mutations);
+		auto                           applyBatch = [runtimeGuard, mutations = std::move(mutations)]() mutable
+		{
+			if (!runtimeGuard)
+				return;
+			runtimeGuard->beginMiniWindowMutationBatch();
+			const auto closeMiniWindowBatch = qScopeGuard(
+			    [runtimeGuard]
+			    {
+				    if (runtimeGuard)
+					    runtimeGuard->endMiniWindowMutationBatch();
+			    });
+			runtimeGuard->beginOutputViewMutationBatch();
+			const auto closeOutputViewBatch = qScopeGuard(
+			    [runtimeGuard]
+			    {
+				    if (runtimeGuard)
+					    runtimeGuard->endOutputViewMutationBatch();
+			    });
+			for (auto &mutation : mutations)
+			{
+				if (mutation)
+					mutation();
+			}
+		};
+
+		if (QThread::currentThread() == runtime->thread())
+		{
+			applyBatch();
+			return;
+		}
+
+		if (!qmudLuaBridgeInvokeOnObjectThread(runtime, applyBatch))
+		{
+			qWarning().noquote()
+			    << QStringLiteral("[QMud][LuaBridge] deferred runtime mutation journal apply failed: %1")
+			           .arg(qmudLuaBridgeLastError());
+		}
+	}
+
+	void applyLuaDeferredRuntimeMutationBatches(LuaBatchDispatchResult &result)
+	{
+		QVector<LuaDeferredRuntimeMutationBatch> batches;
+		batches.swap(result.deferredRuntimeMutationBatches);
+		for (LuaDeferredRuntimeMutationBatch &batch : batches)
+			applyLuaDeferredRuntimeMutationBatch(std::move(batch));
+	}
+
 	[[nodiscard]] bool textRectangleSettingsEqual(const WorldRuntime::TextRectangleSettings &lhs,
 	                                              const WorldRuntime::TextRectangleSettings &rhs)
 	{
@@ -225,9 +719,49 @@ namespace
 		return !plugin.attributes.value(QStringLiteral("id")).trimmed().isEmpty();
 	}
 
+	QString normalizedPluginId(const QString &pluginId)
+	{
+		return pluginId.trimmed().toLower();
+	}
+
+	QString normalizedAsyncResultApiName(const QString &apiName)
+	{
+		return apiName.trimmed().toLower();
+	}
+
 	bool canExecutePlugin(const WorldRuntime::Plugin &plugin)
 	{
 		return hasValidPluginId(plugin) && plugin.enabled && plugin.lua && !plugin.installPending;
+	}
+
+	QVector<int> collectExecutablePluginRecipientIndicesForCallback(
+	    const QString &functionName, const QList<WorldRuntime::Plugin> &plugins,
+	    const QHash<QString, QVector<int>> &recipientIndexCache)
+	{
+		QVector<int> recipientIndices;
+		if (functionName.isEmpty())
+			return recipientIndices;
+
+		const auto recipientsIt = recipientIndexCache.constFind(functionName);
+		if (recipientsIt == recipientIndexCache.constEnd())
+			return recipientIndices;
+
+		const int          pluginCount = safeQSizeToInt(plugins.size());
+		const QVector<int> indices = qmudFilterValidPluginRecipientIndices(recipientsIt.value(), pluginCount);
+		if (indices.isEmpty())
+			return recipientIndices;
+
+		recipientIndices.reserve(indices.size());
+		for (const int pluginIndex : indices)
+		{
+			if (pluginIndex < 0 || pluginIndex >= plugins.size())
+				continue;
+			const auto &plugin = plugins.at(pluginIndex);
+			if (!canExecutePlugin(plugin))
+				continue;
+			recipientIndices.push_back(pluginIndex);
+		}
+		return recipientIndices;
 	}
 
 	long roundedToLong(const double value)
@@ -320,6 +854,12 @@ static double runtimeRandomUnit()
 	if (AppController *app = AppController::instance())
 		return app->nextRandomUnit();
 	return QRandomGenerator::global()->generateDouble();
+}
+
+static MiniWindowUtils::RandomUnit seededMiniWindowRandomUnit(const quint32 seed)
+{
+	auto generator = std::make_shared<QRandomGenerator>(seed);
+	return [generator]() { return generator->generateDouble(); };
 }
 
 constexpr int kChatNameChange         = 1;
@@ -459,8 +999,8 @@ static long extractChatStamp(QByteArray &payload)
 		return 0;
 	const auto *data  = reinterpret_cast<const unsigned char *>(payload.constData());
 	const long  stamp = static_cast<long>(data[0]) | (static_cast<long>(data[1]) << 8) |
-	                   (static_cast<long>(data[2]) << 16) | (static_cast<long>(data[3]) << 24);
-	payload = payload.mid(4);
+	                    (static_cast<long>(data[2]) << 16) | (static_cast<long>(data[3]) << 24);
+	payload           = payload.mid(4);
 	return stamp;
 }
 
@@ -502,15 +1042,9 @@ namespace
 	constexpr int kDbErrorDatabaseAlreadyExists = -6;
 	constexpr int kDbErrorColumnOutOfRange      = -7;
 
-	constexpr int kEdgeRaised   = 5;
-	constexpr int kEdgeEtched   = 6;
-	constexpr int kEdgeBump     = 9;
-	constexpr int kEdgeSunken   = 10;
 	constexpr int kAnsiBold     = 1;
 	constexpr int kAnsiTextRed  = 31;
 	constexpr int kAnsiTextCyan = 36;
-
-	constexpr int kBfTopLeft = 0x0003;
 
 } // namespace
 
@@ -561,7 +1095,7 @@ class WorldRuntime::ChatConnection : public QObject
 			if (m_runtime && m_wasConnected)
 			{
 				m_runtime->callPluginCallbacksWithNumberAndString(
-				    QStringLiteral("OnPluginChatUserDisconnect"), m_chatId, m_remoteUserName);
+				    QStringLiteral("OnPluginChatUserDisconnect"), m_chatId, m_remoteUserName, false);
 			}
 		}
 
@@ -844,7 +1378,7 @@ class WorldRuntime::ChatConnection : public QObject
 					sendChatMessage(kChatStamp, QString::fromLatin1(makeChatStamp(m_zChatStamp)));
 				}
 				m_runtime->callPluginCallbacksWithNumberAndString(QStringLiteral("OnPluginChatNewUser"),
-				                                                  m_chatId, m_remoteUserName);
+				                                                  m_chatId, m_remoteUserName, false);
 			}
 
 			if (m_chatStatus == kChatStatusAwaitingConnectionRequest)
@@ -940,7 +1474,7 @@ class WorldRuntime::ChatConnection : public QObject
 				}
 
 				m_runtime->callPluginCallbacksWithNumberAndString(QStringLiteral("OnPluginChatNewUser"),
-				                                                  m_chatId, m_remoteUserName);
+				                                                  m_chatId, m_remoteUserName, false);
 			}
 
 			while (!m_deleteMe && !m_outstandingInput.isEmpty())
@@ -1680,12 +2214,12 @@ class WorldRuntime::ChatConnection : public QObject
 
 		long makeRandomStamp()
 		{
-			const QString seed = QStringLiteral("%1 %2 %3 %4 %5")
-			                         .arg(m_runtime ? m_runtime->worldName() : QString())
-			                         .arg(QRandomGenerator::global()->generate())
-			                         .arg(QCoreApplication::applicationPid())
-			                         .arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate))
-			                         .arg(reinterpret_cast<quintptr>(this));
+			const QString    seed      = QStringLiteral("%1 %2 %3 %4 %5")
+			                                 .arg(m_runtime ? m_runtime->worldName() : QString())
+			                                 .arg(QRandomGenerator::global()->generate())
+			                                 .arg(QCoreApplication::applicationPid())
+			                                 .arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate))
+			                                 .arg(reinterpret_cast<quintptr>(this));
 			const QByteArray seedBytes = seed.toLatin1();
 			const QByteArray digest    = QCryptographicHash::hash(seedBytes, QCryptographicHash::Sha1);
 			return sha1Word(digest, 0);
@@ -1753,33 +2287,7 @@ class WorldRuntime::ChatConnection : public QObject
 
 namespace
 {
-	constexpr int kBfTopRight    = 0x0006;
-	constexpr int kBfBottomLeft  = 0x0009;
-	constexpr int kBfBottomRight = 0x000C;
-	constexpr int kBfRect        = 0x000F;
-	constexpr int kBfMiddle      = 0x0800;
-
-	constexpr int kPsStyleMask  = 0x0000000F;
-	constexpr int kPsEndCapMask = 0x00000F00;
-	constexpr int kPsJoinMask   = 0x0000F000;
-
-	constexpr int kPsSolid       = 0;
-	constexpr int kPsDash        = 1;
-	constexpr int kPsDot         = 2;
-	constexpr int kPsDashDot     = 3;
-	constexpr int kPsDashDotDot  = 4;
-	constexpr int kPsNull        = 5;
-	constexpr int kPsInsideFrame = 6;
-
-	constexpr int kPsEndCapRound  = 0x00000000;
-	constexpr int kPsEndCapSquare = 0x00000100;
-	constexpr int kPsEndCapFlat   = 0x00000200;
-
-	constexpr int kPsJoinRound = 0x00000000;
-	constexpr int kPsJoinBevel = 0x00001000;
-	constexpr int kPsJoinMiter = 0x00002000;
-
-	QColor        colorFromRef(long value)
+	QColor colorFromRef(long value)
 	{
 		return MiniWindowUtils::colorFromRef(value);
 	}
@@ -1790,43 +2298,6 @@ namespace
 		       (static_cast<long>(color.blue()) << 16);
 	}
 
-	Qt::PenStyle mapPenStyle(long style)
-	{
-		switch (static_cast<int>(style & 0xFF))
-		{
-		case 1:
-			return Qt::DashLine;
-		case 2:
-			return Qt::DotLine;
-		case 3:
-			return Qt::DashDotLine;
-		case 4:
-			return Qt::DashDotDotLine;
-		case 5:
-			return Qt::NoPen;
-		default:
-			return Qt::SolidLine;
-		}
-	}
-
-	Qt::PenCapStyle mapPenCap(long style)
-	{
-		if (style & 0x00000100)
-			return Qt::SquareCap;
-		if (style & 0x00000200)
-			return Qt::FlatCap;
-		return Qt::RoundCap;
-	}
-
-	Qt::PenJoinStyle mapPenJoin(long style)
-	{
-		if (style & 0x00001000)
-			return Qt::BevelJoin;
-		if (style & 0x00002000)
-			return Qt::MiterJoin;
-		return Qt::RoundJoin;
-	}
-
 	unsigned char clampByte(long value)
 	{
 		if (value < 0)
@@ -1834,407 +2305,6 @@ namespace
 		if (value > 255)
 			return 255;
 		return static_cast<unsigned char>(value);
-	}
-
-	int validatePenStyle(long penStyle, int penWidth)
-	{
-		switch (penStyle & kPsStyleMask)
-		{
-		case kPsSolid:
-		case kPsNull:
-		case kPsInsideFrame:
-			break;
-		case kPsDash:
-		case kPsDot:
-		case kPsDashDot:
-		case kPsDashDotDot:
-			if (penWidth > 1)
-				return ePenStyleNotValid;
-			break;
-		default:
-			return ePenStyleNotValid;
-		}
-
-		switch (penStyle & kPsEndCapMask)
-		{
-		case kPsEndCapRound:
-		case kPsEndCapSquare:
-		case kPsEndCapFlat:
-			break;
-		default:
-			return ePenStyleNotValid;
-		}
-
-		switch (penStyle & kPsJoinMask)
-		{
-		case kPsJoinRound:
-		case kPsJoinBevel:
-		case kPsJoinMiter:
-			break;
-		default:
-			return ePenStyleNotValid;
-		}
-
-		return eOK;
-	}
-
-	int validateBrushStyle(long brushStyle)
-	{
-		switch (brushStyle)
-		{
-		case 0:
-		case 1:
-		case 2:
-		case 3:
-		case 4:
-		case 5:
-		case 6:
-		case 7:
-		case 8:
-		case 9:
-		case 10:
-		case 11:
-		case 12:
-			return eOK;
-		default:
-			return eBrushStyleNotValid;
-		}
-	}
-
-	int bytesPerLine(int width, int bitsPerPixel)
-	{
-		return ((width * bitsPerPixel + 31) / 32) * 4;
-	}
-
-	int bytesPerLine24(int width)
-	{
-		return bytesPerLine(width, 24);
-	}
-
-	void imageToBgrBuffer(const QImage &image, QByteArray &buffer, int width, int height, int bpl)
-	{
-		buffer.resize(bpl * height);
-		buffer.fill(0);
-		for (int y = 0; y < height; ++y)
-		{
-			auto *line = reinterpret_cast<unsigned char *>(buffer.data() + y * bpl);
-			for (int x = 0; x < width; ++x)
-			{
-				const QRgb pixel  = image.pixel(x, y);
-				const int  offset = x * 3;
-				line[offset]      = static_cast<unsigned char>(qBlue(pixel));
-				line[offset + 1]  = static_cast<unsigned char>(qGreen(pixel));
-				line[offset + 2]  = static_cast<unsigned char>(qRed(pixel));
-			}
-		}
-	}
-
-	void bgrBufferToImage(const QByteArray &buffer, QImage &image, int width, int height, int bpl)
-	{
-		for (int y = 0; y < height; ++y)
-		{
-			const auto *line = reinterpret_cast<const unsigned char *>(buffer.constData() + y * bpl);
-			for (int x = 0; x < width; ++x)
-			{
-				const int offset = x * 3;
-				const int b      = line[offset];
-				const int g      = line[offset + 1];
-				const int r      = line[offset + 2];
-				image.setPixel(x, y, qRgba(r, g, b, 0xFF));
-			}
-		}
-	}
-
-	void noise(unsigned char *buffer, long width, long height, long bpl, double options)
-	{
-		Q_UNUSED(width);
-		const long   count     = bpl * height;
-		const double threshold = options / 100.0;
-		for (long i = 0; i < count; ++i)
-		{
-			long c = buffer[i];
-			c += roundedToLong((128.0 - runtimeRandomUnit() * 256.0) * threshold);
-			buffer[i] = clampByte(c);
-		}
-	}
-
-	void monoNoise(unsigned char *buffer, long width, long height, long bpl, double options)
-	{
-		Q_UNUSED(width);
-		const double threshold = options / 100.0;
-		for (long row = 0; row < height; ++row)
-		{
-			unsigned char *line = buffer + row * bpl;
-			for (long i = 0; i < width; ++i)
-			{
-				const long j = roundedToLong((128.0 - runtimeRandomUnit() * 256.0) * threshold);
-				for (int channel = 0; channel < 3; ++channel)
-				{
-					const long c  = line[channel] + j;
-					line[channel] = clampByte(c);
-				}
-				line += 3;
-			}
-		}
-	}
-
-	void brightness(unsigned char *buffer, long width, long height, long bpl, double options)
-	{
-		Q_UNUSED(width);
-		const long count = bpl * height;
-		for (long i = 0; i < count; ++i)
-		{
-			long c = buffer[i];
-			c += roundedToLong(options);
-			buffer[i] = clampByte(c);
-		}
-	}
-
-	void contrast(unsigned char *buffer, long width, long height, long bpl, double options)
-	{
-		Q_UNUSED(width);
-		const long count = bpl * height;
-		for (long i = 0; i < count; ++i)
-		{
-			double c = buffer[i] - 128;
-			c *= options;
-			buffer[i] = clampByte(static_cast<long>(c + 128));
-		}
-	}
-
-	void gammaAdjust(unsigned char *buffer, long width, long height, long bpl, double options)
-	{
-		Q_UNUSED(width);
-		if (options < 0.0)
-			options = 0.0;
-
-		const long count = bpl * height;
-		for (long i = 0; i < count; ++i)
-		{
-			double c  = static_cast<double>(buffer[i]) / 255.0;
-			c         = qPow(c, options);
-			buffer[i] = clampByte(static_cast<long>(c * 255));
-		}
-	}
-
-	void colourBrightness(unsigned char *buffer, long width, long height, long bpl, double options,
-	                      long channel)
-	{
-		for (long row = 0; row < height; ++row)
-		{
-			unsigned char *line = buffer + row * bpl + channel;
-			for (long i = 0; i < width; ++i)
-			{
-				long c = *line;
-				c += roundedToLong(options);
-				*line = clampByte(c);
-				line += 3;
-			}
-		}
-	}
-
-	void colourBrightnessMultiply(unsigned char *buffer, long width, long height, long bpl, double options,
-	                              long channel)
-	{
-		for (long row = 0; row < height; ++row)
-		{
-			unsigned char *line = buffer + row * bpl + channel;
-			for (long i = 0; i < width; ++i)
-			{
-				long c = *line;
-				c      = roundedToLong(static_cast<double>(c) * options);
-				*line  = clampByte(c);
-				line += 3;
-			}
-		}
-	}
-
-	void colourContrast(unsigned char *buffer, long width, long height, long bpl, double options,
-	                    long channel)
-	{
-		unsigned char lookup[256];
-		for (int i = 0; i < 256; ++i)
-		{
-			double c = i - 128;
-			c *= options;
-			lookup[i] = clampByte(static_cast<long>(c + 128));
-		}
-
-		for (long row = 0; row < height; ++row)
-		{
-			unsigned char *line = buffer + row * bpl + channel;
-			for (long i = 0; i < width; ++i)
-			{
-				*line = lookup[*line];
-				line += 3;
-			}
-		}
-	}
-
-	void colourGamma(unsigned char *buffer, long width, long height, long bpl, double options, long channel)
-	{
-		if (options < 0.0)
-			options = 0.0;
-		unsigned char lookup[256];
-		for (int i = 0; i < 256; ++i)
-		{
-			double c  = static_cast<double>(i) / 255.0;
-			c         = qPow(c, options);
-			lookup[i] = clampByte(static_cast<long>(c * 255));
-		}
-
-		for (long row = 0; row < height; ++row)
-		{
-			unsigned char *line = buffer + row * bpl + channel;
-			for (long i = 0; i < width; ++i)
-			{
-				*line = lookup[*line];
-				line += 3;
-			}
-		}
-	}
-
-	void makeGreyscale(unsigned char *buffer, long width, long height, long bpl, double options, bool linear)
-	{
-		Q_UNUSED(options);
-		for (long row = 0; row < height; ++row)
-		{
-			unsigned char *line = buffer + row * bpl;
-			for (long i = 0; i < width; ++i)
-			{
-				double c;
-				if (linear)
-					c = (line[0] + line[1] + line[2]) / 3.0;
-				else
-					c = line[0] * 0.11 + line[1] * 0.59 + line[2] * 0.30;
-				const unsigned char value = clampByte(static_cast<long>(c));
-				line[0]                   = value;
-				line[1]                   = value;
-				line[2]                   = value;
-				line += 3;
-			}
-		}
-	}
-
-	void averageBuffer(unsigned char *buffer, long width, long height, long bpl)
-	{
-		Q_UNUSED(bpl);
-		qint64    r         = 0;
-		qint64    g         = 0;
-		qint64    b         = 0;
-		qint64    count     = 0;
-		const int increment = bytesPerLine24(static_cast<int>(width));
-		for (long col = 0; col < width; ++col)
-		{
-			unsigned char const *p = buffer + col * 3;
-			for (long row = 0; row < height; ++row)
-			{
-				b += p[0];
-				g += p[1];
-				r += p[2];
-				++count;
-				p += increment;
-			}
-		}
-
-		if (count == 0)
-			return;
-
-		b /= count;
-		g /= count;
-		r /= count;
-
-		for (long col = 0; col < width; ++col)
-		{
-			unsigned char *p = buffer + col * 3;
-			for (long row = 0; row < height; ++row)
-			{
-				p[0] = clampByte(b);
-				p[1] = clampByte(g);
-				p[2] = clampByte(r);
-				p += increment;
-			}
-		}
-	}
-
-	void brightnessMultiply(unsigned char *buffer, long width, long height, long bpl, double options)
-	{
-		Q_UNUSED(width);
-		const long count = bpl * height;
-		for (long i = 0; i < count; ++i)
-		{
-			long c    = buffer[i];
-			c         = roundedToLong(static_cast<double>(c) * options);
-			buffer[i] = clampByte(c);
-		}
-	}
-
-	void generalFilter(unsigned char *buffer, long width, long height, long bpl, double options,
-	                   const double *matrix, double divisor)
-	{
-		if (options != 2)
-		{
-			for (long row = 0; row < height; ++row)
-			{
-				unsigned char *line     = buffer + bpl * row;
-				const int      lastByte = static_cast<int>(width * 3);
-				for (long rgb = 0; rgb < 3; ++rgb)
-				{
-					long window[5];
-					for (long col = 0; col < 4; ++col)
-						window[col + 1] =
-						    line[qBound(0, static_cast<int>(rgb + (col * 3) - 6), lastByte - 1)];
-
-					for (long col = 0; col < lastByte - 4; col += 3)
-					{
-						window[0] = window[1];
-						window[1] = window[2];
-						window[2] = window[3];
-						window[3] = window[4];
-						window[4] = line[qBound(0, static_cast<int>(col + rgb + 6), lastByte - 1)];
-
-						long total = 0;
-						for (int i = 0; i < 5; ++i)
-							total += roundedToLong(static_cast<double>(window[i]) * matrix[i]);
-
-						line[col + rgb] = clampByte(roundedToLong(static_cast<double>(total) / divisor));
-					}
-				}
-			}
-		}
-
-		if (options != 1)
-		{
-			const int lastByte = static_cast<int>(width * 3);
-			for (long col = 0; col < lastByte; ++col)
-			{
-				long window[5];
-				for (long row = 0; row < 4; ++row)
-				{
-					const long           from = qBound(0L, row - 2, height - 1);
-					unsigned char const *line = buffer + col + (from * bpl);
-					window[row + 1]           = *line;
-				}
-
-				for (long row = 0; row < height; ++row)
-				{
-					const long     from = qBound(0L, row + 3, height - 1);
-					unsigned char *line = buffer + col + (from * bpl);
-					window[0]           = window[1];
-					window[1]           = window[2];
-					window[2]           = window[3];
-					window[3]           = window[4];
-					window[4]           = *line;
-
-					long total = 0;
-					for (int i = 0; i < 5; ++i)
-						total += roundedToLong(static_cast<double>(window[i]) * matrix[i]);
-
-					line  = buffer + col + (row * bpl);
-					*line = clampByte(roundedToLong(static_cast<double>(total) / divisor));
-				}
-			}
-		}
 	}
 
 	bool blendPixelInternal(long blend, long base, short mode, double opacity, long &out)
@@ -2253,19 +2323,14 @@ namespace
 		if (opacity < 0.0 || opacity > 1.0)
 			return false;
 
-		static const quint8 *cosTable = []
+		static const std::array<quint8, 256> cosTable = []
 		{
-			static quint8 table[256]  = {};
-			static bool   initialized = false;
-			if (!initialized)
+			std::array<quint8, 256> table{};
+			constexpr double        pi_div255 = 3.1415926535898 / 255.0;
+			for (int i = 0; i < 256; ++i)
 			{
-				constexpr double pi_div255 = 3.1415926535898 / 255.0;
-				for (int i = 0; i < 256; ++i)
-				{
-					const double a = 64.0 - qCos(static_cast<double>(i) * pi_div255) * 64.0;
-					table[i]       = static_cast<quint8>(std::lround(a));
-				}
-				initialized = true;
+				const double a                = 64.0 - qCos(static_cast<double>(i) * pi_div255) * 64.0;
+				table[static_cast<size_t>(i)] = static_cast<quint8>(std::lround(a));
 			}
 			return table;
 		}();
@@ -2312,7 +2377,7 @@ namespace
 			break;
 		case 3:
 			applyBlendOp([](const long blendChannel, const long baseChannel)
-			             { return QMudBlend::interpolate(blendChannel, baseChannel, cosTable); });
+			             { return QMudBlend::interpolate(blendChannel, baseChannel, cosTable.data()); });
 			break;
 		case 4:
 		{
@@ -2533,17 +2598,10 @@ namespace
 		}
 		break;
 		case 64:
-		{
-			const QColor cA(lowByteToInt(rA), lowByteToInt(gA), lowByteToInt(bA));
-			const qreal  hue       = cA.hslHueF();
-			const qreal  sat       = cA.hslSaturationF();
-			const qreal  lum       = cA.lightnessF();
-			const double hueScaled = (hue < 0.0) ? 0.0 : hue * 255.0;
-			r                      = QMudBlend::simpleOpacity(longToDouble(rB), hueScaled, opacity);
-			g                      = QMudBlend::simpleOpacity(longToDouble(gB), sat * 255.0, opacity);
-			b                      = QMudBlend::simpleOpacity(longToDouble(bB), lum * 255.0, opacity);
-		}
-		break;
+			r = QMudBlend::simpleOpacity(longToDouble(rB), 0.0, opacity);
+			g = QMudBlend::simpleOpacity(longToDouble(gB), 0.0, opacity);
+			b = QMudBlend::simpleOpacity(longToDouble(bB), 0.0, opacity);
+			break;
 		default:
 			return false;
 		}
@@ -3007,6 +3065,74 @@ namespace
 		return output;
 	}
 
+	QByteArray
+	resolveDefinitionEntities(const QByteArray &source, const QMap<QByteArray, QByteArray> &values,
+	                          const std::function<bool(const QByteArray &, QByteArray &)> &entityResolver)
+	{
+		auto decodeNumericEntity = [](const QByteArray &name, QByteArray &decoded) -> bool
+		{
+			if (!name.startsWith('#'))
+				return false;
+			bool     ok   = false;
+			uint32_t code = 0;
+			if (name.size() > 2 && (name.at(1) == 'x' || name.at(1) == 'X'))
+				code = name.mid(2).toUInt(&ok, 16);
+			else
+				code = name.mid(1).toUInt(&ok, 10);
+			if (!ok || code > 0x10FFFFu)
+				return false;
+			QString out;
+			out.reserve(2);
+			out.append(QChar::fromUcs4(code));
+			decoded = out.toUtf8();
+			return !decoded.isEmpty();
+		};
+
+		QByteArray output;
+		output.reserve(source.size());
+		for (qsizetype i = 0; i < source.size(); ++i)
+		{
+			const char ch = source.at(i);
+			if (ch != '&')
+			{
+				output.append(ch);
+				continue;
+			}
+			const qsizetype semi = source.indexOf(';', i + 1);
+			if (semi < 0)
+			{
+				output.append(ch);
+				continue;
+			}
+			const QByteArray name = source.mid(i + 1, semi - i - 1);
+			if (name == "text")
+			{
+				output.append('&');
+				output.append(name);
+				output.append(';');
+				i = semi;
+				continue;
+			}
+			const QByteArray key = name.toLower();
+			if (values.contains(key))
+				output.append(values.value(key));
+			else
+			{
+				QByteArray resolved;
+				if (decodeNumericEntity(name, resolved) || (entityResolver && entityResolver(name, resolved)))
+					output.append(resolved);
+				else
+				{
+					output.append('&');
+					output.append(name);
+					output.append(';');
+				}
+			}
+			i = semi;
+		}
+		return output;
+	}
+
 	bool parseDefinitionAlias(const QByteArray &definition, QByteArray &aliasTag,
 	                          QMap<QByteArray, QByteArray> &aliasAttributes)
 	{
@@ -3114,399 +3240,6 @@ namespace
 	{
 		return value == QStringLiteral("1") || value.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
 		       value.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
-	}
-
-	struct FixedColumnWrapConfig
-	{
-			bool enabled{false};
-			int  wrapColumn{0};
-			bool indentParas{true};
-	};
-
-	int wrapColumnFromWorldSettings(const QMap<QString, QString> &attrs)
-	{
-		return attrs.value(QStringLiteral("wrap_column")).toInt();
-	}
-
-	int wrapColumnWithWorldMinimum(const int calculatedColumns, const int worldWrapColumn)
-	{
-		if (worldWrapColumn <= 0)
-			return calculatedColumns;
-		if (calculatedColumns <= 0)
-			return worldWrapColumn;
-		return qMax(calculatedColumns, worldWrapColumn);
-	}
-
-	int localWrapColumnForOutput(const QMap<QString, QString> &attrs, const bool nawsNegotiated,
-	                             const int windowColumns)
-	{
-		if (!isEnabledFlag(attrs.value(QStringLiteral("wrap"))))
-			return 0;
-
-		const int  worldWrapColumn = wrapColumnFromWorldSettings(attrs);
-		const bool autoWrapWindow  = isEnabledFlag(attrs.value(QStringLiteral("auto_wrap_window_width")));
-
-		if (nawsNegotiated)
-			return wrapColumnWithWorldMinimum(windowColumns, worldWrapColumn);
-
-		if (autoWrapWindow)
-			return wrapColumnWithWorldMinimum(windowColumns, worldWrapColumn);
-
-		return worldWrapColumn;
-	}
-
-	bool indentParasEnabled(const QMap<QString, QString> &attrs)
-	{
-		const QString indentValue = attrs.value(QStringLiteral("indent_paras"));
-		return !(indentValue == QStringLiteral("0") ||
-		         indentValue.compare(QStringLiteral("n"), Qt::CaseInsensitive) == 0 ||
-		         indentValue.compare(QStringLiteral("false"), Qt::CaseInsensitive) == 0);
-	}
-
-	FixedColumnWrapConfig localOutputWrapConfig(const QMap<QString, QString> &attrs,
-	                                            const bool nawsNegotiated, const int windowColumns)
-	{
-		FixedColumnWrapConfig config;
-		config.indentParas = indentParasEnabled(attrs);
-		config.wrapColumn  = localWrapColumnForOutput(attrs, nawsNegotiated, windowColumns);
-		config.enabled     = config.wrapColumn > 0;
-		return config;
-	}
-
-	bool sameStyleForWrap(const WorldRuntime::StyleSpan &a, const WorldRuntime::StyleSpan &b)
-	{
-		return a.fore == b.fore && a.back == b.back && a.bold == b.bold && a.underline == b.underline &&
-		       a.italic == b.italic && a.blink == b.blink && a.strike == b.strike && a.inverse == b.inverse &&
-		       a.changed == b.changed && a.actionType == b.actionType && a.action == b.action &&
-		       a.hint == b.hint && a.variable == b.variable && a.startTag == b.startTag;
-	}
-
-	bool isSingleCharGrapheme(const QStringView grapheme, const QChar ch)
-	{
-		return grapheme.size() == 1 && grapheme.at(0) == ch;
-	}
-
-	bool isWhitespaceGrapheme(const QStringView grapheme)
-	{
-		for (const QChar ch : grapheme)
-		{
-			if (!ch.isSpace())
-				return false;
-		}
-		return !grapheme.isEmpty();
-	}
-
-	bool isZeroWidthWrapCodeUnit(const QChar ch)
-	{
-		switch (ch.category())
-		{
-		case QChar::Mark_NonSpacing:
-		case QChar::Mark_SpacingCombining:
-		case QChar::Mark_Enclosing:
-		case QChar::Other_Format:
-			return true;
-		default:
-			break;
-		}
-		return false;
-	}
-
-	int graphemeColumnWidthForWrap(const QStringView grapheme)
-	{
-		if (grapheme.isEmpty())
-			return 0;
-		bool hasVisibleCodeUnit = false;
-		for (const QChar ch : grapheme)
-		{
-			if (isZeroWidthWrapCodeUnit(ch))
-				continue;
-			hasVisibleCodeUnit = true;
-			break;
-		}
-		return hasVisibleCodeUnit ? 1 : 0;
-	}
-
-	int trailingLineColumnWidthForWrap(const QString &text)
-	{
-		if (text.isEmpty())
-			return 0;
-
-		constexpr auto      kNoBoundary = qsizetype{-1};
-		QTextBoundaryFinder boundary(QTextBoundaryFinder::Grapheme, text);
-		const QStringView   textView{text};
-		int                 column = 0;
-		for (qsizetype graphemeStart = 0, graphemeEnd = boundary.toNextBoundary(); graphemeEnd != kNoBoundary;
-		     graphemeStart = graphemeEnd, graphemeEnd = boundary.toNextBoundary())
-		{
-			const QStringView grapheme = textView.sliced(graphemeStart, graphemeEnd - graphemeStart);
-			if (isSingleCharGrapheme(grapheme, QLatin1Char('\n')))
-			{
-				column = 0;
-				continue;
-			}
-			column += graphemeColumnWidthForWrap(grapheme);
-		}
-		return column;
-	}
-
-	void wrapPlainLineForColumn(QString &text, const int wrapColumn, const bool indentParas,
-	                            const int firstLinePrefixColumns = 0)
-	{
-		if (wrapColumn <= 0 || text.isEmpty())
-		{
-			return;
-		}
-		constexpr auto kNoBoundary = qsizetype{-1};
-
-		QString        wrappedText;
-		wrappedText.reserve(safeQSizeToInt(text.size() + text.size() / qMax(1, wrapColumn)));
-
-		int  column             = qMax(0, firstLinePrefixColumns);
-		int  lineStart          = 0;
-		int  lastSpace          = -1;
-		bool lineHasVisibleChar = column > 0;
-
-		auto recomputeLineState = [&]
-		{
-			column             = 0;
-			lineStart          = 0;
-			lastSpace          = -1;
-			lineHasVisibleChar = false;
-			for (int i = safeQSizeToInt(wrappedText.size()) - 1; i >= 0; --i)
-			{
-				if (wrappedText.at(i) == QLatin1Char('\n'))
-				{
-					lineStart = i + 1;
-					break;
-				}
-			}
-			QTextBoundaryFinder boundary(QTextBoundaryFinder::Grapheme, wrappedText);
-			boundary.setPosition(lineStart);
-			const QStringView wrappedView{wrappedText};
-			for (qsizetype graphemeStart = static_cast<qsizetype>(lineStart),
-			               graphemeEnd   = boundary.toNextBoundary();
-			     graphemeEnd != kNoBoundary;
-			     graphemeStart = graphemeEnd, graphemeEnd = boundary.toNextBoundary())
-			{
-				const QStringView grapheme = wrappedView.sliced(graphemeStart, graphemeEnd - graphemeStart);
-				if (isSingleCharGrapheme(grapheme, QLatin1Char('\n')))
-				{
-					lineStart          = boundedQSizeToInt(graphemeEnd);
-					column             = 0;
-					lastSpace          = -1;
-					lineHasVisibleChar = false;
-					continue;
-				}
-				if (isSingleCharGrapheme(grapheme, QLatin1Char(' ')))
-					lastSpace = boundedQSizeToInt(graphemeEnd - 1);
-				if (!isWhitespaceGrapheme(grapheme))
-					lineHasVisibleChar = true;
-				column += graphemeColumnWidthForWrap(grapheme);
-			}
-		};
-
-		QTextBoundaryFinder boundary(QTextBoundaryFinder::Grapheme, text);
-		const QStringView   textView{text};
-		for (qsizetype graphemeStart = 0, graphemeEnd = boundary.toNextBoundary(); graphemeEnd != kNoBoundary;
-		     graphemeStart = graphemeEnd, graphemeEnd = boundary.toNextBoundary())
-		{
-			const QStringView grapheme = textView.sliced(graphemeStart, graphemeEnd - graphemeStart);
-			wrappedText.append(grapheme);
-
-			if (isSingleCharGrapheme(grapheme, QLatin1Char('\n')))
-			{
-				column             = 0;
-				lineStart          = safeQSizeToInt(wrappedText.size());
-				lastSpace          = -1;
-				lineHasVisibleChar = false;
-				continue;
-			}
-
-			if (isSingleCharGrapheme(grapheme, QLatin1Char(' ')))
-				lastSpace = safeQSizeToInt(wrappedText.size()) - 1;
-			if (!isWhitespaceGrapheme(grapheme))
-				lineHasVisibleChar = true;
-
-			column += graphemeColumnWidthForWrap(grapheme);
-			if (column < wrapColumn)
-				continue;
-
-			if (!lineHasVisibleChar)
-				continue;
-
-			int insertPos = safeQSizeToInt(wrappedText.size());
-			if (lastSpace >= lineStart)
-			{
-				insertPos = indentParas ? lastSpace : lastSpace + 1;
-
-				bool onlyWhitespace = true;
-				for (int j = lineStart, size = safeQSizeToInt(wrappedText.size()); j < insertPos && j < size;
-				     ++j)
-				{
-					if (!wrappedText.at(j).isSpace())
-					{
-						onlyWhitespace = false;
-						break;
-					}
-				}
-				if (onlyWhitespace)
-					insertPos = safeQSizeToInt(wrappedText.size());
-			}
-
-			wrappedText.insert(insertPos, QLatin1Char('\n'));
-			recomputeLineState();
-		}
-
-		text = wrappedText;
-	}
-
-	void wrapStyledLineForColumn(QString &text, QVector<WorldRuntime::StyleSpan> &spans, const int wrapColumn,
-	                             const bool indentParas, const int firstLinePrefixColumns = 0)
-	{
-		if (wrapColumn <= 0 || text.isEmpty())
-			return;
-
-		constexpr auto                   kNoBoundary = qsizetype{-1};
-
-		QVector<WorldRuntime::StyleSpan> expandedStyles;
-		expandedStyles.reserve(text.size());
-		WorldRuntime::StyleSpan lastStyle;
-		int                     covered = 0;
-		for (const WorldRuntime::StyleSpan &span : spans)
-		{
-			lastStyle     = span;
-			const int len = qMax(0, span.length);
-			for (int i = 0; i < len && covered < text.size(); ++i, ++covered)
-				expandedStyles.push_back(span);
-			if (covered >= text.size())
-				break;
-		}
-		while (expandedStyles.size() < text.size())
-			expandedStyles.push_back(lastStyle);
-
-		QString wrappedText;
-		wrappedText.reserve(safeQSizeToInt(text.size() + text.size() / qMax(1, wrapColumn)));
-		QVector<WorldRuntime::StyleSpan> wrappedStyles;
-		wrappedStyles.reserve(
-		    safeQSizeToInt(expandedStyles.size() + expandedStyles.size() / qMax(1, wrapColumn)));
-
-		int  column             = qMax(0, firstLinePrefixColumns);
-		int  lineStart          = 0;
-		int  lastSpace          = -1;
-		bool lineHasVisibleChar = column > 0;
-
-		auto recomputeLineState = [&]
-		{
-			column             = 0;
-			lineStart          = 0;
-			lastSpace          = -1;
-			lineHasVisibleChar = false;
-			for (int i = safeQSizeToInt(wrappedText.size()) - 1; i >= 0; --i)
-			{
-				if (wrappedText.at(i) == QLatin1Char('\n'))
-				{
-					lineStart = i + 1;
-					break;
-				}
-			}
-			QTextBoundaryFinder boundary(QTextBoundaryFinder::Grapheme, wrappedText);
-			boundary.setPosition(lineStart);
-			const QStringView wrappedView{wrappedText};
-			for (qsizetype graphemeStart = static_cast<qsizetype>(lineStart),
-			               graphemeEnd   = boundary.toNextBoundary();
-			     graphemeEnd != kNoBoundary;
-			     graphemeStart = graphemeEnd, graphemeEnd = boundary.toNextBoundary())
-			{
-				const QStringView grapheme = wrappedView.sliced(graphemeStart, graphemeEnd - graphemeStart);
-				if (isSingleCharGrapheme(grapheme, QLatin1Char('\n')))
-				{
-					lineStart          = boundedQSizeToInt(graphemeEnd);
-					column             = 0;
-					lastSpace          = -1;
-					lineHasVisibleChar = false;
-					continue;
-				}
-				if (isSingleCharGrapheme(grapheme, QLatin1Char(' ')))
-					lastSpace = boundedQSizeToInt(graphemeEnd - 1);
-				if (!isWhitespaceGrapheme(grapheme))
-					lineHasVisibleChar = true;
-				column += graphemeColumnWidthForWrap(grapheme);
-			}
-		};
-
-		QTextBoundaryFinder boundary(QTextBoundaryFinder::Grapheme, text);
-		const QStringView   textView{text};
-		for (qsizetype graphemeStart = 0, graphemeEnd = boundary.toNextBoundary(); graphemeEnd != kNoBoundary;
-		     graphemeStart = graphemeEnd, graphemeEnd = boundary.toNextBoundary())
-		{
-			const QStringView grapheme = textView.sliced(graphemeStart, graphemeEnd - graphemeStart);
-			wrappedText.append(grapheme);
-			for (qsizetype i = graphemeStart; i < graphemeEnd; ++i)
-				wrappedStyles.push_back(expandedStyles.value(boundedQSizeToInt(i)));
-			const WorldRuntime::StyleSpan style = expandedStyles.value(boundedQSizeToInt(graphemeEnd - 1));
-
-			if (isSingleCharGrapheme(grapheme, QLatin1Char('\n')))
-			{
-				column             = 0;
-				lineStart          = safeQSizeToInt(wrappedText.size());
-				lastSpace          = -1;
-				lineHasVisibleChar = false;
-				continue;
-			}
-
-			if (isSingleCharGrapheme(grapheme, QLatin1Char(' ')))
-				lastSpace = safeQSizeToInt(wrappedText.size()) - 1;
-			if (!isWhitespaceGrapheme(grapheme))
-				lineHasVisibleChar = true;
-
-			column += graphemeColumnWidthForWrap(grapheme);
-			if (column < wrapColumn)
-				continue;
-
-			if (!lineHasVisibleChar)
-				continue;
-
-			int insertPos = safeQSizeToInt(wrappedText.size());
-			if (lastSpace >= lineStart)
-			{
-				insertPos = indentParas ? lastSpace : lastSpace + 1;
-
-				bool onlyWhitespace = true;
-				for (int j = lineStart, size = safeQSizeToInt(wrappedText.size()); j < insertPos && j < size;
-				     ++j)
-				{
-					if (!wrappedText.at(j).isSpace())
-					{
-						onlyWhitespace = false;
-						break;
-					}
-				}
-				if (onlyWhitespace)
-					insertPos = safeQSizeToInt(wrappedText.size());
-			}
-
-			const WorldRuntime::StyleSpan newlineStyle = insertPos > 0 && insertPos - 1 < wrappedStyles.size()
-			                                                 ? wrappedStyles.at(insertPos - 1)
-			                                                 : style;
-			wrappedText.insert(insertPos, QLatin1Char('\n'));
-			wrappedStyles.insert(insertPos, newlineStyle);
-			recomputeLineState();
-		}
-
-		QVector<WorldRuntime::StyleSpan> rebuilt;
-		rebuilt.reserve(wrappedStyles.size());
-		for (const WorldRuntime::StyleSpan &oneStyle : wrappedStyles)
-		{
-			WorldRuntime::StyleSpan span = oneStyle;
-			span.length                  = 1;
-			if (!rebuilt.isEmpty() && sameStyleForWrap(rebuilt.last(), span))
-				rebuilt.last().length++;
-			else
-				rebuilt.push_back(span);
-		}
-
-		text  = wrappedText;
-		spans = rebuilt;
 	}
 
 	int currentMxpDebugLevel(const QMap<QString, QString> &worldAttributes)
@@ -3632,13 +3365,11 @@ namespace
 		return ok ? seq : kDefaultPluginSequence;
 	}
 
-	double toOleDate(const QDateTime &time)
+	qlonglong toLuaSystemTime(const QDateTime &time)
 	{
 		if (!time.isValid())
-			return 0.0;
-		const QDateTime base(QDate(1899, 12, 30), QTime(0, 0), QTimeZone::systemTimeZone());
-		const qint64    seconds = base.secsTo(time);
-		return static_cast<double>(seconds) / 86400.0;
+			return 0;
+		return time.toSecsSinceEpoch();
 	}
 
 	int findPluginIndex(const QList<WorldRuntime::Plugin> &plugins, const QString &pluginId)
@@ -4216,13 +3947,24 @@ namespace
 		const QString language = attrs.value(QStringLiteral("script_language"));
 		return language.compare(QStringLiteral("Lua"), Qt::CaseInsensitive) == 0;
 	}
+
+	QSharedPointer<LuaCallbackEngine> makeNonOwningLuaEngineRef(LuaCallbackEngine *engine)
+	{
+		return {engine, [](LuaCallbackEngine * /*unused*/) {}};
+	}
 } // namespace
 
 WorldRuntime::WorldRuntime(QObject *parent) : QObject(parent)
 {
 	m_luaExecutor  = makeLuaExecutor();
 	m_luaCallbacks = new LuaCallbackEngine();
-	m_luaExecutor->setWorldRuntime(m_luaCallbacks, this);
+	{
+		LuaEngineObservedInitializationRequest request;
+		request.engine     = m_luaCallbacks;
+		request.runtime    = this;
+		request.scriptText = QString();
+		dispatchInitializeLuaEnginesWithObservedCallbacks({request}, true);
+	}
 	m_socket         = new WorldSocket(this);
 	m_statusTime     = QDateTime::currentDateTime();
 	m_lastFlushTime  = QDateTime::currentDateTime();
@@ -4254,14 +3996,15 @@ WorldRuntime::WorldRuntime(QObject *parent) : QObject(parent)
 	callbacks.onTelnetSubnegotiation = [this](int number, const QByteArray &data)
 	{
 		m_lastTelnetSubnegotiation = QString::fromLatin1(data);
-		callPluginCallbacksWithNumberAndBytes(QStringLiteral("OnPluginTelnetSubnegotiation"), number, data);
+		callPluginCallbacksWithNumberAndBytes(QStringLiteral("OnPluginTelnetSubnegotiation"), number, data,
+		                                      true);
 	};
 	callbacks.onTelnetOption = [this](const QByteArray &data)
-	{ callPluginCallbacksWithBytes(QStringLiteral("OnPluginTelnetOption"), data); };
+	{ callPluginCallbacksWithBytes(QStringLiteral("OnPluginTelnetOption"), data, true); };
 	callbacks.onIacGa = [this]
 	{
 		m_lastLineWithIacGa = m_linesReceived;
-		callPluginCallbacksNoArgs(QStringLiteral("OnPluginIacGa"));
+		callPluginCallbacksNoArgs(QStringLiteral("OnPluginIacGa"), true);
 	};
 	callbacks.onMxpStart = [this](bool pueblo, bool manual)
 	{
@@ -4477,20 +4220,25 @@ WorldRuntime::~WorldRuntime()
 	for (auto &plugin : m_plugins)
 	{
 		if (plugin.lua && hasValidPluginId(plugin))
-			m_luaExecutor->callFunctionNoArgs(plugin.lua.data(), QStringLiteral("OnPluginClose"), nullptr,
-			                                  true);
+			dispatchSingleEngineNoArgCallback(plugin.lua, QStringLiteral("OnPluginClose"), true);
 		savePluginStateForPlugin(plugin, false, nullptr);
 	}
+	m_pluginCallbackDispatchShuttingDown = true;
+
+	QVector<QSharedPointer<LuaCallbackEngine>> enginesToTeardown;
+	enginesToTeardown.reserve((m_luaCallbacks ? 1 : 0) + m_plugins.size());
 	for (auto &plugin : m_plugins)
 	{
 		if (!plugin.lua)
 			continue;
-		teardownLuaEngine(plugin.lua.data());
+		enginesToTeardown.push_back(plugin.lua);
 		plugin.lua.clear();
 	}
 	if (m_luaCallbacks)
+		enginesToTeardown.push_back(makeNonOwningLuaEngineRef(m_luaCallbacks));
+	dispatchTeardownLuaEngines(enginesToTeardown, true);
+	if (m_luaCallbacks)
 	{
-		teardownLuaEngine(m_luaCallbacks);
 		delete m_luaCallbacks;
 		m_luaCallbacks = nullptr;
 	}
@@ -4544,13 +4292,8 @@ void WorldRuntime::addScriptTime(qint64 nanos)
 double WorldRuntime::scriptTimeSeconds() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		double     result  = 0.0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = scriptTimeSeconds(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0.0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0.0,
+		                          [this] { return scriptTimeSeconds(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::scriptTimeSeconds");
 	return static_cast<double>(m_scriptTimeNanos.load(std::memory_order_relaxed)) / 1000000000.0;
@@ -4594,8 +4337,26 @@ void WorldRuntime::receiveRawData(const QByteArray &data)
 	if (data.isEmpty())
 		return;
 
-	const bool simulatedInput = m_doingSimulate;
+	m_pendingRawIngressPayloads.enqueue({data, m_doingSimulate});
+	if (m_rawIngressProcessing)
+		return;
 
+	beginOutputViewMutationBatch();
+	const auto closeOutputViewBatch      = qScopeGuard([this] { endOutputViewMutationBatch(); });
+	m_rawIngressProcessing               = true;
+	const auto closeRawIngressProcessing = qScopeGuard([this] { m_rawIngressProcessing = false; });
+	while (!m_pendingRawIngressPayloads.isEmpty())
+	{
+		const RawIngressPayload payload                = m_pendingRawIngressPayloads.dequeue();
+		const bool              previousSimulatedInput = m_doingSimulate;
+		m_doingSimulate                                = payload.simulatedInput;
+		processRawDataPayload(payload.data, payload.simulatedInput);
+		m_doingSimulate = previousSimulatedInput;
+	}
+}
+
+void WorldRuntime::processRawDataPayload(const QByteArray &data, const bool simulatedInput)
+{
 	if (!simulatedInput)
 	{
 		if (AppController const *app = AppController::instance())
@@ -4693,10 +4454,10 @@ void WorldRuntime::receiveRawData(const QByteArray &data)
 	{
 		auto appendPacketDebug = [this](const QString &caption, const QByteArray &packet, qint64 number)
 		{
-			const QString worldName = m_worldAttributes.value(QStringLiteral("name"));
-			const QString title     = QStringLiteral("Packet debug - %1")
-			                          .arg(worldName.isEmpty() ? QStringLiteral("World") : worldName);
-			const QDateTime now = QDateTime::currentDateTime();
+			const QString   worldName = m_worldAttributes.value(QStringLiteral("name"));
+			const QString   title     = QStringLiteral("Packet debug - %1")
+			                                .arg(worldName.isEmpty() ? QStringLiteral("World") : worldName);
+			const QDateTime now       = QDateTime::currentDateTime();
 			const QString   timestamp =
 			    QLocale::system().toString(now, QStringLiteral("dddd, MMMM dd, yyyy, h:mm:ss AP"));
 			QString const header = QStringLiteral("\r\n%1 packet: %2 (%3 bytes) at %4\r\n\r\n")
@@ -5987,7 +5748,8 @@ void WorldRuntime::receiveRawData(const QByteArray &data)
 							QByteArray payload = name.toLower();
 							payload.append('=');
 							payload.append(value);
-							callPluginCallbacksWithBytes(QStringLiteral("OnPluginMXPsetEntity"), payload);
+							callPluginCallbacksWithBytes(QStringLiteral("OnPluginMXPsetEntity"), payload,
+							                             true);
 						}
 					}
 				}
@@ -6012,9 +5774,18 @@ void WorldRuntime::receiveRawData(const QByteArray &data)
 					if (!openTagCallback.isEmpty() && m_luaCallbacks && tag != "afk")
 					{
 						const QMap<QString, QString> argumentTable = buildArgumentTable(parsed.args);
-						const bool                   suppress      = m_luaExecutor->callMxpStartTag(
-                            m_luaCallbacks, openTagCallback, tagText, argsForScript, argumentTable);
-						if (suppress)
+						const QSharedPointer<LuaCallbackEngine> worldLua(
+						    m_luaCallbacks, [](LuaCallbackEngine * /*unused*/) {});
+						LuaBatchDispatchRequest request;
+						request.kind                        = LuaBatchDispatchKind::MxpStartTag;
+						request.engines                     = {worldLua};
+						request.functionName                = openTagCallback;
+						request.stringArg                   = tagText;
+						request.stringArg2                  = argsForScript;
+						request.mapArg                      = argumentTable;
+						const LuaBatchDispatchResult result = queuePluginCallbackDispatch(request, true);
+						if (const bool suppress = result.boolResultValid ? result.boolResult : false;
+						    suppress)
 							continue;
 					}
 				}
@@ -6632,27 +6403,45 @@ void WorldRuntime::receiveRawData(const QByteArray &data)
 
 						if (!closeTagCallback.isEmpty() && m_luaCallbacks)
 						{
-							m_luaExecutor->callMxpEndTag(m_luaCallbacks, closeTagCallback,
-							                             QString::fromLatin1(frame.tag), sanitizedText);
+							const QSharedPointer<LuaCallbackEngine> worldLua(
+							    m_luaCallbacks, [](LuaCallbackEngine * /*unused*/) {});
+							LuaBatchDispatchRequest request;
+							request.kind         = LuaBatchDispatchKind::MxpEndTag;
+							request.engines      = {worldLua};
+							request.functionName = closeTagCallback;
+							request.stringArg    = QString::fromLatin1(frame.tag);
+							request.stringArg2   = sanitizedText;
+							static_cast<void>(queuePluginCallbackDispatch(request, true));
 						}
 
 						const QString pluginClosePayload =
 						    QStringLiteral("%1,%2").arg(QString::fromLatin1(frame.tag), sanitizedText);
-						callPluginCallbacks(QStringLiteral("OnPluginMXPcloseTag"), pluginClosePayload);
+						callPluginCallbacks(QStringLiteral("OnPluginMXPcloseTag"), pluginClosePayload, true);
 
 						if (!frame.variableName.isEmpty())
 						{
 							const QString variableName = QStringLiteral("mxp_%1").arg(frame.variableName);
 							setVariable(variableName, sanitizedText);
 							if (!setVarCallback.isEmpty() && m_luaCallbacks)
-								m_luaExecutor->callMxpSetVariable(m_luaCallbacks, setVarCallback,
-								                                  variableName, sanitizedText);
+							{
+								const QSharedPointer<LuaCallbackEngine> worldLua(
+								    m_luaCallbacks, [](LuaCallbackEngine * /*unused*/) {});
+								LuaBatchDispatchRequest request;
+								request.kind         = LuaBatchDispatchKind::MxpSetVariable;
+								request.engines      = {worldLua};
+								request.functionName = setVarCallback;
+								request.stringArg    = variableName;
+								request.stringArg2   = sanitizedText;
+								static_cast<void>(queuePluginCallbackDispatch(request, true));
+							}
 
 							const QString pluginVarPayload =
 							    QStringLiteral("%1=%2").arg(variableName, sanitizedText);
-							callPluginCallbacks(QStringLiteral("OnPluginMXPsetVariable"), pluginVarPayload);
+							callPluginCallbacks(QStringLiteral("OnPluginMXPsetVariable"), pluginVarPayload,
+							                    true);
 							if (frame.tag == "var" || frame.tag == "v")
-								callPluginCallbacks(QStringLiteral("OnPluginMXPsetEntity"), pluginVarPayload);
+								callPluginCallbacks(QStringLiteral("OnPluginMXPsetEntity"), pluginVarPayload,
+								                    true);
 						}
 
 						if (mxpTagsEquivalent(frame.tag, closeTag) && closeTagsToApply.isEmpty() &&
@@ -6785,13 +6574,7 @@ void WorldRuntime::cancelStartTlsFallbackTimer()
 bool WorldRuntime::connectToWorld(const QString &host, quint16 port)
 {
 	if (QThread::currentThread() != thread())
-	{
-		bool       result  = false;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, host, port] { result = connectToWorld(host, port); },
-		    Qt::BlockingQueuedConnection);
-		return invoked && result;
-	}
+		return qmudInvokeMethodTrueOnSuccess(this, [this, host, port] { return connectToWorld(host, port); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::connectToWorld");
 	if (!m_socket)
@@ -6944,11 +6727,15 @@ void WorldRuntime::disconnectFromWorld()
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this] { disconnectFromWorld(); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this] { disconnectFromWorld(); });
 		return;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::disconnectFromWorld");
+	m_deferredConnectAfterPluginInstallPending = false;
+	m_deferredWorldConnectHandlersPending      = false;
+	m_deferredConnectHost.clear();
+	m_deferredConnectPort = 0;
 	if (!m_socket)
 		return;
 	if (m_connectPhase == eConnectNotConnected || m_connectPhase == eConnectDisconnecting)
@@ -7062,12 +6849,13 @@ void WorldRuntime::closeSocketForReloadReconnect()
 	m_reloadReattachUseDeferredMxpReplay = false;
 	m_reloadReattachMxpProbeEvents.clear();
 	m_reloadReattachMxpProbeModeChanges.clear();
-	m_incomingSocketDataPaused        = false;
-	m_disconnectOk                    = true;
-	m_connectViaProxy                 = false;
-	m_connectPhase                    = eConnectNotConnected;
-	m_tlsDisableCertificateValidation = false;
-	m_socketReadyForWorld             = false;
+	m_incomingSocketDataPaused            = false;
+	m_disconnectOk                        = true;
+	m_deferredWorldConnectHandlersPending = false;
+	m_connectViaProxy                     = false;
+	m_connectPhase                        = eConnectNotConnected;
+	m_tlsDisableCertificateValidation     = false;
+	m_socketReadyForWorld                 = false;
 	m_socket->abortSocket();
 	m_telnet.resetConnectionState();
 	m_telnet.setStartTlsEnabled(false);
@@ -7292,10 +7080,10 @@ void WorldRuntime::sendToWorld(const QByteArray &payload)
 	{
 		auto appendPacketDebug = [this](const QString &caption, const QByteArray &packet, qint64 number)
 		{
-			const QString worldName = m_worldAttributes.value(QStringLiteral("name"));
-			const QString title     = QStringLiteral("Packet debug - %1")
-			                          .arg(worldName.isEmpty() ? QStringLiteral("World") : worldName);
-			const QDateTime now = QDateTime::currentDateTime();
+			const QString   worldName = m_worldAttributes.value(QStringLiteral("name"));
+			const QString   title     = QStringLiteral("Packet debug - %1")
+			                                .arg(worldName.isEmpty() ? QStringLiteral("World") : worldName);
+			const QDateTime now       = QDateTime::currentDateTime();
 			const QString   timestamp =
 			    QLocale::system().toString(now, QStringLiteral("dddd, MMMM dd, yyyy, h:mm:ss AP"));
 			QString const header = QStringLiteral("\r\n%1 packet: %2 (%3 bytes) at %4\r\n\r\n")
@@ -7356,13 +7144,7 @@ int WorldRuntime::totalLinesSent() const
 int WorldRuntime::totalLinesReceived() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = totalLinesReceived(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return runtimeCountersSnapshot(false).totalLinesReceived;
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::totalLinesReceived");
 	return m_linesReceived;
@@ -7377,7 +7159,7 @@ void WorldRuntime::setNewLines(int value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this, value] { setNewLines(value); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, value] { setNewLines(value); });
 		return;
 	}
 
@@ -7570,13 +7352,8 @@ QString WorldRuntime::firstSpecialFontPath() const
 bool WorldRuntime::isConnected() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		bool       result  = false;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = isConnected(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked && result;
-	}
+		return qmudInvokeMethodTrueOnSuccess(const_cast<WorldRuntime *>(this),
+		                                     [this] { return isConnected(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::isConnected");
 	return m_connectPhase == eConnectConnectedToMud;
@@ -7595,13 +7372,8 @@ int WorldRuntime::outputWrapColumns() const
 int WorldRuntime::connectPhase() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eConnectNotConnected;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = connectPhase(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eConnectNotConnected;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), eConnectNotConnected,
+		                          [this] { return connectPhase(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::connectPhase");
 	return m_connectPhase;
@@ -7650,13 +7422,8 @@ void WorldRuntime::setLastTimerTreeExpandedGroup(const QString &group)
 QDateTime WorldRuntime::connectTime() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QDateTime  result;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = connectTime(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : QDateTime();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QDateTime(),
+		                          [this] { return connectTime(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::connectTime");
 	return m_connectTime;
@@ -7685,13 +7452,8 @@ bool WorldRuntime::reconnectOnLinkFailure() const
 QDateTime WorldRuntime::statusTime() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QDateTime  result;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = statusTime(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : QDateTime();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QDateTime(),
+		                          [this] { return statusTime(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::statusTime");
 	return m_statusTime;
@@ -7701,7 +7463,7 @@ void WorldRuntime::resetStatusTime()
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this] { resetStatusTime(); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this] { resetStatusTime(); });
 		return;
 	}
 
@@ -7962,6 +7724,13 @@ bool WorldRuntime::saveWorldFile(const QString &fileName, QString *error)
 	if (!writeSaveSnapshot(snapshot, error))
 		return false;
 
+	m_worldFilePath = snapshot.targetFilePath;
+	if (saveStateMatchesSnapshot(snapshot))
+	{
+		setWorldFileModified(false);
+		setVariablesChanged(false);
+	}
+
 	return true;
 }
 
@@ -7992,27 +7761,25 @@ void WorldRuntime::saveWorldFileAsync(const QString                             
 	    {
 		    QString    saveError;
 		    const bool ok = writeSaveSnapshot(*snapshot, &saveError);
-		    qmudInvokeMethod(
-		        qApp,
-		        [guard, snapshot, completionFn, ok, saveError]
-		        {
-			        if (!guard)
-				        return;
+		    qmudInvokeMethodQueued(qApp,
+		                           [guard, snapshot, completionFn, ok, saveError]
+		                           {
+			                           if (!guard)
+				                           return;
 
-			        if (ok)
-			        {
-				        guard->m_worldFilePath = snapshot->targetFilePath;
-				        if (guard->saveStateMatchesSnapshot(*snapshot))
-				        {
-					        guard->setWorldFileModified(false);
-					        guard->setVariablesChanged(false);
-				        }
-			        }
+			                           if (ok)
+			                           {
+				                           guard->m_worldFilePath = snapshot->targetFilePath;
+				                           if (guard->saveStateMatchesSnapshot(*snapshot))
+				                           {
+					                           guard->setWorldFileModified(false);
+					                           guard->setVariablesChanged(false);
+				                           }
+			                           }
 
-			        if (completionFn && *completionFn)
-				        (*completionFn)(ok, saveError);
-		        },
-		        Qt::QueuedConnection);
+			                           if (completionFn && *completionFn)
+				                           (*completionFn)(ok, saveError);
+		                           });
 	    });
 }
 
@@ -8020,10 +7787,10 @@ bool WorldRuntime::writeSaveSnapshot(const SaveSnapshot &snapshot, QString *erro
 {
 	SaveSnapshot  normalizedSnapshot = snapshot;
 	const QString workingDir         = resolveWorkingDir(normalizedSnapshot.startupDirectory);
-	const QString worldDir           = normalizedSnapshot.worldFilePath.trimmed().isEmpty()
-	                                       ? QString()
-	                                       : QFileInfo(normalizedSnapshot.worldFilePath.trimmed()).absolutePath();
-	const QString pluginsDir         = normalizedSnapshot.pluginsDirectory.trimmed();
+	const QString worldDir   = normalizedSnapshot.worldFilePath.trimmed().isEmpty()
+	                               ? QString()
+	                               : QFileInfo(normalizedSnapshot.worldFilePath.trimmed()).absolutePath();
+	const QString pluginsDir = normalizedSnapshot.pluginsDirectory.trimmed();
 
 	const auto    normalizePathAttributes = [&](QMap<QString, QString> &attributes)
 	{ normalizePathAttributeMapForStorage(attributes, workingDir); };
@@ -8821,7 +8588,7 @@ void WorldRuntime::setStatusMessage(const QString &value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this, value] { setStatusMessage(value); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, value] { setStatusMessage(value); });
 		return;
 	}
 
@@ -8834,14 +8601,20 @@ QString WorldRuntime::statusMessage() const
 	return m_statusMessage;
 }
 
-void WorldRuntime::setWordUnderMenu(const QString &value)
+void WorldRuntime::setWordUnderMenu(const QString &value, const bool resolved)
 {
-	m_wordUnderMenu = value;
+	m_wordUnderMenu         = value;
+	m_wordUnderMenuResolved = resolved;
 }
 
 QString WorldRuntime::wordUnderMenu() const
 {
 	return m_wordUnderMenu;
+}
+
+bool WorldRuntime::wordUnderMenuResolved() const
+{
+	return m_wordUnderMenuResolved;
 }
 
 void WorldRuntime::setDebugIncomingPackets(bool enabled)
@@ -8890,18 +8663,14 @@ void WorldRuntime::addRecentLine(const QString &line)
 	m_recentLines.push_back(line);
 	if (m_recentLines.size() > kMaxRecentLines)
 		m_recentLines.pop_front();
+	invalidateLuaCallbackLineBufferSnapshot();
 }
 
 QStringList WorldRuntime::recentLines(int maxCount) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList result;
-		const bool  invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &result, maxCount] { result = recentLines(maxCount); },
-            Qt::BlockingQueuedConnection);
-		return invoked ? result : QStringList();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QStringList(),
+		                          [this, maxCount] { return recentLines(maxCount); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::recentLines");
 	if (maxCount <= 0 || maxCount >= m_recentLines.size())
@@ -8912,14 +8681,14 @@ QStringList WorldRuntime::recentLines(int maxCount) const
 void WorldRuntime::clearRecentLines()
 {
 	m_recentLines.clear();
+	invalidateLuaCallbackLineBufferSnapshot();
 }
 
 void WorldRuntime::bookmarkLine(int lineNumber, bool set)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(
-		    this, [this, lineNumber, set] { bookmarkLine(lineNumber, set); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, lineNumber, set] { bookmarkLine(lineNumber, set); });
 		return;
 	}
 
@@ -8932,14 +8701,14 @@ void WorldRuntime::bookmarkLine(int lineNumber, bool set)
 		entry.flags |= LineBookmark;
 	else
 		entry.flags &= ~LineBookmark;
+	invalidateLuaCallbackLineBufferSnapshot();
 }
 
 void WorldRuntime::setStopTriggerEvaluation(StopTriggerEvaluation mode)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(
-		    this, [this, mode] { setStopTriggerEvaluation(mode); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, mode] { setStopTriggerEvaluation(mode); });
 		return;
 	}
 
@@ -8962,30 +8731,1444 @@ const ILuaExecutor *WorldRuntime::luaExecutor() const
 	return m_luaExecutor.get();
 }
 
-void WorldRuntime::teardownLuaEngine(LuaCallbackEngine *engine) const
+void WorldRuntime::invalidateLuaCallbackLineBufferSnapshot() const
 {
-	if (!engine || !m_luaExecutor)
+	++m_luaCallbackLineBufferSnapshotGeneration;
+	m_luaCallbackLineBufferSnapshotCache.clear();
+	m_luaCallbackLineBufferSnapshotCacheGeneration = 0;
+	m_luaCallbackRecentLineBufferSnapshotCache.clear();
+	m_luaCallbackRecentLineBufferSnapshotCacheGeneration = 0;
+	m_luaCallbackRecentTextLineBufferSnapshotCache.clear();
+	m_luaCallbackRecentTextLineBufferSnapshotCacheGeneration = 0;
+}
+
+void WorldRuntime::invalidateLuaCallbackDispatchSnapshot() const
+{
+	++m_luaCallbackDispatchSnapshotGeneration;
+	m_luaCallbackDispatchSnapshotBaseCache.clear();
+	m_luaCallbackDispatchSnapshotCacheGeneration = 0;
+}
+
+QSharedPointer<LuaCallbackMiniWindowSnapshot> WorldRuntime::cloneLuaCallbackDispatchSnapshotBase() const
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::cloneLuaCallbackDispatchSnapshotBase");
+	if (!m_luaCallbackDispatchSnapshotBaseCache ||
+	    m_luaCallbackDispatchSnapshotCacheGeneration != m_luaCallbackDispatchSnapshotGeneration)
+	{
+		return {};
+	}
+
+	return QSharedPointer<LuaCallbackMiniWindowSnapshot>::create(*m_luaCallbackDispatchSnapshotBaseCache);
+}
+
+void WorldRuntime::clearLuaCallbackDispatchVolatileSnapshot(LuaCallbackMiniWindowSnapshot &snapshot)
+{
+	snapshot.framePointer    = nullptr;
+	snapshot.hasFramePointer = false;
+
+	snapshot.hasCallbackOutputAnchor            = false;
+	snapshot.callbackOutputAnchorBufferIndex    = 0;
+	snapshot.callbackOutputAnchorAbsoluteNumber = 0;
+	snapshot.hasLineBufferSnapshot              = false;
+	snapshot.lineBufferCount                    = 0;
+	snapshot.lineBufferSnapshot.clear();
+	snapshot.lineEntriesByBufferIndex.clear();
+	snapshot.hasLineBufferDeltaSnapshot = false;
+	snapshot.hasLineBufferCountDelta    = false;
+	snapshot.lineBufferDeltaCount       = 0;
+	snapshot.lineEntryDeltasByBufferIndex.clear();
+	snapshot.missingLineEntryDeltasByBufferIndex.clear();
+	snapshot.hasRecentLinesSnapshot = false;
+	snapshot.recentLinesSnapshot.clear();
+
+	snapshot.hasCommandUiSnapshot        = false;
+	snapshot.commandUiHasView            = false;
+	snapshot.commandUiHasFrameData       = false;
+	snapshot.commandUiOutputClientHeight = 0;
+	snapshot.commandUiOutputClientWidth  = 0;
+	snapshot.commandUiViewHeight         = 0;
+	snapshot.commandUiViewWidth          = 0;
+	snapshot.commandUiValues.clear();
+
+	snapshot.hasRuntimeCountersSnapshot = false;
+	snapshot.runtimeOutputFontHeight    = 0;
+	snapshot.runtimeOutputFontWidth     = 0;
+	snapshot.runtimeCounterValues.clear();
+
+	snapshot.hasEntitySnapshot = false;
+	snapshot.entityValuesByName.clear();
+
+	snapshot.hasWindowOutputTextRenderSnapshot = false;
+	snapshot.windowOutputTextAnsiStreamState   = QMudAnsiStreamState{};
+	snapshot.windowOutputTextAnsiRenderState   = LuaCallbackAnsiRenderStateSnapshot{};
+	snapshot.windowOutputTextMxpStyleState     = LuaCallbackMxpStyleStateSnapshot{};
+	snapshot.windowOutputTextMxpStyleStack.clear();
+	snapshot.windowOutputTextMxpBlockStack.clear();
+	snapshot.windowOutputTextMxpLinkOpen = false;
+	snapshot.windowOutputTextMxpPreDepth = 0;
+	snapshot.windowOutputTextCustomElements.clear();
+
+	snapshot.hasUiSnapshot = false;
+	snapshot.guiSystemValues.clear();
+	snapshot.hasClipboardText = false;
+	snapshot.clipboardText.clear();
+	snapshot.mainWindowPositionsByMode.clear();
+	snapshot.mainWindowPositionsDirty = false;
+	snapshot.worldWindowPositionsByKey.clear();
+	snapshot.missingWorldWindowPositionKeys.clear();
+	snapshot.dirtyWorldWindowPositionOrdinals.clear();
+	snapshot.notepadWindowPositionsByKey.clear();
+	snapshot.missingNotepadWindowPositionKeys.clear();
+	snapshot.dirtyNotepadWindowPositionKeys.clear();
+	snapshot.dirtyNotepadDocumentKeys.clear();
+	snapshot.notepadLengthByKey.clear();
+	snapshot.missingNotepadLengthKeys.clear();
+	snapshot.notepadTextByKey.clear();
+	snapshot.missingNotepadTextKeys.clear();
+	snapshot.dirtyNotepadListKeys.clear();
+	snapshot.notepadListByKey.clear();
+	snapshot.missingNotepadListKeys.clear();
+	snapshot.worldRuntimeSnapshot.clear();
+	snapshot.worldWindowPositionSnapshot.clear();
+	snapshot.notepadSnapshot.clear();
+}
+
+void WorldRuntime::populateLuaCallbackDispatchVolatileSnapshot(
+    LuaCallbackMiniWindowSnapshot &snapshot, const LuaCallbackLineSnapshotPolicy lineSnapshotPolicy) const
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::populateLuaCallbackDispatchVolatileSnapshot");
+	clearLuaCallbackDispatchVolatileSnapshot(snapshot);
+	refreshMiniWindowMouseStateForLuaDispatch(snapshot, m_miniWindows);
+
+	const int callbackOutputAnchorBufferIndex = luaContextLinesInBufferCount();
+	if (callbackOutputAnchorBufferIndex > 0)
+	{
+		LineEntry callbackOutputAnchorEntry;
+		if (luaContextLineEntry(callbackOutputAnchorBufferIndex, callbackOutputAnchorEntry) &&
+		    callbackOutputAnchorEntry.lineNumber > 0)
+		{
+			snapshot.hasCallbackOutputAnchor            = true;
+			snapshot.callbackOutputAnchorBufferIndex    = callbackOutputAnchorBufferIndex;
+			snapshot.callbackOutputAnchorAbsoluteNumber = callbackOutputAnchorEntry.lineNumber;
+		}
+	}
+
+	const CommandUiSnapshot commandUi    = commandUiSnapshot(false, true, false);
+	snapshot.hasCommandUiSnapshot        = true;
+	snapshot.commandUiHasView            = commandUi.hasView;
+	snapshot.commandUiHasFrameData       = commandUi.hasFrameData;
+	snapshot.commandUiOutputClientHeight = commandUi.outputClientHeight;
+	snapshot.commandUiOutputClientWidth  = commandUi.outputClientWidth;
+	snapshot.commandUiViewHeight         = commandUi.viewHeight;
+	snapshot.commandUiViewWidth          = commandUi.viewWidth;
+	snapshot.commandUiValues.reserve(52);
+	snapshot.commandUiValues.insert(QStringLiteral("queuedCommands"), commandUi.queuedCommands);
+	snapshot.commandUiValues.insert(QStringLiteral("commandInputText"), commandUi.commandInputText);
+	snapshot.commandUiValues.insert(QStringLiteral("inputSelectionStartColumn"),
+	                                commandUi.inputSelectionStartColumn);
+	snapshot.commandUiValues.insert(QStringLiteral("inputSelectionEndColumn"),
+	                                commandUi.inputSelectionEndColumn);
+	snapshot.commandUiValues.insert(QStringLiteral("outputSelectionEndColumn"),
+	                                commandUi.outputSelectionEndColumn);
+	snapshot.commandUiValues.insert(QStringLiteral("outputSelectionEndLine"),
+	                                commandUi.outputSelectionEndLine);
+	snapshot.commandUiValues.insert(QStringLiteral("outputSelectionStartColumn"),
+	                                commandUi.outputSelectionStartColumn);
+	snapshot.commandUiValues.insert(QStringLiteral("outputSelectionStartLine"),
+	                                commandUi.outputSelectionStartLine);
+	snapshot.commandUiValues.insert(QStringLiteral("textRectangleLeft"), commandUi.textRectangleLeft);
+	snapshot.commandUiValues.insert(QStringLiteral("textRectangleTop"), commandUi.textRectangleTop);
+	snapshot.commandUiValues.insert(QStringLiteral("textRectangleRight"), commandUi.textRectangleRight);
+	snapshot.commandUiValues.insert(QStringLiteral("textRectangleBottom"), commandUi.textRectangleBottom);
+	snapshot.commandUiValues.insert(QStringLiteral("textRectangleBorderOffset"),
+	                                commandUi.textRectangleBorderOffset);
+	snapshot.commandUiValues.insert(QStringLiteral("textRectangleBorderWidth"),
+	                                commandUi.textRectangleBorderWidth);
+	snapshot.commandUiValues.insert(QStringLiteral("textRectangleOutsideFillColour"),
+	                                commandUi.textRectangleOutsideFillColour);
+	snapshot.commandUiValues.insert(QStringLiteral("textRectangleOutsideFillStyle"),
+	                                commandUi.textRectangleOutsideFillStyle);
+	snapshot.commandUiValues.insert(QStringLiteral("textRectangleBorderColour"),
+	                                commandUi.textRectangleBorderColour);
+	snapshot.commandUiValues.insert(QStringLiteral("hasView"), commandUi.hasView);
+	snapshot.commandUiValues.insert(QStringLiteral("hasFrameData"), commandUi.hasFrameData);
+	snapshot.commandUiValues.insert(QStringLiteral("outputScrollBarWanted"), commandUi.outputScrollBarWanted);
+	snapshot.commandUiValues.insert(QStringLiteral("outputScrollPosition"), commandUi.outputScrollPosition);
+	snapshot.commandUiValues.insert(QStringLiteral("outputClientHeight"), commandUi.outputClientHeight);
+	snapshot.commandUiValues.insert(QStringLiteral("outputClientWidth"), commandUi.outputClientWidth);
+	snapshot.commandUiValues.insert(QStringLiteral("viewHeight"), commandUi.viewHeight);
+	snapshot.commandUiValues.insert(QStringLiteral("viewWidth"), commandUi.viewWidth);
+	snapshot.commandUiValues.insert(QStringLiteral("outputTextRectLeft"), commandUi.outputTextRectLeft);
+	snapshot.commandUiValues.insert(QStringLiteral("outputTextRectTop"), commandUi.outputTextRectTop);
+	snapshot.commandUiValues.insert(QStringLiteral("outputTextRectRight"), commandUi.outputTextRectRight);
+	snapshot.commandUiValues.insert(QStringLiteral("outputTextRectBottom"), commandUi.outputTextRectBottom);
+	snapshot.commandUiValues.insert(QStringLiteral("hasLastMousePosition"), commandUi.hasLastMousePosition);
+	snapshot.commandUiValues.insert(QStringLiteral("lastMouseX"), commandUi.lastMouseX);
+	snapshot.commandUiValues.insert(QStringLiteral("lastMouseY"), commandUi.lastMouseY);
+	snapshot.commandUiValues.insert(QStringLiteral("selectedWord"), commandUi.selectedWord);
+	snapshot.commandUiValues.insert(QStringLiteral("selectedWordResolved"), commandUi.selectedWordResolved);
+	snapshot.commandUiValues.insert(QStringLiteral("fullScreenMode"), commandUi.fullScreenMode);
+	snapshot.commandUiValues.insert(QStringLiteral("worldWindowCount"), commandUi.worldWindowCount);
+	snapshot.commandUiValues.insert(QStringLiteral("worldWindowShowCommand"),
+	                                commandUi.worldWindowShowCommand);
+	snapshot.commandUiValues.insert(QStringLiteral("mainClientHeight"), commandUi.mainClientHeight);
+	snapshot.commandUiValues.insert(QStringLiteral("mainClientWidth"), commandUi.mainClientWidth);
+	snapshot.commandUiValues.insert(QStringLiteral("mainToolbarHeight"), commandUi.mainToolbarHeight);
+	snapshot.commandUiValues.insert(QStringLiteral("mainToolbarWidth"), commandUi.mainToolbarWidth);
+	snapshot.commandUiValues.insert(QStringLiteral("worldToolbarHeight"), commandUi.worldToolbarHeight);
+	snapshot.commandUiValues.insert(QStringLiteral("worldToolbarWidth"), commandUi.worldToolbarWidth);
+	snapshot.commandUiValues.insert(QStringLiteral("activityToolbarHeight"), commandUi.activityToolbarHeight);
+	snapshot.commandUiValues.insert(QStringLiteral("activityToolbarWidth"), commandUi.activityToolbarWidth);
+	snapshot.commandUiValues.insert(QStringLiteral("infoBarHeight"), commandUi.infoBarHeight);
+	snapshot.commandUiValues.insert(QStringLiteral("infoBarWidth"), commandUi.infoBarWidth);
+	snapshot.commandUiValues.insert(QStringLiteral("statusBarHeight"), commandUi.statusBarHeight);
+	snapshot.commandUiValues.insert(QStringLiteral("statusBarWidth"), commandUi.statusBarWidth);
+	snapshot.commandUiValues.insert(QStringLiteral("worldChildWindowHeight"),
+	                                commandUi.worldChildWindowHeight);
+	snapshot.commandUiValues.insert(QStringLiteral("worldChildWindowWidth"), commandUi.worldChildWindowWidth);
+
+	const RuntimeCountersSnapshot counters = runtimeCountersSnapshot(true);
+	snapshot.hasRuntimeCountersSnapshot    = true;
+	snapshot.runtimeOutputFontHeight       = counters.outputFontHeight;
+	snapshot.runtimeOutputFontWidth        = counters.outputFontWidth;
+	snapshot.runtimeCounterValues.reserve(88);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("newLines"), counters.newLines);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("totalLinesSent"), counters.totalLinesSent);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("inputPacketCount"), counters.inputPacketCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("outputPacketCount"), counters.outputPacketCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("totalUncompressedBytes"),
+	                                     QVariant::fromValue(counters.totalUncompressedBytes));
+	snapshot.runtimeCounterValues.insert(QStringLiteral("totalCompressedBytes"),
+	                                     QVariant::fromValue(counters.totalCompressedBytes));
+	snapshot.runtimeCounterValues.insert(QStringLiteral("mccpType"), counters.mccpType);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("mxpErrorCount"), counters.mxpErrorCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("mxpTagCount"),
+	                                     QVariant::fromValue(counters.mxpTagCount));
+	snapshot.runtimeCounterValues.insert(QStringLiteral("mxpEntityCount"),
+	                                     QVariant::fromValue(counters.mxpEntityCount));
+	snapshot.runtimeCounterValues.insert(QStringLiteral("bytesIn"), QVariant::fromValue(counters.bytesIn));
+	snapshot.runtimeCounterValues.insert(QStringLiteral("bytesOut"), QVariant::fromValue(counters.bytesOut));
+	snapshot.runtimeCounterValues.insert(QStringLiteral("totalLinesReceived"), counters.totalLinesReceived);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("outputFontHeight"), counters.outputFontHeight);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("outputFontWidth"), counters.outputFontWidth);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("inputFontHeight"), counters.inputFontHeight);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("inputFontWidth"), counters.inputFontWidth);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("variableCount"), counters.variableCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("triggerCount"), counters.triggerCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("timerCount"), counters.timerCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("aliasCount"), counters.aliasCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("queuedCommandCount"), counters.queuedCommandCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("mappingCount"), counters.mappingCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("outputLineCount"), counters.outputLineCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("customElementCount"), counters.customElementCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("customEntityCount"), counters.customEntityCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("connectPhase"), counters.connectPhase);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("peerAddressV4"), counters.peerAddressV4);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("proxyAddressV4"), counters.proxyAddressV4);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("logFilePosition"),
+	                                     QVariant::fromValue(counters.logFilePosition));
+	snapshot.runtimeCounterValues.insert(QStringLiteral("triggerTimeSeconds"), counters.triggerTimeSeconds);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("aliasTimeSeconds"), counters.aliasTimeSeconds);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("scriptTimeSeconds"), counters.scriptTimeSeconds);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("noCommandEcho"), counters.noCommandEcho);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("debugIncomingPackets"),
+	                                     counters.debugIncomingPackets);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("isCompressing"), counters.isCompressing);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("isMxpActive"), counters.isMxpActive);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("isPuebloActive"), counters.isPuebloActive);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("removeMapReverses"), counters.removeMapReverses);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("notesInRgb"), counters.notesInRgb);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("disconnectOk"), counters.disconnectOk);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("traceEnabled"), counters.traceEnabled);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("isLogOpen"), counters.isLogOpen);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("scriptFileChanged"), counters.scriptFileChanged);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("worldFileModified"), counters.worldFileModified);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("isMapping"), counters.isMapping);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("isActive"), counters.isActive);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("outputFrozen"), counters.outputFrozen);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("variablesChanged"), counters.variablesChanged);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("doingSimulate"), counters.doingSimulate);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("lineOmittedFromOutput"),
+	                                     counters.lineOmittedFromOutput);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("hasLuaCallbacks"), counters.hasLuaCallbacks);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("pluginProcessingSent"),
+	                                     counters.pluginProcessingSent);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("isChatAcceptingCalls"),
+	                                     counters.isChatAcceptingCalls);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("noteStyle"), counters.noteStyle);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("noteTextColour"), counters.noteTextColour);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("noteColourBack"),
+	                                     QVariant::fromValue(counters.noteColourBack));
+	snapshot.runtimeCounterValues.insert(QStringLiteral("noteColourFore"),
+	                                     QVariant::fromValue(counters.noteColourFore));
+	snapshot.runtimeCounterValues.insert(QStringLiteral("backgroundColour"),
+	                                     QVariant::fromValue(counters.backgroundColour));
+	snapshot.runtimeCounterValues.insert(QStringLiteral("utf8ErrorCount"), counters.utf8ErrorCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("triggersEvaluatedCount"),
+	                                     counters.triggersEvaluatedCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("triggersMatchedThisSession"),
+	                                     counters.triggersMatchedThisSession);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("aliasesEvaluatedCount"),
+	                                     counters.aliasesEvaluatedCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("aliasesMatchedThisSession"),
+	                                     counters.aliasesMatchedThisSession);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("timersFiredThisSession"),
+	                                     counters.timersFiredThisSession);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("lastLineWithIacGa"), counters.lastLineWithIacGa);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("outputWindowRedrawCount"),
+	                                     counters.outputWindowRedrawCount);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("currentActionSource"), counters.currentActionSource);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("newlinesReceived"),
+	                                     QVariant::fromValue(counters.newlinesReceived));
+	snapshot.runtimeCounterValues.insert(QStringLiteral("connectTime"), counters.connectTime);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("statusTime"), counters.statusTime);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("lastFlushTime"), counters.lastFlushTime);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("clientStartTime"), counters.clientStartTime);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("worldStartTime"), counters.worldStartTime);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("scriptFileModTime"), counters.scriptFileModTime);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("logFileName"), counters.logFileName);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("lastImmediateExpression"),
+	                                     counters.lastImmediateExpression);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("statusMessage"), counters.statusMessage);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("worldFilePath"), counters.worldFilePath);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("windowTitleOverride"), counters.windowTitleOverride);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("mainTitleOverride"), counters.mainTitleOverride);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("defaultWorldDirectory"),
+	                                     counters.defaultWorldDirectory);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("defaultLogDirectory"), counters.defaultLogDirectory);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("pluginsDirectory"), counters.pluginsDirectory);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("peerAddressString"), counters.peerAddressString);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("proxyAddressString"), counters.proxyAddressString);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("startupDirectory"), counters.startupDirectory);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("translatorFile"), counters.translatorFile);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("locale"), counters.locale);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("fixedPitchFont"), counters.fixedPitchFont);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("lastTelnetSubnegotiation"),
+	                                     counters.lastTelnetSubnegotiation);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("firstSpecialFontPath"),
+	                                     counters.firstSpecialFontPath);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("preferencesDatabaseName"),
+	                                     counters.preferencesDatabaseName);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("fileBrowsingDirectory"),
+	                                     counters.fileBrowsingDirectory);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("stateFilesDirectory"), counters.stateFilesDirectory);
+	snapshot.runtimeCounterValues.insert(QStringLiteral("lastCommandSent"), counters.lastCommandSent);
+
+	const QMap<QString, QString> entitySnapshot = customEntitySnapshot();
+	for (auto it = entitySnapshot.constBegin(); it != entitySnapshot.constEnd(); ++it)
+		snapshot.entityValuesByName.insert(it.key(), it.value());
+	snapshot.hasEntitySnapshot = true;
+
+	const auto makeAnsiRenderSnapshot = [](const AnsiRenderState &state)
+	{
+		LuaCallbackAnsiRenderStateSnapshot row;
+		row.bold       = state.bold;
+		row.underline  = state.underline;
+		row.italic     = state.italic;
+		row.blink      = state.blink;
+		row.inverse    = state.inverse;
+		row.strike     = state.strike;
+		row.monospace  = state.monospace;
+		row.fore       = state.fore;
+		row.back       = state.back;
+		row.actionType = state.actionType;
+		row.action     = state.action;
+		row.hint       = state.hint;
+		row.variable   = state.variable;
+		row.startTag   = state.startTag;
+		return row;
+	};
+	const auto makeMxpStyleSnapshot = [](const MxpStyleState &state)
+	{
+		LuaCallbackMxpStyleStateSnapshot row;
+		row.bold       = state.bold;
+		row.underline  = state.underline;
+		row.italic     = state.italic;
+		row.blink      = state.blink;
+		row.strike     = state.strike;
+		row.monospace  = state.monospace;
+		row.inverse    = state.inverse;
+		row.fore       = state.fore;
+		row.back       = state.back;
+		row.actionType = state.actionType;
+		row.action     = state.action;
+		row.hint       = state.hint;
+		row.variable   = state.variable;
+		row.startTag   = state.startTag;
+		return row;
+	};
+	const auto makeMxpStyleFrameSnapshot = [&makeMxpStyleSnapshot](const MxpStyleFrame &frame)
+	{
+		LuaCallbackMxpStyleFrameSnapshot row;
+		row.tag   = frame.tag;
+		row.state = makeMxpStyleSnapshot(frame.state);
+		return row;
+	};
+
+	snapshot.hasWindowOutputTextRenderSnapshot = true;
+	snapshot.windowOutputTextAnsiStreamState   = m_ansiStreamState;
+	snapshot.windowOutputTextAnsiRenderState   = makeAnsiRenderSnapshot(m_ansiRenderState);
+	snapshot.windowOutputTextMxpStyleState     = makeMxpStyleSnapshot(m_mxpRenderStyle);
+	snapshot.windowOutputTextMxpBlockStack     = m_mxpRenderBlockStack;
+	snapshot.windowOutputTextMxpLinkOpen       = m_mxpRenderLinkOpen;
+	snapshot.windowOutputTextMxpPreDepth       = m_mxpRenderPreDepth;
+	snapshot.windowOutputTextMxpStyleStack.reserve(m_mxpRenderStack.size());
+	for (const MxpStyleFrame &frame : m_mxpRenderStack)
+		snapshot.windowOutputTextMxpStyleStack.push_back(makeMxpStyleFrameSnapshot(frame));
+	const QList<TelnetProcessor::CustomElementInfo> customElements = m_telnet.customElementInfos();
+	snapshot.windowOutputTextCustomElements.reserve(customElements.size());
+	for (const TelnetProcessor::CustomElementInfo &element : customElements)
+	{
+		LuaCallbackMxpCustomElementSnapshot row;
+		row.name       = element.name;
+		row.open       = element.open;
+		row.command    = element.command;
+		row.tag        = element.tag;
+		row.flag       = element.flag;
+		row.definition = element.definition;
+		row.attributes = element.attributes;
+		snapshot.windowOutputTextCustomElements.push_back(row);
+	}
+
+	if (lineSnapshotPolicy == LuaCallbackLineSnapshotPolicy::CountAndRecentText ||
+	    lineSnapshotPolicy == LuaCallbackLineSnapshotPolicy::Full ||
+	    lineSnapshotPolicy == LuaCallbackLineSnapshotPolicy::CountAndRecent)
+	{
+		snapshot.lineBufferSnapshot    = captureLuaCallbackLineBufferSnapshotForDispatch(lineSnapshotPolicy);
+		snapshot.hasLineBufferSnapshot = static_cast<bool>(snapshot.lineBufferSnapshot);
+		if (snapshot.lineBufferSnapshot)
+		{
+			snapshot.lineBufferCount        = snapshot.lineBufferSnapshot->lineBufferCount;
+			snapshot.recentLinesSnapshot    = snapshot.lineBufferSnapshot->recentLinesSnapshot;
+			snapshot.hasRecentLinesSnapshot = true;
+		}
+	}
+
+	captureMainWindowSnapshotForLuaDispatch(snapshot, this);
+}
+
+QSharedPointer<const LuaCallbackLineBufferSnapshot>
+WorldRuntime::captureLuaCallbackLineBufferSnapshotForDispatch(
+    const LuaCallbackLineSnapshotPolicy lineSnapshotPolicy) const
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::captureLuaCallbackLineBufferSnapshotForDispatch");
+	if (lineSnapshotPolicy == LuaCallbackLineSnapshotPolicy::Full && m_luaCallbackLineBufferSnapshotCache &&
+	    m_luaCallbackLineBufferSnapshotCacheGeneration == m_luaCallbackLineBufferSnapshotGeneration)
+	{
+		return m_luaCallbackLineBufferSnapshotCache;
+	}
+	if (lineSnapshotPolicy == LuaCallbackLineSnapshotPolicy::CountAndRecent &&
+	    m_luaCallbackRecentLineBufferSnapshotCache &&
+	    m_luaCallbackRecentLineBufferSnapshotCacheGeneration == m_luaCallbackLineBufferSnapshotGeneration)
+	{
+		return m_luaCallbackRecentLineBufferSnapshotCache;
+	}
+	if (lineSnapshotPolicy == LuaCallbackLineSnapshotPolicy::CountAndRecentText &&
+	    m_luaCallbackRecentTextLineBufferSnapshotCache &&
+	    m_luaCallbackRecentTextLineBufferSnapshotCacheGeneration == m_luaCallbackLineBufferSnapshotGeneration)
+	{
+		return m_luaCallbackRecentTextLineBufferSnapshotCache;
+	}
+
+	const auto makeLineSnapshot = [](const LineEntry &entry) -> LuaCallbackLineEntrySnapshot
+	{
+		LuaCallbackLineEntrySnapshot row;
+		row.text       = entry.text;
+		row.flags      = entry.flags;
+		row.hardReturn = entry.hardReturn;
+		row.time       = entry.time;
+		row.lineNumber = entry.lineNumber;
+		row.ticks      = entry.ticks;
+		row.elapsed    = entry.elapsed;
+		row.spans.reserve(entry.spans.size());
+		for (const StyleSpan &span : entry.spans)
+		{
+			LuaCallbackLineStyleSnapshot spanRow;
+			spanRow.length     = span.length;
+			spanRow.fore       = colorToLong(span.fore);
+			spanRow.back       = colorToLong(span.back);
+			spanRow.bold       = span.bold;
+			spanRow.underline  = span.underline;
+			spanRow.italic     = span.italic;
+			spanRow.blink      = span.blink;
+			spanRow.strike     = span.strike;
+			spanRow.inverse    = span.inverse;
+			spanRow.changed    = span.changed;
+			spanRow.actionType = span.actionType;
+			spanRow.action     = span.action;
+			spanRow.hint       = span.hint;
+			spanRow.variable   = span.variable;
+			spanRow.startTag   = span.startTag;
+			row.spans.push_back(std::move(spanRow));
+		}
+		return row;
+	};
+
+	const QSharedPointer<LuaCallbackLineBufferSnapshot> snapshot =
+	    QSharedPointer<LuaCallbackLineBufferSnapshot>::create();
+	snapshot->lineBufferCount = luaContextLinesInBufferCount();
+	if (lineSnapshotPolicy != LuaCallbackLineSnapshotPolicy::CountAndRecentText)
+	{
+		constexpr int kRecentLineSnapshotLimit = 200;
+		const int firstLineNumber = lineSnapshotPolicy == LuaCallbackLineSnapshotPolicy::Full
+		                                ? 1
+		                                : qMax(1, snapshot->lineBufferCount - kRecentLineSnapshotLimit + 1);
+		for (int lineNumber = firstLineNumber; lineNumber <= snapshot->lineBufferCount; ++lineNumber)
+		{
+			LineEntry entry;
+			if (luaContextLineEntry(lineNumber, entry))
+				snapshot->lineEntriesByBufferIndex.insert(lineNumber, makeLineSnapshot(entry));
+		}
+	}
+	snapshot->recentLinesSnapshot = recentLines();
+
+	if (lineSnapshotPolicy == LuaCallbackLineSnapshotPolicy::Full)
+	{
+		m_luaCallbackLineBufferSnapshotCache           = snapshot;
+		m_luaCallbackLineBufferSnapshotCacheGeneration = m_luaCallbackLineBufferSnapshotGeneration;
+	}
+	else if (lineSnapshotPolicy == LuaCallbackLineSnapshotPolicy::CountAndRecent)
+	{
+		m_luaCallbackRecentLineBufferSnapshotCache           = snapshot;
+		m_luaCallbackRecentLineBufferSnapshotCacheGeneration = m_luaCallbackLineBufferSnapshotGeneration;
+	}
+	else
+	{
+		m_luaCallbackRecentTextLineBufferSnapshotCache           = snapshot;
+		m_luaCallbackRecentTextLineBufferSnapshotCacheGeneration = m_luaCallbackLineBufferSnapshotGeneration;
+	}
+	return snapshot;
+}
+
+QSharedPointer<const LuaCallbackMiniWindowSnapshot> WorldRuntime::captureLuaCallbackSnapshotForDispatch(
+    const QVector<QSharedPointer<LuaCallbackEngine>> &recipients,
+    const LuaCallbackLineSnapshotPolicy               lineSnapshotPolicy) const
+{
+	if (QThread::currentThread() != thread())
+	{
+		return qmudInvokeMethodOr(
+		    const_cast<WorldRuntime *>(this), QSharedPointer<const LuaCallbackMiniWindowSnapshot>{},
+		    [this, recipients, lineSnapshotPolicy]
+		    { return captureLuaCallbackSnapshotForDispatch(recipients, lineSnapshotPolicy); });
+	}
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::captureLuaCallbackSnapshotForDispatch");
+	if (auto *mutableRuntime = const_cast<WorldRuntime *>(this);
+	    mutableRuntime->applyPendingObservedPluginCallbackPresenceSnapshots())
+	{
+		mutableRuntime->invalidateLuaCallbackDispatchSnapshot();
+		mutableRuntime->m_pluginCallbackPresenceDirty = true;
+	}
+
+	if (QSharedPointer<LuaCallbackMiniWindowSnapshot> cachedSnapshot = cloneLuaCallbackDispatchSnapshotBase())
+	{
+		populateLuaCallbackDispatchVolatileSnapshot(*cachedSnapshot, lineSnapshotPolicy);
+		return cachedSnapshot;
+	}
+
+	const QSharedPointer<LuaCallbackMiniWindowSnapshot> snapshot =
+	    captureMiniWindowSnapshotForLuaDispatch(m_miniWindows);
+	if (!snapshot)
+		return {};
+
+	const int callbackOutputAnchorBufferIndex = luaContextLinesInBufferCount();
+	if (callbackOutputAnchorBufferIndex > 0)
+	{
+		LineEntry callbackOutputAnchorEntry;
+		if (luaContextLineEntry(callbackOutputAnchorBufferIndex, callbackOutputAnchorEntry) &&
+		    callbackOutputAnchorEntry.lineNumber > 0)
+		{
+			snapshot->hasCallbackOutputAnchor            = true;
+			snapshot->callbackOutputAnchorBufferIndex    = callbackOutputAnchorBufferIndex;
+			snapshot->callbackOutputAnchorAbsoluteNumber = callbackOutputAnchorEntry.lineNumber;
+		}
+	}
+
+	const auto makeTriggerSnapshot = [](const Trigger &trigger) -> LuaCallbackTriggerSnapshot
+	{
+		LuaCallbackTriggerSnapshot row;
+		row.attributes           = trigger.attributes;
+		row.children             = trigger.children;
+		row.included             = trigger.included;
+		row.matched              = trigger.matched;
+		row.invocationCount      = trigger.invocationCount;
+		row.matchAttempts        = trigger.matchAttempts;
+		row.lastMatchTarget      = trigger.lastMatchTarget;
+		row.lastMatched          = trigger.lastMatched;
+		row.runtimeId            = trigger.runtimeId;
+		row.executingScriptDepth = trigger.executingScriptDepth;
+		row.executingScript      = trigger.executingScript;
+		return row;
+	};
+	const auto makeTriggerSnapshots =
+	    [&makeTriggerSnapshot](const QList<Trigger> &triggers) -> QList<LuaCallbackTriggerSnapshot>
+	{
+		QList<LuaCallbackTriggerSnapshot> rows;
+		rows.reserve(triggers.size());
+		for (const Trigger &trigger : triggers)
+			rows.push_back(makeTriggerSnapshot(trigger));
+		return rows;
+	};
+	const auto makeAliasSnapshot = [](const Alias &alias) -> LuaCallbackAliasSnapshot
+	{
+		LuaCallbackAliasSnapshot row;
+		row.attributes           = alias.attributes;
+		row.children             = alias.children;
+		row.included             = alias.included;
+		row.matched              = alias.matched;
+		row.invocationCount      = alias.invocationCount;
+		row.matchAttempts        = alias.matchAttempts;
+		row.lastMatchTarget      = alias.lastMatchTarget;
+		row.lastMatched          = alias.lastMatched;
+		row.runtimeId            = alias.runtimeId;
+		row.executingScriptDepth = alias.executingScriptDepth;
+		row.executingScript      = alias.executingScript;
+		return row;
+	};
+	const auto makeAliasSnapshots =
+	    [&makeAliasSnapshot](const QList<Alias> &aliases) -> QList<LuaCallbackAliasSnapshot>
+	{
+		QList<LuaCallbackAliasSnapshot> rows;
+		rows.reserve(aliases.size());
+		for (const Alias &alias : aliases)
+			rows.push_back(makeAliasSnapshot(alias));
+		return rows;
+	};
+	const auto makeTimerSnapshot = [](const Timer &timer) -> LuaCallbackTimerSnapshot
+	{
+		LuaCallbackTimerSnapshot row;
+		row.attributes           = timer.attributes;
+		row.children             = timer.children;
+		row.included             = timer.included;
+		row.lastFired            = timer.lastFired;
+		row.nextFireTime         = timer.nextFireTime;
+		row.firedCount           = timer.firedCount;
+		row.invocationCount      = timer.invocationCount;
+		row.executingScript      = timer.executingScript;
+		row.runtimeId            = timer.runtimeId;
+		row.executingScriptDepth = timer.executingScriptDepth;
+		return row;
+	};
+	const auto makeTimerSnapshots =
+	    [&makeTimerSnapshot](const QList<Timer> &timers) -> QList<LuaCallbackTimerSnapshot>
+	{
+		QList<LuaCallbackTimerSnapshot> rows;
+		rows.reserve(timers.size());
+		for (const Timer &timer : timers)
+			rows.push_back(makeTimerSnapshot(timer));
+		return rows;
+	};
+	const auto makeAnsiRenderSnapshot = [](const AnsiRenderState &state)
+	{
+		LuaCallbackAnsiRenderStateSnapshot row;
+		row.bold       = state.bold;
+		row.underline  = state.underline;
+		row.italic     = state.italic;
+		row.blink      = state.blink;
+		row.inverse    = state.inverse;
+		row.strike     = state.strike;
+		row.monospace  = state.monospace;
+		row.fore       = state.fore;
+		row.back       = state.back;
+		row.actionType = state.actionType;
+		row.action     = state.action;
+		row.hint       = state.hint;
+		row.variable   = state.variable;
+		row.startTag   = state.startTag;
+		return row;
+	};
+	const auto makeMxpStyleSnapshot = [](const MxpStyleState &state)
+	{
+		LuaCallbackMxpStyleStateSnapshot row;
+		row.bold       = state.bold;
+		row.underline  = state.underline;
+		row.italic     = state.italic;
+		row.blink      = state.blink;
+		row.strike     = state.strike;
+		row.monospace  = state.monospace;
+		row.inverse    = state.inverse;
+		row.fore       = state.fore;
+		row.back       = state.back;
+		row.actionType = state.actionType;
+		row.action     = state.action;
+		row.hint       = state.hint;
+		row.variable   = state.variable;
+		row.startTag   = state.startTag;
+		return row;
+	};
+	const auto makeMxpStyleFrameSnapshot = [&makeMxpStyleSnapshot](const MxpStyleFrame &frame)
+	{
+		LuaCallbackMxpStyleFrameSnapshot row;
+		row.tag   = frame.tag;
+		row.state = makeMxpStyleSnapshot(frame.state);
+		return row;
+	};
+
+	const CommandUiSnapshot commandUi     = commandUiSnapshot(false, true, false);
+	snapshot->hasCommandUiSnapshot        = true;
+	snapshot->commandUiHasView            = commandUi.hasView;
+	snapshot->commandUiHasFrameData       = commandUi.hasFrameData;
+	snapshot->commandUiOutputClientHeight = commandUi.outputClientHeight;
+	snapshot->commandUiOutputClientWidth  = commandUi.outputClientWidth;
+	snapshot->commandUiViewHeight         = commandUi.viewHeight;
+	snapshot->commandUiViewWidth          = commandUi.viewWidth;
+	snapshot->commandUiValues.reserve(52);
+	snapshot->commandUiValues.insert(QStringLiteral("queuedCommands"), commandUi.queuedCommands);
+	snapshot->commandUiValues.insert(QStringLiteral("commandInputText"), commandUi.commandInputText);
+	snapshot->commandUiValues.insert(QStringLiteral("inputSelectionStartColumn"),
+	                                 commandUi.inputSelectionStartColumn);
+	snapshot->commandUiValues.insert(QStringLiteral("inputSelectionEndColumn"),
+	                                 commandUi.inputSelectionEndColumn);
+	snapshot->commandUiValues.insert(QStringLiteral("outputSelectionEndColumn"),
+	                                 commandUi.outputSelectionEndColumn);
+	snapshot->commandUiValues.insert(QStringLiteral("outputSelectionEndLine"),
+	                                 commandUi.outputSelectionEndLine);
+	snapshot->commandUiValues.insert(QStringLiteral("outputSelectionStartColumn"),
+	                                 commandUi.outputSelectionStartColumn);
+	snapshot->commandUiValues.insert(QStringLiteral("outputSelectionStartLine"),
+	                                 commandUi.outputSelectionStartLine);
+	snapshot->commandUiValues.insert(QStringLiteral("textRectangleLeft"), commandUi.textRectangleLeft);
+	snapshot->commandUiValues.insert(QStringLiteral("textRectangleTop"), commandUi.textRectangleTop);
+	snapshot->commandUiValues.insert(QStringLiteral("textRectangleRight"), commandUi.textRectangleRight);
+	snapshot->commandUiValues.insert(QStringLiteral("textRectangleBottom"), commandUi.textRectangleBottom);
+	snapshot->commandUiValues.insert(QStringLiteral("textRectangleBorderOffset"),
+	                                 commandUi.textRectangleBorderOffset);
+	snapshot->commandUiValues.insert(QStringLiteral("textRectangleBorderWidth"),
+	                                 commandUi.textRectangleBorderWidth);
+	snapshot->commandUiValues.insert(QStringLiteral("textRectangleOutsideFillColour"),
+	                                 commandUi.textRectangleOutsideFillColour);
+	snapshot->commandUiValues.insert(QStringLiteral("textRectangleOutsideFillStyle"),
+	                                 commandUi.textRectangleOutsideFillStyle);
+	snapshot->commandUiValues.insert(QStringLiteral("textRectangleBorderColour"),
+	                                 commandUi.textRectangleBorderColour);
+	snapshot->commandUiValues.insert(QStringLiteral("hasView"), commandUi.hasView);
+	snapshot->commandUiValues.insert(QStringLiteral("hasFrameData"), commandUi.hasFrameData);
+	snapshot->commandUiValues.insert(QStringLiteral("outputScrollBarWanted"),
+	                                 commandUi.outputScrollBarWanted);
+	snapshot->commandUiValues.insert(QStringLiteral("outputScrollPosition"), commandUi.outputScrollPosition);
+	snapshot->commandUiValues.insert(QStringLiteral("outputClientHeight"), commandUi.outputClientHeight);
+	snapshot->commandUiValues.insert(QStringLiteral("outputClientWidth"), commandUi.outputClientWidth);
+	snapshot->commandUiValues.insert(QStringLiteral("viewHeight"), commandUi.viewHeight);
+	snapshot->commandUiValues.insert(QStringLiteral("viewWidth"), commandUi.viewWidth);
+	snapshot->commandUiValues.insert(QStringLiteral("outputTextRectLeft"), commandUi.outputTextRectLeft);
+	snapshot->commandUiValues.insert(QStringLiteral("outputTextRectTop"), commandUi.outputTextRectTop);
+	snapshot->commandUiValues.insert(QStringLiteral("outputTextRectRight"), commandUi.outputTextRectRight);
+	snapshot->commandUiValues.insert(QStringLiteral("outputTextRectBottom"), commandUi.outputTextRectBottom);
+	snapshot->commandUiValues.insert(QStringLiteral("hasLastMousePosition"), commandUi.hasLastMousePosition);
+	snapshot->commandUiValues.insert(QStringLiteral("lastMouseX"), commandUi.lastMouseX);
+	snapshot->commandUiValues.insert(QStringLiteral("lastMouseY"), commandUi.lastMouseY);
+	snapshot->commandUiValues.insert(QStringLiteral("selectedWord"), commandUi.selectedWord);
+	snapshot->commandUiValues.insert(QStringLiteral("selectedWordResolved"), commandUi.selectedWordResolved);
+	snapshot->commandUiValues.insert(QStringLiteral("fullScreenMode"), commandUi.fullScreenMode);
+	snapshot->commandUiValues.insert(QStringLiteral("worldWindowCount"), commandUi.worldWindowCount);
+	snapshot->commandUiValues.insert(QStringLiteral("worldWindowShowCommand"),
+	                                 commandUi.worldWindowShowCommand);
+	snapshot->commandUiValues.insert(QStringLiteral("mainClientHeight"), commandUi.mainClientHeight);
+	snapshot->commandUiValues.insert(QStringLiteral("mainClientWidth"), commandUi.mainClientWidth);
+	snapshot->commandUiValues.insert(QStringLiteral("mainToolbarHeight"), commandUi.mainToolbarHeight);
+	snapshot->commandUiValues.insert(QStringLiteral("mainToolbarWidth"), commandUi.mainToolbarWidth);
+	snapshot->commandUiValues.insert(QStringLiteral("worldToolbarHeight"), commandUi.worldToolbarHeight);
+	snapshot->commandUiValues.insert(QStringLiteral("worldToolbarWidth"), commandUi.worldToolbarWidth);
+	snapshot->commandUiValues.insert(QStringLiteral("activityToolbarHeight"),
+	                                 commandUi.activityToolbarHeight);
+	snapshot->commandUiValues.insert(QStringLiteral("activityToolbarWidth"), commandUi.activityToolbarWidth);
+	snapshot->commandUiValues.insert(QStringLiteral("infoBarHeight"), commandUi.infoBarHeight);
+	snapshot->commandUiValues.insert(QStringLiteral("infoBarWidth"), commandUi.infoBarWidth);
+	snapshot->commandUiValues.insert(QStringLiteral("statusBarHeight"), commandUi.statusBarHeight);
+	snapshot->commandUiValues.insert(QStringLiteral("statusBarWidth"), commandUi.statusBarWidth);
+	snapshot->commandUiValues.insert(QStringLiteral("worldChildWindowHeight"),
+	                                 commandUi.worldChildWindowHeight);
+	snapshot->commandUiValues.insert(QStringLiteral("worldChildWindowWidth"),
+	                                 commandUi.worldChildWindowWidth);
+
+	const RuntimeCountersSnapshot counters = runtimeCountersSnapshot(true);
+	snapshot->hasRuntimeCountersSnapshot   = true;
+	snapshot->runtimeOutputFontHeight      = counters.outputFontHeight;
+	snapshot->runtimeOutputFontWidth       = counters.outputFontWidth;
+	snapshot->runtimeCounterValues.reserve(88);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("newLines"), counters.newLines);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("totalLinesSent"), counters.totalLinesSent);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("inputPacketCount"), counters.inputPacketCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("outputPacketCount"), counters.outputPacketCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("totalUncompressedBytes"),
+	                                      QVariant::fromValue(counters.totalUncompressedBytes));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("totalCompressedBytes"),
+	                                      QVariant::fromValue(counters.totalCompressedBytes));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("mccpType"), counters.mccpType);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("mxpErrorCount"), counters.mxpErrorCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("mxpTagCount"),
+	                                      QVariant::fromValue(counters.mxpTagCount));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("mxpEntityCount"),
+	                                      QVariant::fromValue(counters.mxpEntityCount));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("bytesIn"), QVariant::fromValue(counters.bytesIn));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("bytesOut"), QVariant::fromValue(counters.bytesOut));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("totalLinesReceived"), counters.totalLinesReceived);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("outputFontHeight"), counters.outputFontHeight);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("outputFontWidth"), counters.outputFontWidth);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("inputFontHeight"), counters.inputFontHeight);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("inputFontWidth"), counters.inputFontWidth);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("variableCount"), counters.variableCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("triggerCount"), counters.triggerCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("timerCount"), counters.timerCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("aliasCount"), counters.aliasCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("queuedCommandCount"), counters.queuedCommandCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("mappingCount"), counters.mappingCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("outputLineCount"), counters.outputLineCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("customElementCount"), counters.customElementCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("customEntityCount"), counters.customEntityCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("connectPhase"), counters.connectPhase);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("peerAddressV4"), counters.peerAddressV4);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("proxyAddressV4"), counters.proxyAddressV4);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("logFilePosition"),
+	                                      QVariant::fromValue(counters.logFilePosition));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("triggerTimeSeconds"), counters.triggerTimeSeconds);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("aliasTimeSeconds"), counters.aliasTimeSeconds);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("scriptTimeSeconds"), counters.scriptTimeSeconds);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("noCommandEcho"), counters.noCommandEcho);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("debugIncomingPackets"),
+	                                      counters.debugIncomingPackets);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("isCompressing"), counters.isCompressing);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("isMxpActive"), counters.isMxpActive);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("isPuebloActive"), counters.isPuebloActive);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("removeMapReverses"), counters.removeMapReverses);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("notesInRgb"), counters.notesInRgb);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("disconnectOk"), counters.disconnectOk);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("traceEnabled"), counters.traceEnabled);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("isLogOpen"), counters.isLogOpen);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("scriptFileChanged"), counters.scriptFileChanged);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("worldFileModified"), counters.worldFileModified);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("isMapping"), counters.isMapping);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("isActive"), counters.isActive);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("outputFrozen"), counters.outputFrozen);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("variablesChanged"), counters.variablesChanged);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("doingSimulate"), counters.doingSimulate);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("lineOmittedFromOutput"),
+	                                      counters.lineOmittedFromOutput);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("hasLuaCallbacks"), counters.hasLuaCallbacks);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("pluginProcessingSent"),
+	                                      counters.pluginProcessingSent);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("isChatAcceptingCalls"),
+	                                      counters.isChatAcceptingCalls);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("noteStyle"), counters.noteStyle);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("noteTextColour"), counters.noteTextColour);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("noteColourBack"),
+	                                      QVariant::fromValue(counters.noteColourBack));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("noteColourFore"),
+	                                      QVariant::fromValue(counters.noteColourFore));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("backgroundColour"),
+	                                      QVariant::fromValue(counters.backgroundColour));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("utf8ErrorCount"), counters.utf8ErrorCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("triggersEvaluatedCount"),
+	                                      counters.triggersEvaluatedCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("triggersMatchedThisSession"),
+	                                      counters.triggersMatchedThisSession);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("aliasesEvaluatedCount"),
+	                                      counters.aliasesEvaluatedCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("aliasesMatchedThisSession"),
+	                                      counters.aliasesMatchedThisSession);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("timersFiredThisSession"),
+	                                      counters.timersFiredThisSession);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("lastLineWithIacGa"), counters.lastLineWithIacGa);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("outputWindowRedrawCount"),
+	                                      counters.outputWindowRedrawCount);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("currentActionSource"),
+	                                      counters.currentActionSource);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("newlinesReceived"),
+	                                      QVariant::fromValue(counters.newlinesReceived));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("connectTime"), counters.connectTime);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("statusTime"), counters.statusTime);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("lastFlushTime"), counters.lastFlushTime);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("clientStartTime"), counters.clientStartTime);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("worldStartTime"), counters.worldStartTime);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("scriptFileModTime"), counters.scriptFileModTime);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("logFileName"), counters.logFileName);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("lastImmediateExpression"),
+	                                      counters.lastImmediateExpression);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("statusMessage"), counters.statusMessage);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("worldFilePath"), counters.worldFilePath);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("windowTitleOverride"),
+	                                      counters.windowTitleOverride);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("mainTitleOverride"), counters.mainTitleOverride);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("defaultWorldDirectory"),
+	                                      counters.defaultWorldDirectory);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("defaultLogDirectory"),
+	                                      counters.defaultLogDirectory);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("pluginsDirectory"), counters.pluginsDirectory);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("peerAddressString"), counters.peerAddressString);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("proxyAddressString"), counters.proxyAddressString);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("startupDirectory"), counters.startupDirectory);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("translatorFile"), counters.translatorFile);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("locale"), counters.locale);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("fixedPitchFont"), counters.fixedPitchFont);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("lastTelnetSubnegotiation"),
+	                                      counters.lastTelnetSubnegotiation);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("firstSpecialFontPath"),
+	                                      counters.firstSpecialFontPath);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("preferencesDatabaseName"),
+	                                      counters.preferencesDatabaseName);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("fileBrowsingDirectory"),
+	                                      counters.fileBrowsingDirectory);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("stateFilesDirectory"),
+	                                      counters.stateFilesDirectory);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("lastCommandSent"), counters.lastCommandSent);
+
+	snapshot->worldVariablesSnapshot    = variableSnapshot();
+	snapshot->hasWorldVariablesSnapshot = true;
+	snapshot->triggerListsByPluginId.insert(QString(), makeTriggerSnapshots(m_triggers));
+	snapshot->aliasListsByPluginId.insert(QString(), makeAliasSnapshots(m_aliases));
+	snapshot->timerListsByPluginId.insert(QString(), makeTimerSnapshots(m_timers));
+	snapshot->triggerWildcardsSnapshot      = m_triggerWildcards;
+	snapshot->triggerNamedWildcardsSnapshot = m_triggerNamedWildcards;
+	snapshot->aliasWildcardsSnapshot        = m_aliasWildcards;
+	snapshot->aliasNamedWildcardsSnapshot   = m_aliasNamedWildcards;
+	for (const Plugin &plugin : m_plugins)
+	{
+		const QString pluginKey = normalizedPluginId(plugin.attributes.value(QStringLiteral("id")));
+		if (pluginKey.isEmpty())
+			continue;
+		snapshot->pluginVariablesSnapshotById.insert(pluginKey, plugin.variables);
+		snapshot->triggerListsByPluginId.insert(pluginKey, makeTriggerSnapshots(plugin.triggers));
+		snapshot->aliasListsByPluginId.insert(pluginKey, makeAliasSnapshots(plugin.aliases));
+		snapshot->timerListsByPluginId.insert(pluginKey, makeTimerSnapshots(plugin.timers));
+		snapshot->pluginTriggerWildcardsSnapshotById.insert(pluginKey, plugin.triggerWildcards);
+		snapshot->pluginTriggerNamedWildcardsSnapshotById.insert(pluginKey, plugin.triggerNamedWildcards);
+		snapshot->pluginAliasWildcardsSnapshotById.insert(pluginKey, plugin.aliasWildcards);
+		snapshot->pluginAliasNamedWildcardsSnapshotById.insert(pluginKey, plugin.aliasNamedWildcards);
+	}
+	snapshot->worldAttributesSnapshot           = m_worldAttributes;
+	snapshot->worldMultilineAttributesSnapshot  = m_worldMultilineAttributes;
+	snapshot->hasWorldAttributeSnapshot         = true;
+	const QMap<QString, QString> entitySnapshot = customEntitySnapshot();
+	for (auto it = entitySnapshot.constBegin(); it != entitySnapshot.constEnd(); ++it)
+		snapshot->entityValuesByName.insert(it.key(), it.value());
+	snapshot->hasEntitySnapshot                 = true;
+	snapshot->hasWindowOutputTextRenderSnapshot = true;
+	snapshot->windowOutputTextAnsiStreamState   = m_ansiStreamState;
+	snapshot->windowOutputTextAnsiRenderState   = makeAnsiRenderSnapshot(m_ansiRenderState);
+	snapshot->windowOutputTextMxpStyleState     = makeMxpStyleSnapshot(m_mxpRenderStyle);
+	snapshot->windowOutputTextMxpBlockStack     = m_mxpRenderBlockStack;
+	snapshot->windowOutputTextMxpLinkOpen       = m_mxpRenderLinkOpen;
+	snapshot->windowOutputTextMxpPreDepth       = m_mxpRenderPreDepth;
+	snapshot->windowOutputTextMxpStyleStack.reserve(m_mxpRenderStack.size());
+	for (const MxpStyleFrame &frame : m_mxpRenderStack)
+		snapshot->windowOutputTextMxpStyleStack.push_back(makeMxpStyleFrameSnapshot(frame));
+	const QList<TelnetProcessor::CustomElementInfo> customElements = m_telnet.customElementInfos();
+	snapshot->windowOutputTextCustomElements.reserve(customElements.size());
+	for (const TelnetProcessor::CustomElementInfo &element : customElements)
+	{
+		LuaCallbackMxpCustomElementSnapshot row;
+		row.name       = element.name;
+		row.open       = element.open;
+		row.command    = element.command;
+		row.tag        = element.tag;
+		row.flag       = element.flag;
+		row.definition = element.definition;
+		row.attributes = element.attributes;
+		snapshot->windowOutputTextCustomElements.push_back(row);
+	}
+	snapshot->arrayNamesSnapshot = m_arrays.keys();
+	for (auto arrayIt = m_arrays.constBegin(); arrayIt != m_arrays.constEnd(); ++arrayIt)
+		snapshot->arraysByName.insert(arrayIt.key(), arrayIt.value().values);
+	snapshot->hasArraySnapshot          = true;
+	snapshot->chatConnectionIdsSnapshot = chatList();
+	for (const long chatId : snapshot->chatConnectionIdsSnapshot)
+	{
+		for (int infoType = 1; infoType <= 46; ++infoType)
+			snapshot->chatInfoValuesById[chatId].insert(infoType, chatInfo(chatId, infoType));
+		for (const QString &optionName :
+		     {QStringLiteral("can_send_commands"), QStringLiteral("can_send_files"),
+		      QStringLiteral("can_snoop"), QStringLiteral("ignore"), QStringLiteral("served"),
+		      QStringLiteral("private"), QStringLiteral("user"), QStringLiteral("server"),
+		      QStringLiteral("username"), QStringLiteral("group"), QStringLiteral("version"),
+		      QStringLiteral("address")})
+		{
+			snapshot->chatOptionValuesById[chatId].insert(optionName, chatOption(chatId, optionName));
+		}
+		const QString userName = chatInfo(chatId, 2).toString().trimmed().toLower();
+		if (!userName.isEmpty())
+			snapshot->chatIdsByLookupKey.insert(userName, chatId);
+		snapshot->chatIdsByLookupKey.insert(QString::number(chatId), chatId);
+	}
+	snapshot->hasChatSnapshot = true;
+	for (int index = 1; index <= 8; ++index)
+	{
+		const QColor boldColour = ansiColour(true, index);
+		snapshot->boldAnsiColoursByIndex.insert(index, boldColour.isValid() ? colorToLong(boldColour) : 0);
+		snapshot->normalAnsiColoursByIndex.insert(index, normalColour(index));
+	}
+	QVector<QColor> normalAnsi;
+	QVector<QColor> customText;
+	QVector<QColor> customBack;
+	buildCustomColours(m_colours, normalAnsi, customText, customBack);
+	QVector<QString> customNames(MAX_CUSTOM);
+	QVector<uchar>   customNameResolved(MAX_CUSTOM, 0);
+	for (const auto &colour : m_colours)
+	{
+		const QString groupKey = colour.group.trimmed().toLower();
+		if (groupKey != QStringLiteral("custom/custom") && groupKey != QStringLiteral("custom"))
+			continue;
+		const int index = colourSeqFromAttributes(colour.attributes) - 1;
+		if (index < 0 || index >= MAX_CUSTOM || customNameResolved.at(index) != 0)
+			continue;
+		customNames[index]        = colour.attributes.value(QStringLiteral("name")).trimmed();
+		customNameResolved[index] = 1;
+	}
+	for (int index = 1; index <= MAX_CUSTOM; ++index)
+	{
+		snapshot->customTextColoursByIndex.insert(index, colorToLong(customText.value(index - 1)));
+		snapshot->customBackgroundColoursByIndex.insert(index, colorToLong(customBack.value(index - 1)));
+		const QString customName = customNames.value(index - 1);
+		snapshot->customColourNamesByIndex.insert(
+		    index, customName.isEmpty() ? QStringLiteral("Custom%1").arg(index) : customName);
+	}
+	snapshot->mapColourSnapshot          = mapColourList();
+	snapshot->hasMapColourSnapshot       = true;
+	snapshot->mappingEntriesSnapshot     = m_mappingList;
+	snapshot->hasMappingEntriesSnapshot  = true;
+	snapshot->udpListenerPluginIdsByPort = udpListenerPluginIdsByPort();
+	snapshot->udpPortsSnapshot           = snapshot->udpListenerPluginIdsByPort.keys();
+	std::ranges::sort(snapshot->udpPortsSnapshot);
+	snapshot->hasUdpPortSnapshot = true;
+	if (MainWindowHost *host = resolveMainWindowHostForRuntime(this))
+	{
+		for (const WorldWindowDescriptor &entry : host->worldWindowDescriptors())
+		{
+			if (!entry.runtime)
+				continue;
+			const QList<int> ports = entry.runtime == this ? udpPortList() : entry.runtime->udpPortList();
+			for (const int port : ports)
+			{
+				snapshot->usedUdpPortsSnapshot.insert(port);
+				snapshot->usedUdpPortReferenceCountsSnapshot[port] += 1;
+			}
+		}
+	}
+	if (snapshot->usedUdpPortsSnapshot.isEmpty())
+	{
+		for (const int port : snapshot->udpPortsSnapshot)
+		{
+			snapshot->usedUdpPortsSnapshot.insert(port);
+			snapshot->usedUdpPortReferenceCountsSnapshot[port] += 1;
+		}
+	}
+	snapshot->hasUsedUdpPortsSnapshot = true;
+
+	if (lineSnapshotPolicy == LuaCallbackLineSnapshotPolicy::CountAndRecentText ||
+	    lineSnapshotPolicy == LuaCallbackLineSnapshotPolicy::Full ||
+	    lineSnapshotPolicy == LuaCallbackLineSnapshotPolicy::CountAndRecent)
+	{
+		snapshot->lineBufferSnapshot    = captureLuaCallbackLineBufferSnapshotForDispatch(lineSnapshotPolicy);
+		snapshot->hasLineBufferSnapshot = static_cast<bool>(snapshot->lineBufferSnapshot);
+		if (snapshot->lineBufferSnapshot)
+		{
+			snapshot->lineBufferCount        = snapshot->lineBufferSnapshot->lineBufferCount;
+			snapshot->recentLinesSnapshot    = snapshot->lineBufferSnapshot->recentLinesSnapshot;
+			snapshot->hasRecentLinesSnapshot = true;
+		}
+	}
+
+	snapshot->databaseNamesSnapshot   = databaseList();
+	snapshot->hasDatabaseListSnapshot = true;
+	snapshot->hasDatabaseSnapshot     = true;
+	for (const QString &databaseName : snapshot->databaseNamesSnapshot)
+	{
+		LuaCallbackDatabaseSnapshot database;
+		if (const auto dbIt = m_databases.constFind(databaseName); dbIt != m_databases.constEnd())
+		{
+			database.diskName        = dbIt->diskName;
+			database.isOpen          = dbIt->db.isValid() && dbIt->db.isOpen();
+			database.stmtPrepared    = dbIt->stmtPrepared;
+			database.validRow        = dbIt->validRow;
+			database.columns         = dbIt->columns;
+			database.columnsStatus   = databaseColumns(databaseName);
+			database.lastError       = dbIt->lastError;
+			database.errorText       = databaseError(databaseName);
+			database.totalChanges    = databaseTotalChanges(databaseName);
+			database.changes         = databaseChanges(databaseName);
+			database.lastInsertRowid = databaseLastInsertRowid(databaseName);
+			database.columnNames     = databaseColumnNames(databaseName);
+			static_cast<void>(databaseColumnValues(databaseName, database.columnValues));
+		}
+		snapshot->databaseSnapshotsByName.insert(databaseName, database);
+	}
+	for (int buffer = 1; buffer <= kMaxSoundBuffers; ++buffer)
+		snapshot->soundStatusByBuffer.insert(buffer, soundStatus(buffer));
+	for (const Macro &macro : m_macros)
+	{
+		LuaCallbackAttributeChildrenSnapshot row;
+		row.attributes = macro.attributes;
+		row.children   = macro.children;
+		snapshot->macroEntriesSnapshot.push_back(row);
+	}
+	snapshot->hasMacroEntriesSnapshot = true;
+	for (const Variable &variable : m_variables)
+	{
+		LuaCallbackAttributeContentSnapshot row;
+		row.attributes = variable.attributes;
+		row.content    = variable.content;
+		snapshot->variableEntriesSnapshot.push_back(row);
+	}
+	snapshot->hasVariableEntriesSnapshot = true;
+	for (const Keypad &keypad : m_keypadEntries)
+	{
+		LuaCallbackAttributeContentSnapshot row;
+		row.attributes = keypad.attributes;
+		row.content    = keypad.content;
+		snapshot->keypadEntriesSnapshot.push_back(row);
+	}
+	snapshot->hasKeypadEntriesSnapshot = true;
+	for (const AcceleratorSnapshot &accelerator : acceleratorSnapshot())
+	{
+		LuaCallbackAcceleratorSnapshot row;
+		row.key       = accelerator.key;
+		row.commandId = accelerator.commandId;
+		row.text      = accelerator.text;
+		row.sendTo    = accelerator.sendTo;
+		snapshot->acceleratorSnapshot.push_back(row);
+	}
+	snapshot->hasAcceleratorSnapshot = true;
+
+	for (const Plugin &plugin : m_plugins)
+	{
+		const QString pluginId = normalizedPluginId(plugin.attributes.value(QStringLiteral("id")));
+		if (pluginId.isEmpty())
+			continue;
+		snapshot->pluginIdsSnapshot.push_back(plugin.attributes.value(QStringLiteral("id")));
+		snapshot->pluginIdsByLookupKey.insert(pluginId, pluginId);
+		snapshot->pluginNamesById.insert(pluginId, plugin.attributes.value(QStringLiteral("name")));
+		QString dir = plugin.directory;
+		if (!dir.isEmpty() && !dir.endsWith('/') && !dir.endsWith('\\'))
+			dir += '/';
+#ifdef Q_OS_WIN
+		snapshot->pluginDirectoriesById.insert(pluginId, QDir::toNativeSeparators(dir));
+#else
+		dir.replace(QLatin1Char('\\'), QLatin1Char('/'));
+		snapshot->pluginDirectoriesById.insert(pluginId, dir);
+#endif
+		snapshot->pluginEnabledById.insert(pluginId, plugin.enabled);
+		snapshot->pluginEnginesById.insert(pluginId, plugin.lua);
+		if (const auto functionsIt = m_pluginLuaFunctionCatalogById.constFind(pluginId);
+		    functionsIt != m_pluginLuaFunctionCatalogById.constEnd())
+		{
+			snapshot->pluginLuaFunctionsById.insert(pluginId, functionsIt.value());
+		}
+		auto &pluginInfo = snapshot->pluginInfoValuesById[pluginId];
+		pluginInfo.insert(1, plugin.attributes.value(QStringLiteral("name")));
+		pluginInfo.insert(2, plugin.attributes.value(QStringLiteral("author")));
+		pluginInfo.insert(3, plugin.description);
+		pluginInfo.insert(4, plugin.script);
+		pluginInfo.insert(5, plugin.attributes.value(QStringLiteral("language")));
+		pluginInfo.insert(6, plugin.source);
+		pluginInfo.insert(7, plugin.attributes.value(QStringLiteral("id")));
+		pluginInfo.insert(8, plugin.attributes.value(QStringLiteral("purpose")));
+		pluginInfo.insert(9, plugin.triggers.size());
+		pluginInfo.insert(10, plugin.aliases.size());
+		pluginInfo.insert(11, plugin.timers.size());
+		pluginInfo.insert(12, plugin.variables.size());
+		pluginInfo.insert(13, plugin.dateWritten.isValid() ? QVariant(plugin.dateWritten) : QVariant());
+		pluginInfo.insert(14, plugin.dateModified.isValid() ? QVariant(plugin.dateModified) : QVariant());
+		pluginInfo.insert(15, plugin.saveState);
+		pluginInfo.insert(16, plugin.lua != nullptr);
+		pluginInfo.insert(17, plugin.enabled);
+		pluginInfo.insert(18, plugin.requiredVersion);
+		pluginInfo.insert(19, plugin.version);
+		pluginInfo.insert(20, snapshot->pluginDirectoriesById.value(pluginId));
+		pluginInfo.insert(21, snapshot->pluginIdsSnapshot.size());
+		pluginInfo.insert(22, plugin.dateInstalled.isValid() ? QVariant(plugin.dateInstalled) : QVariant());
+		pluginInfo.insert(23, plugin.callingPluginId);
+		pluginInfo.insert(24, 0.0);
+		pluginInfo.insert(25, plugin.sequence);
+	}
+	for (const Plugin &plugin : m_plugins)
+	{
+		const QString pluginId = normalizedPluginId(plugin.attributes.value(QStringLiteral("id")));
+		if (pluginId.isEmpty())
+			continue;
+		const QString pluginNameKey = plugin.attributes.value(QStringLiteral("name")).trimmed().toLower();
+		if (!pluginNameKey.isEmpty() && !snapshot->pluginIdsByLookupKey.contains(pluginNameKey))
+			snapshot->pluginIdsByLookupKey.insert(pluginNameKey, pluginId);
+	}
+	for (const QString &callbackName :
+	     {QStringLiteral("OnPluginBroadcast"), QStringLiteral("OnPluginChatDisplay"),
+	      QStringLiteral("OnPluginTrace")})
+	{
+		snapshot->pluginCallbackPresenceByName.insert(
+		    callbackName, const_cast<WorldRuntime *>(this)->hasPluginCallbackRecipient(callbackName));
+	}
+	const QVector<int> broadcastRecipientIndices =
+	    collectExecutablePluginRecipientIndicesWithWarmupFallback(QStringLiteral("OnPluginBroadcast"));
+	snapshot->broadcastPluginIdsSnapshot.reserve(broadcastRecipientIndices.size());
+	snapshot->broadcastPluginEnginesSnapshot.reserve(broadcastRecipientIndices.size());
+	for (const int pluginIndex : broadcastRecipientIndices)
+	{
+		if (pluginIndex < 0 || pluginIndex >= m_plugins.size())
+			continue;
+		const Plugin &plugin = m_plugins.at(pluginIndex);
+		snapshot->broadcastPluginIdsSnapshot.push_back(plugin.attributes.value(QStringLiteral("id")));
+		snapshot->broadcastPluginEnginesSnapshot.push_back(plugin.lua);
+	}
+	snapshot->hasBroadcastPluginSnapshot = true;
+	captureMainWindowSnapshotForLuaDispatch(*snapshot, this);
+
+	const QSharedPointer<LuaCallbackMiniWindowSnapshot> cachedBase =
+	    QSharedPointer<LuaCallbackMiniWindowSnapshot>::create(*snapshot);
+	clearLuaCallbackDispatchVolatileSnapshot(*cachedBase);
+	m_luaCallbackDispatchSnapshotBaseCache       = cachedBase;
+	m_luaCallbackDispatchSnapshotCacheGeneration = m_luaCallbackDispatchSnapshotGeneration;
+
+	return snapshot;
+}
+
+LuaBatchDispatchResult WorldRuntime::dispatchLuaStringsAndWildcards(
+    const QSharedPointer<LuaCallbackEngine> &engine, const QString &functionName, const QStringList &args,
+    const QStringList &wildcards, const QMap<QString, QString> &namedWildcards,
+    const QVector<LuaStyleRun> *styleRuns, const bool triggerOutputReplacesMatchedLine,
+    const int triggerMatchedLineBufferIndex, const qint64 triggerMatchedLineAbsoluteNumber) const
+{
+	if (!engine || functionName.isEmpty())
+		return {};
+	LuaBatchDispatchRequest request;
+	request.kind           = LuaBatchDispatchKind::StringsAndWildcards;
+	request.engines        = {engine};
+	request.functionName   = functionName;
+	request.stringListArg  = args;
+	request.stringListArg2 = wildcards;
+	request.mapArg         = namedWildcards;
+	request.lane           = LuaBatchDispatchLane::Callback;
+	request.styleRunsArg   = styleRuns ? QSharedPointer<QVector<LuaStyleRun>>::create(*styleRuns)
+	                                   : QSharedPointer<const QVector<LuaStyleRun>>{};
+	request.triggerOutputReplacesMatchedLine = triggerOutputReplacesMatchedLine;
+	request.triggerMatchedLineBufferIndex    = triggerMatchedLineBufferIndex;
+	request.triggerMatchedLineAbsoluteNumber = triggerMatchedLineAbsoluteNumber;
+	request.inputCritical                    = triggerMatchedLineAbsoluteNumber > 0;
+	request.lineSnapshotPolicy               = LuaCallbackLineSnapshotPolicy::CountAndRecentText;
+	request.miniWindowSnapshotArg =
+	    captureLuaCallbackSnapshotForDispatch(request.engines, request.lineSnapshotPolicy);
+	if (const unsigned short actionSource = currentActionSource(); actionSource != eUnknownActionSource)
+	{
+		request.actionSourceOverride    = actionSource;
+		request.hasActionSourceOverride = true;
+	}
+	return const_cast<WorldRuntime *>(this)->queuePluginCallbackDispatch(request, true);
+}
+
+#ifdef QMUD_ENABLE_LUA_SCRIPTING
+LuaBatchDispatchResult WorldRuntime::dispatchLuaCallPluginMarshalling(
+    const QSharedPointer<LuaCallbackEngine> &engine, const QString &routine, lua_State *callerState,
+    const int firstArg, const QString &callingPluginId,
+    const QSharedPointer<const LuaCallbackMiniWindowSnapshot> &snapshot) const
+{
+	if (!engine || routine.trimmed().isEmpty() || !callerState)
+		return {};
+	LuaBatchDispatchRequest request;
+	request.kind                        = LuaBatchDispatchKind::CallPluginLuaMarshalling;
+	request.engines                     = {engine};
+	request.functionName                = routine;
+	request.intArg1                     = firstArg;
+	request.luaStateArg                 = callerState;
+	request.refreshCallbackCatalogAfter = true;
+	request.applyCallingPluginContext   = true;
+	request.callingPluginId             = callingPluginId;
+	request.lane                        = LuaBatchDispatchLane::Callback;
+	request.miniWindowSnapshotArg       = snapshot;
+	return dispatchLuaBatch(request);
+}
+#endif
+
+void WorldRuntime::dispatchLuaStringsAndWildcardsAsync(
+    const QSharedPointer<LuaCallbackEngine> &engine, const QString &functionName, const QStringList &args,
+    const QStringList &wildcards, const QMap<QString, QString> &namedWildcards,
+    const QVector<LuaStyleRun> *styleRuns, const int actionSourceOverride,
+    const bool triggerOutputReplacesMatchedLine, const int triggerMatchedLineBufferIndex,
+    const qint64                                               triggerMatchedLineAbsoluteNumber,
+    const std::function<void(const LuaBatchDispatchResult &)> &completion) const
+{
+	if (!engine || functionName.isEmpty())
+	{
+		if (completion)
+			completion({});
 		return;
-	m_luaExecutor->teardownEngine(engine);
+	}
+	LuaBatchDispatchRequest request;
+	request.kind           = LuaBatchDispatchKind::StringsAndWildcards;
+	request.engines        = {engine};
+	request.functionName   = functionName;
+	request.stringListArg  = args;
+	request.stringListArg2 = wildcards;
+	request.mapArg         = namedWildcards;
+	request.lane           = LuaBatchDispatchLane::Callback;
+	request.styleRunsArg   = styleRuns ? QSharedPointer<QVector<LuaStyleRun>>::create(*styleRuns)
+	                                   : QSharedPointer<const QVector<LuaStyleRun>>{};
+	request.triggerOutputReplacesMatchedLine = triggerOutputReplacesMatchedLine;
+	request.triggerMatchedLineBufferIndex    = triggerMatchedLineBufferIndex;
+	request.triggerMatchedLineAbsoluteNumber = triggerMatchedLineAbsoluteNumber;
+	request.inputCritical                    = triggerMatchedLineAbsoluteNumber > 0;
+	request.lineSnapshotPolicy               = LuaCallbackLineSnapshotPolicy::CountAndRecentText;
+	request.miniWindowSnapshotArg =
+	    captureLuaCallbackSnapshotForDispatch(request.engines, request.lineSnapshotPolicy);
+	if (actionSourceOverride >= 0)
+	{
+		request.actionSourceOverride    = actionSourceOverride;
+		request.hasActionSourceOverride = true;
+	}
+	const_cast<WorldRuntime *>(this)->queuePluginCallbackDispatchAsync(request, completion);
+}
+
+LuaBatchDispatchResult WorldRuntime::dispatchLuaStringsAndWildcards(
+    LuaCallbackEngine *engine, const QString &functionName, const QStringList &args,
+    const QStringList &wildcards, const QMap<QString, QString> &namedWildcards,
+    const QVector<LuaStyleRun> *styleRuns, const bool triggerOutputReplacesMatchedLine,
+    const int triggerMatchedLineBufferIndex, const qint64 triggerMatchedLineAbsoluteNumber) const
+{
+	return dispatchLuaStringsAndWildcards(makeNonOwningLuaEngineRef(engine), functionName, args, wildcards,
+	                                      namedWildcards, styleRuns, triggerOutputReplacesMatchedLine,
+	                                      triggerMatchedLineBufferIndex, triggerMatchedLineAbsoluteNumber);
+}
+
+bool WorldRuntime::dispatchLuaExecuteScript(const QSharedPointer<LuaCallbackEngine> &engine,
+                                            const QString &code, const QString &description,
+                                            const QVector<LuaStyleRun> *styleRuns,
+                                            const bool                  hasTriggerContext,
+                                            const bool                  triggerOutputReplacesMatchedLine,
+                                            const int                   triggerMatchedLineBufferIndex,
+                                            const qint64 triggerMatchedLineAbsoluteNumber) const
+{
+	if (!engine)
+		return false;
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::dispatchLuaExecuteScript");
+
+	const unsigned short previousActionSource = currentActionSource();
+	const bool           changedActionSource  = previousActionSource == eUnknownActionSource;
+	if (changedActionSource)
+		const_cast<WorldRuntime *>(this)->setCurrentActionSource(eLuaSandbox);
+	[[maybe_unused]] const auto restoreActionSource = qScopeGuard(
+	    [this, changedActionSource, previousActionSource]
+	    {
+		    if (changedActionSource)
+			    const_cast<WorldRuntime *>(this)->setCurrentActionSource(previousActionSource);
+	    });
+
+	LuaBatchDispatchRequest request;
+	request.kind         = LuaBatchDispatchKind::ExecuteScript;
+	request.lane         = LuaBatchDispatchLane::Callback;
+	request.engines      = {engine};
+	request.stringArg    = code;
+	request.stringArg2   = description;
+	request.styleRunsArg = styleRuns ? QSharedPointer<QVector<LuaStyleRun>>::create(*styleRuns)
+	                                 : QSharedPointer<const QVector<LuaStyleRun>>{};
+	request.executeScriptHasTriggerContext   = hasTriggerContext;
+	request.triggerOutputReplacesMatchedLine = triggerOutputReplacesMatchedLine;
+	request.triggerMatchedLineBufferIndex    = triggerMatchedLineBufferIndex;
+	request.triggerMatchedLineAbsoluteNumber = triggerMatchedLineAbsoluteNumber;
+	request.inputCritical                    = hasTriggerContext;
+	request.lineSnapshotPolicy = hasTriggerContext ? LuaCallbackLineSnapshotPolicy::CountAndRecentText
+	                                               : LuaCallbackLineSnapshotPolicy::None;
+	request.miniWindowSnapshotArg =
+	    captureLuaCallbackSnapshotForDispatch(request.engines, request.lineSnapshotPolicy);
+
+	const LuaBatchDispatchResult result =
+	    hasTriggerContext ? const_cast<WorldRuntime *>(this)->queuePluginCallbackDispatch(request, true)
+	                      : dispatchLuaBatch(request);
+	return result.boolResultValid ? result.boolResult : false;
+}
+
+void WorldRuntime::dispatchLuaExecuteScriptAsync(
+    const QSharedPointer<LuaCallbackEngine> &engine, const QString &code, const QString &description,
+    const QVector<LuaStyleRun> *styleRuns, const bool hasTriggerContext,
+    const bool triggerOutputReplacesMatchedLine, const int triggerMatchedLineBufferIndex,
+    const qint64 triggerMatchedLineAbsoluteNumber, std::function<void(bool)> completion) const
+{
+	if (!engine)
+	{
+		if (completion)
+			completion(false);
+		return;
+	}
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::dispatchLuaExecuteScriptAsync");
+
+	const unsigned short previousActionSource = currentActionSource();
+	const bool           changedActionSource  = previousActionSource == eUnknownActionSource;
+	if (changedActionSource)
+		const_cast<WorldRuntime *>(this)->setCurrentActionSource(eLuaSandbox);
+
+	LuaBatchDispatchRequest request;
+	request.kind         = LuaBatchDispatchKind::ExecuteScript;
+	request.lane         = LuaBatchDispatchLane::Callback;
+	request.engines      = {engine};
+	request.stringArg    = code;
+	request.stringArg2   = description;
+	request.styleRunsArg = styleRuns ? QSharedPointer<QVector<LuaStyleRun>>::create(*styleRuns)
+	                                 : QSharedPointer<const QVector<LuaStyleRun>>{};
+	request.executeScriptHasTriggerContext   = hasTriggerContext;
+	request.triggerOutputReplacesMatchedLine = triggerOutputReplacesMatchedLine;
+	request.triggerMatchedLineBufferIndex    = triggerMatchedLineBufferIndex;
+	request.triggerMatchedLineAbsoluteNumber = triggerMatchedLineAbsoluteNumber;
+	request.inputCritical                    = hasTriggerContext;
+	request.lineSnapshotPolicy = hasTriggerContext ? LuaCallbackLineSnapshotPolicy::CountAndRecentText
+	                                               : LuaCallbackLineSnapshotPolicy::None;
+	request.miniWindowSnapshotArg =
+	    captureLuaCallbackSnapshotForDispatch(request.engines, request.lineSnapshotPolicy);
+
+	const_cast<WorldRuntime *>(this)->queuePluginCallbackDispatchAsync(
+	    request,
+	    [this, changedActionSource, previousActionSource,
+	     completion = std::move(completion)](const LuaBatchDispatchResult &result) mutable
+	    {
+		    if (changedActionSource)
+			    const_cast<WorldRuntime *>(this)->setCurrentActionSource(previousActionSource);
+		    if (completion)
+			    completion(result.boolResultValid ? result.boolResult : false);
+	    });
+}
+
+bool WorldRuntime::dispatchLuaExecuteScript(LuaCallbackEngine *engine, const QString &code,
+                                            const QString &description, const QVector<LuaStyleRun> *styleRuns,
+                                            const bool   hasTriggerContext,
+                                            const bool   triggerOutputReplacesMatchedLine,
+                                            const int    triggerMatchedLineBufferIndex,
+                                            const qint64 triggerMatchedLineAbsoluteNumber) const
+{
+	return dispatchLuaExecuteScript(makeNonOwningLuaEngineRef(engine), code, description, styleRuns,
+	                                hasTriggerContext, triggerOutputReplacesMatchedLine,
+	                                triggerMatchedLineBufferIndex, triggerMatchedLineAbsoluteNumber);
+}
+
+bool WorldRuntime::dispatchLuaResetAndLoadScript(const QSharedPointer<LuaCallbackEngine> &engine) const
+{
+	if (!engine)
+		return false;
+	LuaBatchDispatchRequest request;
+	request.kind                        = LuaBatchDispatchKind::ResetAndLoadScript;
+	request.lane                        = LuaBatchDispatchLane::Callback;
+	request.engines                     = {engine};
+	const LuaBatchDispatchResult result = dispatchLuaBatch(request);
+	return result.boolResultValid ? result.boolResult : false;
+}
+
+bool WorldRuntime::dispatchLuaResetAndLoadScript(LuaCallbackEngine *engine) const
+{
+	return dispatchLuaResetAndLoadScript(makeNonOwningLuaEngineRef(engine));
 }
 
 void WorldRuntime::applyPackageRestrictions(bool enablePackage)
 {
+	QVector<QSharedPointer<LuaCallbackEngine>> engines;
+	engines.reserve((m_luaCallbacks ? 1 : 0) + m_plugins.size());
 	if (m_luaCallbacks)
-		m_luaExecutor->applyPackageRestrictions(m_luaCallbacks, enablePackage);
-
+		engines.push_back(makeNonOwningLuaEngineRef(m_luaCallbacks));
 	for (auto &plugin : m_plugins)
 	{
 		if (plugin.lua)
-			m_luaExecutor->applyPackageRestrictions(plugin.lua.data(), enablePackage);
+			engines.push_back(plugin.lua);
 	}
+	dispatchApplyPackageRestrictions(engines, enablePackage, false);
 }
 
 void WorldRuntime::setTraceEnabled(bool enabled)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this, enabled] { setTraceEnabled(enabled); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, enabled] { setTraceEnabled(enabled); });
 		return;
 	}
 
@@ -8996,13 +10179,8 @@ void WorldRuntime::setTraceEnabled(bool enabled)
 bool WorldRuntime::traceEnabled() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		bool       result  = false;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = traceEnabled(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked && result;
-	}
+		return qmudInvokeMethodTrueOnSuccess(const_cast<WorldRuntime *>(this),
+		                                     [this] { return traceEnabled(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::traceEnabled");
 	return m_traceEnabled;
@@ -9012,8 +10190,7 @@ void WorldRuntime::setWorldFileModified(bool modified)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(
-		    this, [this, modified] { setWorldFileModified(modified); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, modified] { setWorldFileModified(modified); });
 		return;
 	}
 
@@ -9100,6 +10277,15 @@ QList<int> WorldRuntime::udpPortList() const
 	for (auto it = m_udpListeners.cbegin(); it != m_udpListeners.cend(); ++it)
 		ports.append(it.key());
 	return ports;
+}
+
+QHash<int, QString> WorldRuntime::udpListenerPluginIdsByPort() const
+{
+	QHash<int, QString> owners;
+	owners.reserve(m_udpListeners.size());
+	for (auto it = m_udpListeners.cbegin(); it != m_udpListeners.cend(); ++it)
+		owners.insert(it.key(), it->pluginId);
+	return owners;
 }
 
 int WorldRuntime::udpListen(const QString &pluginId, const QString &ip, int port, const QString &script)
@@ -9210,13 +10396,8 @@ static bool isAbsolutePathPortable(const QString &path)
 int WorldRuntime::playSound(int buffer, const QString &fileName, bool loop, double volume, double pan)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eCannotPlaySound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, buffer, fileName, loop, volume, pan]
-		    { result = playSound(buffer, fileName, loop, volume, pan); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eCannotPlaySound;
-	}
+		return qmudInvokeMethodOr(this, eCannotPlaySound, [this, buffer, fileName, loop, volume, pan]
+		                          { return playSound(buffer, fileName, loop, volume, pan); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::playSound");
 	Q_UNUSED(pan);
@@ -9339,13 +10520,8 @@ int WorldRuntime::playSound(int buffer, const QString &fileName, bool loop, doub
 int WorldRuntime::playSoundMemory(int buffer, const QByteArray &data, bool loop, double volume, double pan)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eCannotPlaySound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, buffer, data, loop, volume, pan]
-		    { result = playSoundMemory(buffer, data, loop, volume, pan); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eCannotPlaySound;
-	}
+		return qmudInvokeMethodOr(this, eCannotPlaySound, [this, buffer, data, loop, volume, pan]
+		                          { return playSoundMemory(buffer, data, loop, volume, pan); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::playSoundMemory");
 	if (data.isEmpty())
@@ -9424,12 +10600,7 @@ int WorldRuntime::playSoundMemory(int buffer, const QByteArray &data, bool loop,
 int WorldRuntime::stopSound(int buffer)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eCannotPlaySound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, buffer] { result = stopSound(buffer); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eCannotPlaySound;
-	}
+		return qmudInvokeMethodOr(this, eCannotPlaySound, [this, buffer] { return stopSound(buffer); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::stopSound");
 	if (buffer == 0 && !m_inCancelSoundPluginCallback)
@@ -9483,13 +10654,8 @@ int WorldRuntime::stopSound(int buffer)
 int WorldRuntime::soundStatus(int buffer) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = -3;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, buffer] { result = soundStatus(buffer); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : -3;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), -3,
+		                          [this, buffer] { return soundStatus(buffer); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::soundStatus");
 	if (buffer < 1 || buffer > kMaxSoundBuffers)
@@ -9505,13 +10671,8 @@ int WorldRuntime::soundStatus(int buffer) const
 int WorldRuntime::playSound(int, const QString &, bool, double, double)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eCannotPlaySound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result] { result = playSound(0, QString(), false, 0.0, 0.0); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eCannotPlaySound;
-	}
+		return qmudInvokeMethodOr(this, eCannotPlaySound,
+		                          [this] { return playSound(0, QString(), false, 0.0, 0.0); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::playSound");
 	return eCannotPlaySound;
@@ -9520,13 +10681,8 @@ int WorldRuntime::playSound(int, const QString &, bool, double, double)
 int WorldRuntime::playSoundMemory(int, const QByteArray &, bool, double, double)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eCannotPlaySound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result] { result = playSoundMemory(0, QByteArray(), false, 0.0, 0.0); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eCannotPlaySound;
-	}
+		return qmudInvokeMethodOr(this, eCannotPlaySound,
+		                          [this] { return playSoundMemory(0, QByteArray(), false, 0.0, 0.0); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::playSoundMemory");
 	return eCannotPlaySound;
@@ -9535,12 +10691,7 @@ int WorldRuntime::playSoundMemory(int, const QByteArray &, bool, double, double)
 int WorldRuntime::stopSound(int)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result = eCannotPlaySound;
-		const bool invoked =
-		    qmudInvokeMethod(this, [this, &result] { result = stopSound(0); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eCannotPlaySound;
-	}
+		return qmudInvokeMethodOr(this, eCannotPlaySound, [this] { return stopSound(0); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::stopSound");
 	return eCannotPlaySound;
@@ -9549,13 +10700,7 @@ int WorldRuntime::stopSound(int)
 int WorldRuntime::soundStatus(int) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = -3;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = soundStatus(0); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : -3;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), -3, [this] { return soundStatus(0); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::soundStatus");
 	return -3;
@@ -10051,13 +11196,8 @@ static int colourSeqFromAttributes(const QMap<QString, QString> &attributes)
 int WorldRuntime::setCustomColourText(int index, const QColor &color)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eBadParameter;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, index, color] { result = setCustomColourText(index, color); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eBadParameter;
-	}
+		return qmudInvokeMethodOr(this, eBadParameter,
+		                          [this, index, color] { return setCustomColourText(index, color); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::setCustomColourText");
 	if (index < 1 || index > MAX_CUSTOM || !color.isValid())
@@ -10107,13 +11247,8 @@ int WorldRuntime::setCustomColourText(int index, const QColor &color)
 int WorldRuntime::setCustomColourBackground(int index, const QColor &color)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eBadParameter;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, index, color] { result = setCustomColourBackground(index, color); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eBadParameter;
-	}
+		return qmudInvokeMethodOr(this, eBadParameter,
+		                          [this, index, color] { return setCustomColourBackground(index, color); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::setCustomColourBackground");
 	if (index < 1 || index > MAX_CUSTOM || !color.isValid())
@@ -10163,13 +11298,8 @@ int WorldRuntime::setCustomColourBackground(int index, const QColor &color)
 int WorldRuntime::setCustomColourName(int index, const QString &name)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eOptionOutOfRange;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, index, name] { result = setCustomColourName(index, name); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eOptionOutOfRange;
-	}
+		return qmudInvokeMethodOr(this, eOptionOutOfRange,
+		                          [this, index, name] { return setCustomColourName(index, name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::setCustomColourName");
 	if (index < 1 || index > MAX_CUSTOM)
@@ -10210,16 +11340,36 @@ int WorldRuntime::setCustomColourName(int index, const QString &name)
 	return eOK;
 }
 
+QString WorldRuntime::customColourName(int index) const
+{
+	if (QThread::currentThread() != thread())
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QString(),
+		                          [this, index] { return customColourName(index); });
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::customColourName");
+	if (index < 1 || index > MAX_CUSTOM)
+		return {};
+
+	for (const auto &colour : m_colours)
+	{
+		const QString groupKey = colour.group.trimmed().toLower();
+		if (groupKey != QStringLiteral("custom/custom") && groupKey != QStringLiteral("custom"))
+			continue;
+		if (colourSeqFromAttributes(colour.attributes) != index)
+			continue;
+		const QString name = colour.attributes.value(QStringLiteral("name")).trimmed();
+		if (!name.isEmpty())
+			return name;
+		break;
+	}
+	return QStringLiteral("Custom%1").arg(index);
+}
+
 long WorldRuntime::customColourText(int index) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		long       result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, index] { result = customColourText(index); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0L,
+		                          [this, index] { return customColourText(index); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::customColourText");
 	if (index < 1 || index > MAX_CUSTOM)
@@ -10234,13 +11384,8 @@ long WorldRuntime::customColourText(int index) const
 long WorldRuntime::customColourBackground(int index) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		long       result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this),
-		    [this, &result, index] { result = customColourBackground(index); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0L,
+		                          [this, index] { return customColourBackground(index); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::customColourBackground");
 	if (index < 1 || index > MAX_CUSTOM)
@@ -10254,43 +11399,57 @@ long WorldRuntime::customColourBackground(int index) const
 
 namespace
 {
-	int loadWorldImage(const QString &rawName, QImage &target, QString &storedName)
+	bool isAsciiLetter(const ushort code)
 	{
-		const QString fileName = rawName.trimmed();
-		if (fileName.isEmpty())
-		{
-			target = QImage();
-			storedName.clear();
-			return eOK;
-		}
+		return (code >= 'A' && code <= 'Z') || (code >= 'a' && code <= 'z');
+	}
 
-		if (fileName.size() < 5)
-			return eBadParameter;
-
-		const QString lower = fileName.toLower();
-		if (!lower.endsWith(QStringLiteral(".png")) && !lower.endsWith(QStringLiteral(".bmp")))
-			return eBadParameter;
-
-		if (!QFileInfo::exists(fileName))
-			return eFileNotFound;
-
-		QImageReader reader(fileName);
-		reader.setAutoTransform(true);
-		const QImage image = reader.read();
-		if (image.isNull())
-			return eCouldNotOpenFile;
-
-		target     = image;
-		storedName = fileName;
-		return eOK;
+	bool isAsciiDigit(const ushort code)
+	{
+		return code >= '0' && code <= '9';
 	}
 } // namespace
+
+int WorldRuntime::loadWorldImageFile(const QString &rawName, QImage *target, QString *storedName)
+{
+	const QString fileName = rawName.trimmed();
+	if (fileName.isEmpty())
+	{
+		if (target)
+			*target = QImage();
+		if (storedName)
+			storedName->clear();
+		return eOK;
+	}
+
+	if (fileName.size() < 5)
+		return eBadParameter;
+
+	const QString lower = fileName.toLower();
+	if (!lower.endsWith(QStringLiteral(".png")) && !lower.endsWith(QStringLiteral(".bmp")))
+		return eBadParameter;
+
+	if (!QFileInfo::exists(fileName))
+		return eFileNotFound;
+
+	QImageReader reader(fileName);
+	reader.setAutoTransform(true);
+	const QImage image = reader.read();
+	if (image.isNull())
+		return eCouldNotOpenFile;
+
+	if (target)
+		*target = image;
+	if (storedName)
+		*storedName = fileName;
+	return eOK;
+}
 
 int WorldRuntime::setBackgroundImage(const QString &fileName, int mode)
 {
 	if (mode < 0 || mode > 13)
 		return eBadParameter;
-	const int result = loadWorldImage(fileName, m_backgroundImage, m_backgroundImageName);
+	const int result = loadWorldImageFile(fileName, &m_backgroundImage, &m_backgroundImageName);
 	if (result == eOK)
 	{
 		m_backgroundImageMode = mode;
@@ -10308,7 +11467,7 @@ int WorldRuntime::setForegroundImage(const QString &fileName, int mode)
 {
 	if (mode < 0 || mode > 13)
 		return eBadParameter;
-	const int result = loadWorldImage(fileName, m_foregroundImage, m_foregroundImageName);
+	const int result = loadWorldImageFile(fileName, &m_foregroundImage, &m_foregroundImageName);
 	if (result == eOK)
 	{
 		m_foregroundImageMode = mode;
@@ -10354,68 +11513,22 @@ QString WorldRuntime::foregroundImageName() const
 
 bool WorldRuntime::closeNotepad(const QString &title, bool querySave)
 {
-	if (QThread::currentThread() != thread())
-	{
-		bool       result  = false;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, title, querySave] { result = closeNotepad(title, querySave); },
-		    Qt::BlockingQueuedConnection);
-		return invoked && result;
-	}
-
-	qmudAssertObjectThreadAffinity(this, "WorldRuntime::closeNotepad");
 	const QString trimmedTitle = title.trimmed();
 	if (trimmedTitle.isEmpty())
 		return false;
-	const auto           ownerToken = reinterpret_cast<qulonglong>(this);
-	const QString        worldId    = m_worldAttributes.value(QStringLiteral("id")).trimmed();
-
-	AppController const *app  = AppController::instance();
-	MainWindow const    *main = app ? app->mainWindow() : nullptr;
-	if (!main)
-		return false;
-
-	TextChildWindow               *target          = nullptr;
-	TextChildWindow               *unnamedFallback = nullptr;
-	const QList<TextChildWindow *> notepads        = main->findChildren<TextChildWindow *>();
-	for (TextChildWindow *text : notepads)
+	const auto ownerToken = reinterpret_cast<qulonglong>(this);
+	QString    worldId;
+	if (QThread::currentThread() == thread())
 	{
-		if (text->windowTitle().compare(trimmedTitle, Qt::CaseInsensitive) != 0)
-			continue;
-
-		const qulonglong relatedToken = text->property("worldRuntimeToken").toULongLong();
-		if (relatedToken == ownerToken)
-		{
-			target = text;
-			break;
-		}
-		if (relatedToken != 0)
-			continue;
-
-		if (worldId.isEmpty())
-		{
-			target = text;
-			break;
-		}
-		const QString related = text->property("worldId").toString().trimmed();
-		if (related.compare(worldId, Qt::CaseInsensitive) == 0)
-		{
-			target = text;
-			break;
-		}
-		if (related.isEmpty() && !unnamedFallback)
-			unnamedFallback = text;
+		qmudAssertObjectThreadAffinity(this, "WorldRuntime::closeNotepad");
+		worldId = m_worldAttributes.value(QStringLiteral("id")).trimmed();
 	}
-	if (!target)
-		target = unnamedFallback;
-
-	if (!target)
-		return false;
-
-	QPointer const guard(target);
-	target->setQuerySaveOnClose(querySave);
-	target->close();
-	return guard.isNull() || !guard->isVisible();
+	else
+	{
+		worldId = qmudInvokeMethodOr(this, QString(), [this]
+		                             { return m_worldAttributes.value(QStringLiteral("id")).trimmed(); });
+	}
+	return closeNotepadWindowOnMainThread(trimmedTitle, querySave, ownerToken, worldId);
 }
 
 QVariant WorldRuntime::debugCommand(const QString &command)
@@ -10580,13 +11693,7 @@ int WorldRuntime::queuedCommandCount() const
 qint64 WorldRuntime::bytesIn() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		qint64     result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = bytesIn(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return runtimeCountersSnapshot(false).bytesIn;
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::bytesIn");
 	return m_bytesIn;
@@ -10595,13 +11702,7 @@ qint64 WorldRuntime::bytesIn() const
 qint64 WorldRuntime::bytesOut() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		qint64     result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = bytesOut(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return runtimeCountersSnapshot(false).bytesOut;
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::bytesOut");
 	return m_bytesOut;
@@ -10731,13 +11832,8 @@ bool WorldRuntime::isConnecting() const
 bool WorldRuntime::isMapping() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		bool       result  = false;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = isMapping(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked && result;
-	}
+		return qmudInvokeMethodTrueOnSuccess(const_cast<WorldRuntime *>(this),
+		                                     [this] { return isMapping(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::isMapping");
 	return m_isMapping;
@@ -10746,13 +11842,7 @@ bool WorldRuntime::isMapping() const
 int WorldRuntime::mappingCount() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = mappingCount(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0, [this] { return mappingCount(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::mappingCount");
 	return safeQSizeToInt(m_mappingList.size());
@@ -10761,13 +11851,8 @@ int WorldRuntime::mappingCount() const
 QString WorldRuntime::mappingItem(int index) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QString    result;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, index] { result = mappingItem(index); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : QString();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QString(),
+		                          [this, index] { return mappingItem(index); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::mappingItem");
 	if (index < 0 || index >= m_mappingList.size())
@@ -10778,13 +11863,8 @@ QString WorldRuntime::mappingItem(int index) const
 QString WorldRuntime::mappingString(bool omitComments) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QString    result;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, omitComments]
-		    { result = mappingString(omitComments); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : QString();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QString(),
+		                          [this, omitComments] { return mappingString(omitComments); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::mappingString");
 	QString lastDir;
@@ -10839,13 +11919,8 @@ QString WorldRuntime::mappingString(bool omitComments) const
 unsigned short WorldRuntime::noteStyle() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		unsigned short result  = 0;
-		const bool     invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &result] { result = noteStyle(); },
-            Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), static_cast<unsigned short>(0),
+		                          [this] { return noteStyle(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::noteStyle");
 	return m_noteStyle;
@@ -10855,7 +11930,7 @@ void WorldRuntime::setNoteStyle(unsigned short style)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this, style] { setNoteStyle(style); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, style] { setNoteStyle(style); });
 		return;
 	}
 
@@ -10996,13 +12071,8 @@ constexpr int kAnsiWhite = 7;
 bool          WorldRuntime::notesInRgb() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		bool       result  = false;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = notesInRgb(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked && result;
-	}
+		return qmudInvokeMethodTrueOnSuccess(const_cast<WorldRuntime *>(this),
+		                                     [this] { return notesInRgb(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::notesInRgb");
 	return m_notesInRgb;
@@ -11011,13 +12081,7 @@ bool          WorldRuntime::notesInRgb() const
 int WorldRuntime::noteTextColour() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = -1;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = noteTextColour(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : -1;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), -1, [this] { return noteTextColour(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::noteTextColour");
 	return m_noteTextColour;
@@ -11027,7 +12091,7 @@ void WorldRuntime::setNoteTextColour(int value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this, value] { setNoteTextColour(value); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, value] { setNoteTextColour(value); });
 		return;
 	}
 
@@ -11041,13 +12105,7 @@ void WorldRuntime::setNoteTextColour(int value)
 long WorldRuntime::noteColourFore() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		long       result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = noteColourFore(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0L, [this] { return noteColourFore(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::noteColourFore");
 	if (m_notesInRgb)
@@ -11070,13 +12128,7 @@ long WorldRuntime::noteColourFore() const
 long WorldRuntime::noteColourBack() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		long       result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = noteColourBack(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0L, [this] { return noteColourBack(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::noteColourBack");
 	if (m_notesInRgb)
@@ -11100,7 +12152,7 @@ void WorldRuntime::setNoteColourFore(long value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this, value] { setNoteColourFore(value); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, value] { setNoteColourFore(value); });
 		return;
 	}
 
@@ -11128,7 +12180,7 @@ void WorldRuntime::setNoteColourBack(long value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this, value] { setNoteColourBack(value); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, value] { setNoteColourBack(value); });
 		return;
 	}
 
@@ -11163,13 +12215,8 @@ long WorldRuntime::mapColourValue(long original) const
 long WorldRuntime::getMapColour(long value) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		long       result  = value;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, value] { result = getMapColour(value); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : value;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), value,
+		                          [this, value] { return getMapColour(value); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::getMapColour");
 	return mapColourValue(value);
@@ -11177,90 +12224,7 @@ long WorldRuntime::getMapColour(long value) const
 
 long WorldRuntime::getSysColor(int index)
 {
-	const QPalette palette = QGuiApplication::palette();
-	QColor         color;
-	switch (index)
-	{
-	case 0: // Scrollbar
-		color = palette.color(QPalette::Mid);
-		break;
-	case 1: // Background (desktop)
-		color = palette.color(QPalette::Window);
-		break;
-	case 2: // Active caption
-		color = palette.color(QPalette::Highlight);
-		break;
-	case 3: // Inactive caption
-		color = palette.color(QPalette::Dark);
-		break;
-	case 4: // Menu
-		color = palette.color(QPalette::Button);
-		break;
-	case 5: // Window
-		color = palette.color(QPalette::Window);
-		break;
-	case 6: // Window frame
-		color = palette.color(QPalette::Shadow);
-		break;
-	case 7: // Menu text
-		color = palette.color(QPalette::ButtonText);
-		break;
-	case 8: // Window text
-		color = palette.color(QPalette::WindowText);
-		break;
-	case 9: // Caption text
-		color = palette.color(QPalette::HighlightedText);
-		break;
-	case 10: // Active border
-		color = palette.color(QPalette::Dark);
-		break;
-	case 11: // Inactive border
-		color = palette.color(QPalette::Mid);
-		break;
-	case 12: // Application workspace
-		color = palette.color(QPalette::Base);
-		break;
-	case 13: // Highlight
-		color = palette.color(QPalette::Highlight);
-		break;
-	case 14: // Highlight text
-		color = palette.color(QPalette::HighlightedText);
-		break;
-	case 15: // Button face
-		color = palette.color(QPalette::Button);
-		break;
-	case 16: // Button shadow
-		color = palette.color(QPalette::Shadow);
-		break;
-	case 17: // Gray text
-		color = palette.color(QPalette::Mid);
-		break;
-	case 18: // Button text
-		color = palette.color(QPalette::ButtonText);
-		break;
-	case 19: // Inactive caption text
-		color = palette.color(QPalette::WindowText);
-		break;
-	case 20: // Button highlight
-		color = palette.color(QPalette::Light);
-		break;
-	case 21: // 3D dark shadow
-		color = palette.color(QPalette::Dark);
-		break;
-	case 22: // 3D light
-		color = palette.color(QPalette::Light);
-		break;
-	case 23: // Info text
-		color = palette.color(QPalette::ToolTipText);
-		break;
-	case 24: // Info background
-		color = palette.color(QPalette::ToolTipBase);
-		break;
-	default:
-		return 0;
-	}
-
-	return colorToLong(color);
+	return qmudGuiSystemColor(index);
 }
 
 long WorldRuntime::getUniqueNumber()
@@ -11311,9 +12275,7 @@ void WorldRuntime::mapColour(long original, long replacement)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(
-		    this, [this, original, replacement] { mapColour(original, replacement); },
-		    Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, original, replacement] { mapColour(original, replacement); });
 		return;
 	}
 
@@ -11324,13 +12286,8 @@ void WorldRuntime::mapColour(long original, long replacement)
 QMap<long, long> WorldRuntime::mapColourList() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QMap<long, long> result;
-		const bool       invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &result] { result = mapColourList(); },
-            Qt::BlockingQueuedConnection);
-		return invoked ? result : QMap<long, long>();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QMap<long, long>(),
+		                          [this] { return mapColourList(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::mapColourList");
 	return m_colourTranslationMap;
@@ -11339,13 +12296,8 @@ QMap<long, long> WorldRuntime::mapColourList() const
 long WorldRuntime::normalColour(int index) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		long       result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, index] { result = normalColour(index); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0L,
+		                          [this, index] { return normalColour(index); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::normalColour");
 	if (index < 1 || index > 8)
@@ -11375,8 +12327,7 @@ void WorldRuntime::setNormalColour(int index, long value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(
-		    this, [this, index, value] { setNormalColour(index, value); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, index, value] { setNormalColour(index, value); });
 		return;
 	}
 
@@ -11405,17 +12356,11 @@ void WorldRuntime::setNormalColour(int index, long value)
 int WorldRuntime::addToMapper(const QString &direction, const QString &reverse)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eBadMapItem;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, direction, reverse] { result = addToMapper(direction, reverse); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eBadMapItem;
-	}
+		return qmudInvokeMethodOr(this, eBadMapItem,
+		                          [this, direction, reverse] { return addToMapper(direction, reverse); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::addToMapper");
-	const auto badChars = QStringLiteral("{}()/\\");
-	if (direction.contains(badChars) || reverse.contains(badChars))
+	if (containsReservedMapperCharacter(direction) || containsReservedMapperCharacter(reverse))
 		return eBadMapItem;
 
 	if (direction.isEmpty() && reverse.isEmpty())
@@ -11423,43 +12368,52 @@ int WorldRuntime::addToMapper(const QString &direction, const QString &reverse)
 
 	const QString entry = QStringLiteral("%1/%2").arg(direction, reverse);
 	m_mappingList.append(entry);
+	invalidateLuaCallbackDispatchSnapshot();
 	return eOK;
 }
 
 int WorldRuntime::addMapperComment(const QString &comment)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eBadMapItem;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, comment] { result = addMapperComment(comment); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eBadMapItem;
-	}
+		return qmudInvokeMethodOr(this, eBadMapItem, [this, comment] { return addMapperComment(comment); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::addMapperComment");
-	const auto badChars = QStringLiteral("{}()/\\");
-	if (comment.contains(badChars))
+	if (containsReservedMapperCharacter(comment))
 		return eBadMapItem;
 
 	const QString entry = QStringLiteral("{%1}").arg(comment);
 	m_mappingList.append(entry);
+	invalidateLuaCallbackDispatchSnapshot();
 	return eOK;
+}
+
+bool WorldRuntime::containsReservedMapperCharacter(const QString &text)
+{
+	for (const QChar ch : text)
+	{
+		switch (ch.unicode())
+		{
+		case '{':
+		case '}':
+		case '(':
+		case ')':
+		case '/':
+		case '\\':
+			return true;
+		default:
+			break;
+		}
+	}
+	return false;
 }
 
 int WorldRuntime::shiftTabCompleteItem(const QString &item)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eBadParameter;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, item] { result = shiftTabCompleteItem(item); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eBadParameter;
-	}
+		return qmudInvokeMethodOr(this, eBadParameter, [this, item] { return shiftTabCompleteItem(item); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::shiftTabCompleteItem");
-	if (item.isEmpty() || item.size() > 30)
+	if (!isValidShiftTabCompleteItem(item))
 		return eBadParameter;
 	if (item == QStringLiteral("<clear>"))
 	{
@@ -11477,58 +12431,56 @@ int WorldRuntime::shiftTabCompleteItem(const QString &item)
 		return eOK;
 	}
 
-	const QChar  first     = item.at(0);
-	const ushort firstCode = first.unicode();
-	const bool   firstIsLetter =
-	    (firstCode >= 'A' && firstCode <= 'Z') || (firstCode >= 'a' && firstCode <= 'z');
-	if (!firstIsLetter)
-		return eBadParameter;
-
-	for (const QChar ch : item)
-	{
-		const ushort code = ch.unicode();
-		const bool   isAlnum =
-		    (code >= 'A' && code <= 'Z') || (code >= 'a' && code <= 'z') || (code >= '0' && code <= '9');
-		if (isAlnum || code == '_' || code == '-' || code == '.')
-			continue;
-		return eBadParameter;
-	}
-
 	m_shiftTabCompleteItems.insert(item);
 	return eOK;
+}
+
+bool WorldRuntime::isValidShiftTabCompleteItem(const QString &item)
+{
+	if (item.isEmpty() || item.size() > 30)
+		return false;
+	if (item == QStringLiteral("<clear>") || item == QStringLiteral("<functions>") ||
+	    item == QStringLiteral("<nofunctions>"))
+	{
+		return true;
+	}
+
+	const ushort firstCode = item.at(0).unicode();
+	if (!isAsciiLetter(firstCode))
+		return false;
+
+	return std::ranges::all_of(item,
+	                           [](const QChar ch)
+	                           {
+		                           const ushort code = ch.unicode();
+		                           return isAsciiLetter(code) || isAsciiDigit(code) || code == '_' ||
+		                                  code == '-' || code == '.';
+	                           });
 }
 
 int WorldRuntime::deleteLastMapItem()
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eNoMapItems;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result] { result = deleteLastMapItem(); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eNoMapItems;
-	}
+		return qmudInvokeMethodOr(this, eNoMapItems, [this] { return deleteLastMapItem(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::deleteLastMapItem");
 	if (m_mappingList.isEmpty())
 		return eNoMapItems;
 	m_mappingList.removeLast();
+	invalidateLuaCallbackDispatchSnapshot();
 	return eOK;
 }
 
 int WorldRuntime::deleteAllMapItems()
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eNoMapItems;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result] { result = deleteAllMapItems(); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eNoMapItems;
-	}
+		return qmudInvokeMethodOr(this, eNoMapItems, [this] { return deleteAllMapItems(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::deleteAllMapItems");
 	if (m_mappingList.isEmpty())
 		return eNoMapItems;
 	m_mappingList.clear();
+	invalidateLuaCallbackDispatchSnapshot();
 	return eOK;
 }
 
@@ -11536,7 +12488,7 @@ void WorldRuntime::deleteLines(int count)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this, count] { deleteLines(count); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, count] { deleteLines(count); });
 		return;
 	}
 
@@ -11547,6 +12499,7 @@ void WorldRuntime::deleteLines(int count)
 		m_lines.clear();
 	else
 		m_lines.erase(m_lines.end() - count, m_lines.end());
+	invalidateLuaCallbackLineBufferSnapshot();
 	if (m_view)
 		m_view->rebuildOutputFromLines(m_lines);
 }
@@ -11555,12 +12508,13 @@ void WorldRuntime::deleteOutput()
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this] { deleteOutput(); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this] { deleteOutput(); });
 		return;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::deleteOutput");
 	m_lines.clear();
+	invalidateLuaCallbackLineBufferSnapshot();
 	if (m_view)
 		m_view->clearOutputBuffer();
 }
@@ -11568,12 +12522,7 @@ void WorldRuntime::deleteOutput()
 int WorldRuntime::deleteVariable(const QString &name)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eVariableNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, name] { result = deleteVariable(name); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eVariableNotFound;
-	}
+		return qmudInvokeMethodOr(this, eVariableNotFound, [this, name] { return deleteVariable(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::deleteVariable");
 	for (int i = 0; i < m_variables.size(); ++i)
@@ -11593,13 +12542,8 @@ int WorldRuntime::deleteVariable(const QString &name)
 int WorldRuntime::discardQueuedCommands() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = discardQueuedCommands(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0,
+		                          [this] { return discardQueuedCommands(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::discardQueuedCommands");
 	if (!m_commandProcessor)
@@ -11611,7 +12555,7 @@ void WorldRuntime::setMappingEnabled(bool enabled)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this, enabled] { setMappingEnabled(enabled); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, enabled] { setMappingEnabled(enabled); });
 		return;
 	}
 
@@ -11622,13 +12566,8 @@ void WorldRuntime::setMappingEnabled(bool enabled)
 QString WorldRuntime::evaluateSpeedwalk(const QString &speedWalkString) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QString    result;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, speedWalkString]
-		    { result = evaluateSpeedwalk(speedWalkString); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : QString();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QString(),
+		                          [this, speedWalkString] { return evaluateSpeedwalk(speedWalkString); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::evaluateSpeedwalk");
 	if (!m_commandProcessor)
@@ -11639,13 +12578,8 @@ QString WorldRuntime::evaluateSpeedwalk(const QString &speedWalkString) const
 int WorldRuntime::executeCommand(const QString &text) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eWorldClosed;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, text] { result = executeCommand(text); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eWorldClosed;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), eWorldClosed,
+		                          [this, text] { return executeCommand(text); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::executeCommand");
 	if (!m_commandProcessor)
@@ -11659,6 +12593,17 @@ QString WorldRuntime::getEntityValue(const QString &name) const
 	if (m_telnet.getCustomEntityValue(name.toLocal8Bit(), value))
 		return QString::fromUtf8(value);
 	return {};
+}
+
+QMap<QString, QString> WorldRuntime::customEntitySnapshot() const
+{
+	QMap<QString, QString>             snapshot;
+	const QMap<QByteArray, QByteArray> entities = m_telnet.customEntitySnapshot();
+	for (auto it = entities.constBegin(); it != entities.constEnd(); ++it)
+	{
+		snapshot.insert(QString::fromLocal8Bit(it.key()), QString::fromUtf8(it.value()));
+	}
+	return snapshot;
 }
 
 void WorldRuntime::setEntityValue(const QString &name, const QString &value)
@@ -11712,16 +12657,16 @@ void WorldRuntime::setLastGoToLine(int line)
 
 void WorldRuntime::fireWorldConnectHandlers()
 {
+	if (m_pluginInstallDeferred || m_pluginInstallInProgress || hasPendingPluginInstallWork())
+	{
+		m_deferredWorldConnectHandlersPending = true;
+		return;
+	}
+
 	const unsigned short previousActionSource = m_currentActionSource;
 	m_currentActionSource                     = eWorldAction;
-	if (isLuaScriptingEnabled(m_worldAttributes) && m_luaCallbacks)
-	{
-		if (const QString callbackName =
-		        m_worldAttributes.value(QStringLiteral("on_world_connect")).trimmed();
-		    !callbackName.isEmpty())
-			m_luaExecutor->callFunctionNoArgs(m_luaCallbacks, callbackName, nullptr, true);
-	}
-	callPluginCallbacksNoArgs(QStringLiteral("OnPluginConnect"));
+	dispatchWorldNoArgCallbackByAttribute(QStringLiteral("on_world_connect"), true);
+	callPluginCallbacksNoArgs(QStringLiteral("OnPluginConnect"), true);
 	m_currentActionSource = previousActionSource;
 }
 
@@ -11729,14 +12674,8 @@ void WorldRuntime::fireWorldDisconnectHandlers()
 {
 	const unsigned short previousActionSource = m_currentActionSource;
 	m_currentActionSource                     = eWorldAction;
-	if (isLuaScriptingEnabled(m_worldAttributes) && m_luaCallbacks)
-	{
-		if (const QString callbackName =
-		        m_worldAttributes.value(QStringLiteral("on_world_disconnect")).trimmed();
-		    !callbackName.isEmpty())
-			m_luaExecutor->callFunctionNoArgs(m_luaCallbacks, callbackName, nullptr, true);
-	}
-	callPluginCallbacksNoArgs(QStringLiteral("OnPluginDisconnect"));
+	dispatchWorldNoArgCallbackByAttribute(QStringLiteral("on_world_disconnect"), true);
+	callPluginCallbacksNoArgs(QStringLiteral("OnPluginDisconnect"), true);
 	m_currentActionSource = previousActionSource;
 }
 
@@ -11744,12 +12683,7 @@ void WorldRuntime::fireWorldOpenHandlers()
 {
 	const unsigned short previousActionSource = m_currentActionSource;
 	m_currentActionSource                     = eWorldAction;
-	if (isLuaScriptingEnabled(m_worldAttributes) && m_luaCallbacks)
-	{
-		if (const QString callbackName = m_worldAttributes.value(QStringLiteral("on_world_open")).trimmed();
-		    !callbackName.isEmpty())
-			m_luaExecutor->callFunctionNoArgs(m_luaCallbacks, callbackName, nullptr, true);
-	}
+	dispatchWorldNoArgCallbackByAttribute(QStringLiteral("on_world_open"), false);
 	m_currentActionSource = previousActionSource;
 }
 
@@ -11757,12 +12691,7 @@ void WorldRuntime::fireWorldCloseHandlers()
 {
 	const unsigned short previousActionSource = m_currentActionSource;
 	m_currentActionSource                     = eWorldAction;
-	if (isLuaScriptingEnabled(m_worldAttributes) && m_luaCallbacks)
-	{
-		if (const QString callbackName = m_worldAttributes.value(QStringLiteral("on_world_close")).trimmed();
-		    !callbackName.isEmpty())
-			m_luaExecutor->callFunctionNoArgs(m_luaCallbacks, callbackName, nullptr, true);
-	}
+	dispatchWorldNoArgCallbackByAttribute(QStringLiteral("on_world_close"), false);
 	m_currentActionSource = previousActionSource;
 }
 
@@ -11770,13 +12699,8 @@ void WorldRuntime::fireWorldSaveHandlers()
 {
 	const unsigned short previousActionSource = m_currentActionSource;
 	m_currentActionSource                     = eWorldAction;
-	if (isLuaScriptingEnabled(m_worldAttributes) && m_luaCallbacks)
-	{
-		if (const QString callbackName = m_worldAttributes.value(QStringLiteral("on_world_save")).trimmed();
-		    !callbackName.isEmpty())
-			m_luaExecutor->callFunctionNoArgs(m_luaCallbacks, callbackName, nullptr, true);
-	}
-	callPluginCallbacksNoArgs(QStringLiteral("OnPluginWorldSave"));
+	dispatchWorldNoArgCallbackByAttribute(QStringLiteral("on_world_save"), true);
+	callPluginCallbacksNoArgs(QStringLiteral("OnPluginWorldSave"), true);
 	m_currentActionSource = previousActionSource;
 }
 
@@ -11784,14 +12708,8 @@ void WorldRuntime::fireWorldGetFocusHandlers()
 {
 	const unsigned short previousActionSource = m_currentActionSource;
 	m_currentActionSource                     = eWorldAction;
-	if (isLuaScriptingEnabled(m_worldAttributes) && m_luaCallbacks)
-	{
-		if (const QString callbackName =
-		        m_worldAttributes.value(QStringLiteral("on_world_get_focus")).trimmed();
-		    !callbackName.isEmpty())
-			m_luaExecutor->callFunctionNoArgs(m_luaCallbacks, callbackName, nullptr, true);
-	}
-	callPluginCallbacksNoArgs(QStringLiteral("OnPluginGetFocus"));
+	dispatchWorldNoArgCallbackByAttribute(QStringLiteral("on_world_get_focus"), false);
+	callPluginCallbacksNoArgs(QStringLiteral("OnPluginGetFocus"), false);
 	m_currentActionSource = previousActionSource;
 }
 
@@ -11799,14 +12717,8 @@ void WorldRuntime::fireWorldLoseFocusHandlers()
 {
 	const unsigned short previousActionSource = m_currentActionSource;
 	m_currentActionSource                     = eWorldAction;
-	if (isLuaScriptingEnabled(m_worldAttributes) && m_luaCallbacks)
-	{
-		if (const QString callbackName =
-		        m_worldAttributes.value(QStringLiteral("on_world_lose_focus")).trimmed();
-		    !callbackName.isEmpty())
-			m_luaExecutor->callFunctionNoArgs(m_luaCallbacks, callbackName, nullptr, true);
-	}
-	callPluginCallbacksNoArgs(QStringLiteral("OnPluginLoseFocus"));
+	dispatchWorldNoArgCallbackByAttribute(QStringLiteral("on_world_lose_focus"), false);
+	callPluginCallbacksNoArgs(QStringLiteral("OnPluginLoseFocus"), false);
 	m_currentActionSource = previousActionSource;
 }
 
@@ -11815,9 +12727,18 @@ void WorldRuntime::mxpError(int level, long messageNumber, const QString &messag
 	if (const QString callbackName = m_worldAttributes.value(QStringLiteral("on_mxp_error")).trimmed();
 	    !callbackName.isEmpty() && m_luaCallbacks)
 	{
-		const bool suppress = m_luaExecutor->callMxpError(m_luaCallbacks, callbackName, level, messageNumber,
-		                                                  m_linesReceived, message);
-		if (suppress)
+		const QSharedPointer<LuaCallbackEngine> worldLua(m_luaCallbacks,
+		                                                 [](LuaCallbackEngine * /*unused*/) {});
+		LuaBatchDispatchRequest                 request;
+		request.kind                        = LuaBatchDispatchKind::MxpError;
+		request.engines                     = {worldLua};
+		request.functionName                = callbackName;
+		request.intArg1                     = level;
+		request.numberArg1                  = messageNumber;
+		request.intArg2                     = m_linesReceived;
+		request.stringArg                   = message;
+		const LuaBatchDispatchResult result = queuePluginCallbackDispatch(request, true);
+		if (const bool suppress = result.boolResultValid ? result.boolResult : false; suppress)
 			return;
 	}
 
@@ -11853,7 +12774,7 @@ void WorldRuntime::mxpError(int level, long messageNumber, const QString &messag
 	                                  .arg(messageNumber)
 	                                  .arg(m_linesReceived)
 	                                  .arg(message);
-	callPluginCallbacks(QStringLiteral("OnPluginMXPerror"), pluginPayload);
+	callPluginCallbacks(QStringLiteral("OnPluginMXPerror"), pluginPayload, true);
 
 	const QString formatted = QStringLiteral("%1 %2: (%3) %4\r\n")
 	                              .arg(QString::fromLatin1(p))
@@ -11861,7 +12782,7 @@ void WorldRuntime::mxpError(int level, long messageNumber, const QString &messag
 	                              .arg(m_linesReceived, 5)
 	                              .arg(message);
 
-	emit mxpDebugMessage(title, formatted);
+	emit          mxpDebugMessage(title, formatted);
 }
 
 void WorldRuntime::mxpStartUp()
@@ -11874,10 +12795,18 @@ void WorldRuntime::mxpStartUp()
 	{
 		const QString callbackName = m_worldAttributes.value(QStringLiteral("on_mxp_start")).trimmed();
 		if (!callbackName.isEmpty())
-			m_luaExecutor->callMxpStartUp(m_luaCallbacks, callbackName);
+		{
+			const QSharedPointer<LuaCallbackEngine> worldLua(m_luaCallbacks,
+			                                                 [](LuaCallbackEngine * /*unused*/) {});
+			LuaBatchDispatchRequest                 request;
+			request.kind         = LuaBatchDispatchKind::MxpStartUp;
+			request.engines      = {worldLua};
+			request.functionName = callbackName;
+			static_cast<void>(queuePluginCallbackDispatch(request, true));
+		}
 	}
 
-	callPluginCallbacksNoArgs(QStringLiteral("OnPluginMXPstart"));
+	callPluginCallbacksNoArgs(QStringLiteral("OnPluginMXPstart"), true);
 }
 
 void WorldRuntime::mxpShutDown()
@@ -11895,10 +12824,18 @@ void WorldRuntime::mxpShutDown()
 	{
 		const QString callbackName = m_worldAttributes.value(QStringLiteral("on_mxp_stop")).trimmed();
 		if (!callbackName.isEmpty())
-			m_luaExecutor->callMxpShutDown(m_luaCallbacks, callbackName);
+		{
+			const QSharedPointer<LuaCallbackEngine> worldLua(m_luaCallbacks,
+			                                                 [](LuaCallbackEngine * /*unused*/) {});
+			LuaBatchDispatchRequest                 request;
+			request.kind         = LuaBatchDispatchKind::MxpShutDown;
+			request.engines      = {worldLua};
+			request.functionName = callbackName;
+			static_cast<void>(queuePluginCallbackDispatch(request, true));
+		}
 	}
 
-	callPluginCallbacksNoArgs(QStringLiteral("OnPluginMXPstop"));
+	callPluginCallbacksNoArgs(QStringLiteral("OnPluginMXPstop"), true);
 }
 
 void WorldRuntime::resetMxp()
@@ -11921,7 +12858,7 @@ void WorldRuntime::resetIpCache()
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this] { resetIpCache(); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this] { resetIpCache(); });
 		return;
 	}
 
@@ -11958,13 +12895,8 @@ int WorldRuntime::mxpOpenTagCount() const
 int WorldRuntime::openLog(const QString &logFileName, bool append)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eCouldNotOpenFile;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, logFileName, append] { result = openLog(logFileName, append); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eCouldNotOpenFile;
-	}
+		return qmudInvokeMethodOr(this, eCouldNotOpenFile,
+		                          [this, logFileName, append] { return openLog(logFileName, append); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::openLog");
 	if (m_logFile.isOpen())
@@ -12024,12 +12956,7 @@ int WorldRuntime::openLog(const QString &logFileName, bool append)
 int WorldRuntime::closeLog()
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result = eLogFileNotOpen;
-		const bool invoked =
-		    qmudInvokeMethod(this, [this, &result] { result = closeLog(); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eLogFileNotOpen;
-	}
+		return qmudInvokeMethodOr(this, eLogFileNotOpen, [this] { return closeLog(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::closeLog");
 	if (!m_logFile.isOpen())
@@ -12147,12 +13074,7 @@ int WorldRuntime::rotateLogFile()
 int WorldRuntime::writeLog(const QByteArray &bytes)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eLogFileNotOpen;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, bytes] { result = writeLog(bytes); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eLogFileNotOpen;
-	}
+		return qmudInvokeMethodOr(this, eLogFileNotOpen, [this, bytes] { return writeLog(bytes); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::writeLog(QByteArray)");
 	if (!m_logFile.isOpen())
@@ -12179,12 +13101,7 @@ int WorldRuntime::writeLog(const QByteArray &bytes)
 int WorldRuntime::writeLog(const QString &text)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eLogFileNotOpen;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, text] { result = writeLog(text); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eLogFileNotOpen;
-	}
+		return qmudInvokeMethodOr(this, eLogFileNotOpen, [this, text] { return writeLog(text); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::writeLog(QString)");
 	return writeLog(text.toLocal8Bit());
@@ -12193,12 +13110,7 @@ int WorldRuntime::writeLog(const QString &text)
 int WorldRuntime::flushLog()
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result = eLogFileNotOpen;
-		const bool invoked =
-		    qmudInvokeMethod(this, [this, &result] { result = flushLog(); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eLogFileNotOpen;
-	}
+		return qmudInvokeMethodOr(this, eLogFileNotOpen, [this] { return flushLog(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::flushLog");
 	if (!m_logFile.isOpen())
@@ -12209,13 +13121,8 @@ int WorldRuntime::flushLog()
 bool WorldRuntime::isLogOpen() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		bool       result  = false;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = isLogOpen(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked && result;
-	}
+		return qmudInvokeMethodTrueOnSuccess(const_cast<WorldRuntime *>(this),
+		                                     [this] { return isLogOpen(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::isLogOpen");
 	return m_logFile.isOpen();
@@ -12310,16 +13217,16 @@ bool WorldRuntime::hasAnyPluginCallback(const QString &functionName)
 	if (functionName.isEmpty())
 		return false;
 
+	if (applyPendingObservedPluginCallbackPresenceSnapshots())
+		m_pluginCallbackPresenceDirty = true;
+
 	noteObservedPluginCallbackQuery(m_observedPluginCallbackQueryGeneration, functionName,
 	                                m_observedPluginCallbackGeneration);
 
 	if (ensureObservedPluginCallback(m_observedPluginCallbacks, functionName))
 	{
-		for (auto &plugin : m_plugins)
-		{
-			if (plugin.lua)
-				m_luaExecutor->setObservedPluginCallbacks(plugin.lua.data(), m_observedPluginCallbacks);
-		}
+		m_observedPluginCallbacksPendingWarmup.insert(functionName);
+		scheduleObservedPluginCallbackPropagation();
 		m_pluginCallbackPresenceDirty = true;
 	}
 
@@ -12335,18 +13242,234 @@ bool WorldRuntime::hasAnyPluginCallback(const QString &functionName)
 
 	if (m_pluginCallbackPresenceDirty)
 		rebuildPluginCallbackPresenceCache();
-	return m_pluginCallbackPresenceCounts.value(functionName) > 0;
+	if (m_pluginCallbackPresenceCounts.value(functionName) > 0)
+		return true;
+	if (!isObservedPluginCallbackPropagationPending(functionName))
+		return false;
+	return hasAnyExecutableLuaPluginRecipient();
+}
+
+bool WorldRuntime::hasPluginCallbackRecipient(const QString &functionName)
+{
+	if (QThread::currentThread() != thread())
+		return qmudInvokeMethodOr(this, false,
+		                          [this, functionName] { return hasPluginCallbackRecipient(functionName); });
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::hasPluginCallbackRecipient");
+	return hasAnyPluginCallback(functionName);
 }
 
 void WorldRuntime::invalidatePluginCallbackPresenceCache()
 {
+	if (QThread::currentThread() != thread())
+	{
+		bool expected = false;
+		if (!m_pluginCallbackPresenceInvalidateQueued.compare_exchange_strong(
+		        expected, true, std::memory_order_acq_rel, std::memory_order_acquire))
+		{
+			return;
+		}
+		const bool queued = qmudInvokeMethodQueued(this,
+		                                           [this]
+		                                           {
+			                                           m_pluginCallbackPresenceInvalidateQueued.store(
+			                                               false, std::memory_order_release);
+			                                           invalidatePluginCallbackPresenceCache();
+		                                           });
+		if (!queued)
+		{
+			m_pluginCallbackPresenceInvalidateQueued.store(false, std::memory_order_release);
+			qWarning().noquote() << QStringLiteral(
+			    "[QMud][LuaBridge] Failed to queue plugin callback presence cache invalidation");
+		}
+		return;
+	}
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::invalidatePluginCallbackPresenceCache");
+	m_pluginCallbackPresenceInvalidateQueued.store(false, std::memory_order_release);
 	m_pluginCallbackPresenceDirty = true;
+}
+
+void WorldRuntime::recordObservedPluginCallbackPresenceSnapshot(const QString       &pluginId,
+                                                                const QSet<QString> &presentCallbacks,
+                                                                const QSet<QString> &luaFunctions)
+{
+	const QString normalizedId = normalizedPluginId(pluginId);
+	if (normalizedId.isEmpty())
+		return;
+	{
+		QMutexLocker locker(&m_pluginObservedCallbackPresenceMutex);
+		m_pendingPluginObservedCallbackPresenceById.insert(normalizedId, presentCallbacks);
+		m_pendingPluginLuaFunctionCatalogById.insert(normalizedId, luaFunctions);
+	}
+	invalidatePluginCallbackPresenceCache();
+}
+
+bool WorldRuntime::applyPendingObservedPluginCallbackPresenceSnapshots()
+{
+	QHash<QString, QSet<QString>> pendingSnapshots;
+	QHash<QString, QSet<QString>> pendingFunctionCatalogs;
+	{
+		QMutexLocker locker(&m_pluginObservedCallbackPresenceMutex);
+		if (m_pendingPluginObservedCallbackPresenceById.isEmpty() &&
+		    m_pendingPluginLuaFunctionCatalogById.isEmpty())
+			return false;
+		pendingSnapshots.swap(m_pendingPluginObservedCallbackPresenceById);
+		pendingFunctionCatalogs.swap(m_pendingPluginLuaFunctionCatalogById);
+	}
+
+	bool changed = false;
+	for (auto it = pendingSnapshots.constBegin(); it != pendingSnapshots.constEnd(); ++it)
+	{
+		const QString       &pluginId    = it.key();
+		const QSet<QString> &presentSet  = it.value();
+		const auto           existingIt  = m_pluginObservedCallbackPresenceById.constFind(pluginId);
+		const bool           hasExisting = existingIt != m_pluginObservedCallbackPresenceById.constEnd();
+		if (const bool existingSetIsSame = hasExisting && existingIt.value() == presentSet; existingSetIsSame)
+			continue;
+		if (presentSet.isEmpty())
+			m_pluginObservedCallbackPresenceById.remove(pluginId);
+		else
+			m_pluginObservedCallbackPresenceById.insert(pluginId, presentSet);
+		changed = true;
+	}
+	for (auto it = pendingFunctionCatalogs.constBegin(); it != pendingFunctionCatalogs.constEnd(); ++it)
+	{
+		const QString       &pluginId    = it.key();
+		const QSet<QString> &functionSet = it.value();
+		const auto           existingIt  = m_pluginLuaFunctionCatalogById.constFind(pluginId);
+		const bool           hasExisting = existingIt != m_pluginLuaFunctionCatalogById.constEnd();
+		if (hasExisting && existingIt.value() == functionSet)
+			continue;
+		if (functionSet.isEmpty())
+			m_pluginLuaFunctionCatalogById.remove(pluginId);
+		else
+			m_pluginLuaFunctionCatalogById.insert(pluginId, functionSet);
+		changed = true;
+	}
+	return changed;
+}
+
+bool WorldRuntime::isObservedPluginCallbackPropagationPending(const QString &functionName) const
+{
+	return !functionName.isEmpty() && m_observedPluginCallbacksPendingWarmup.contains(functionName);
+}
+
+bool WorldRuntime::hasAnyExecutableLuaPluginRecipient() const
+{
+	return std::ranges::any_of(m_plugins, [](const Plugin &plugin) { return canExecutePlugin(plugin); });
+}
+
+QVector<int>
+WorldRuntime::collectExecutablePluginRecipientIndicesWithWarmupFallback(const QString &functionName) const
+{
+	QVector<int> recipientIndices = collectExecutablePluginRecipientIndicesForCallback(
+	    functionName, m_plugins, m_pluginCallbackRecipientIndices);
+	if (!recipientIndices.isEmpty() || !isObservedPluginCallbackPropagationPending(functionName))
+		return recipientIndices;
+
+	recipientIndices.reserve(m_plugins.size());
+	for (int pluginIndex = 0; pluginIndex < m_plugins.size(); ++pluginIndex)
+	{
+		const Plugin &plugin = m_plugins.at(pluginIndex);
+		if (!canExecutePlugin(plugin))
+			continue;
+		recipientIndices.push_back(pluginIndex);
+	}
+	return recipientIndices;
+}
+
+QVector<QSharedPointer<LuaCallbackEngine>>
+WorldRuntime::collectExecutablePluginRecipientEnginesWithWarmupFallback(const QString &functionName) const
+{
+	const QVector<int> recipientIndices =
+	    collectExecutablePluginRecipientIndicesWithWarmupFallback(functionName);
+	if (recipientIndices.isEmpty())
+		return {};
+
+	QVector<QSharedPointer<LuaCallbackEngine>> recipients;
+	recipients.reserve(recipientIndices.size());
+	for (const int pluginIndex : recipientIndices)
+	{
+		if (pluginIndex < 0 || pluginIndex >= m_plugins.size())
+			continue;
+		const Plugin &plugin = m_plugins.at(pluginIndex);
+		if (!plugin.lua)
+			continue;
+		recipients.push_back(plugin.lua);
+	}
+	return recipients;
+}
+
+void WorldRuntime::scheduleObservedPluginCallbackPropagation()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::scheduleObservedPluginCallbackPropagation");
+
+	if (m_observedPluginCallbacksPendingWarmup.isEmpty())
+		return;
+	if (m_observedPluginCallbackPropagationInFlight)
+	{
+		m_observedPluginCallbackPropagationQueued = true;
+		return;
+	}
+
+	QVector<QSharedPointer<LuaCallbackEngine>> engines;
+	engines.reserve(m_plugins.size());
+	for (const Plugin &plugin : m_plugins)
+	{
+		if (plugin.lua)
+			engines.push_back(plugin.lua);
+	}
+
+	if (engines.isEmpty() || !m_luaExecutor)
+	{
+		m_observedPluginCallbacksPendingWarmup.clear();
+		m_observedPluginCallbackPropagationInFlight = false;
+		m_observedPluginCallbackPropagationQueued   = false;
+		return;
+	}
+
+	m_observedPluginCallbackPropagationInFlight     = true;
+	m_observedPluginCallbackPropagationQueued       = false;
+	const QSet<QString>     propagatedCallbackNames = m_observedPluginCallbacks;
+
+	LuaBatchDispatchRequest request;
+	request.kind                     = LuaBatchDispatchKind::UpdateObservedCallbacksMany;
+	request.engines                  = std::move(engines);
+	request.observedCallbackNamesArg = propagatedCallbackNames;
+
+	m_luaExecutor->dispatchBatchAsync(
+	    request, this, [this, propagatedCallbackNames](const LuaBatchDispatchResult & /*unused*/)
+	    { onObservedPluginCallbackPropagationCompleted(propagatedCallbackNames); });
+}
+
+void WorldRuntime::onObservedPluginCallbackPropagationCompleted(const QSet<QString> &propagatedCallbackNames)
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::onObservedPluginCallbackPropagationCompleted");
+
+	for (const QString &callbackName : propagatedCallbackNames)
+	{
+		if (callbackName.isEmpty())
+			continue;
+		m_observedPluginCallbacksPendingWarmup.remove(callbackName);
+	}
+	m_pluginCallbackPresenceDirty               = true;
+	m_observedPluginCallbackPropagationInFlight = false;
+
+	if (m_observedPluginCallbackPropagationQueued || !m_observedPluginCallbacksPendingWarmup.isEmpty())
+	{
+		m_observedPluginCallbackPropagationQueued = false;
+		scheduleObservedPluginCallbackPropagation();
+	}
 }
 
 void WorldRuntime::rebuildPluginCallbackPresenceCache()
 {
+	if (applyPendingObservedPluginCallbackPresenceSnapshots())
+		m_pluginCallbackPresenceDirty = true;
+
 	m_pluginCallbackPresenceCounts.clear();
 	m_pluginCallbackRecipientIndices.clear();
+	m_pluginCallbackRecipientEngines.clear();
 	pruneStaleObservedPluginCallbacks(m_observedPluginCallbacks, m_observedPluginCallbackQueryGeneration,
 	                                  m_observedPluginCallbackGeneration,
 	                                  observedPluginCallbackRetentionGenerations());
@@ -12361,21 +13484,20 @@ void WorldRuntime::rebuildPluginCallbackPresenceCache()
 
 	for (int pluginIndex = 0; pluginIndex < m_plugins.size(); ++pluginIndex)
 	{
-		auto &plugin = m_plugins[pluginIndex];
-		if (!canExecutePlugin(plugin) || !plugin.lua)
+		const auto &plugin = m_plugins[pluginIndex];
+		if (!canExecutePlugin(plugin))
 			continue;
-		m_luaExecutor->setObservedPluginCallbacks(plugin.lua.data(), m_observedPluginCallbacks);
-		if (!m_luaExecutor->loadScript(plugin.lua.data()))
+		const QString pluginId = normalizedPluginId(plugin.attributes.value(QStringLiteral("id")));
+		if (pluginId.isEmpty())
 			continue;
-		for (const QString &name : m_observedPluginCallbacks)
+		const QSet<QString> presentCallbacks = m_pluginObservedCallbackPresenceById.value(pluginId);
+		for (const QString &name : presentCallbacks)
 		{
-			if (name.isEmpty())
+			if (name.isEmpty() || !m_observedPluginCallbacks.contains(name))
 				continue;
-			if (m_luaExecutor->hasObservedPluginCallback(plugin.lua.data(), name))
-			{
-				++m_pluginCallbackPresenceCounts[name];
-				m_pluginCallbackRecipientIndices[name].push_back(pluginIndex);
-			}
+			++m_pluginCallbackPresenceCounts[name];
+			m_pluginCallbackRecipientIndices[name].push_back(pluginIndex);
+			m_pluginCallbackRecipientEngines[name].push_back(plugin.lua);
 		}
 	}
 	m_pluginCallbackPresencePluginCount = safeQSizeToInt(m_plugins.size());
@@ -12383,232 +13505,832 @@ void WorldRuntime::rebuildPluginCallbackPresenceCache()
 	advanceObservedPluginCallbackGeneration(m_observedPluginCallbackGeneration);
 }
 
-void WorldRuntime::bindPluginCallbackObserver(const Plugin &plugin)
+QVector<QSharedPointer<LuaCallbackEngine>>
+WorldRuntime::collectPluginCallbackRecipients(const QString &functionName)
 {
-	if (!plugin.lua)
+	if (!hasAnyPluginCallback(functionName))
+		return {};
+	return collectExecutablePluginRecipientEnginesWithWarmupFallback(functionName);
+}
+
+void WorldRuntime::revalidateObservedCallbackRecipients(LuaBatchDispatchRequest &request)
+{
+	if (!request.revalidateObservedRecipients || request.functionName.isEmpty() || request.engines.isEmpty())
 		return;
-	m_luaExecutor->setObservedPluginCallbacks(plugin.lua.data(), m_observedPluginCallbacks);
-	m_luaExecutor->setCallbackCatalogObserver(plugin.lua.data(),
-	                                          [this] { invalidatePluginCallbackPresenceCache(); });
-	invalidatePluginCallbackPresenceCache();
+
+	if (applyPendingObservedPluginCallbackPresenceSnapshots())
+		m_pluginCallbackPresenceDirty = true;
+
+	const int pluginCount = safeQSizeToInt(m_plugins.size());
+	if (m_pluginCallbackPresencePluginCount != pluginCount)
+	{
+		m_pluginCallbackPresencePluginCount = pluginCount;
+		m_pluginCallbackPresenceDirty       = true;
+	}
+
+	if (m_pluginCallbackPresenceDirty)
+		rebuildPluginCallbackPresenceCache();
+
+	const QVector<QSharedPointer<LuaCallbackEngine>> currentRecipients =
+	    collectExecutablePluginRecipientEnginesWithWarmupFallback(request.functionName);
+	if (currentRecipients.isEmpty())
+	{
+		request.engines.clear();
+		return;
+	}
+
+	QSet<const LuaCallbackEngine *> currentSet;
+	currentSet.reserve(currentRecipients.size());
+	for (const QSharedPointer<LuaCallbackEngine> &engine : currentRecipients)
+	{
+		if (engine)
+			currentSet.insert(engine.data());
+	}
+	if (currentSet.isEmpty())
+	{
+		request.engines.clear();
+		return;
+	}
+
+	QVector<QSharedPointer<LuaCallbackEngine>> filteredRecipients;
+	filteredRecipients.reserve(request.engines.size());
+	for (const QSharedPointer<LuaCallbackEngine> &engine : request.engines)
+	{
+		if (engine && currentSet.contains(engine.data()))
+			filteredRecipients.push_back(engine);
+	}
+	request.engines = std::move(filteredRecipients);
+}
+
+bool WorldRuntime::shouldDispatchPluginAsyncResult(const Plugin &plugin, const QString &apiName)
+{
+	if (plugin.asyncResultFilterAll)
+		return true;
+	const QString normalizedApiName = normalizedAsyncResultApiName(apiName);
+	if (normalizedApiName.isEmpty())
+		return false;
+	return plugin.asyncResultFilterApis.contains(normalizedApiName);
+}
+
+LuaBatchDispatchResult WorldRuntime::queuePluginCallbackDispatch(const LuaBatchDispatchRequest &request,
+                                                                 const bool completionBarrier)
+{
+	LuaBatchDispatchRequest callbackRequest = request;
+	callbackRequest.lane                    = LuaBatchDispatchLane::Callback;
+	const qint64           dispatchStartNs  = pluginCallbackDispatchNowNs();
+	LuaBatchDispatchResult fallback         = pluginCallbackDispatchFallback(callbackRequest);
+
+	if (QThread::currentThread() != thread())
+	{
+		return qmudInvokeMethodOr(
+		    this, fallback, [this, callbackRequest, completionBarrier]
+		    { return queuePluginCallbackDispatch(callbackRequest, completionBarrier); });
+	}
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::queuePluginCallbackDispatch");
+	if (m_pluginCallbackDispatchShuttingDown)
+		return fallback;
+
+	const bool missingFunctionName =
+	    callbackRequest.kind != LuaBatchDispatchKind::ExecuteScript && callbackRequest.functionName.isEmpty();
+	if (missingFunctionName || callbackRequest.engines.isEmpty())
+		return fallback;
+	if (!m_luaExecutor)
+		return fallback;
+	if (!callbackRequest.miniWindowSnapshotArg)
+		callbackRequest.miniWindowSnapshotArg = captureLuaCallbackSnapshotForDispatch(
+		    callbackRequest.engines, callbackRequest.lineSnapshotPolicy);
+	revalidateObservedCallbackRecipients(callbackRequest);
+	if (callbackRequest.engines.isEmpty())
+		return fallback;
+	const bool dispatchDiagnosticsEnabled = m_traceEnabled;
+	const bool inputCritical              = pluginCallbackDispatchIsInputCritical(callbackRequest);
+	callbackRequest.inputCritical         = inputCritical;
+	const bool canRetainQueuedResult =
+	    completionBarrier && (inputCritical || (!m_pluginCallbackDispatchWorkerInFlight &&
+	                                            m_pluginCallbackDispatchQueue.isEmpty()));
+
+	if (completionBarrier && !m_pluginCallbackDispatchActive && !m_pluginCallbackDispatchWorkerInFlight &&
+	    m_pluginCallbackDispatchQueue.isEmpty() && !m_pluginCallbackDispatchDrainQueued)
+	{
+		const qint64           executeStartNs = pluginCallbackDispatchNowNs();
+		LuaBatchDispatchResult directResult   = m_luaExecutor->dispatchBatch(callbackRequest);
+		applyLuaDeferredRuntimeMutationBatches(directResult);
+		const qint64 executeMs = pluginCallbackDispatchElapsedMs(executeStartNs);
+		if (pluginCallbackDispatchShouldLog(dispatchDiagnosticsEnabled, callbackRequest.functionName,
+		                                    executeMs))
+		{
+			qInfo().noquote()
+			    << QStringLiteral(
+			           "[QMud][LuaDispatchDiag] dispatch-direct-sync callback=%1 kind=%2 exec_ms=%3")
+			           .arg(callbackRequest.functionName,
+			                pluginCallbackDispatchKindLabel(callbackRequest.kind))
+			           .arg(executeMs);
+		}
+		return directResult;
+	}
+
+	PluginCallbackDispatchCommand command;
+	command.id                  = m_nextPluginCallbackDispatchId++;
+	command.request             = callbackRequest;
+	command.retainResult        = canRetainQueuedResult;
+	command.enqueuedAtNs        = dispatchStartNs;
+	command.queueDepthAtEnqueue = safeQSizeToInt(m_pluginCallbackDispatchQueue.size()) + 1;
+	if (inputCritical)
+	{
+		auto insertIt = m_pluginCallbackDispatchQueue.begin();
+		while (insertIt != m_pluginCallbackDispatchQueue.end() && !insertIt->request.lowPriority)
+			++insertIt;
+		m_pluginCallbackDispatchQueue.insert(insertIt, command);
+	}
+	else
+	{
+		m_pluginCallbackDispatchQueue.enqueue(command);
+	}
+
+	if (command.retainResult)
+	{
+		bool          timeoutLogged = false;
+		QElapsedTimer waitTimer;
+		waitTimer.start();
+		const qint64 timeoutMs = qMax<qint64>(1, qmudLuaBridgeInvokeTimeoutMs());
+		while (!m_pluginCallbackDispatchResults.contains(command.id))
+		{
+			drainPluginCallbackDispatchQueue(command.id);
+			if (m_pluginCallbackDispatchResults.contains(command.id))
+				break;
+
+			if (!inputCritical)
+				break;
+
+			QCoreApplication::sendPostedEvents(this, QEvent::MetaCall);
+			if (m_pluginCallbackDispatchResults.contains(command.id))
+				break;
+
+			if (qmudLuaBridgePumpCurrentThreadOnce())
+				continue;
+
+			if (!m_pluginCallbackDispatchWorkerInFlight && m_pluginCallbackDispatchQueue.isEmpty() &&
+			    !m_pluginCallbackDispatchActive)
+				break;
+
+			if (!timeoutLogged && waitTimer.elapsed() >= timeoutMs)
+			{
+				timeoutLogged = true;
+				qWarning().noquote()
+				    << QStringLiteral(
+				           "[QMud][LuaDispatchDiag] input-critical barrier queued behind callback work "
+				           "for %1 ms; waiting for completion id=%2 callback=%3 kind=%4")
+				           .arg(waitTimer.elapsed())
+				           .arg(command.id)
+				           .arg(callbackRequest.functionName,
+				                pluginCallbackDispatchKindLabel(callbackRequest.kind));
+			}
+
+			static_cast<void>(qmudLuaBridgeWaitForCurrentThreadWake(10));
+		}
+		auto it = m_pluginCallbackDispatchResults.find(command.id);
+		if (it == m_pluginCallbackDispatchResults.end())
+		{
+			const qint64 totalWaitMs = pluginCallbackDispatchElapsedMs(dispatchStartNs);
+			if (pluginCallbackDispatchShouldLog(dispatchDiagnosticsEnabled, callbackRequest.functionName,
+			                                    totalWaitMs))
+			{
+				qInfo().noquote() << QStringLiteral(
+				                         "[QMud][LuaDispatchDiag] barrier-miss id=%1 callback=%2 kind=%3 "
+				                         "wait_ms=%4 queue_at_enqueue=%5 active=%6 pending_queue=%7")
+				                         .arg(command.id)
+				                         .arg(callbackRequest.functionName,
+				                              pluginCallbackDispatchKindLabel(callbackRequest.kind))
+				                         .arg(totalWaitMs)
+				                         .arg(command.queueDepthAtEnqueue)
+				                         .arg(m_pluginCallbackDispatchActive ? QStringLiteral("1")
+				                                                             : QStringLiteral("0"))
+				                         .arg(m_pluginCallbackDispatchQueue.size());
+			}
+			return fallback;
+		}
+		LuaBatchDispatchResult result = std::move(it.value());
+		m_pluginCallbackDispatchResults.erase(it);
+		applyLuaDeferredRuntimeMutationBatches(result);
+		const qint64 totalWaitMs = pluginCallbackDispatchElapsedMs(dispatchStartNs);
+		if (pluginCallbackDispatchShouldLog(dispatchDiagnosticsEnabled, callbackRequest.functionName,
+		                                    totalWaitMs))
+		{
+			qInfo().noquote()
+			    << QStringLiteral("[QMud][LuaDispatchDiag] barrier-done id=%1 callback=%2 kind=%3 wait_ms=%4 "
+			                      "queue_at_enqueue=%5 pending_queue=%6")
+			           .arg(command.id)
+			           .arg(callbackRequest.functionName,
+			                pluginCallbackDispatchKindLabel(callbackRequest.kind))
+			           .arg(totalWaitMs)
+			           .arg(command.queueDepthAtEnqueue)
+			           .arg(m_pluginCallbackDispatchQueue.size());
+		}
+		return result;
+	}
+
+	queuePluginCallbackDispatchDrain();
+	return fallback;
+}
+
+void WorldRuntime::queuePluginCallbackDispatchAsync(
+    const LuaBatchDispatchRequest &request, std::function<void(const LuaBatchDispatchResult &)> completion)
+{
+	LuaBatchDispatchRequest callbackRequest = request;
+	callbackRequest.lane                    = LuaBatchDispatchLane::Callback;
+	const qint64           dispatchStartNs  = pluginCallbackDispatchNowNs();
+	LuaBatchDispatchResult fallback         = pluginCallbackDispatchFallback(callbackRequest);
+
+	if (QThread::currentThread() != thread())
+	{
+		const bool queued = qmudInvokeMethodQueued(
+		    this, [this, callbackRequest, completion = std::move(completion)]() mutable
+		    { queuePluginCallbackDispatchAsync(callbackRequest, std::move(completion)); });
+		if (!queued)
+		{
+			qWarning().noquote() << QStringLiteral(
+			    "[QMud][LuaBridge] failed to queue plugin callback dispatch to runtime "
+			    "thread");
+		}
+		return;
+	}
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::queuePluginCallbackDispatchAsync");
+	if (m_pluginCallbackDispatchShuttingDown)
+	{
+		if (completion)
+			completion(fallback);
+		return;
+	}
+
+	const bool missingFunctionName =
+	    callbackRequest.kind != LuaBatchDispatchKind::ExecuteScript && callbackRequest.functionName.isEmpty();
+	if (missingFunctionName || callbackRequest.engines.isEmpty())
+	{
+		if (completion)
+			completion(fallback);
+		return;
+	}
+	if (!m_luaExecutor)
+	{
+		if (completion)
+			completion(fallback);
+		return;
+	}
+	if (!callbackRequest.miniWindowSnapshotArg)
+		callbackRequest.miniWindowSnapshotArg = captureLuaCallbackSnapshotForDispatch(
+		    callbackRequest.engines, callbackRequest.lineSnapshotPolicy);
+	revalidateObservedCallbackRecipients(callbackRequest);
+	if (callbackRequest.engines.isEmpty())
+	{
+		if (completion)
+			completion(fallback);
+		return;
+	}
+	const bool inputCritical      = pluginCallbackDispatchIsInputCritical(callbackRequest);
+	callbackRequest.inputCritical = inputCritical;
+	callbackRequest.lowPriority   = !inputCritical;
+	PluginCallbackDispatchCommand command;
+	command.id                  = m_nextPluginCallbackDispatchId++;
+	command.request             = callbackRequest;
+	command.retainResult        = false;
+	command.completion          = std::move(completion);
+	command.enqueuedAtNs        = dispatchStartNs;
+	command.queueDepthAtEnqueue = safeQSizeToInt(m_pluginCallbackDispatchQueue.size()) + 1;
+	m_pluginCallbackDispatchQueue.enqueue(std::move(command));
+	queuePluginCallbackDispatchDrain();
+}
+
+LuaBatchDispatchResult WorldRuntime::dispatchLuaBatch(const LuaBatchDispatchRequest &request) const
+{
+	if (!m_luaExecutor)
+		return {};
+	LuaBatchDispatchResult result = m_luaExecutor->dispatchBatch(request);
+	applyLuaDeferredRuntimeMutationBatches(result);
+	return result;
+}
+
+void WorldRuntime::dispatchLuaBatchAsync(const LuaBatchDispatchRequest &request) const
+{
+	if (!m_luaExecutor)
+		return;
+	m_luaExecutor->dispatchBatchAsync(request, const_cast<WorldRuntime *>(this),
+	                                  [](const LuaBatchDispatchResult &result)
+	                                  {
+		                                  LuaBatchDispatchResult appliedResult = result;
+		                                  applyLuaDeferredRuntimeMutationBatches(appliedResult);
+	                                  });
+}
+
+void WorldRuntime::dispatchInitializeLuaEnginesWithObservedCallbacks(
+    const QVector<LuaEngineObservedInitializationRequest> &initRequests, const bool completionBarrier) const
+{
+	if (initRequests.isEmpty())
+		return;
+	LuaBatchDispatchRequest request;
+	request.kind = LuaBatchDispatchKind::InitializeEnginesWithObservedCallbacksMany;
+	request.lane = LuaBatchDispatchLane::Callback;
+	request.initRequestsArg =
+	    QSharedPointer<QVector<LuaEngineObservedInitializationRequest>>::create(initRequests);
+	if (completionBarrier)
+		static_cast<void>(dispatchLuaBatch(request));
+	else
+		dispatchLuaBatchAsync(request);
+}
+
+void WorldRuntime::dispatchTeardownLuaEngines(const QVector<QSharedPointer<LuaCallbackEngine>> &engines,
+                                              const bool completionBarrier) const
+{
+	if (engines.isEmpty())
+		return;
+	LuaBatchDispatchRequest request;
+	request.kind    = LuaBatchDispatchKind::TeardownEnginesMany;
+	request.lane    = LuaBatchDispatchLane::Callback;
+	request.engines = engines;
+	if (completionBarrier)
+		static_cast<void>(dispatchLuaBatch(request));
+	else
+		dispatchLuaBatchAsync(request);
+}
+
+void WorldRuntime::dispatchApplyPackageRestrictions(const QVector<QSharedPointer<LuaCallbackEngine>> &engines,
+                                                    const bool enablePackage,
+                                                    const bool completionBarrier) const
+{
+	if (engines.isEmpty())
+		return;
+	LuaBatchDispatchRequest request;
+	request.kind       = LuaBatchDispatchKind::ApplyPackageRestrictionsMany;
+	request.lane       = LuaBatchDispatchLane::Callback;
+	request.engines    = engines;
+	request.optionFlag = enablePackage;
+	if (completionBarrier)
+		static_cast<void>(dispatchLuaBatch(request));
+	else
+		dispatchLuaBatchAsync(request);
+}
+
+void WorldRuntime::dispatchSingleEngineNoArgCallback(const QSharedPointer<LuaCallbackEngine> &engine,
+                                                     const QString                           &functionName,
+                                                     const bool completionBarrier, const bool defaultResult)
+{
+	if (!engine || functionName.isEmpty())
+		return;
+	LuaBatchDispatchRequest request;
+	request.kind          = LuaBatchDispatchKind::NoArgs;
+	request.engines       = {engine};
+	request.functionName  = functionName;
+	request.defaultResult = defaultResult;
+	static_cast<void>(queuePluginCallbackDispatch(request, completionBarrier));
+}
+
+void WorldRuntime::dispatchWorldNoArgCallbackByAttribute(const QString &attributeName,
+                                                         const bool     completionBarrier)
+{
+	if (attributeName.isEmpty() || !isLuaScriptingEnabled(m_worldAttributes) || !m_luaCallbacks)
+		return;
+	const QString callbackName = m_worldAttributes.value(attributeName).trimmed();
+	if (callbackName.isEmpty())
+		return;
+	dispatchSingleEngineNoArgCallback(makeNonOwningLuaEngineRef(m_luaCallbacks), callbackName,
+	                                  completionBarrier);
+}
+
+void WorldRuntime::drainPluginCallbackDispatchQueue(const quint64 completionCommandId)
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::drainPluginCallbackDispatchQueue");
+
+	if (m_pluginCallbackDispatchActive)
+	{
+		if (completionCommandId == 0)
+		{
+			if (!m_pluginCallbackDispatchQueue.isEmpty())
+				queuePluginCallbackDispatchDrain();
+			return;
+		}
+		while (!m_pluginCallbackDispatchResults.contains(completionCommandId))
+		{
+			if (m_pluginCallbackDispatchQueue.isEmpty())
+				break;
+			processNextPluginCallbackDispatchCommand();
+		}
+		return;
+	}
+	if (m_pluginCallbackDispatchWorkerInFlight)
+		return;
+
+	m_pluginCallbackDispatchActive = true;
+	const auto    resetQueueActive = qScopeGuard([this] { m_pluginCallbackDispatchActive = false; });
+	constexpr int nonBarrierBurst  = 32;
+	int           processed        = 0;
+	while (!m_pluginCallbackDispatchQueue.isEmpty())
+	{
+		processNextPluginCallbackDispatchCommand();
+		++processed;
+		if (m_pluginCallbackDispatchWorkerInFlight)
+			break;
+		if (completionCommandId != 0 && m_pluginCallbackDispatchResults.contains(completionCommandId))
+			break;
+		if (completionCommandId == 0 && processed >= nonBarrierBurst)
+			break;
+	}
+	if (!m_pluginCallbackDispatchQueue.isEmpty())
+		queuePluginCallbackDispatchDrain();
+}
+
+void WorldRuntime::queuePluginCallbackDispatchDrain()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::queuePluginCallbackDispatchDrain");
+	if (m_pluginCallbackDispatchDrainQueued)
+		return;
+
+	m_pluginCallbackDispatchDrainQueued = true;
+	const bool queued                   = QMetaObject::invokeMethod(
+	    this,
+	    [this]
+	    {
+		    qmudAssertObjectThreadAffinity(this, "WorldRuntime::queuePluginCallbackDispatchDrain::drain");
+		    m_pluginCallbackDispatchDrainQueued = false;
+		    if (!m_pluginCallbackDispatchQueue.isEmpty())
+			    drainPluginCallbackDispatchQueue();
+	    },
+	    Qt::QueuedConnection);
+	if (queued)
+		return;
+
+	m_pluginCallbackDispatchDrainQueued = false;
+	if (!m_pluginCallbackDispatchActive)
+		drainPluginCallbackDispatchQueue();
+}
+
+void WorldRuntime::processNextPluginCallbackDispatchCommand()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::processNextPluginCallbackDispatchCommand");
+	if (m_pluginCallbackDispatchQueue.isEmpty())
+		return;
+	if (m_pluginCallbackDispatchWorkerInFlight)
+		return;
+	PluginCallbackDispatchCommand command = m_pluginCallbackDispatchQueue.dequeue();
+	revalidateObservedCallbackRecipients(command.request);
+	if (command.request.engines.isEmpty())
+	{
+		const LuaBatchDispatchResult fallback = pluginCallbackDispatchFallback(command.request);
+		if (command.retainResult)
+			m_pluginCallbackDispatchResults.insert(command.id, fallback);
+		else if (command.completion)
+			command.completion(fallback);
+		return;
+	}
+	const qint64 queueWaitMs                = pluginCallbackDispatchElapsedMs(command.enqueuedAtNs);
+	const bool   dispatchDiagnosticsEnabled = m_traceEnabled;
+	if (command.retainResult)
+	{
+		const qint64           executeStartNs = pluginCallbackDispatchNowNs();
+		LuaBatchDispatchResult result         = m_luaExecutor->dispatchBatch(command.request);
+		applyLuaDeferredRuntimeMutationBatches(result);
+		const qint64 executeMs = pluginCallbackDispatchElapsedMs(executeStartNs);
+		m_pluginCallbackDispatchResults.insert(command.id, result);
+		if (pluginCallbackDispatchShouldLog(dispatchDiagnosticsEnabled, command.request.functionName,
+		                                    queueWaitMs + executeMs))
+		{
+			qInfo().noquote() << QStringLiteral(
+			                         "[QMud][LuaDispatchDiag] dispatch-sync id=%1 callback=%2 kind=%3 "
+			                         "queue_wait_ms=%4 exec_ms=%5 queue_at_enqueue=%6 queue_remaining=%7")
+			                         .arg(command.id)
+			                         .arg(command.request.functionName,
+			                              pluginCallbackDispatchKindLabel(command.request.kind))
+			                         .arg(queueWaitMs)
+			                         .arg(executeMs)
+			                         .arg(command.queueDepthAtEnqueue)
+			                         .arg(m_pluginCallbackDispatchQueue.size());
+		}
+		return;
+	}
+	if (command.completion)
+	{
+		if (pluginCallbackDispatchShouldLog(dispatchDiagnosticsEnabled, command.request.functionName,
+		                                    queueWaitMs))
+		{
+			qInfo().noquote()
+			    << QStringLiteral(
+			           "[QMud][LuaDispatchDiag] dispatch-async-completion id=%1 callback=%2 kind=%3 "
+			           "queue_wait_ms=%4 queue_at_enqueue=%5 queue_remaining=%6")
+			           .arg(command.id)
+			           .arg(command.request.functionName,
+			                pluginCallbackDispatchKindLabel(command.request.kind))
+			           .arg(queueWaitMs)
+			           .arg(command.queueDepthAtEnqueue)
+			           .arg(m_pluginCallbackDispatchQueue.size());
+		}
+		m_pluginCallbackDispatchWorkerInFlight = true;
+		m_luaExecutor->dispatchBatchAsync(
+		    command.request, this,
+		    [this, completion = std::move(command.completion)](const LuaBatchDispatchResult &result) mutable
+		    {
+			    qmudCompleteLuaWorkerCallbackDispatch(
+			        m_pluginCallbackDispatchWorkerInFlight,
+			        [&completion, &result]
+			        {
+				        LuaBatchDispatchResult appliedResult = result;
+				        applyLuaDeferredRuntimeMutationBatches(appliedResult);
+				        if (completion)
+					        completion(appliedResult);
+			        },
+			        [this]
+			        {
+				        if (!m_pluginCallbackDispatchQueue.isEmpty())
+					        queuePluginCallbackDispatchDrain();
+			        });
+		    });
+		return;
+	}
+	if (pluginCallbackDispatchShouldLog(dispatchDiagnosticsEnabled, command.request.functionName,
+	                                    queueWaitMs))
+	{
+		qInfo().noquote() << QStringLiteral(
+		                         "[QMud][LuaDispatchDiag] dispatch-async id=%1 callback=%2 kind=%3 "
+		                         "queue_wait_ms=%4 queue_at_enqueue=%5 queue_remaining=%6")
+		                         .arg(command.id)
+		                         .arg(command.request.functionName,
+		                              pluginCallbackDispatchKindLabel(command.request.kind))
+		                         .arg(queueWaitMs)
+		                         .arg(command.queueDepthAtEnqueue)
+		                         .arg(m_pluginCallbackDispatchQueue.size());
+	}
+	m_pluginCallbackDispatchWorkerInFlight = true;
+	m_luaExecutor->dispatchBatchAsync(command.request, this,
+	                                  [this](const LuaBatchDispatchResult &result)
+	                                  {
+		                                  qmudCompleteLuaWorkerCallbackDispatch(
+		                                      m_pluginCallbackDispatchWorkerInFlight,
+		                                      [&result]
+		                                      {
+			                                      LuaBatchDispatchResult appliedResult = result;
+			                                      applyLuaDeferredRuntimeMutationBatches(appliedResult);
+		                                      },
+		                                      [this]
+		                                      {
+			                                      if (!m_pluginCallbackDispatchQueue.isEmpty())
+				                                      queuePluginCallbackDispatchDrain();
+		                                      });
+	                                  });
+}
+
+void WorldRuntime::propagateObservedPluginCallbacksToLuaEngines(const bool completionBarrier) const
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::propagateObservedPluginCallbacksToLuaEngines");
+	QVector<QSharedPointer<LuaCallbackEngine>> engines;
+	engines.reserve(m_plugins.size());
+	for (const Plugin &plugin : m_plugins)
+	{
+		if (plugin.lua)
+			engines.push_back(plugin.lua);
+	}
+	if (engines.isEmpty())
+		return;
+
+	LuaBatchDispatchRequest request;
+	request.kind                     = LuaBatchDispatchKind::UpdateObservedCallbacksMany;
+	request.engines                  = std::move(engines);
+	request.observedCallbackNamesArg = m_observedPluginCallbacks;
+	if (completionBarrier)
+		static_cast<void>(dispatchLuaBatch(request));
+	else
+		dispatchLuaBatchAsync(request);
 }
 
 bool WorldRuntime::callPluginCallbacksStopOnFalse(const QString &functionName, const QString &payload)
 {
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::callPluginCallbacksStopOnFalse");
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return true;
 
-	bool result = true;
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		bool       hasFunction = false;
-		const bool ok = m_luaExecutor->callFunctionWithString(plugin.lua.data(), functionName, payload,
-		                                                      &hasFunction, true);
-		if (hasFunction && !ok)
-		{
-			result = false;
-			break;
-		}
-	}
-	return result;
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::StringStopOnFalse;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.stringArg                    = payload;
+	request.defaultResult                = true;
+	request.revalidateObservedRecipients = true;
+	const LuaBatchDispatchResult result  = queuePluginCallbackDispatch(request, true);
+	return result.boolResultValid ? result.boolResult : true;
 }
 
-void WorldRuntime::callPluginCallbacks(const QString &functionName, const QString &payload)
+void WorldRuntime::callPluginCallbacks(const QString &functionName, const QString &payload,
+                                       const bool completionBarrier)
 {
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::callPluginCallbacks");
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return;
-
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		m_luaExecutor->callFunctionWithString(plugin.lua.data(), functionName, payload, nullptr, true);
-	}
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::String;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.stringArg                    = payload;
+	request.defaultResult                = true;
+	request.revalidateObservedRecipients = true;
+	static_cast<void>(queuePluginCallbackDispatch(request, completionBarrier));
 }
 
-void WorldRuntime::callPluginCallbacksNoArgs(const QString &functionName)
+void WorldRuntime::callPluginCallbacksNoArgs(const QString &functionName, const bool completionBarrier)
 {
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::callPluginCallbacksNoArgs");
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return;
-
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		m_luaExecutor->callFunctionNoArgs(plugin.lua.data(), functionName, nullptr, true);
-	}
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::NoArgs;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.defaultResult                = true;
+	request.revalidateObservedRecipients = true;
+	static_cast<void>(queuePluginCallbackDispatch(request, completionBarrier));
 }
 
 bool WorldRuntime::callPluginCallbacksStopOnTrue(const QString &functionName, long arg1, const QString &arg2)
 {
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return false;
-
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		bool       hasFunction = false;
-		const bool ok = m_luaExecutor->callFunctionWithNumberAndString(plugin.lua.data(), functionName, arg1,
-		                                                               arg2, &hasFunction, false);
-		if (hasFunction && ok)
-			return true;
-	}
-	return false;
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::NumberAndStringStopOnTrue;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.numberArg1                   = arg1;
+	request.stringArg2                   = arg2;
+	request.defaultResult                = false;
+	request.revalidateObservedRecipients = true;
+	const LuaBatchDispatchResult result  = queuePluginCallbackDispatch(request, true);
+	return result.boolResultValid ? result.boolResult : false;
 }
 
 bool WorldRuntime::callPluginCallbacksStopOnTrueWithString(const QString &functionName,
                                                            const QString &payload)
 {
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return false;
-
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		bool hasFunction = false;
-		m_luaExecutor->callFunctionWithString(plugin.lua.data(), functionName, payload, &hasFunction, false);
-		// Legacy SendToFirstPluginCallbacks semantics: handled if callback exists,
-		// regardless of the callback's boolean return value.
-		if (hasFunction)
-			return true;
-	}
-	return false;
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::StringHandled;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.stringArg                    = payload;
+	request.revalidateObservedRecipients = true;
+	const LuaBatchDispatchResult result  = queuePluginCallbackDispatch(request, true);
+	return result.boolResultValid ? result.boolResult : false;
 }
 
 void WorldRuntime::callPluginCallbacksTransformBytes(const QString &functionName, QByteArray &payload)
 {
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return;
-
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		bool hasFunction = false;
-		m_luaExecutor->callFunctionWithBytesInOut(plugin.lua.data(), functionName, payload, &hasFunction);
-	}
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::BytesInOut;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.bytesArg                     = payload;
+	request.revalidateObservedRecipients = true;
+	const LuaBatchDispatchResult result  = queuePluginCallbackDispatch(request, true);
+	payload                              = result.bytesResult;
 }
 
 void WorldRuntime::callPluginCallbacksTransformString(const QString &functionName, QString &payload)
 {
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return;
-
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		bool hasFunction = false;
-		m_luaExecutor->callFunctionWithStringInOut(plugin.lua.data(), functionName, payload, &hasFunction);
-	}
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::StringInOut;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.stringArg                    = payload;
+	request.revalidateObservedRecipients = true;
+	const LuaBatchDispatchResult result  = queuePluginCallbackDispatch(request, true);
+	payload                              = result.stringResult;
 }
 
 bool WorldRuntime::callPluginCallbacksStopOnFalseWithNumberAndString(const QString &functionName, long arg1,
                                                                      const QString &arg2)
 {
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return true;
-
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		bool       hasFunction = false;
-		const bool ok = m_luaExecutor->callFunctionWithNumberAndString(plugin.lua.data(), functionName, arg1,
-		                                                               arg2, &hasFunction, true);
-		if (hasFunction && !ok)
-			return false;
-	}
-	return true;
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::NumberAndStringStopOnFalse;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.numberArg1                   = arg1;
+	request.stringArg2                   = arg2;
+	request.defaultResult                = true;
+	request.revalidateObservedRecipients = true;
+	const LuaBatchDispatchResult result  = queuePluginCallbackDispatch(request, true);
+	return result.boolResultValid ? result.boolResult : true;
 }
 
 bool WorldRuntime::callPluginCallbacksStopOnFalseWithTwoNumbersAndString(const QString &functionName,
                                                                          long arg1, long arg2,
                                                                          const QString &arg3)
 {
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return true;
-
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		bool       hasFunction = false;
-		const bool ok          = m_luaExecutor->callFunctionWithTwoNumbersAndString(
-            plugin.lua.data(), functionName, arg1, arg2, arg3, &hasFunction, true);
-		if (hasFunction && !ok)
-			return false;
-	}
-	return true;
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::TwoNumbersAndStringStopOnFalse;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.numberArg1                   = arg1;
+	request.numberArg2                   = arg2;
+	request.stringArg2                   = arg3;
+	request.defaultResult                = true;
+	request.revalidateObservedRecipients = true;
+	const LuaBatchDispatchResult result  = queuePluginCallbackDispatch(request, true);
+	return result.boolResultValid ? result.boolResult : true;
 }
 
 void WorldRuntime::callPluginCallbacksWithNumberAndString(const QString &functionName, long arg1,
-                                                          const QString &arg2)
+                                                          const QString &arg2, const bool completionBarrier)
 {
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return;
-
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		m_luaExecutor->callFunctionWithNumberAndString(plugin.lua.data(), functionName, arg1, arg2, nullptr,
-		                                               true);
-	}
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::NumberAndString;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.numberArg1                   = arg1;
+	request.stringArg2                   = arg2;
+	request.defaultResult                = true;
+	request.revalidateObservedRecipients = true;
+	static_cast<void>(queuePluginCallbackDispatch(request, completionBarrier));
 }
 
-void WorldRuntime::callPluginCallbacksWithBytes(const QString &functionName, const QByteArray &payload)
+void WorldRuntime::callPluginCallbacksWithBytes(const QString &functionName, const QByteArray &payload,
+                                                const bool completionBarrier)
 {
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return;
-
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		m_luaExecutor->callFunctionWithBytes(plugin.lua.data(), functionName, payload, nullptr, true);
-	}
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::Bytes;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.bytesArg                     = payload;
+	request.defaultResult                = true;
+	request.revalidateObservedRecipients = true;
+	static_cast<void>(queuePluginCallbackDispatch(request, completionBarrier));
 }
 
 bool WorldRuntime::callPluginCallbacksStopOnTrueBytes(const QString &functionName, long arg1,
                                                       const QByteArray &payload)
 {
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return false;
-
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		bool       hasFunction = false;
-		const bool ok = m_luaExecutor->callFunctionWithNumberAndBytes(plugin.lua.data(), functionName, arg1,
-		                                                              payload, &hasFunction, false);
-		if (hasFunction && ok)
-			return true;
-	}
-	return false;
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::NumberAndBytesStopOnTrue;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.numberArg1                   = arg1;
+	request.bytesArg                     = payload;
+	request.defaultResult                = false;
+	request.revalidateObservedRecipients = true;
+	const LuaBatchDispatchResult result  = queuePluginCallbackDispatch(request, true);
+	return result.boolResultValid ? result.boolResult : false;
 }
 
 void WorldRuntime::callPluginCallbacksWithNumberAndBytes(const QString &functionName, long arg1,
-                                                         const QByteArray &payload)
+                                                         const QByteArray &payload,
+                                                         const bool        completionBarrier)
 {
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return;
-
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		m_luaExecutor->callFunctionWithNumberAndBytes(plugin.lua.data(), functionName, arg1, payload, nullptr,
-		                                              true);
-	}
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::NumberAndBytes;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.numberArg1                   = arg1;
+	request.bytesArg                     = payload;
+	request.defaultResult                = true;
+	request.revalidateObservedRecipients = true;
+	static_cast<void>(queuePluginCallbackDispatch(request, completionBarrier));
 }
 
 bool WorldRuntime::callPluginHotspotFunction(const QString &pluginId, const QString &functionName, long flags,
@@ -12624,31 +14346,50 @@ bool WorldRuntime::callPluginHotspotFunction(const QString &pluginId, const QStr
 		return false;
 	const unsigned short previousActionSource = m_currentActionSource;
 	m_currentActionSource                     = eHotspotCallback;
-	bool       hasFunction                    = false;
-	const bool ok = m_luaExecutor->callFunctionWithNumberAndString(plugin.lua.data(), functionName, flags,
-	                                                               hotspotId, &hasFunction, false);
-	m_currentActionSource = previousActionSource;
-	return hasFunction && ok;
+	LuaBatchDispatchRequest request;
+	request.kind                        = LuaBatchDispatchKind::NumberAndStringStopOnTrue;
+	request.engines                     = {plugin.lua};
+	request.functionName                = functionName;
+	request.numberArg1                  = flags;
+	request.stringArg2                  = hotspotId;
+	request.defaultResult               = false;
+	request.inputCritical               = true;
+	const LuaBatchDispatchResult result = queuePluginCallbackDispatch(request, true);
+	m_currentActionSource               = previousActionSource;
+	return result.boolResultValid ? result.boolResult : false;
 }
 
 bool WorldRuntime::callWorldHotspotFunction(const QString &functionName, long flags, const QString &hotspotId)
 {
 	if (functionName.isEmpty() || !m_luaCallbacks)
 		return false;
-	const unsigned short previousActionSource = m_currentActionSource;
-	m_currentActionSource                     = eHotspotCallback;
-	bool       hasFunction                    = false;
-	const bool ok = m_luaExecutor->callFunctionWithNumberAndString(m_luaCallbacks, functionName, flags,
-	                                                               hotspotId, &hasFunction, false);
-	m_currentActionSource = previousActionSource;
-	return hasFunction && ok;
+	const QSharedPointer<LuaCallbackEngine> worldLua(m_luaCallbacks, [](LuaCallbackEngine * /*unused*/) {});
+	const unsigned short                    previousActionSource = m_currentActionSource;
+	m_currentActionSource                                        = eHotspotCallback;
+	LuaBatchDispatchRequest request;
+	request.kind                        = LuaBatchDispatchKind::NumberAndStringStopOnTrue;
+	request.engines                     = {worldLua};
+	request.functionName                = functionName;
+	request.numberArg1                  = flags;
+	request.stringArg2                  = hotspotId;
+	request.defaultResult               = false;
+	request.inputCritical               = true;
+	const LuaBatchDispatchResult result = queuePluginCallbackDispatch(request, true);
+	m_currentActionSource               = previousActionSource;
+	return result.boolResultValid ? result.boolResult : false;
 }
 
 void WorldRuntime::setLuaScriptText(const QString &script)
 {
 	m_luaScriptText = script;
 	if (m_luaCallbacks)
-		m_luaExecutor->setScriptText(m_luaCallbacks, script);
+	{
+		LuaEngineObservedInitializationRequest request;
+		request.engine     = m_luaCallbacks;
+		request.runtime    = this;
+		request.scriptText = script;
+		dispatchInitializeLuaEnginesWithObservedCallbacks({request}, true);
+	}
 }
 
 void WorldRuntime::sendText(const QString &text, bool addNewline)
@@ -12679,7 +14420,9 @@ void WorldRuntime::outputText(const QString &text, bool note, bool newLine)
 	        : localOutputWrapConfig(m_worldAttributes, serverSideWrapActive, m_telnet.windowColumns());
 	if (wrapConfig.enabled && !displayText.isEmpty())
 		wrapPlainLineForColumn(displayText, wrapConfig.wrapColumn, wrapConfig.indentParas);
-	emit outputRequested(displayText, newLine, note);
+	const QVector<OutputLineSegment> segments = splitOutputTextAtLineBreaks(displayText, {}, newLine);
+	for (const OutputLineSegment &segment : segments)
+		emit outputRequested(segment.text, segment.hardReturn, note);
 }
 
 void WorldRuntime::outputStyledText(const QString &text, const QVector<StyleSpan> &spans, bool note,
@@ -12705,7 +14448,10 @@ void WorldRuntime::outputStyledText(const QString &text, const QVector<StyleSpan
 		else
 			wrapStyledLineForColumn(displayText, displaySpans, wrapConfig.wrapColumn, wrapConfig.indentParas);
 	}
-	emit outputStyledRequested(displayText, displaySpans, newLine, note);
+	const QVector<OutputLineSegment> segments =
+	    splitOutputTextAtLineBreaks(displayText, displaySpans, newLine);
+	for (const OutputLineSegment &segment : segments)
+		emit outputStyledRequested(segment.text, segment.spans, segment.hardReturn, note);
 }
 
 void WorldRuntime::prepareInputEchoForDisplay(QString &text, QVector<StyleSpan> &spans,
@@ -13120,14 +14866,9 @@ int WorldRuntime::sendCommand(const QString &text, bool echo, bool queue, bool l
                               bool immediate) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eWorldClosed;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, text, echo, queue, log, history, immediate]
-		    { result = sendCommand(text, echo, queue, log, history, immediate); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eWorldClosed;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), eWorldClosed,
+		                          [this, text, echo, queue, log, history, immediate]
+		                          { return sendCommand(text, echo, queue, log, history, immediate); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::sendCommand");
 	if (m_connectPhase != eConnectConnectedToMud)
@@ -13148,9 +14889,7 @@ void WorldRuntime::logInputCommand(const QString &text) const
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, text] { logInputCommand(text); },
-		    Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(const_cast<WorldRuntime *>(this), [this, text] { logInputCommand(text); });
 		return;
 	}
 
@@ -13237,16 +14976,242 @@ void WorldRuntime::refreshCommandProcessorOptions()
 	m_commandProcessor->setRuntime(this);
 }
 
+WorldRuntime::CommandUiSnapshot WorldRuntime::commandUiSnapshot(const bool includeHistory,
+                                                                const bool includeFrameData,
+                                                                const bool allowSelectedWordHitTest) const
+{
+	if (QThread::currentThread() != thread())
+		return qmudInvokeMethodOr(
+		    const_cast<WorldRuntime *>(this), CommandUiSnapshot{},
+		    [this, includeHistory, includeFrameData, allowSelectedWordHitTest]
+		    { return commandUiSnapshot(includeHistory, includeFrameData, allowSelectedWordHitTest); });
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::commandUiSnapshot");
+	CommandUiSnapshot snapshot;
+	if (m_commandProcessor)
+		snapshot.queuedCommands = m_commandProcessor->queuedCommands();
+	snapshot.textRectangleLeft              = m_textRectangle.left;
+	snapshot.textRectangleTop               = m_textRectangle.top;
+	snapshot.textRectangleRight             = m_textRectangle.right;
+	snapshot.textRectangleBottom            = m_textRectangle.bottom;
+	snapshot.textRectangleBorderOffset      = m_textRectangle.borderOffset;
+	snapshot.textRectangleBorderWidth       = m_textRectangle.borderWidth;
+	snapshot.textRectangleOutsideFillColour = m_textRectangle.outsideFillColour;
+	snapshot.textRectangleOutsideFillStyle  = m_textRectangle.outsideFillStyle;
+	snapshot.textRectangleBorderColour      = m_textRectangle.borderColour;
+	if (m_view)
+	{
+		snapshot.inputSelectionStartColumn = m_view->inputSelectionStartColumn();
+		snapshot.inputSelectionEndColumn   = m_view->inputSelectionEndColumn();
+		snapshot.commandInputText          = m_view->inputText();
+		if (includeHistory)
+			snapshot.commandHistory = m_view->commandHistoryList();
+		snapshot.outputSelectionEndColumn     = m_view->outputSelectionEndColumn();
+		snapshot.outputSelectionEndLine       = m_view->outputSelectionEndLine();
+		snapshot.outputSelectionStartColumn   = m_view->outputSelectionStartColumn();
+		snapshot.outputSelectionStartLine     = m_view->outputSelectionStartLine();
+		snapshot.hasView                      = true;
+		snapshot.outputScrollBarWanted        = m_view->outputScrollBarWanted();
+		snapshot.outputScrollPosition         = m_view->outputScrollPosition();
+		snapshot.outputClientHeight           = m_view->outputClientHeight();
+		snapshot.outputClientWidth            = m_view->outputClientWidth();
+		snapshot.viewHeight                   = m_view->height();
+		snapshot.viewWidth                    = m_view->width();
+		const bool  textRectangleCompatActive = m_textRectangle.left != 0 || m_textRectangle.top != 0 ||
+		                                        m_textRectangle.right != 0 || m_textRectangle.bottom != 0;
+		const QRect outputRect        = textRectangleCompatActive ? m_view->outputTextRectangleUnreserved()
+		                                                          : m_view->outputTextRectangle();
+		snapshot.outputTextRectLeft   = outputRect.left();
+		snapshot.outputTextRectTop    = outputRect.top();
+		snapshot.outputTextRectRight  = outputRect.left() + outputRect.width();
+		snapshot.outputTextRectBottom = outputRect.top() + outputRect.height();
+		snapshot.hasLastMousePosition = m_view->hasLastMousePosition();
+		if (snapshot.hasLastMousePosition)
+		{
+			snapshot.lastMouseX = m_view->lastMousePosition().x();
+			snapshot.lastMouseY = m_view->lastMousePosition().y();
+		}
+	}
+	snapshot.selectedWord         = m_wordUnderMenu;
+	snapshot.selectedWordResolved = m_wordUnderMenuResolved;
+	if (includeFrameData)
+	{
+		MainWindowHost *host = resolveMainWindowHostForRuntime(const_cast<WorldRuntime *>(this));
+		if (auto *frame = dynamic_cast<MainWindow *>(host); frame)
+		{
+			if (snapshot.selectedWord.isEmpty() && allowSelectedWordHitTest)
+			{
+				if (WorldChildWindow *activeWorld = frame->activeWorldChildWindow())
+				{
+					if (WorldView *activeView = activeWorld->view())
+						snapshot.selectedWord = activeView->wordUnderCursor();
+				}
+				snapshot.selectedWordResolved = true;
+			}
+			snapshot.fullScreenMode   = frame->isFullScreenMode();
+			snapshot.worldWindowCount = frame->worldWindowCount();
+			if (const QWidget *client = frame->centralWidget())
+			{
+				snapshot.mainClientHeight = client->height();
+				snapshot.mainClientWidth  = client->width();
+			}
+			if (const QToolBar *toolBar = frame->mainToolbar())
+			{
+				snapshot.mainToolbarHeight = toolBar->height();
+				snapshot.mainToolbarWidth  = toolBar->width();
+			}
+			if (const QToolBar *toolBar = frame->worldToolbar())
+			{
+				snapshot.worldToolbarHeight = toolBar->height();
+				snapshot.worldToolbarWidth  = toolBar->width();
+			}
+			if (const QToolBar *toolBar = frame->activityToolbar())
+			{
+				snapshot.activityToolbarHeight = toolBar->height();
+				snapshot.activityToolbarWidth  = toolBar->width();
+			}
+			if (const QWidget *infoBar = frame->infoBarWidget())
+			{
+				snapshot.infoBarHeight = infoBar->height();
+				snapshot.infoBarWidth  = infoBar->width();
+			}
+			if (const QStatusBar *statusBar = frame->frameStatusBar())
+			{
+				snapshot.statusBarHeight = statusBar->height();
+				snapshot.statusBarWidth  = statusBar->width();
+			}
+			if (WorldChildWindow *childWindow = frame->findWorldChildWindow(const_cast<WorldRuntime *>(this)))
+			{
+				if (!childWindow->isVisible())
+					snapshot.worldWindowShowCommand = 0;
+				else if (childWindow->isMinimized())
+					snapshot.worldWindowShowCommand = 6;
+				else if (childWindow->isMaximized())
+					snapshot.worldWindowShowCommand = 3;
+				snapshot.worldChildWindowHeight = childWindow->height();
+				snapshot.worldChildWindowWidth  = childWindow->width();
+			}
+			snapshot.hasFrameData = true;
+		}
+	}
+	return snapshot;
+}
+
+WorldRuntime::RuntimeCountersSnapshot WorldRuntime::runtimeCountersSnapshot(const bool includeStrings) const
+{
+	if (QThread::currentThread() != thread())
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), RuntimeCountersSnapshot{},
+		                          [this, includeStrings] { return runtimeCountersSnapshot(includeStrings); });
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::runtimeCountersSnapshot");
+	RuntimeCountersSnapshot snapshot;
+	snapshot.newLines               = m_newLines;
+	snapshot.totalLinesSent         = m_totalLinesSent;
+	snapshot.inputPacketCount       = m_inputPacketCount;
+	snapshot.outputPacketCount      = m_outputPacketCount;
+	snapshot.totalUncompressedBytes = m_telnet.totalUncompressedBytes();
+	snapshot.totalCompressedBytes   = m_telnet.totalCompressedBytes();
+	snapshot.mccpType               = m_telnet.mccpType();
+	snapshot.mxpErrorCount          = m_mxpErrors;
+	snapshot.mxpTagCount            = m_telnet.mxpTagCount();
+	snapshot.mxpEntityCount         = m_telnet.mxpEntityCount();
+	snapshot.bytesIn                = m_bytesIn;
+	snapshot.bytesOut               = m_bytesOut;
+	snapshot.totalLinesReceived     = m_linesReceived;
+	snapshot.outputFontHeight       = m_outputFontHeight;
+	snapshot.outputFontWidth        = m_outputFontWidth;
+	snapshot.inputFontHeight        = m_inputFontHeight;
+	snapshot.inputFontWidth         = m_inputFontWidth;
+	snapshot.variableCount          = m_variableCount;
+	snapshot.triggerCount           = m_triggerCount;
+	snapshot.timerCount             = m_timerCount;
+	snapshot.aliasCount             = m_aliasCount;
+	snapshot.queuedCommandCount     = m_queuedCommandCount;
+	snapshot.mappingCount           = safeQSizeToInt(m_mappingList.size());
+	snapshot.outputLineCount        = safeQSizeToInt(m_lines.size());
+	snapshot.customElementCount     = m_telnet.customElementCount();
+	snapshot.customEntityCount      = m_telnet.customEntityCount();
+	snapshot.connectPhase           = m_connectPhase;
+	snapshot.peerAddressV4          = m_socket ? m_socket->peerAddressV4() : 0;
+	snapshot.proxyAddressV4         = m_proxyAddressV4;
+	snapshot.logFilePosition        = m_logFile.isOpen() ? m_logFile.pos() : 0;
+	snapshot.triggerTimeSeconds     = static_cast<double>(m_triggerTimeNs) / 1000000000.0;
+	snapshot.aliasTimeSeconds       = static_cast<double>(m_aliasTimeNs) / 1000000000.0;
+	snapshot.scriptTimeSeconds =
+	    static_cast<double>(m_scriptTimeNanos.load(std::memory_order_relaxed)) / 1000000000.0;
+	snapshot.noCommandEcho          = m_commandProcessor ? m_commandProcessor->noEcho() : false;
+	snapshot.debugIncomingPackets   = m_debugIncomingPackets;
+	snapshot.isCompressing          = m_telnet.isCompressing();
+	snapshot.isMxpActive            = m_mxpActive;
+	snapshot.isPuebloActive         = m_telnet.isPuebloActive();
+	snapshot.removeMapReverses      = m_removeMapReverses;
+	snapshot.notesInRgb             = m_notesInRgb;
+	snapshot.disconnectOk           = m_disconnectOk;
+	snapshot.traceEnabled           = m_traceEnabled;
+	snapshot.isLogOpen              = m_logFile.isOpen();
+	snapshot.scriptFileChanged      = m_scriptFileChanged;
+	snapshot.worldFileModified      = m_worldFileModified;
+	snapshot.isMapping              = m_isMapping;
+	snapshot.isActive               = m_active;
+	snapshot.outputFrozen           = m_outputFrozen;
+	snapshot.variablesChanged       = m_variablesChanged;
+	snapshot.doingSimulate          = m_doingSimulate;
+	snapshot.lineOmittedFromOutput  = m_lineOmittedFromOutput;
+	snapshot.hasLuaCallbacks        = m_luaCallbacks != nullptr;
+	snapshot.pluginProcessingSent   = m_commandProcessor ? m_commandProcessor->pluginProcessingSent() : false;
+	snapshot.isChatAcceptingCalls   = m_chatServer != nullptr;
+	snapshot.noteStyle              = m_noteStyle;
+	snapshot.noteTextColour         = m_noteTextColour;
+	snapshot.noteColourBack         = m_noteColourBack;
+	snapshot.noteColourFore         = m_noteColourFore;
+	snapshot.backgroundColour       = m_backgroundColour;
+	snapshot.utf8ErrorCount         = m_utf8ErrorCount;
+	snapshot.triggersEvaluatedCount = m_triggersEvaluatedCount;
+	snapshot.triggersMatchedThisSession = m_triggersMatchedThisSession;
+	snapshot.aliasesEvaluatedCount      = m_aliasesEvaluatedCount;
+	snapshot.aliasesMatchedThisSession  = m_aliasesMatchedThisSession;
+	snapshot.timersFiredThisSession     = m_timersFiredThisSession;
+	snapshot.lastLineWithIacGa          = m_lastLineWithIacGa;
+	snapshot.outputWindowRedrawCount    = m_outputWindowRedrawCount;
+	snapshot.currentActionSource        = static_cast<int>(m_currentActionSource);
+	snapshot.newlinesReceived           = m_newlinesReceived;
+	snapshot.connectTime                = m_connectTime;
+	snapshot.statusTime                 = m_statusTime;
+	snapshot.lastFlushTime              = m_lastFlushTime;
+	snapshot.clientStartTime            = m_clientStartTime;
+	snapshot.worldStartTime             = m_worldStartTime;
+	if (includeStrings)
+	{
+		snapshot.scriptFileModTime        = scriptFileModTime();
+		snapshot.logFileName              = m_logFileName;
+		snapshot.lastImmediateExpression  = m_lastImmediateExpression;
+		snapshot.statusMessage            = m_statusMessage;
+		snapshot.worldFilePath            = m_worldFilePath;
+		snapshot.windowTitleOverride      = m_windowTitleOverride;
+		snapshot.mainTitleOverride        = m_mainTitleOverride;
+		snapshot.defaultWorldDirectory    = m_defaultWorldDirectory;
+		snapshot.defaultLogDirectory      = m_defaultLogDirectory;
+		snapshot.pluginsDirectory         = m_pluginsDirectory;
+		snapshot.peerAddressString        = m_socket ? m_socket->peerAddressString() : QString();
+		snapshot.proxyAddressString       = m_proxyAddressString;
+		snapshot.startupDirectory         = m_startupDirectory;
+		snapshot.translatorFile           = m_translatorFile;
+		snapshot.locale                   = m_locale;
+		snapshot.fixedPitchFont           = m_fixedPitchFont;
+		snapshot.lastTelnetSubnegotiation = m_lastTelnetSubnegotiation;
+		snapshot.firstSpecialFontPath     = firstSpecialFontPath();
+		snapshot.preferencesDatabaseName  = m_preferencesDatabaseName;
+		snapshot.fileBrowsingDirectory    = m_fileBrowsingDirectory;
+		snapshot.stateFilesDirectory      = m_stateFilesDirectory;
+		snapshot.lastCommandSent          = m_lastCommandSent;
+	}
+	return snapshot;
+}
+
 QStringList WorldRuntime::queuedCommands() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList result;
-		const bool  invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &result] { result = queuedCommands(); },
-            Qt::BlockingQueuedConnection);
-		return invoked ? result : QStringList();
-	}
+		return commandUiSnapshot(false, false).queuedCommands;
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::queuedCommands");
 	if (!m_commandProcessor)
@@ -13257,13 +15222,7 @@ QStringList WorldRuntime::queuedCommands() const
 QString WorldRuntime::commandInputText() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QString    result;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = commandInputText(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : QString();
-	}
+		return commandUiSnapshot(false, false).commandInputText;
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::commandInputText");
 	return m_view ? m_view->inputText() : QString();
@@ -13272,13 +15231,7 @@ QString WorldRuntime::commandInputText() const
 QStringList WorldRuntime::commandHistorySnapshot() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList result;
-		const bool  invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &result] { result = commandHistorySnapshot(); },
-            Qt::BlockingQueuedConnection);
-		return invoked ? result : QStringList();
-	}
+		return commandUiSnapshot(true, false).commandHistory;
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::commandHistorySnapshot");
 	return m_view ? m_view->commandHistoryList() : QStringList();
@@ -13287,13 +15240,7 @@ QStringList WorldRuntime::commandHistorySnapshot() const
 int WorldRuntime::outputSelectionEndColumn() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = outputSelectionEndColumn(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return commandUiSnapshot(false, false).outputSelectionEndColumn;
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::outputSelectionEndColumn");
 	return m_view ? m_view->outputSelectionEndColumn() : 0;
@@ -13302,13 +15249,7 @@ int WorldRuntime::outputSelectionEndColumn() const
 int WorldRuntime::outputSelectionEndLine() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = outputSelectionEndLine(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return commandUiSnapshot(false, false).outputSelectionEndLine;
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::outputSelectionEndLine");
 	return m_view ? m_view->outputSelectionEndLine() : 0;
@@ -13317,13 +15258,7 @@ int WorldRuntime::outputSelectionEndLine() const
 int WorldRuntime::outputSelectionStartColumn() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = outputSelectionStartColumn(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return commandUiSnapshot(false, false).outputSelectionStartColumn;
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::outputSelectionStartColumn");
 	return m_view ? m_view->outputSelectionStartColumn() : 0;
@@ -13332,13 +15267,7 @@ int WorldRuntime::outputSelectionStartColumn() const
 int WorldRuntime::outputSelectionStartLine() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = outputSelectionStartLine(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return commandUiSnapshot(false, false).outputSelectionStartLine;
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::outputSelectionStartLine");
 	return m_view ? m_view->outputSelectionStartLine() : 0;
@@ -13347,12 +15276,7 @@ int WorldRuntime::outputSelectionStartLine() const
 int WorldRuntime::allocateAcceleratorCommand()
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = -1;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result] { result = allocateAcceleratorCommand(); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : -1;
-	}
+		return qmudInvokeMethodOr(this, -1, [this] { return allocateAcceleratorCommand(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::allocateAcceleratorCommand");
 	if (m_nextAcceleratorCommand >= (kAcceleratorFirstCommand + kAcceleratorCount))
@@ -13364,9 +15288,8 @@ void WorldRuntime::registerAccelerator(qint64 key, int commandId, const Accelera
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(
-		    this, [this, key, commandId, entry] { registerAccelerator(key, commandId, entry); },
-		    Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, key, commandId, entry]
+		                        { registerAccelerator(key, commandId, entry); });
 		return;
 	}
 
@@ -13379,7 +15302,7 @@ void WorldRuntime::removeAccelerator(qint64 key)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(this, [this, key] { removeAccelerator(key); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, key] { removeAccelerator(key); });
 		return;
 	}
 
@@ -13394,13 +15317,8 @@ void WorldRuntime::removeAccelerator(qint64 key)
 int WorldRuntime::acceleratorCommandForKey(qint64 key) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = -1;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this),
-		    [this, &result, key] { result = acceleratorCommandForKey(key); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : -1;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), -1,
+		                          [this, key] { return acceleratorCommandForKey(key); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::acceleratorCommandForKey");
 	const auto it = m_acceleratorKeyToCommand.constFind(key);
@@ -13423,13 +15341,8 @@ const WorldRuntime::AcceleratorEntry *WorldRuntime::acceleratorEntryForCommand(i
 QVector<qint64> WorldRuntime::acceleratorKeys() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QVector<qint64> keys;
-		const bool      invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &keys] { keys = acceleratorKeys(); },
-            Qt::BlockingQueuedConnection);
-		return invoked ? keys : QVector<qint64>();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QVector<qint64>(),
+		                          [this] { return acceleratorKeys(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::acceleratorKeys");
 	QVector<qint64> keys;
@@ -13439,16 +15352,35 @@ QVector<qint64> WorldRuntime::acceleratorKeys() const
 	return keys;
 }
 
+QVector<WorldRuntime::AcceleratorSnapshot> WorldRuntime::acceleratorSnapshot() const
+{
+	if (QThread::currentThread() != thread())
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QVector<AcceleratorSnapshot>{},
+		                          [this] { return acceleratorSnapshot(); });
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::acceleratorSnapshot");
+	QVector<AcceleratorSnapshot> snapshot;
+	snapshot.reserve(m_acceleratorKeyToCommand.size());
+	for (auto it = m_acceleratorKeyToCommand.constBegin(); it != m_acceleratorKeyToCommand.constEnd(); ++it)
+	{
+		AcceleratorSnapshot row;
+		row.key       = it.key();
+		row.commandId = it.value();
+		if (const AcceleratorEntry *entry = acceleratorEntryForCommand(row.commandId))
+		{
+			row.text   = entry->text;
+			row.sendTo = entry->sendTo;
+		}
+		snapshot.push_back(row);
+	}
+	return snapshot;
+}
+
 QString WorldRuntime::acceleratorCommandText(int commandId) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QString    text;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &text, commandId]
-		    { text = acceleratorCommandText(commandId); }, Qt::BlockingQueuedConnection);
-		return invoked ? text : QString();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QString(),
+		                          [this, commandId] { return acceleratorCommandText(commandId); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::acceleratorCommandText");
 	if (const AcceleratorEntry *entry = acceleratorEntryForCommand(commandId))
@@ -13459,13 +15391,8 @@ QString WorldRuntime::acceleratorCommandText(int commandId) const
 int WorldRuntime::acceleratorSendTarget(int commandId) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        sendTo  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &sendTo, commandId]
-		    { sendTo = acceleratorSendTarget(commandId); }, Qt::BlockingQueuedConnection);
-		return invoked ? sendTo : 0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0,
+		                          [this, commandId] { return acceleratorSendTarget(commandId); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::acceleratorSendTarget");
 	if (const AcceleratorEntry *entry = acceleratorEntryForCommand(commandId))
@@ -13487,7 +15414,7 @@ bool WorldRuntime::firePluginCommand(const QString &text)
 
 void WorldRuntime::firePluginCommandChanged()
 {
-	callPluginCallbacksNoArgs(QStringLiteral("OnPluginCommandChanged"));
+	callPluginCallbacksNoArgs(QStringLiteral("OnPluginCommandChanged"), false);
 }
 
 bool WorldRuntime::firePluginSend(const QString &text)
@@ -13525,28 +15452,75 @@ void WorldRuntime::firePluginScreendraw(int type, int log, const QString &text)
 	if (m_inScreendrawCallback)
 		return;
 	m_inScreendrawCallback = true;
-	callPluginCallbacksWithTwoNumbersAndString(QStringLiteral("OnPluginScreendraw"), type, log, text);
+	callPluginCallbacksWithTwoNumbersAndString(QStringLiteral("OnPluginScreendraw"), type, log, text, true);
 	m_inScreendrawCallback = false;
 }
 
 void WorldRuntime::firePluginTick()
 {
-	callPluginCallbacksNoArgs(QStringLiteral("OnPluginTick"));
+	callPluginCallbacksNoArgs(QStringLiteral("OnPluginTick"), false);
 }
 
 void WorldRuntime::firePluginSent(const QString &text)
 {
-	callPluginCallbacks(QStringLiteral("OnPluginSent"), text);
+	callPluginCallbacks(QStringLiteral("OnPluginSent"), text, true);
 }
 
 void WorldRuntime::firePluginPartialLine(const QString &text)
 {
-	callPluginCallbacks(QStringLiteral("OnPluginPartialLine"), text);
+	callPluginCallbacks(QStringLiteral("OnPluginPartialLine"), text, true);
 }
 
 void WorldRuntime::notifyMiniWindowMouseMoved(int x, int y, const QString &windowName)
 {
-	callPluginCallbacksWithTwoNumbersAndString(QStringLiteral("OnPluginMouseMoved"), x, y, windowName);
+	if (QThread::currentThread() != thread())
+	{
+		qmudInvokeMethodQueued(this,
+		                       [this, x, y, windowName] { notifyMiniWindowMouseMoved(x, y, windowName); });
+		return;
+	}
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::notifyMiniWindowMouseMoved");
+	static const QString callbackName = QStringLiteral("OnPluginMouseMoved");
+	if (!hasAnyPluginCallback(callbackName))
+		return;
+
+	m_pendingMiniWindowMouseX          = x;
+	m_pendingMiniWindowMouseY          = y;
+	m_pendingMiniWindowMouseWindowName = windowName;
+	m_hasPendingMiniWindowMouseMoved   = true;
+	if (m_pendingMiniWindowMouseMovedQueued)
+		return;
+
+	m_pendingMiniWindowMouseMovedQueued = true;
+	const bool queued                   = QMetaObject::invokeMethod(
+	    this,
+	    [this]
+	    {
+		    qmudAssertObjectThreadAffinity(this, "WorldRuntime::notifyMiniWindowMouseMoved::flush");
+		    flushPendingMiniWindowMouseMoved();
+	    },
+	    Qt::QueuedConnection);
+	if (queued)
+		return;
+
+	m_pendingMiniWindowMouseMovedQueued = false;
+	flushPendingMiniWindowMouseMoved();
+}
+
+void WorldRuntime::flushPendingMiniWindowMouseMoved()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::flushPendingMiniWindowMouseMoved");
+	m_pendingMiniWindowMouseMovedQueued = false;
+	if (!m_hasPendingMiniWindowMouseMoved)
+		return;
+
+	const int     x                  = m_pendingMiniWindowMouseX;
+	const int     y                  = m_pendingMiniWindowMouseY;
+	const QString windowName         = m_pendingMiniWindowMouseWindowName;
+	m_hasPendingMiniWindowMouseMoved = false;
+	m_pendingMiniWindowMouseWindowName.clear();
+	callPluginCallbacksWithTwoNumbersAndString(QStringLiteral("OnPluginMouseMoved"), x, y, windowName, false);
 }
 
 void WorldRuntime::notifyWorldOutputResized()
@@ -13554,7 +15528,7 @@ void WorldRuntime::notifyWorldOutputResized()
 	updateTelnetWindowSizeForNaws();
 	if (m_suppressWorldOutputResizedCallbacks > 0)
 		return;
-	callPluginCallbacksNoArgs(QStringLiteral("OnPluginWorldOutputResized"));
+	callPluginCallbacksNoArgs(QStringLiteral("OnPluginWorldOutputResized"), false);
 }
 
 void WorldRuntime::refreshNawsWindowSize()
@@ -13623,7 +15597,7 @@ void WorldRuntime::notifyDrawOutputWindow(int firstLine, int offset)
 	++m_outputWindowRedrawCount;
 	m_inDrawOutputWindowCallback = true;
 	callPluginCallbacksWithTwoNumbersAndString(QStringLiteral("OnPluginDrawOutputWindow"), firstLine, offset,
-	                                           QString());
+	                                           QString(), false);
 	m_inDrawOutputWindowCallback = false;
 }
 
@@ -13655,7 +15629,7 @@ void WorldRuntime::popForceScriptErrorOutputToWorld()
 
 void WorldRuntime::notifyOutputSelectionChanged()
 {
-	callPluginCallbacksNoArgs(QStringLiteral("OnPluginSelectionChanged"));
+	callPluginCallbacksNoArgs(QStringLiteral("OnPluginSelectionChanged"), false);
 }
 
 static void setDefault(QMap<QString, QString> &attributes, const QString &key, const QString &value)
@@ -13894,6 +15868,7 @@ void WorldRuntime::applyFromDocument(const WorldDocument &doc)
 	m_proxyAddressV4 = 0;
 	m_connectTime    = QDateTime();
 	m_recentLines.clear();
+	invalidateLuaCallbackLineBufferSnapshot();
 	m_stopTriggerEvaluation = KeepEvaluating;
 
 	m_triggers.clear();
@@ -13985,20 +15960,35 @@ void WorldRuntime::applyFromDocument(const WorldDocument &doc)
 		applyPrintingDefaults(rp);
 		m_printingStyles.push_back(rp);
 	}
+	QVector<QSharedPointer<LuaCallbackEngine>> pluginEnginesToTeardown;
+	pluginEnginesToTeardown.reserve(m_plugins.size());
 	for (auto &plugin : m_plugins)
 	{
 		if (!plugin.lua)
 			continue;
-		teardownLuaEngine(plugin.lua.data());
+		pluginEnginesToTeardown.push_back(plugin.lua);
 		plugin.lua.clear();
 	}
+	dispatchTeardownLuaEngines(pluginEnginesToTeardown, false);
 	m_plugins.clear();
 	resetObservedPluginCallbackTracking(m_observedPluginCallbacks, m_observedPluginCallbackQueryGeneration,
 	                                    m_observedPluginCallbackGeneration);
+	m_observedPluginCallbacksPendingWarmup.clear();
+	m_observedPluginCallbackPropagationInFlight = false;
+	m_observedPluginCallbackPropagationQueued   = false;
+	{
+		QMutexLocker locker(&m_pluginObservedCallbackPresenceMutex);
+		m_pendingPluginObservedCallbackPresenceById.clear();
+		m_pendingPluginLuaFunctionCatalogById.clear();
+	}
+	m_pluginObservedCallbackPresenceById.clear();
+	m_pluginLuaFunctionCatalogById.clear();
 	m_pluginCallbackPresenceCounts.clear();
 	m_pluginCallbackRecipientIndices.clear();
 	m_pluginCallbackPresencePluginCount = -1;
 	invalidatePluginCallbackPresenceCache();
+	QVector<LuaEngineObservedInitializationRequest> pluginLuaInitRequests;
+	pluginLuaInitRequests.reserve(safeQSizeToInt(doc.plugins().size()));
 	for (const auto &p : doc.plugins())
 	{
 		Plugin rp;
@@ -14097,11 +16087,18 @@ void WorldRuntime::applyFromDocument(const WorldDocument &doc)
 		if (language.compare(QStringLiteral("lua"), Qt::CaseInsensitive) == 0)
 		{
 			rp.lua = QSharedPointer<LuaCallbackEngine>::create();
-			m_luaExecutor->setWorldRuntime(rp.lua.data(), this);
-			m_luaExecutor->setScriptText(rp.lua.data(), rp.script);
-			m_luaExecutor->setPluginInfo(rp.lua.data(), rp.attributes.value(QStringLiteral("id")),
-			                             rp.attributes.value(QStringLiteral("name")));
-			bindPluginCallbackObserver(rp);
+			LuaEngineObservedInitializationRequest initRequest;
+			initRequest.engine          = rp.lua.data();
+			initRequest.runtime         = this;
+			initRequest.scriptText      = rp.script;
+			initRequest.pluginId        = rp.attributes.value(QStringLiteral("id"));
+			initRequest.pluginName      = rp.attributes.value(QStringLiteral("name"));
+			initRequest.pluginDirectory = rp.directory;
+			initRequest.callbackNames   = m_observedPluginCallbacks;
+			initRequest.observer = [this](const QString &pluginId, const QSet<QString> &presentCallbacks,
+			                              const QSet<QString> &luaFunctions)
+			{ recordObservedPluginCallbackPresenceSnapshot(pluginId, presentCallbacks, luaFunctions); };
+			pluginLuaInitRequests.push_back(std::move(initRequest));
 		}
 		if (!requestedEnabled && rp.lua && hasValidPluginId(rp))
 		{
@@ -14110,9 +16107,16 @@ void WorldRuntime::applyFromDocument(const WorldDocument &doc)
 		}
 		m_plugins.push_back(rp);
 	}
+	if (!pluginLuaInitRequests.isEmpty())
+	{
+		dispatchInitializeLuaEnginesWithObservedCallbacks(pluginLuaInitRequests, true);
+		invalidatePluginCallbackPresenceCache();
+	}
 	sortPluginsBySequence();
 	m_pluginCount = safeQSizeToInt(m_plugins.size());
 	invalidatePluginCallbackPresenceCache();
+	invalidateLuaCallbackDispatchSnapshot();
+	markTriggerRulesChanged();
 	for (auto &plugin : m_plugins)
 	{
 		queuePluginInstall(plugin);
@@ -14172,13 +16176,8 @@ const QMap<QString, QString> &WorldRuntime::worldAttributes() const
 QString WorldRuntime::worldAttributeValue(const QString &key) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QString    value;
-		const bool resolved = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &value, key] { value = worldAttributeValue(key); },
-		    Qt::BlockingQueuedConnection);
-		return resolved ? value : QString();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QString(),
+		                          [this, key] { return worldAttributeValue(key); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::worldAttributeValue");
 	return m_worldAttributes.value(key);
@@ -14188,8 +16187,7 @@ void WorldRuntime::setWorldAttribute(const QString &key, const QString &value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(
-		    this, [this, key, value] { setWorldAttribute(key, value); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, key, value] { setWorldAttribute(key, value); });
 		return;
 	}
 
@@ -14205,8 +16203,9 @@ void WorldRuntime::setWorldAttribute(const QString &key, const QString &value)
 		return;
 	}
 	m_worldAttributes.insert(key, normalizedValue);
+	invalidateLuaCallbackDispatchSnapshot();
 	if (key == QStringLiteral("max_output_lines"))
-		enforceOutputLineLimit();
+		static_cast<void>(enforceOutputLineLimit());
 	if (key == QStringLiteral("naws"))
 	{
 		updateTelnetWindowSizeForNaws();
@@ -14241,13 +16240,8 @@ const QMap<QString, QString> &WorldRuntime::worldMultilineAttributes() const
 QString WorldRuntime::worldMultilineAttributeValue(const QString &key) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QString    value;
-		const bool resolved = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this),
-		    [this, &value, key] { value = worldMultilineAttributeValue(key); }, Qt::BlockingQueuedConnection);
-		return resolved ? value : QString();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QString(),
+		                          [this, key] { return worldMultilineAttributeValue(key); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::worldMultilineAttributeValue");
 	return m_worldMultilineAttributes.value(key);
@@ -14257,15 +16251,14 @@ void WorldRuntime::setWorldMultilineAttribute(const QString &key, const QString 
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(
-		    this, [this, key, value] { setWorldMultilineAttribute(key, value); },
-		    Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, key, value] { setWorldMultilineAttribute(key, value); });
 		return;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::setWorldMultilineAttribute");
 	if (!upsertWorldMultilineAttributeIfChanged(m_worldMultilineAttributes, key, value))
 		return;
+	invalidateLuaCallbackDispatchSnapshot();
 	if (!m_loadingDocument)
 		m_worldFileModified = true;
 	if (key == QStringLiteral("script"))
@@ -14347,6 +16340,11 @@ const QList<WorldRuntime::Trigger> &WorldRuntime::triggers() const
 	return m_triggers;
 }
 
+quint64 WorldRuntime::triggerRuleGeneration() const
+{
+	return m_triggerRuleGeneration;
+}
+
 QList<WorldRuntime::Trigger> &WorldRuntime::triggersMutable()
 {
 	return m_triggers;
@@ -14363,12 +16361,28 @@ void WorldRuntime::setTriggers(const QList<Trigger> &triggers)
 	}
 	m_triggerCount      = safeQSizeToInt(m_triggers.size());
 	m_worldFileModified = true;
+	invalidateLuaCallbackDispatchSnapshot();
+	markTriggerRulesChanged();
 }
 
 void WorldRuntime::markTriggersChanged()
 {
 	m_triggerCount      = safeQSizeToInt(m_triggers.size());
 	m_worldFileModified = true;
+	invalidateLuaCallbackDispatchSnapshot();
+	markTriggerRulesChanged();
+}
+
+void WorldRuntime::markTriggerRulesChanged()
+{
+	if (QThread::currentThread() != thread())
+	{
+		qmudInvokeMethodChecked(this, [this] { markTriggerRulesChanged(); });
+		return;
+	}
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::markTriggerRulesChanged");
+	++m_triggerRuleGeneration;
 }
 
 const QList<WorldRuntime::Alias> &WorldRuntime::aliases() const
@@ -14392,12 +16406,14 @@ void WorldRuntime::setAliases(const QList<Alias> &aliases)
 	}
 	m_aliasCount        = safeQSizeToInt(m_aliases.size());
 	m_worldFileModified = true;
+	invalidateLuaCallbackDispatchSnapshot();
 }
 
 void WorldRuntime::markAliasesChanged()
 {
 	m_aliasCount        = safeQSizeToInt(m_aliases.size());
 	m_worldFileModified = true;
+	invalidateLuaCallbackDispatchSnapshot();
 }
 
 const QList<WorldRuntime::Timer> &WorldRuntime::timers() const
@@ -14422,12 +16438,14 @@ void WorldRuntime::setTimers(const QList<Timer> &timers)
 	m_timerCount = safeQSizeToInt(m_timers.size());
 	noteTimerStructureMutation();
 	m_worldFileModified = true;
+	invalidateLuaCallbackDispatchSnapshot();
 }
 
 void WorldRuntime::markTimersChanged()
 {
 	m_timerCount        = safeQSizeToInt(m_timers.size());
 	m_worldFileModified = true;
+	invalidateLuaCallbackDispatchSnapshot();
 }
 
 quint64 WorldRuntime::timerStructureMutationSerial() const
@@ -14450,6 +16468,7 @@ void WorldRuntime::setMacros(const QList<Macro> &macros)
 	m_macros            = normalizeMacroSlots(macros);
 	m_macroCount        = safeQSizeToInt(m_macros.size());
 	m_worldFileModified = true;
+	invalidateLuaCallbackDispatchSnapshot();
 }
 
 const QList<WorldRuntime::Variable> &WorldRuntime::variables() const
@@ -14461,14 +16480,17 @@ bool WorldRuntime::findVariable(const QString &name, QString &value) const
 {
 	if (QThread::currentThread() != thread())
 	{
-		bool       found = false;
-		QString    resolvedValue;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &found, &resolvedValue, name]
-		    { found = findVariable(name, resolvedValue); }, Qt::BlockingQueuedConnection);
-		if (invoked && found)
-			value = resolvedValue;
-		return invoked && found;
+		const auto resolved =
+		    qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), std::pair<bool, QString>{false, {}},
+		                       [this, name]
+		                       {
+			                       QString    resolvedValue;
+			                       const bool found = findVariable(name, resolvedValue);
+			                       return std::pair<bool, QString>{found, resolvedValue};
+		                       });
+		if (resolved.first)
+			value = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::findVariable");
@@ -14487,13 +16509,8 @@ bool WorldRuntime::findVariable(const QString &name, QString &value) const
 QStringList WorldRuntime::variableList() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList result;
-		const bool  invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &result] { result = variableList(); },
-            Qt::BlockingQueuedConnection);
-		return invoked ? result : QStringList();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QStringList(),
+		                          [this] { return variableList(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::variableList");
 	QStringList names;
@@ -14507,12 +16524,29 @@ QStringList WorldRuntime::variableList() const
 	return names;
 }
 
+QMap<QString, QString> WorldRuntime::variableSnapshot() const
+{
+	if (QThread::currentThread() != thread())
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QMap<QString, QString>{},
+		                          [this] { return variableSnapshot(); });
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::variableSnapshot");
+	QMap<QString, QString> snapshot;
+	for (const auto &var : m_variables)
+	{
+		const QString name = var.attributes.value(QStringLiteral("name"));
+		if (name.isEmpty())
+			continue;
+		snapshot.insert(name, var.content);
+	}
+	return snapshot;
+}
+
 void WorldRuntime::setVariable(const QString &name, const QString &value)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(
-		    this, [this, name, value] { setVariable(name, value); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, name, value] { setVariable(name, value); });
 		return;
 	}
 
@@ -14524,6 +16558,7 @@ void WorldRuntime::setVariable(const QString &name, const QString &value)
 		{
 			var.content        = value;
 			m_variablesChanged = true;
+			invalidateLuaCallbackDispatchSnapshot();
 			return;
 		}
 	}
@@ -14533,6 +16568,7 @@ void WorldRuntime::setVariable(const QString &name, const QString &value)
 	variable.content = value;
 	m_variables.push_back(variable);
 	m_variablesChanged = true;
+	invalidateLuaCallbackDispatchSnapshot();
 }
 
 void WorldRuntime::setVariables(const QList<Variable> &variables)
@@ -14542,72 +16578,56 @@ void WorldRuntime::setVariables(const QList<Variable> &variables)
 		applyVariableDefaults(var);
 	m_variableCount    = safeQSizeToInt(m_variables.size());
 	m_variablesChanged = true;
+	invalidateLuaCallbackDispatchSnapshot();
 }
 
 int WorldRuntime::arrayCreate(const QString &name)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eArrayDoesNotExist;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, name] { result = arrayCreate(name); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eArrayDoesNotExist;
-	}
+		return qmudInvokeMethodOr(this, eArrayDoesNotExist, [this, name] { return arrayCreate(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arrayCreate");
 	if (m_arrays.contains(name))
 		return eArrayAlreadyExists;
 	ArrayEntry const entry;
 	m_arrays.insert(name, entry);
+	invalidateLuaCallbackDispatchSnapshot();
 	return eOK;
 }
 
 int WorldRuntime::arrayDelete(const QString &name)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eArrayDoesNotExist;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, name] { result = arrayDelete(name); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eArrayDoesNotExist;
-	}
+		return qmudInvokeMethodOr(this, eArrayDoesNotExist, [this, name] { return arrayDelete(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arrayDelete");
 	const auto it = m_arrays.find(name);
 	if (it == m_arrays.end())
 		return eArrayDoesNotExist;
 	m_arrays.erase(it);
+	invalidateLuaCallbackDispatchSnapshot();
 	return eOK;
 }
 
 int WorldRuntime::arrayClear(const QString &name)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eArrayDoesNotExist;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, name] { result = arrayClear(name); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eArrayDoesNotExist;
-	}
+		return qmudInvokeMethodOr(this, eArrayDoesNotExist, [this, name] { return arrayClear(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arrayClear");
 	const auto it = m_arrays.find(name);
 	if (it == m_arrays.end())
 		return eArrayDoesNotExist;
 	it->values.clear();
+	invalidateLuaCallbackDispatchSnapshot();
 	return eOK;
 }
 
 bool WorldRuntime::arrayExists(const QString &name) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		bool       result  = false;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, name] { result = arrayExists(name); },
-		    Qt::BlockingQueuedConnection);
-		return invoked && result;
-	}
+		return qmudInvokeMethodTrueOnSuccess(const_cast<WorldRuntime *>(this),
+		                                     [this, name] { return arrayExists(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arrayExists");
 	return m_arrays.contains(name);
@@ -14616,13 +16636,7 @@ bool WorldRuntime::arrayExists(const QString &name) const
 int WorldRuntime::arrayCount() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = arrayCount(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0, [this] { return arrayCount(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arrayCount");
 	return safeQSizeToInt(m_arrays.size());
@@ -14631,13 +16645,8 @@ int WorldRuntime::arrayCount() const
 int WorldRuntime::arraySize(const QString &name) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, name] { result = arraySize(name); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0,
+		                          [this, name] { return arraySize(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arraySize");
 	const auto it = m_arrays.find(name);
@@ -14649,13 +16658,8 @@ int WorldRuntime::arraySize(const QString &name) const
 bool WorldRuntime::arrayKeyExists(const QString &name, const QString &key) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		bool       result  = false;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this),
-		    [this, &result, name, key] { result = arrayKeyExists(name, key); }, Qt::BlockingQueuedConnection);
-		return invoked && result;
-	}
+		return qmudInvokeMethodTrueOnSuccess(const_cast<WorldRuntime *>(this),
+		                                     [this, name, key] { return arrayKeyExists(name, key); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arrayKeyExists");
 	const auto it = m_arrays.find(name);
@@ -14668,14 +16672,17 @@ bool WorldRuntime::arrayGet(const QString &name, const QString &key, QString &va
 {
 	if (QThread::currentThread() != thread())
 	{
-		QString    localValue;
-		bool       result  = false;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, &localValue, name, key]
-		    { result = arrayGet(name, key, localValue); }, Qt::BlockingQueuedConnection);
-		if (invoked && result)
-			value = localValue;
-		return invoked && result;
+		const auto resolved =
+		    qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), std::pair<bool, QString>{false, {}},
+		                       [this, name, key]
+		                       {
+			                       QString    localValue;
+			                       const bool found = arrayGet(name, key, localValue);
+			                       return std::pair<bool, QString>{found, localValue};
+		                       });
+		if (resolved.first)
+			value = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arrayGet");
@@ -14692,13 +16699,8 @@ bool WorldRuntime::arrayGet(const QString &name, const QString &key, QString &va
 int WorldRuntime::arraySet(const QString &name, const QString &key, const QString &value)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eArrayDoesNotExist;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, name, key, value] { result = arraySet(name, key, value); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eArrayDoesNotExist;
-	}
+		return qmudInvokeMethodOr(this, eArrayDoesNotExist,
+		                          [this, name, key, value] { return arraySet(name, key, value); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arraySet");
 	const auto it = m_arrays.find(name);
@@ -14707,22 +16709,19 @@ int WorldRuntime::arraySet(const QString &name, const QString &key, const QStrin
 	if (it->values.contains(key))
 	{
 		it->values.insert(key, value);
+		invalidateLuaCallbackDispatchSnapshot();
 		return eSetReplacingExistingValue;
 	}
 	it->values.insert(key, value);
+	invalidateLuaCallbackDispatchSnapshot();
 	return eOK;
 }
 
 int WorldRuntime::arrayDeleteKey(const QString &name, const QString &key)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eArrayDoesNotExist;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, name, key] { result = arrayDeleteKey(name, key); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eArrayDoesNotExist;
-	}
+		return qmudInvokeMethodOr(this, eArrayDoesNotExist,
+		                          [this, name, key] { return arrayDeleteKey(name, key); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arrayDeleteKey");
 	const auto it = m_arrays.find(name);
@@ -14732,6 +16731,7 @@ int WorldRuntime::arrayDeleteKey(const QString &name, const QString &key)
 	if (kv == it->values.end())
 		return eKeyDoesNotExist;
 	it->values.erase(kv);
+	invalidateLuaCallbackDispatchSnapshot();
 	return eOK;
 }
 
@@ -14739,14 +16739,17 @@ bool WorldRuntime::arrayFirstKey(const QString &name, QString &key) const
 {
 	if (QThread::currentThread() != thread())
 	{
-		QString    localKey;
-		bool       result  = false;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, &localKey, name]
-		    { result = arrayFirstKey(name, localKey); }, Qt::BlockingQueuedConnection);
-		if (invoked && result)
-			key = localKey;
-		return invoked && result;
+		const auto resolved =
+		    qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), std::pair<bool, QString>{false, {}},
+		                       [this, name]
+		                       {
+			                       QString    localKey;
+			                       const bool found = arrayFirstKey(name, localKey);
+			                       return std::pair<bool, QString>{found, localKey};
+		                       });
+		if (resolved.first)
+			key = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arrayFirstKey");
@@ -14761,14 +16764,17 @@ bool WorldRuntime::arrayLastKey(const QString &name, QString &key) const
 {
 	if (QThread::currentThread() != thread())
 	{
-		QString    localKey;
-		bool       result  = false;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, &localKey, name]
-		    { result = arrayLastKey(name, localKey); }, Qt::BlockingQueuedConnection);
-		if (invoked && result)
-			key = localKey;
-		return invoked && result;
+		const auto resolved =
+		    qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), std::pair<bool, QString>{false, {}},
+		                       [this, name]
+		                       {
+			                       QString    localKey;
+			                       const bool found = arrayLastKey(name, localKey);
+			                       return std::pair<bool, QString>{found, localKey};
+		                       });
+		if (resolved.first)
+			key = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arrayLastKey");
@@ -14782,13 +16788,8 @@ bool WorldRuntime::arrayLastKey(const QString &name, QString &key) const
 QStringList WorldRuntime::arrayListAll() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList result;
-		const bool  invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &result] { result = arrayListAll(); },
-            Qt::BlockingQueuedConnection);
-		return invoked ? result : QStringList{};
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QStringList{},
+		                          [this] { return arrayListAll(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arrayListAll");
 	return m_arrays.keys();
@@ -14797,13 +16798,8 @@ QStringList WorldRuntime::arrayListAll() const
 QStringList WorldRuntime::arrayListKeys(const QString &name) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList result;
-		const bool  invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &result, name] { result = arrayListKeys(name); },
-            Qt::BlockingQueuedConnection);
-		return invoked ? result : QStringList{};
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QStringList{},
+		                          [this, name] { return arrayListKeys(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arrayListKeys");
 	const auto it = m_arrays.find(name);
@@ -14815,13 +16811,8 @@ QStringList WorldRuntime::arrayListKeys(const QString &name) const
 QStringList WorldRuntime::arrayListValues(const QString &name) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList result;
-		const bool  invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &result, name] { result = arrayListValues(name); },
-            Qt::BlockingQueuedConnection);
-		return invoked ? result : QStringList{};
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QStringList{},
+		                          [this, name] { return arrayListValues(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::arrayListValues");
 	const auto it = m_arrays.find(name);
@@ -14899,18 +16890,70 @@ namespace
 			return SQLITE_TEXT;
 		}
 	}
+
+	using SqliteExecCallback = int (*)(void *, int, char **, char **);
+	using SqliteExecFn       = int (*)(sqlite3 *, const char *, SqliteExecCallback, void *, char **);
+	using SqliteFreeFn       = void (*)(void *);
+	using SqliteErrmsgFn     = const char *(*)(sqlite3 *);
+
+	struct NativeSqliteApi
+	{
+			QLibrary       library;
+			SqliteExecFn   exec{nullptr};
+			SqliteFreeFn   free{nullptr};
+			SqliteErrmsgFn errmsg{nullptr};
+			QString        errorMessage;
+
+			NativeSqliteApi() : library(QStringLiteral("sqlite3"))
+			{
+				if (!library.load())
+				{
+					library.setFileName(QStringLiteral("libsqlite3.so.0"));
+					library.load();
+				}
+
+				if (!library.isLoaded())
+				{
+					errorMessage = library.errorString();
+					return;
+				}
+
+				exec   = reinterpret_cast<SqliteExecFn>(library.resolve("sqlite3_exec"));
+				free   = reinterpret_cast<SqliteFreeFn>(library.resolve("sqlite3_free"));
+				errmsg = reinterpret_cast<SqliteErrmsgFn>(library.resolve("sqlite3_errmsg"));
+				if (!exec || !free || !errmsg)
+					errorMessage = QStringLiteral("Required SQLite entry points are unavailable.");
+			}
+
+			[[nodiscard]] bool isAvailable() const
+			{
+				return exec && free && errmsg;
+			}
+	};
+
+	const NativeSqliteApi &nativeSqliteApi()
+	{
+		static const NativeSqliteApi api;
+		return api;
+	}
+
+	sqlite3 *nativeSqliteHandle(const QSqlDatabase &db)
+	{
+		QSqlDriver *driver = db.driver();
+		if (!driver)
+			return nullptr;
+		const QVariant handle = driver->handle();
+		if (!handle.isValid() || qstrcmp(handle.typeName(), "sqlite3*") != 0)
+			return nullptr;
+		return *static_cast<sqlite3 *const *>(handle.constData());
+	}
 } // namespace
 
 int WorldRuntime::databaseOpen(const QString &name, const QString &filename, int flags)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = SQLITE_ERROR;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, name, filename, flags] { result = databaseOpen(name, filename, flags); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : SQLITE_ERROR;
-	}
+		return qmudInvokeMethodOr(this, SQLITE_ERROR, [this, name, filename, flags]
+		                          { return databaseOpen(name, filename, flags); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseOpen");
 	const auto it = m_databases.find(name);
@@ -14925,11 +16968,12 @@ int WorldRuntime::databaseOpen(const QString &name, const QString &filename, int
 	if (!isMemory && (flags & SQLITE_OPEN_CREATE) == 0 && !QFileInfo::exists(filename))
 		return SQLITE_CANTOPEN;
 
-	static int    connectionCounter = 0;
-	DatabaseEntry entry;
-	entry.diskName       = filename;
-	entry.connectionName = QStringLiteral("world_db_%1").arg(++connectionCounter);
-	entry.db             = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), entry.connectionName);
+	static std::atomic<quint64> connectionCounter{0};
+	DatabaseEntry               entry;
+	entry.diskName = filename;
+	entry.connectionName =
+	    QStringLiteral("world_db_%1").arg(connectionCounter.fetch_add(1, std::memory_order_relaxed) + 1);
+	entry.db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), entry.connectionName);
 	entry.db.setDatabaseName(isMemory ? QStringLiteral(":memory:") : filename);
 	if (flags & SQLITE_OPEN_READONLY)
 		entry.db.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
@@ -14955,18 +16999,14 @@ int WorldRuntime::databaseOpen(const QString &name, const QString &filename, int
 	}
 
 	m_databases.insert(name, entry);
+	invalidateLuaCallbackDispatchSnapshot();
 	return SQLITE_OK;
 }
 
 int WorldRuntime::databaseClose(const QString &name)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = kDbErrorIdNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, name] { result = databaseClose(name); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : kDbErrorIdNotFound;
-	}
+		return qmudInvokeMethodOr(this, kDbErrorIdNotFound, [this, name] { return databaseClose(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseClose");
 	const auto it = m_databases.find(name);
@@ -14984,19 +17024,15 @@ int WorldRuntime::databaseClose(const QString &name)
 	const QString connectionName = it->connectionName;
 	m_databases.erase(it);
 	QSqlDatabase::removeDatabase(connectionName);
+	invalidateLuaCallbackDispatchSnapshot();
 	return SQLITE_OK;
 }
 
 int WorldRuntime::databasePrepare(const QString &name, const QString &sql)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = kDbErrorIdNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, name, sql] { result = databasePrepare(name, sql); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : kDbErrorIdNotFound;
-	}
+		return qmudInvokeMethodOr(this, kDbErrorIdNotFound,
+		                          [this, name, sql] { return databasePrepare(name, sql); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databasePrepare");
 	const auto it = m_databases.find(name);
@@ -15021,18 +17057,14 @@ int WorldRuntime::databasePrepare(const QString &name, const QString &sql)
 	it->lastError    = SQLITE_OK;
 	it->lastErrorMessage.clear();
 	it->columns = it->stmt->record().count();
+	invalidateLuaCallbackDispatchSnapshot();
 	return SQLITE_OK;
 }
 
 int WorldRuntime::databaseFinalize(const QString &name)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = kDbErrorIdNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, name] { result = databaseFinalize(name); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : kDbErrorIdNotFound;
-	}
+		return qmudInvokeMethodOr(this, kDbErrorIdNotFound, [this, name] { return databaseFinalize(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseFinalize");
 	const auto it = m_databases.find(name);
@@ -15049,18 +17081,14 @@ int WorldRuntime::databaseFinalize(const QString &name)
 	it->stmtExecuted = false;
 	it->validRow     = false;
 	it->columns      = 0;
+	invalidateLuaCallbackDispatchSnapshot();
 	return SQLITE_OK;
 }
 
 int WorldRuntime::databaseReset(const QString &name)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = kDbErrorIdNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, name] { result = databaseReset(name); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : kDbErrorIdNotFound;
-	}
+		return qmudInvokeMethodOr(this, kDbErrorIdNotFound, [this, name] { return databaseReset(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseReset");
 	const auto it = m_databases.find(name);
@@ -15073,20 +17101,15 @@ int WorldRuntime::databaseReset(const QString &name)
 	it->stmt->finish();
 	it->stmtExecuted = false;
 	it->validRow     = false;
-	it->columns      = 0;
+	invalidateLuaCallbackDispatchSnapshot();
 	return SQLITE_OK;
 }
 
 int WorldRuntime::databaseColumns(const QString &name) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = kDbErrorIdNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, name] { result = databaseColumns(name); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : kDbErrorIdNotFound;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), kDbErrorIdNotFound,
+		                          [this, name] { return databaseColumns(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseColumns");
 	const auto it = m_databases.find(name);
@@ -15102,12 +17125,7 @@ int WorldRuntime::databaseColumns(const QString &name) const
 int WorldRuntime::databaseStep(const QString &name)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = kDbErrorIdNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, name] { result = databaseStep(name); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : kDbErrorIdNotFound;
-	}
+		return qmudInvokeMethodOr(this, kDbErrorIdNotFound, [this, name] { return databaseStep(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseStep");
 	const auto it = m_databases.find(name);
@@ -15135,24 +17153,21 @@ int WorldRuntime::databaseStep(const QString &name)
 	{
 		it->validRow  = true;
 		it->lastError = SQLITE_ROW;
+		invalidateLuaCallbackDispatchSnapshot();
 		return SQLITE_ROW;
 	}
 
 	it->validRow  = false;
 	it->lastError = SQLITE_DONE;
+	invalidateLuaCallbackDispatchSnapshot();
 	return SQLITE_DONE;
 }
 
 QString WorldRuntime::databaseError(const QString &name) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QString    result;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, name] { result = databaseError(name); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : QStringLiteral("database error");
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QStringLiteral("database error"),
+		                          [this, name] { return databaseError(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseError");
 	const auto it = m_databases.find(name);
@@ -15163,6 +17178,8 @@ QString WorldRuntime::databaseError(const QString &name) const
 
 	switch (it->lastError)
 	{
+	case SQLITE_OK:
+		return QStringLiteral("not an error");
 	case SQLITE_ROW:
 		return QStringLiteral("row ready");
 	case SQLITE_DONE:
@@ -15189,13 +17206,8 @@ QString WorldRuntime::databaseError(const QString &name) const
 QString WorldRuntime::databaseColumnName(const QString &name, int column) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QString    result;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, name, column]
-		    { result = databaseColumnName(name, column); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : QString();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QString(),
+		                          [this, name, column] { return databaseColumnName(name, column); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseColumnName");
 	const auto it = m_databases.find(name);
@@ -15211,14 +17223,17 @@ QString WorldRuntime::databaseColumnText(const QString &name, int column, bool *
 		*ok = false;
 	if (QThread::currentThread() != thread())
 	{
-		QString    value;
-		bool       localOk = false;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &value, &localOk, name, column]
-		    { value = databaseColumnText(name, column, &localOk); }, Qt::BlockingQueuedConnection);
-		if (invoked && ok)
-			*ok = localOk;
-		return invoked ? value : QString();
+		const auto resolved =
+		    qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), std::pair<QString, bool>{{}, false},
+		                       [this, name, column]
+		                       {
+			                       bool    localOk = false;
+			                       QString value   = databaseColumnText(name, column, &localOk);
+			                       return std::pair<QString, bool>{value, localOk};
+		                       });
+		if (ok)
+			*ok = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseColumnText");
@@ -15238,14 +17253,17 @@ bool WorldRuntime::databaseColumnValue(const QString &name, int column, QVariant
 {
 	if (QThread::currentThread() != thread())
 	{
-		QVariant   localValue;
-		bool       result  = false;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, &localValue, name, column]
-		    { result = databaseColumnValue(name, column, localValue); }, Qt::BlockingQueuedConnection);
-		if (invoked && result)
-			value = localValue;
-		return invoked && result;
+		const auto resolved =
+		    qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), std::pair<bool, QVariant>{false, QVariant()},
+		                       [this, name, column]
+		                       {
+			                       QVariant   localValue;
+			                       const bool found = databaseColumnValue(name, column, localValue);
+			                       return std::pair<bool, QVariant>{found, localValue};
+		                       });
+		if (resolved.first)
+			value = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseColumnValue");
@@ -15261,13 +17279,8 @@ bool WorldRuntime::databaseColumnValue(const QString &name, int column, QVariant
 int WorldRuntime::databaseColumnType(const QString &name, int column) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = kDbErrorIdNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, name, column]
-		    { result = databaseColumnType(name, column); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : kDbErrorIdNotFound;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), kDbErrorIdNotFound,
+		                          [this, name, column] { return databaseColumnType(name, column); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseColumnType");
 	const auto it = m_databases.find(name);
@@ -15287,13 +17300,8 @@ int WorldRuntime::databaseColumnType(const QString &name, int column) const
 int WorldRuntime::databaseTotalChanges(const QString &name) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = kDbErrorIdNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, name] { result = databaseTotalChanges(name); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : kDbErrorIdNotFound;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), kDbErrorIdNotFound,
+		                          [this, name] { return databaseTotalChanges(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseTotalChanges");
 	const auto it = m_databases.find(name);
@@ -15310,13 +17318,8 @@ int WorldRuntime::databaseTotalChanges(const QString &name) const
 int WorldRuntime::databaseChanges(const QString &name) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = kDbErrorIdNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, name] { result = databaseChanges(name); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : kDbErrorIdNotFound;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), kDbErrorIdNotFound,
+		                          [this, name] { return databaseChanges(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseChanges");
 	const auto it = m_databases.find(name);
@@ -15333,13 +17336,8 @@ int WorldRuntime::databaseChanges(const QString &name) const
 QString WorldRuntime::databaseLastInsertRowid(const QString &name) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QString    result;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this),
-		    [this, &result, name] { result = databaseLastInsertRowid(name); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : QString();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QString(),
+		                          [this, name] { return databaseLastInsertRowid(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseLastInsertRowid");
 	const auto it = m_databases.find(name);
@@ -15354,13 +17352,8 @@ QString WorldRuntime::databaseLastInsertRowid(const QString &name) const
 QStringList WorldRuntime::databaseList() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList result;
-		const bool  invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &result] { result = databaseList(); },
-            Qt::BlockingQueuedConnection);
-		return invoked ? result : QStringList{};
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QStringList{},
+		                          [this] { return databaseList(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseList");
 	return m_databases.keys();
@@ -15369,13 +17362,8 @@ QStringList WorldRuntime::databaseList() const
 QVariant WorldRuntime::databaseInfo(const QString &name, int infoType) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QVariant   result;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, name, infoType]
-		    { result = databaseInfo(name, infoType); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : QVariant();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QVariant(),
+		                          [this, name, infoType] { return databaseInfo(name, infoType); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseInfo");
 	const auto it = m_databases.find(name);
@@ -15400,13 +17388,8 @@ QVariant WorldRuntime::databaseInfo(const QString &name, int infoType) const
 int WorldRuntime::databaseExec(const QString &name, const QString &sql)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = kDbErrorIdNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, name, sql] { result = databaseExec(name, sql); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : kDbErrorIdNotFound;
-	}
+		return qmudInvokeMethodOr(this, kDbErrorIdNotFound,
+		                          [this, name, sql] { return databaseExec(name, sql); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseExec");
 	const auto it = m_databases.find(name);
@@ -15419,35 +17402,50 @@ int WorldRuntime::databaseExec(const QString &name, const QString &sql)
 
 	it->validRow = false;
 	it->columns  = 0;
-	QSqlQuery         query(it->db);
-	const QStringList statements = sql.split(QLatin1Char(';'), Qt::SkipEmptyParts);
-	for (const QString &stmt : statements)
+
+	const NativeSqliteApi &api    = nativeSqliteApi();
+	sqlite3               *handle = nativeSqliteHandle(it->db);
+	if (!api.isAvailable() || !handle)
 	{
-		const QString trimmed = stmt.trimmed();
-		if (trimmed.isEmpty())
-			continue;
-		if (!query.exec(trimmed))
+		QSqlQuery query(it->db);
+		if (query.exec(sql))
 		{
-			it->lastError        = mapSqlErrorToSqlite(query.lastError());
-			it->lastErrorMessage = query.lastError().text();
-			return it->lastError;
+			it->lastError = SQLITE_OK;
+			it->lastErrorMessage.clear();
+			return SQLITE_OK;
 		}
+		it->lastError        = mapSqlErrorToSqlite(query.lastError());
+		it->lastErrorMessage = api.errorMessage.isEmpty() ? query.lastError().text() : api.errorMessage;
+		return it->lastError;
 	}
-	it->lastError = SQLITE_OK;
-	it->lastErrorMessage.clear();
-	return SQLITE_OK;
+
+	char            *errorMessage = nullptr;
+	const QByteArray sqlBytes     = sql.toUtf8();
+	const int        result       = api.exec(handle, sqlBytes.constData(), nullptr, nullptr, &errorMessage);
+	it->lastError                 = result;
+	if (result == SQLITE_OK)
+	{
+		it->lastErrorMessage.clear();
+		return SQLITE_OK;
+	}
+
+	if (errorMessage)
+	{
+		it->lastErrorMessage = QString::fromUtf8(errorMessage);
+		api.free(errorMessage);
+	}
+	else
+	{
+		it->lastErrorMessage = QString::fromUtf8(api.errmsg(handle));
+	}
+	return result;
 }
 
 QStringList WorldRuntime::databaseColumnNames(const QString &name) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList result;
-		const bool  invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &result, name] { result = databaseColumnNames(name); },
-            Qt::BlockingQueuedConnection);
-		return invoked ? result : QStringList{};
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QStringList{},
+		                          [this, name] { return databaseColumnNames(name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseColumnNames");
 	const auto it = m_databases.find(name);
@@ -15465,14 +17463,17 @@ bool WorldRuntime::databaseColumnValues(const QString &name, QVector<QVariant> &
 	values.clear();
 	if (QThread::currentThread() != thread())
 	{
-		QVector<QVariant> localValues;
-		bool              result  = false;
-		const bool        invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &result, &localValues, name]
-            { result = databaseColumnValues(name, localValues); }, Qt::BlockingQueuedConnection);
-		if (invoked && result)
-			values = localValues;
-		return invoked && result;
+		const auto resolved = qmudInvokeMethodOr(
+		    const_cast<WorldRuntime *>(this), std::pair<bool, QVector<QVariant>>{false, {}},
+		    [this, name]
+		    {
+			    QVector<QVariant> localValues;
+			    const bool        found = databaseColumnValues(name, localValues);
+			    return std::pair<bool, QVector<QVariant>>{found, localValues};
+		    });
+		if (resolved.first)
+			values = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseColumnValues");
@@ -15496,6 +17497,7 @@ void WorldRuntime::setColours(const QList<Colour> &colours)
 	m_colours           = colours;
 	m_colourCount       = safeQSizeToInt(m_colours.size());
 	m_worldFileModified = true;
+	invalidateLuaCallbackDispatchSnapshot();
 }
 
 namespace
@@ -15590,6 +17592,7 @@ void WorldRuntime::setAnsiColour(bool bold, int index, const QColor &color)
 		colour.attributes.insert(QStringLiteral("seq_index"), QString::number(index - 1));
 		colour.attributes.insert(QStringLiteral("rgb"), rgb);
 		m_worldFileModified = true;
+		invalidateLuaCallbackDispatchSnapshot();
 		return;
 	}
 
@@ -15601,6 +17604,7 @@ void WorldRuntime::setAnsiColour(bool bold, int index, const QColor &color)
 	m_colours.push_back(entry);
 	m_colourCount       = safeQSizeToInt(m_colours.size());
 	m_worldFileModified = true;
+	invalidateLuaCallbackDispatchSnapshot();
 }
 
 const QList<WorldRuntime::Keypad> &WorldRuntime::keypadEntries() const
@@ -15613,6 +17617,7 @@ void WorldRuntime::setKeypadEntries(const QList<Keypad> &entries)
 	m_keypadEntries     = entries;
 	m_keypadCount       = safeQSizeToInt(m_keypadEntries.size());
 	m_worldFileModified = true;
+	invalidateLuaCallbackDispatchSnapshot();
 }
 
 const QList<WorldRuntime::PrintingStyle> &WorldRuntime::printingStyles() const
@@ -15641,19 +17646,18 @@ bool WorldRuntime::loadPluginFile(const QString &fileName, QString *error, bool 
 {
 	if (QThread::currentThread() != thread())
 	{
-		bool       loaded = false;
-		QString    localError;
-		const bool resolved = qmudInvokeMethod(
-		    this,
-		    [this, &loaded, &localError, fileName, markGlobal, needsError = (error != nullptr)]
-		    {
-			    QString *errorPtr = needsError ? &localError : nullptr;
-			    loaded            = loadPluginFile(fileName, errorPtr, markGlobal);
-		    },
-		    Qt::BlockingQueuedConnection);
-		if (error && resolved)
-			*error = localError;
-		return resolved && loaded;
+		const auto resolved = qmudInvokeMethodOr(this, std::pair<bool, QString>{false, {}},
+		                                         [this, fileName, markGlobal, needsError = (error != nullptr)]
+		                                         {
+			                                         QString    localError;
+			                                         QString   *errorPtr = needsError ? &localError : nullptr;
+			                                         const bool loaded =
+			                                             loadPluginFile(fileName, errorPtr, markGlobal);
+			                                         return std::pair<bool, QString>{loaded, localError};
+		                                         });
+		if (error)
+			*error = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::loadPluginFile");
@@ -15693,7 +17697,7 @@ bool WorldRuntime::loadPluginFile(const QString &fileName, QString *error, bool 
 		const QString normalizedWorking   = normalizeSeparators(workingDir);
 		const bool    looksLikeWorldsPath = normalizedResolved.startsWith(QStringLiteral("worlds/"));
 		const bool    pluginsIsWorlds     = normalizedPlugins.endsWith(QStringLiteral("worlds/plugins/")) ||
-		                             normalizedPlugins.endsWith(QStringLiteral("worlds/plugins"));
+		                                    normalizedPlugins.endsWith(QStringLiteral("worlds/plugins"));
 		if (!normalizedPlugins.isEmpty() && !looksLikeWorldsPath && !pluginsIsWorlds)
 			resolved = QDir::cleanPath(QDir(normalizedPlugins).filePath(normalizedResolved));
 		else
@@ -15860,11 +17864,19 @@ bool WorldRuntime::loadPluginFile(const QString &fileName, QString *error, bool 
 	if (language.compare(QStringLiteral("lua"), Qt::CaseInsensitive) == 0)
 	{
 		rp.lua = QSharedPointer<LuaCallbackEngine>::create();
-		m_luaExecutor->setWorldRuntime(rp.lua.data(), this);
-		m_luaExecutor->setScriptText(rp.lua.data(), rp.script);
-		m_luaExecutor->setPluginInfo(rp.lua.data(), rp.attributes.value(QStringLiteral("id")),
-		                             rp.attributes.value(QStringLiteral("name")));
-		bindPluginCallbackObserver(rp);
+		LuaEngineObservedInitializationRequest initRequest;
+		initRequest.engine          = rp.lua.data();
+		initRequest.runtime         = this;
+		initRequest.scriptText      = rp.script;
+		initRequest.pluginId        = rp.attributes.value(QStringLiteral("id"));
+		initRequest.pluginName      = rp.attributes.value(QStringLiteral("name"));
+		initRequest.pluginDirectory = rp.directory;
+		initRequest.callbackNames   = m_observedPluginCallbacks;
+		initRequest.observer        = [this](const QString &pluginId, const QSet<QString> &presentCallbacks,
+		                                     const QSet<QString> &luaFunctions)
+		{ recordObservedPluginCallbackPresenceSnapshot(pluginId, presentCallbacks, luaFunctions); };
+		dispatchInitializeLuaEnginesWithObservedCallbacks({initRequest}, true);
+		invalidatePluginCallbackPresenceCache();
 	}
 	if (!requestedEnabled && rp.lua && hasValidPluginId(rp))
 	{
@@ -15877,13 +17889,14 @@ bool WorldRuntime::loadPluginFile(const QString &fileName, QString *error, bool 
 	m_pluginCount = safeQSizeToInt(m_plugins.size());
 	noteTimerStructureMutation();
 	invalidatePluginCallbackPresenceCache();
+	invalidateLuaCallbackDispatchSnapshot();
 
 	// Queue install for the plugin we just loaded (not "last after sort"),
 	// otherwise lower-sequence plugins can remain permanently install-pending.
 	const int installedIndex = findPluginIndex(m_plugins, pluginId);
 	if (installedIndex >= 0)
 		queuePluginInstall(m_plugins[installedIndex]);
-	callPluginCallbacksNoArgs(QStringLiteral("OnPluginListChanged"));
+	callPluginCallbacksNoArgs(QStringLiteral("OnPluginListChanged"), false);
 	return true;
 }
 
@@ -15891,23 +17904,22 @@ bool WorldRuntime::unloadPlugin(const QString &pluginId, QString *error)
 {
 	if (QThread::currentThread() != thread())
 	{
-		bool       unloaded = false;
-		QString    localError;
-		const bool resolved = qmudInvokeMethod(
-		    this,
-		    [this, &unloaded, &localError, pluginId, needsError = (error != nullptr)]
-		    {
-			    QString *errorPtr = needsError ? &localError : nullptr;
-			    unloaded          = unloadPlugin(pluginId, errorPtr);
-		    },
-		    Qt::BlockingQueuedConnection);
-		if (error && resolved)
-			*error = localError;
-		return resolved && unloaded;
+		const auto resolved = qmudInvokeMethodOr(this, std::pair<bool, QString>{false, {}},
+		                                         [this, pluginId, needsError = (error != nullptr)]
+		                                         {
+			                                         QString    localError;
+			                                         QString   *errorPtr = needsError ? &localError : nullptr;
+			                                         const bool unloaded = unloadPlugin(pluginId, errorPtr);
+			                                         return std::pair<bool, QString>{unloaded, localError};
+		                                         });
+		if (error)
+			*error = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::unloadPlugin");
-	const int index = findPluginIndex(m_plugins, pluginId);
+	const QString resolvedPluginId = resolvePluginIdOrName(pluginId);
+	const int     index            = findPluginIndex(m_plugins, resolvedPluginId);
 	if (index < 0)
 	{
 		if (error)
@@ -15917,31 +17929,38 @@ bool WorldRuntime::unloadPlugin(const QString &pluginId, QString *error)
 
 	Plugin &plugin = m_plugins[index];
 	if (plugin.lua)
-		m_luaExecutor->callFunctionNoArgs(plugin.lua.data(), QStringLiteral("OnPluginClose"), nullptr, true);
+		dispatchSingleEngineNoArgCallback(plugin.lua, QStringLiteral("OnPluginClose"), true);
 	savePluginStateForPlugin(plugin, false, nullptr);
 	if (plugin.lua)
 	{
-		teardownLuaEngine(plugin.lua.data());
+		const QString unloadedPluginId = normalizedPluginId(plugin.attributes.value(QStringLiteral("id")));
+		if (!unloadedPluginId.isEmpty())
+		{
+			{
+				QMutexLocker locker(&m_pluginObservedCallbackPresenceMutex);
+				m_pendingPluginObservedCallbackPresenceById.remove(unloadedPluginId);
+				m_pendingPluginLuaFunctionCatalogById.remove(unloadedPluginId);
+			}
+			m_pluginObservedCallbackPresenceById.remove(unloadedPluginId);
+			m_pluginLuaFunctionCatalogById.remove(unloadedPluginId);
+		}
+		dispatchTeardownLuaEngines({plugin.lua}, false);
 		plugin.lua.clear();
 	}
 	m_plugins.removeAt(index);
 	m_pluginCount = safeQSizeToInt(m_plugins.size());
 	noteTimerStructureMutation();
 	invalidatePluginCallbackPresenceCache();
-	callPluginCallbacksNoArgs(QStringLiteral("OnPluginListChanged"));
+	invalidateLuaCallbackDispatchSnapshot();
+	callPluginCallbacksNoArgs(QStringLiteral("OnPluginListChanged"), false);
 	return true;
 }
 
 bool WorldRuntime::enablePlugin(const QString &pluginId, bool enable)
 {
 	if (QThread::currentThread() != thread())
-	{
-		bool       enabled  = false;
-		const bool resolved = qmudInvokeMethod(
-		    this, [this, &enabled, pluginId, enable] { enabled = enablePlugin(pluginId, enable); },
-		    Qt::BlockingQueuedConnection);
-		return resolved && enabled;
-	}
+		return qmudInvokeMethodTrueOnSuccess(this, [this, pluginId, enable]
+		                                     { return enablePlugin(pluginId, enable); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::enablePlugin");
 	const int index = findPluginIndex(m_plugins, pluginId);
@@ -15955,6 +17974,7 @@ bool WorldRuntime::enablePlugin(const QString &pluginId, bool enable)
 			plugin.disableAfterInstall = false;
 			plugin.attributes.insert(QStringLiteral("enabled"), QStringLiteral("1"));
 			invalidatePluginCallbackPresenceCache();
+			invalidateLuaCallbackDispatchSnapshot();
 			if (!m_loadingDocument)
 				m_worldFileModified = true;
 		}
@@ -15964,11 +17984,11 @@ bool WorldRuntime::enablePlugin(const QString &pluginId, bool enable)
 	if (!enable)
 		plugin.disableAfterInstall = false;
 	plugin.attributes.insert(QStringLiteral("enabled"), enable ? QStringLiteral("1") : QStringLiteral("0"));
+	invalidateLuaCallbackDispatchSnapshot();
 	if (enable)
 	{
 		if (plugin.lua)
-			m_luaExecutor->callFunctionNoArgs(plugin.lua.data(), QStringLiteral("OnPluginEnable"), nullptr,
-			                                  true);
+			dispatchSingleEngineNoArgCallback(plugin.lua, QStringLiteral("OnPluginEnable"), true);
 		// Callback may toggle plugin state (e.g. script calls EnablePlugin on itself).
 		if (plugin.enabled && plugin.installPending)
 			queuePluginInstall(plugin);
@@ -15976,8 +17996,7 @@ bool WorldRuntime::enablePlugin(const QString &pluginId, bool enable)
 	else
 	{
 		if (plugin.lua)
-			m_luaExecutor->callFunctionNoArgs(plugin.lua.data(), QStringLiteral("OnPluginDisable"), nullptr,
-			                                  true);
+			dispatchSingleEngineNoArgCallback(plugin.lua, QStringLiteral("OnPluginDisable"), true);
 	}
 	if (!m_loadingDocument)
 		m_worldFileModified = true;
@@ -15989,23 +18008,22 @@ int WorldRuntime::reloadPlugin(const QString &pluginId, QString *error)
 {
 	if (QThread::currentThread() != thread())
 	{
-		int        result = eNoSuchPlugin;
-		QString    localError;
-		const bool resolved = qmudInvokeMethod(
-		    this,
-		    [this, &result, &localError, pluginId, needsError = (error != nullptr)]
-		    {
-			    QString *errorPtr = needsError ? &localError : nullptr;
-			    result            = reloadPlugin(pluginId, errorPtr);
-		    },
-		    Qt::BlockingQueuedConnection);
-		if (error && resolved)
-			*error = localError;
-		return resolved ? result : eNoSuchPlugin;
+		const auto resolved = qmudInvokeMethodOr(this, std::pair<int, QString>{eNoSuchPlugin, {}},
+		                                         [this, pluginId, needsError = (error != nullptr)]
+		                                         {
+			                                         QString   localError;
+			                                         QString  *errorPtr = needsError ? &localError : nullptr;
+			                                         const int result   = reloadPlugin(pluginId, errorPtr);
+			                                         return std::pair<int, QString>{result, localError};
+		                                         });
+		if (error)
+			*error = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::reloadPlugin");
-	const int index = findPluginIndex(m_plugins, pluginId);
+	const QString resolvedPluginId = resolvePluginIdOrName(pluginId);
+	const int     index            = findPluginIndex(m_plugins, resolvedPluginId);
 	if (index < 0)
 		return eNoSuchPlugin;
 
@@ -16018,7 +18036,7 @@ int WorldRuntime::reloadPlugin(const QString &pluginId, QString *error)
 	const bool wasEnabled = existing.enabled;
 
 	QString    unloadError;
-	if (!unloadPlugin(pluginId, &unloadError))
+	if (!unloadPlugin(resolvedPluginId, &unloadError))
 	{
 		if (error)
 			*error = unloadError;
@@ -16036,7 +18054,7 @@ int WorldRuntime::reloadPlugin(const QString &pluginId, QString *error)
 	}
 
 	if (!wasEnabled)
-		enablePlugin(pluginId, false);
+		enablePlugin(resolvedPluginId, false);
 
 	return eOK;
 }
@@ -16044,20 +18062,52 @@ int WorldRuntime::reloadPlugin(const QString &pluginId, QString *error)
 bool WorldRuntime::isPluginInstalled(const QString &pluginId) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		bool       installed = false;
-		const bool resolved  = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &installed, pluginId]
-            { installed = isPluginInstalled(pluginId); }, Qt::BlockingQueuedConnection);
-		return resolved && installed;
-	}
+		return qmudInvokeMethodTrueOnSuccess(const_cast<WorldRuntime *>(this),
+		                                     [this, pluginId] { return isPluginInstalled(pluginId); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::isPluginInstalled");
 	return findPluginIndex(m_plugins, pluginId) >= 0;
 }
 
+QString WorldRuntime::resolvePluginIdOrName(const QString &pluginIdOrName) const
+{
+	if (QThread::currentThread() != thread())
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QString{},
+		                          [this, pluginIdOrName] { return resolvePluginIdOrName(pluginIdOrName); });
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::resolvePluginIdOrName");
+	const QString key = pluginIdOrName.trimmed();
+	if (key.isEmpty())
+		return {};
+	const int idIndex = findPluginIndex(m_plugins, key);
+	if (idIndex >= 0)
+		return normalizedPluginId(m_plugins.at(idIndex).attributes.value(QStringLiteral("id")));
+	for (const Plugin &plugin : m_plugins)
+	{
+		if (plugin.attributes.value(QStringLiteral("name")).compare(key, Qt::CaseInsensitive) == 0)
+			return normalizedPluginId(plugin.attributes.value(QStringLiteral("id")));
+	}
+	return {};
+}
+
 int WorldRuntime::pluginSupports(const QString &pluginId, const QString &routine) const
 {
+	const auto supportsRoutine = [this, &routine](const QSharedPointer<LuaCallbackEngine> &engine) -> int
+	{
+		if (!engine)
+			return eNoSuchRoutine;
+
+		LuaBatchDispatchRequest request;
+		request.kind                        = LuaBatchDispatchKind::HasFunction;
+		request.engines                     = {engine};
+		request.functionName                = routine;
+		request.lane                        = LuaBatchDispatchLane::Callback;
+		const LuaBatchDispatchResult result = dispatchLuaBatch(request);
+		if (!result.hasFunctionValid)
+			return eNoSuchRoutine;
+		return result.hasFunction ? eOK : eNoSuchRoutine;
+	};
+
 	if (QThread::currentThread() != thread())
 	{
 		struct WorkerSupportsContext
@@ -16066,32 +18116,30 @@ int WorldRuntime::pluginSupports(const QString &pluginId, const QString &routine
 				QSharedPointer<LuaCallbackEngine> lua;
 		};
 
-		WorkerSupportsContext context;
-		const bool            resolved = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this),
-            [this, &context, &pluginId]
-            {
-                const int index = findPluginIndex(m_plugins, pluginId);
-                if (index < 0)
-                {
-                    context.result = eNoSuchPlugin;
-                    return;
-                }
-                const Plugin &plugin = m_plugins.at(index);
-                if (!plugin.lua)
-                {
-                    context.result = eNoSuchRoutine;
-                    return;
-                }
-                context.lua    = plugin.lua;
-                context.result = eOK;
-            },
-            Qt::BlockingQueuedConnection);
-		if (!resolved)
-			return eNoSuchRoutine;
+		const WorkerSupportsContext context =
+		    qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), WorkerSupportsContext{},
+		                       [this, &pluginId]
+		                       {
+			                       WorkerSupportsContext context;
+			                       const int             index = findPluginIndex(m_plugins, pluginId);
+			                       if (index < 0)
+			                       {
+				                       context.result = eNoSuchPlugin;
+				                       return context;
+			                       }
+			                       const Plugin &plugin = m_plugins.at(index);
+			                       if (!plugin.lua)
+			                       {
+				                       context.result = eNoSuchRoutine;
+				                       return context;
+			                       }
+			                       context.lua    = plugin.lua;
+			                       context.result = eOK;
+			                       return context;
+		                       });
 		if (context.result != eOK)
 			return context.result;
-		return m_luaExecutor->hasFunction(context.lua.data(), routine) ? eOK : eNoSuchRoutine;
+		return supportsRoutine(context.lua);
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::pluginSupports");
@@ -16101,9 +18149,7 @@ int WorldRuntime::pluginSupports(const QString &pluginId, const QString &routine
 	if (routine.trimmed().isEmpty())
 		return eNoSuchRoutine;
 	const Plugin &plugin = m_plugins.at(index);
-	if (!plugin.lua)
-		return eNoSuchRoutine;
-	return m_luaExecutor->hasFunction(plugin.lua.data(), routine) ? eOK : eNoSuchRoutine;
+	return supportsRoutine(plugin.lua);
 }
 
 int WorldRuntime::callPlugin(const QString &pluginId, const QString &routine, const QString &argument,
@@ -16113,74 +18159,60 @@ int WorldRuntime::callPlugin(const QString &pluginId, const QString &routine, co
 	{
 		struct WorkerCallContext
 		{
-				int                               result{eErrorCallingPluginRoutine};
-				QSharedPointer<LuaCallbackEngine> lua;
-				QString                           savedCallingPluginId;
-				bool                              callingPluginSet{false};
+				int                                                 result{eErrorCallingPluginRoutine};
+				QSharedPointer<LuaCallbackEngine>                   lua;
+				QSharedPointer<const LuaCallbackMiniWindowSnapshot> miniWindowSnapshot;
 		};
 
-		WorkerCallContext context;
-		const bool        resolved = qmudInvokeMethod(
-            this,
-            [&]
-            {
-                const int index = findPluginIndex(m_plugins, pluginId);
-                if (index < 0)
-                {
-                    context.result = eNoSuchPlugin;
-                    return;
-                }
+		const WorkerCallContext context =
+		    qmudInvokeMethodOr(this, WorkerCallContext{},
+		                       [&]
+		                       {
+			                       WorkerCallContext workerContext;
+			                       const int         index = findPluginIndex(m_plugins, pluginId);
+			                       if (index < 0)
+			                       {
+				                       workerContext.result = eNoSuchPlugin;
+				                       return workerContext;
+			                       }
 
-                Plugin &plugin = m_plugins[index];
-                if (!plugin.lua)
-                {
-                    context.result = eNoSuchRoutine;
-                    return;
-                }
-                if (!plugin.enabled)
-                {
-                    context.result = ePluginDisabled;
-                    return;
-                }
-                if (routine.trimmed().isEmpty())
-                {
-                    context.result = eNoSuchRoutine;
-                    return;
-                }
+			                       Plugin &plugin = m_plugins[index];
+			                       if (!plugin.lua)
+			                       {
+				                       workerContext.result = eNoSuchRoutine;
+				                       return workerContext;
+			                       }
+			                       if (!plugin.enabled)
+			                       {
+				                       workerContext.result = ePluginDisabled;
+				                       return workerContext;
+			                       }
+			                       if (routine.trimmed().isEmpty())
+			                       {
+				                       workerContext.result = eNoSuchRoutine;
+				                       return workerContext;
+			                       }
 
-                context.lua                  = plugin.lua;
-                context.savedCallingPluginId = plugin.callingPluginId;
-                plugin.callingPluginId       = callingPluginId;
-                context.callingPluginSet     = true;
-                context.result               = eOK;
-            },
-            Qt::BlockingQueuedConnection);
-		if (!resolved)
-			return eErrorCallingPluginRoutine;
+			                       workerContext.lua = plugin.lua;
+			                       workerContext.miniWindowSnapshot =
+			                           captureLuaCallbackSnapshotForDispatch({workerContext.lua});
+			                       workerContext.result = eOK;
+			                       return workerContext;
+		                       });
 		if (context.result != eOK)
 			return context.result;
-
-		[[maybe_unused]] const auto restoreCallingPluginId = qScopeGuard(
-		    [this, pluginId, savedCallingPluginId = context.savedCallingPluginId,
-		     shouldRestore = context.callingPluginSet]
-		    {
-			    if (!shouldRestore)
-				    return;
-			    qmudInvokeMethod(
-			        this,
-			        [this, pluginId, savedCallingPluginId]
-			        {
-				        const int restoreIndex = findPluginIndex(m_plugins, pluginId);
-				        if (restoreIndex < 0)
-					        return;
-				        m_plugins[restoreIndex].callingPluginId = savedCallingPluginId;
-			        },
-			        Qt::BlockingQueuedConnection);
-		    });
-
-		bool       hasFunction = false;
-		const bool ok =
-		    m_luaExecutor->callProcedureWithString(context.lua.data(), routine, argument, &hasFunction);
+		LuaBatchDispatchRequest request;
+		request.kind                             = LuaBatchDispatchKind::ProcedureWithString;
+		request.engines                          = {context.lua};
+		request.functionName                     = routine;
+		request.stringArg                        = argument;
+		request.applyCallingPluginContext        = true;
+		request.callingPluginId                  = callingPluginId;
+		request.lane                             = LuaBatchDispatchLane::Callback;
+		request.miniWindowSnapshotArg            = context.miniWindowSnapshot;
+		const LuaBatchDispatchResult result      = dispatchLuaBatch(request);
+		const bool                   hasFunction = result.hasFunctionValid ? result.hasFunction : false;
+		const bool                   ok          = result.boolResultValid ? result.boolResult : false;
 		if (!hasFunction)
 			return eNoSuchRoutine;
 		return ok ? eOK : eErrorCallingPluginRoutine;
@@ -16198,12 +18230,16 @@ int WorldRuntime::callPlugin(const QString &pluginId, const QString &routine, co
 	if (routine.trimmed().isEmpty())
 		return eNoSuchRoutine;
 
-	const QString savedCalling = plugin.callingPluginId;
-	plugin.callingPluginId     = callingPluginId;
-	bool       hasFunction     = false;
-	const bool ok =
-	    m_luaExecutor->callProcedureWithString(plugin.lua.data(), routine, argument, &hasFunction);
-	plugin.callingPluginId = savedCalling;
+	LuaBatchDispatchRequest request;
+	request.kind                             = LuaBatchDispatchKind::ProcedureWithString;
+	request.engines                          = {plugin.lua};
+	request.functionName                     = routine;
+	request.stringArg                        = argument;
+	request.applyCallingPluginContext        = true;
+	request.callingPluginId                  = callingPluginId;
+	const LuaBatchDispatchResult result      = queuePluginCallbackDispatch(request, true);
+	const bool                   hasFunction = result.hasFunctionValid ? result.hasFunction : false;
+	const bool                   ok          = result.boolResultValid ? result.boolResult : false;
 	if (!hasFunction)
 		return eNoSuchRoutine;
 	return ok ? eOK : eErrorCallingPluginRoutine;
@@ -16233,111 +18269,81 @@ int WorldRuntime::callPluginLua(const QString &pluginId, const QString &routine,
 	{
 		struct WorkerCallContext
 		{
-				int                               errorCode{eOK};
-				QString                           errorText;
-				QString                           pluginName;
-				QSharedPointer<LuaCallbackEngine> lua;
-				QString                           savedCallingPluginId;
-				bool                              callingPluginSet{false};
+				int     errorCode{eErrorCallingPluginRoutine};
+				QString errorText{QStringLiteral("Failed to synchronize CallPlugin with runtime thread")};
+				QString pluginName;
+				QSharedPointer<LuaCallbackEngine>                   lua;
+				QSharedPointer<const LuaCallbackMiniWindowSnapshot> miniWindowSnapshot;
 		};
 
-		WorkerCallContext context;
-		const bool        resolved = qmudInvokeMethod(
-            this,
-            [&]
-            {
-                const int index = findPluginIndex(m_plugins, pluginId);
-                if (index < 0)
-                {
-                    context.errorCode = eNoSuchPlugin;
-                    context.errorText = QStringLiteral("Plugin ID (%1) is not installed").arg(pluginId);
-                    return;
-                }
+		const WorkerCallContext context = qmudInvokeMethodOr(
+		    this, WorkerCallContext{},
+		    [&]
+		    {
+			    WorkerCallContext workerContext;
+			    const int         index = findPluginIndex(m_plugins, pluginId);
+			    if (index < 0)
+			    {
+				    workerContext.errorCode = eNoSuchPlugin;
+				    workerContext.errorText = QStringLiteral("Plugin ID (%1) is not installed").arg(pluginId);
+				    return workerContext;
+			    }
 
-                Plugin &plugin     = m_plugins[index];
-                context.pluginName = plugin.attributes.value(QStringLiteral("name"));
-                if (!plugin.enabled)
-                {
-                    context.errorCode = ePluginDisabled;
-                    context.errorText =
-                        QStringLiteral("Plugin '%1' (%2) disabled").arg(context.pluginName, pluginId);
-                    return;
-                }
+			    Plugin &plugin           = m_plugins[index];
+			    workerContext.pluginName = plugin.attributes.value(QStringLiteral("name"));
+			    if (!plugin.enabled)
+			    {
+				    workerContext.errorCode = ePluginDisabled;
+				    workerContext.errorText =
+				        QStringLiteral("Plugin '%1' (%2) disabled").arg(workerContext.pluginName, pluginId);
+				    return workerContext;
+			    }
 
-                if (!plugin.lua)
-                {
-                    context.errorCode = eNoSuchRoutine;
-                    context.errorText = QStringLiteral("Scripting not enabled in plugin '%1' (%2)")
-                                            .arg(context.pluginName, pluginId);
-                    return;
-                }
+			    if (!plugin.lua)
+			    {
+				    workerContext.errorCode = eNoSuchRoutine;
+				    workerContext.errorText = QStringLiteral("Scripting not enabled in plugin '%1' (%2)")
+				                                  .arg(workerContext.pluginName, pluginId);
+				    return workerContext;
+			    }
 
-                context.lua                  = plugin.lua;
-                context.savedCallingPluginId = plugin.callingPluginId;
-                plugin.callingPluginId       = callingPluginId;
-                context.callingPluginSet     = true;
-            },
-            Qt::BlockingQueuedConnection);
-		if (!resolved)
-		{
-			return pushCodeAndMessage(eErrorCallingPluginRoutine,
-			                          QStringLiteral("Failed to synchronize CallPlugin with runtime thread"));
-		}
+			    workerContext.errorCode = eOK;
+			    workerContext.errorText.clear();
+			    workerContext.lua                = plugin.lua;
+			    workerContext.miniWindowSnapshot = captureLuaCallbackSnapshotForDispatch({workerContext.lua});
+			    return workerContext;
+		    });
 		if (context.errorCode != eOK)
 			return pushCodeAndMessage(context.errorCode, context.errorText);
-
-		[[maybe_unused]] const auto restoreCallingPluginId = qScopeGuard(
-		    [this, pluginId, savedCallingPluginId = context.savedCallingPluginId,
-		     shouldRestore = context.callingPluginSet]
-		    {
-			    if (!shouldRestore)
-				    return;
-			    const bool restored = qmudInvokeMethod(
-			        this,
-			        [this, pluginId, savedCallingPluginId]
-			        {
-				        const int restoreIndex = findPluginIndex(m_plugins, pluginId);
-				        if (restoreIndex < 0)
-					        return;
-				        m_plugins[restoreIndex].callingPluginId = savedCallingPluginId;
-			        },
-			        Qt::BlockingQueuedConnection);
-			    if (!restored)
-			    {
-				    qWarning().noquote()
-				        << QStringLiteral("[QMud][LuaExecutor] failed to restore calling-plugin context "
-				                          "for '%1'")
-				               .arg(pluginId);
-			    }
-		    });
-
-		if (!context.lua || !m_luaExecutor->loadScript(context.lua.data()))
+		const int               callerTopBefore = lua_gettop(callerState);
+		LuaBatchDispatchRequest request;
+		request.kind                                     = LuaBatchDispatchKind::CallPluginLuaMarshalling;
+		request.engines                                  = {context.lua};
+		request.functionName                             = routine;
+		request.intArg1                                  = firstArg;
+		request.luaStateArg                              = callerState;
+		request.refreshCallbackCatalogAfter              = true;
+		request.applyCallingPluginContext                = true;
+		request.callingPluginId                          = callingPluginId;
+		request.lane                                     = LuaBatchDispatchLane::Callback;
+		request.miniWindowSnapshotArg                    = context.miniWindowSnapshot;
+		const LuaBatchDispatchResult result              = dispatchLuaBatch(request);
+		const bool                   marshallingExecuted = result.boolResultValid ? result.boolResult : false;
+		const bool                   sameState           = result.marshallingSameState;
+		CallPluginLuaMarshallingResult marshalling;
+		marshalling.error        = result.marshallingErrorValid
+		                               ? static_cast<CallPluginLuaMarshallingError>(result.marshallingError)
+		                               : CallPluginLuaMarshallingError::NoSuchRoutine;
+		marshalling.index        = result.marshallingIndex;
+		marshalling.typeName     = result.marshallingTypeName;
+		marshalling.runtimeError = result.marshallingRuntimeError;
+		marshalling.returnCount  = result.marshallingReturnCount;
+		if (!marshallingExecuted)
 		{
 			return pushCodeAndMessage(eNoSuchRoutine,
 			                          QStringLiteral("Scripting not enabled in plugin '%1' (%2)")
 			                              .arg(context.pluginName, pluginId));
 		}
-
-		lua_State *targetState = m_luaExecutor->luaState(context.lua.data());
-		if (!targetState)
-		{
-			return pushCodeAndMessage(eNoSuchRoutine,
-			                          QStringLiteral("Scripting not enabled in plugin '%1' (%2)")
-			                              .arg(context.pluginName, pluginId));
-		}
-
-		[[maybe_unused]] const auto refreshCallbackCatalog = qScopeGuard(
-		    [this, pluginLua = context.lua]
-		    {
-			    if (pluginLua)
-				    m_luaExecutor->refreshLuaCallbackCatalogNow(pluginLua.data());
-		    });
-
-		const bool                           sameState       = (targetState == callerState);
-		const int                            callerTopBefore = lua_gettop(callerState);
-
-		const CallPluginLuaMarshallingResult marshalling =
-		    qmudCallPluginLuaWithMarshalling(callerState, targetState, routine, firstArg);
 
 		switch (marshalling.error)
 		{
@@ -16351,8 +18357,8 @@ int WorldRuntime::callPluginLua(const QString &pluginId, const QString &routine,
 			lua_pushnumber(callerState, eBadParameter);
 			const int     displayIndex = marshalling.index - firstArg + 3; // plugin ID + routine removed
 			const QString error        = QStringLiteral("Cannot pass argument #%1 (%2 type) to CallPlugin")
-			                          .arg(displayIndex)
-			                          .arg(QString::fromLatin1(marshalling.typeName));
+			                                 .arg(displayIndex)
+			                                 .arg(QString::fromLatin1(marshalling.typeName));
 			lua_pushstring(callerState, error.toLocal8Bit().constData());
 			return 2;
 		}
@@ -16369,8 +18375,8 @@ int WorldRuntime::callPluginLua(const QString &pluginId, const QString &routine,
 		{
 			lua_pushnumber(callerState, eErrorCallingPluginRoutine);
 			const QString error =
-			    QStringLiteral(
-			        "Cannot handle return value #%1 (%2 type) from function '%3' in plugin '%4' (%5)")
+			    QStringLiteral("Cannot handle return value #%1 (%2 type) from function '%3' in plugin "
+			                   "'%4' (%5)")
 			        .arg(marshalling.index)
 			        .arg(QString::fromLatin1(marshalling.typeName))
 			        .arg(routine, context.pluginName, pluginId);
@@ -16405,36 +18411,33 @@ int WorldRuntime::callPluginLua(const QString &pluginId, const QString &routine,
 		                              .arg(plugin.attributes.value(QStringLiteral("name")), pluginId));
 	}
 
-	if (!plugin.lua || !m_luaExecutor->loadScript(plugin.lua.data()))
+	const int               callerTopBefore = lua_gettop(callerState);
+	LuaBatchDispatchRequest request;
+	request.kind                                       = LuaBatchDispatchKind::CallPluginLuaMarshalling;
+	request.engines                                    = {plugin.lua};
+	request.functionName                               = routine;
+	request.intArg1                                    = firstArg;
+	request.luaStateArg                                = callerState;
+	request.refreshCallbackCatalogAfter                = true;
+	request.applyCallingPluginContext                  = true;
+	request.callingPluginId                            = callingPluginId;
+	const LuaBatchDispatchResult   result              = queuePluginCallbackDispatch(request, true);
+	const bool                     marshallingExecuted = result.boolResultValid ? result.boolResult : false;
+	const bool                     sameState           = result.marshallingSameState;
+	CallPluginLuaMarshallingResult marshalling;
+	marshalling.error        = result.marshallingErrorValid
+	                               ? static_cast<CallPluginLuaMarshallingError>(result.marshallingError)
+	                               : CallPluginLuaMarshallingError::NoSuchRoutine;
+	marshalling.index        = result.marshallingIndex;
+	marshalling.typeName     = result.marshallingTypeName;
+	marshalling.runtimeError = result.marshallingRuntimeError;
+	marshalling.returnCount  = result.marshallingReturnCount;
+	if (!marshallingExecuted)
 	{
 		return pushCodeAndMessage(eNoSuchRoutine,
 		                          QStringLiteral("Scripting not enabled in plugin '%1' (%2)")
 		                              .arg(plugin.attributes.value(QStringLiteral("name")), pluginId));
 	}
-
-	lua_State *targetState = m_luaExecutor->luaState(plugin.lua.data());
-	if (!targetState)
-	{
-		return pushCodeAndMessage(eNoSuchRoutine,
-		                          QStringLiteral("Scripting not enabled in plugin '%1' (%2)")
-		                              .arg(plugin.attributes.value(QStringLiteral("name")), pluginId));
-	}
-
-	[[maybe_unused]] const auto refreshCallbackCatalog = qScopeGuard(
-	    [this, &plugin]
-	    {
-		    if (plugin.lua)
-			    m_luaExecutor->refreshLuaCallbackCatalogNow(plugin.lua.data());
-	    });
-
-	const bool    sameState       = (targetState == callerState);
-	const int     callerTopBefore = lua_gettop(callerState);
-	const QString savedCalling    = plugin.callingPluginId;
-	plugin.callingPluginId        = callingPluginId;
-
-	const CallPluginLuaMarshallingResult marshalling =
-	    qmudCallPluginLuaWithMarshalling(callerState, targetState, routine, firstArg);
-	plugin.callingPluginId = savedCalling;
 
 	switch (marshalling.error)
 	{
@@ -16449,8 +18452,8 @@ int WorldRuntime::callPluginLua(const QString &pluginId, const QString &routine,
 		lua_pushnumber(callerState, eBadParameter);
 		const int     displayIndex = marshalling.index - firstArg + 3; // plugin ID + routine removed
 		const QString error        = QStringLiteral("Cannot pass argument #%1 (%2 type) to CallPlugin")
-		                          .arg(displayIndex)
-		                          .arg(QString::fromLatin1(marshalling.typeName));
+		                                 .arg(displayIndex)
+		                                 .arg(QString::fromLatin1(marshalling.typeName));
 		lua_pushstring(callerState, error.toLocal8Bit().constData());
 		return 2;
 	}
@@ -16491,118 +18494,261 @@ int WorldRuntime::broadcastPlugin(long message, const QString &text, const QStri
                                   const QString &callingPluginName)
 {
 	const QString callbackName = QStringLiteral("OnPluginBroadcast");
+
+	struct BroadcastSnapshot
+	{
+			QVector<QSharedPointer<LuaCallbackEngine>>          recipients;
+			QSharedPointer<const LuaCallbackMiniWindowSnapshot> miniWindowSnapshot;
+	};
+
+	const auto collectSnapshot = [&](BroadcastSnapshot &snapshot)
+	{
+		if (!hasAnyPluginCallback(callbackName))
+			return;
+		const QVector<int> recipientIndices =
+		    collectExecutablePluginRecipientIndicesWithWarmupFallback(callbackName);
+		if (recipientIndices.isEmpty())
+			return;
+		const int pluginCount = safeQSizeToInt(m_plugins.size());
+		if (qmudShouldSkipSelfOnlyPluginBroadcast(
+		        recipientIndices, pluginCount, callingPluginId, [this](const int index)
+		        { return m_plugins.at(index).attributes.value(QStringLiteral("id")); }))
+		{
+			return;
+		}
+
+		snapshot.recipients.reserve(recipientIndices.size());
+		for (const int pluginIndex : recipientIndices)
+		{
+			auto         &plugin   = m_plugins[pluginIndex];
+			const QString pluginId = plugin.attributes.value(QStringLiteral("id"));
+			if (!callingPluginId.isEmpty() && pluginId.compare(callingPluginId, Qt::CaseInsensitive) == 0)
+				continue;
+			snapshot.recipients.push_back(plugin.lua);
+		}
+
+		if (snapshot.recipients.isEmpty())
+			return;
+		snapshot.miniWindowSnapshot = captureLuaCallbackSnapshotForDispatch(snapshot.recipients);
+	};
+
+	const auto dispatchSnapshot = [&](const BroadcastSnapshot &snapshot) -> int
+	{
+		if (snapshot.recipients.isEmpty())
+			return 0;
+		return broadcastPluginToRecipients(message, text, callingPluginId, callingPluginName,
+		                                   snapshot.recipients, snapshot.miniWindowSnapshot);
+	};
+
 	if (QThread::currentThread() != thread())
 	{
-		struct WorkerBroadcastContext
-		{
-				QVector<QSharedPointer<LuaCallbackEngine>> recipients;
-		};
-
-		WorkerBroadcastContext context;
-		const bool             resolved = qmudInvokeMethod(
-            this,
-            [&]
-            {
-                if (!hasAnyPluginCallback(callbackName))
-                    return;
-                const auto recipientsIt = m_pluginCallbackRecipientIndices.constFind(callbackName);
-                if (recipientsIt == m_pluginCallbackRecipientIndices.constEnd())
-                    return;
-                const int          pluginCount = safeQSizeToInt(m_plugins.size());
-                const QVector<int> recipientIndices =
-                    qmudFilterValidPluginRecipientIndices(recipientsIt.value(), pluginCount);
-                if (recipientIndices.isEmpty())
-                    return;
-                if (qmudShouldSkipSelfOnlyPluginBroadcast(
-                        recipientIndices, pluginCount, callingPluginId, [this](const int index)
-                        { return m_plugins.at(index).attributes.value(QStringLiteral("id")); }))
-                {
-                    return;
-                }
-
-                context.recipients.reserve(recipientIndices.size());
-                for (const int pluginIndex : recipientIndices)
-                {
-                    if (pluginIndex < 0 || pluginIndex >= m_plugins.size())
-                        continue;
-                    auto &plugin = m_plugins[pluginIndex];
-                    if (!canExecutePlugin(plugin) || !plugin.lua)
-                        continue;
-
-                    const QString pluginId = plugin.attributes.value(QStringLiteral("id"));
-                    if (!callingPluginId.isEmpty() &&
-                        pluginId.compare(callingPluginId, Qt::CaseInsensitive) == 0)
-                    {
-                        continue;
-                    }
-                    context.recipients.push_back(plugin.lua);
-                }
-            },
-            Qt::BlockingQueuedConnection);
-		if (!resolved || context.recipients.isEmpty())
-			return 0;
-
-		const QByteArray callingPluginIdUtf8   = callingPluginId.toUtf8();
-		const QByteArray callingPluginNameUtf8 = callingPluginName.toUtf8();
-		const QByteArray textUtf8              = text.toUtf8();
-
-		int              count = 0;
-		for (const auto &pluginLua : context.recipients)
-		{
-			if (!pluginLua)
-				continue;
-			bool hasFunction = false;
-			m_luaExecutor->callFunctionWithNumberAndUtf8Strings(pluginLua.data(), callbackName, message,
-			                                                    callingPluginIdUtf8, callingPluginNameUtf8,
-			                                                    textUtf8, &hasFunction, true);
-			if (hasFunction)
-				++count;
-		}
-		return count;
+		BroadcastSnapshot snapshot =
+		    qmudInvokeMethodOr(this, BroadcastSnapshot{},
+		                       [&]
+		                       {
+			                       BroadcastSnapshot s;
+			                       // Callback-lane callers must not wait on callback-presence propagation, because this
+			                       // path may already be executing on the callback worker. Capture executable recipients
+			                       // directly from runtime state; dispatch still counts only plugins that implement the
+			                       // callback.
+			                       s.recipients = broadcastPluginRecipientSnapshot(callingPluginId);
+			                       if (!s.recipients.isEmpty())
+				                       s.miniWindowSnapshot =
+				                           captureLuaCallbackSnapshotForDispatch(s.recipients);
+			                       return s;
+		                       });
+		return dispatchSnapshot(snapshot);
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::broadcastPlugin");
-	if (!hasAnyPluginCallback(callbackName))
-		return 0;
-	const auto recipientsIt = m_pluginCallbackRecipientIndices.constFind(callbackName);
-	if (recipientsIt == m_pluginCallbackRecipientIndices.constEnd())
-		return 0;
-	const int          pluginCount = safeQSizeToInt(m_plugins.size());
-	const QVector<int> recipientIndices =
-	    qmudFilterValidPluginRecipientIndices(recipientsIt.value(), pluginCount);
-	if (recipientIndices.isEmpty())
-		return 0;
-	if (qmudShouldSkipSelfOnlyPluginBroadcast(
-	        recipientIndices, pluginCount, callingPluginId,
-	        [this](const int index) { return m_plugins.at(index).attributes.value(QStringLiteral("id")); }))
-		return 0;
-	const QByteArray callingPluginIdUtf8   = callingPluginId.toUtf8();
-	const QByteArray callingPluginNameUtf8 = callingPluginName.toUtf8();
-	const QByteArray textUtf8              = text.toUtf8();
+	BroadcastSnapshot snapshot;
+	collectSnapshot(snapshot);
+	return dispatchSnapshot(snapshot);
+}
 
-	int              count = 0;
-	for (const int pluginIndex : recipientIndices)
+int WorldRuntime::broadcastPluginToRecipients(
+    long message, const QString &text, const QString &callingPluginId, const QString &callingPluginName,
+    const QVector<QSharedPointer<LuaCallbackEngine>>          &recipients,
+    const QSharedPointer<const LuaCallbackMiniWindowSnapshot> &miniWindowSnapshot)
+{
+	if (recipients.isEmpty())
+		return 0;
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::NumberAndUtf8StringsCount;
+	request.engines                      = recipients;
+	request.functionName                 = QStringLiteral("OnPluginBroadcast");
+	request.numberArg1                   = message;
+	request.bytesArg                     = callingPluginId.toUtf8();
+	request.bytesArg2                    = callingPluginName.toUtf8();
+	request.bytesArg3                    = text.toUtf8();
+	request.defaultResult                = true;
+	request.miniWindowSnapshotArg        = miniWindowSnapshot;
+	request.revalidateObservedRecipients = true;
+	if (QThread::currentThread() != thread())
 	{
-		if (pluginIndex < 0 || pluginIndex >= m_plugins.size())
-			continue;
-		auto &plugin = m_plugins[pluginIndex];
-		if (!canExecutePlugin(plugin))
-			continue;
-		if (!plugin.lua)
-			continue;
-
-		const QString pluginId = plugin.attributes.value(QStringLiteral("id"));
-		if (!callingPluginId.isEmpty() && pluginId.compare(callingPluginId, Qt::CaseInsensitive) == 0)
-			continue;
-
-		bool hasFunction = false;
-		m_luaExecutor->callFunctionWithNumberAndUtf8Strings(plugin.lua.data(), callbackName, message,
-		                                                    callingPluginIdUtf8, callingPluginNameUtf8,
-		                                                    textUtf8, &hasFunction, true);
-		if (hasFunction)
-			++count;
+		request.lane = LuaBatchDispatchLane::Callback;
+		if (!request.miniWindowSnapshotArg)
+		{
+			request.miniWindowSnapshotArg =
+			    qmudInvokeMethodOr(this, QSharedPointer<const LuaCallbackMiniWindowSnapshot>{},
+			                       [this, recipients = request.engines]
+			                       { return captureLuaCallbackSnapshotForDispatch(recipients); });
+		}
+		const LuaBatchDispatchResult result = dispatchLuaBatch(request);
+		return result.countResultValid ? result.countResult : 0;
 	}
-	return count;
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::broadcastPluginToRecipients");
+	const LuaBatchDispatchResult result = queuePluginCallbackDispatch(request, true);
+	return result.countResultValid ? result.countResult : 0;
+}
+
+int WorldRuntime::broadcastPluginRecipientCount(const QString &callingPluginId) const
+{
+	const QString callbackName = QStringLiteral("OnPluginBroadcast");
+
+	const auto    resolveCount = [&]() -> int
+	{
+		if (!const_cast<WorldRuntime *>(this)->hasAnyPluginCallback(callbackName))
+			return 0;
+		const QVector<int> recipientIndices =
+		    collectExecutablePluginRecipientIndicesWithWarmupFallback(callbackName);
+		if (recipientIndices.isEmpty())
+			return 0;
+		const int pluginCount = safeQSizeToInt(m_plugins.size());
+		if (qmudShouldSkipSelfOnlyPluginBroadcast(
+		        recipientIndices, pluginCount, callingPluginId, [this](const int index)
+		        { return m_plugins.at(index).attributes.value(QStringLiteral("id")); }))
+		{
+			return 0;
+		}
+		int count = 0;
+		for (const int pluginIndex : recipientIndices)
+		{
+			const QString pluginId = m_plugins.at(pluginIndex).attributes.value(QStringLiteral("id"));
+			if (!callingPluginId.isEmpty() && pluginId.compare(callingPluginId, Qt::CaseInsensitive) == 0)
+				continue;
+			++count;
+		}
+		return count;
+	};
+
+	if (QThread::currentThread() != thread())
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0, [&] { return resolveCount(); });
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::broadcastPluginRecipientCount");
+	return resolveCount();
+}
+
+QVector<QSharedPointer<LuaCallbackEngine>>
+WorldRuntime::broadcastPluginRecipientSnapshot(const QString &callingPluginId) const
+{
+	if (QThread::currentThread() != thread())
+	{
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this),
+		                          QVector<QSharedPointer<LuaCallbackEngine>>{}, [this, callingPluginId]
+		                          { return broadcastPluginRecipientSnapshot(callingPluginId); });
+	}
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::broadcastPluginRecipientSnapshot");
+	const QVector<int> recipientIndices = qmudCollectBroadcastRecipientIndices(
+	    m_plugins, callingPluginId,
+	    [this](const int pluginIndex)
+	    {
+		    if (pluginIndex < 0 || pluginIndex >= m_plugins.size())
+			    return false;
+		    return canExecutePlugin(m_plugins.at(pluginIndex));
+	    },
+	    [this](const int pluginIndex)
+	    {
+		    if (pluginIndex < 0 || pluginIndex >= m_plugins.size())
+			    return QString();
+		    return m_plugins.at(pluginIndex).attributes.value(QStringLiteral("id"));
+	    });
+
+	QVector<QSharedPointer<LuaCallbackEngine>> recipients;
+	recipients.reserve(recipientIndices.size());
+	for (const int pluginIndex : recipientIndices)
+		recipients.push_back(m_plugins.at(pluginIndex).lua);
+	return recipients;
+}
+
+int WorldRuntime::setPluginAsyncResultFilter(const QString &pluginId, const QSet<QString> &apiNames,
+                                             const bool allowAll)
+{
+	if (QThread::currentThread() != thread())
+	{
+		return qmudInvokeMethodOr(this, eNoSuchPlugin, [this, pluginId, apiNames, allowAll]
+		                          { return setPluginAsyncResultFilter(pluginId, apiNames, allowAll); });
+	}
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::setPluginAsyncResultFilter");
+	const QString normalizedId = normalizedPluginId(pluginId);
+	if (normalizedId.isEmpty())
+		return eNotAPlugin;
+
+	Plugin *plugin = pluginForId(normalizedId);
+	if (!plugin)
+		return eNoSuchPlugin;
+
+	plugin->asyncResultFilterAll = allowAll;
+	plugin->asyncResultFilterApis.clear();
+	if (!allowAll)
+	{
+		for (const QString &apiName : apiNames)
+		{
+			const QString normalizedApiName = normalizedAsyncResultApiName(apiName);
+			if (!normalizedApiName.isEmpty())
+				plugin->asyncResultFilterApis.insert(normalizedApiName);
+		}
+	}
+
+	return eOK;
+}
+
+void WorldRuntime::dispatchPluginAsyncResult(const QString &pluginId, const quint64 requestId,
+                                             const QString &apiName, const bool ok, const int errorCode,
+                                             const QString &payload)
+{
+	if (QThread::currentThread() != thread())
+	{
+		const bool queued = qmudInvokeMethodQueued(
+		    this, [this, pluginId, requestId, apiName, ok, errorCode, payload]
+		    { dispatchPluginAsyncResult(pluginId, requestId, apiName, ok, errorCode, payload); });
+		if (!queued)
+		{
+			qWarning().noquote() << QStringLiteral(
+			    "[QMud][LuaBridge] failed to queue plugin async result dispatch to runtime thread");
+		}
+		return;
+	}
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::dispatchPluginAsyncResult");
+	const QString normalizedId = normalizedPluginId(pluginId);
+	if (normalizedId.isEmpty())
+		return;
+
+	const int pluginIndex = findPluginIndex(m_plugins, normalizedId);
+	if (pluginIndex < 0)
+		return;
+	const Plugin &plugin = m_plugins.at(pluginIndex);
+	if (!canExecutePlugin(plugin) || !plugin.lua)
+		return;
+	if (!shouldDispatchPluginAsyncResult(plugin, apiName))
+		return;
+
+	LuaBatchDispatchRequest request;
+	request.kind          = LuaBatchDispatchKind::NumberAndUtf8StringsCount;
+	request.engines       = {plugin.lua};
+	request.functionName  = QStringLiteral("OnPluginAsyncResult");
+	request.numberArg1    = requestId > static_cast<quint64>(std::numeric_limits<long>::max())
+	                            ? std::numeric_limits<long>::max()
+	                            : static_cast<long>(requestId);
+	request.bytesArg      = apiName.toUtf8();
+	request.bytesArg2     = ok ? QByteArrayLiteral("ok") : QByteArray::number(errorCode);
+	request.bytesArg3     = payload.toUtf8();
+	request.defaultResult = true;
+	queuePluginCallbackDispatchAsync(request);
 }
 
 QString WorldRuntime::worldName() const
@@ -16778,12 +18924,8 @@ int WorldRuntime::sendChatMessageToAll(int message, const QString &text, bool un
 int WorldRuntime::chatAcceptCalls(short port)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eCannotCreateChatSocket;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, port] { result = chatAcceptCalls(port); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eCannotCreateChatSocket;
-	}
+		return qmudInvokeMethodOr(this, eCannotCreateChatSocket,
+		                          [this, port] { return chatAcceptCalls(port); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatAcceptCalls");
 	if (m_chatServer)
@@ -16840,13 +18982,8 @@ int WorldRuntime::chatAcceptCalls(short port)
 int WorldRuntime::chatCall(const QString &server, long port, bool zChat)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eCannotCreateChatSocket;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, server, port, zChat] { result = chatCall(server, port, zChat); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eCannotCreateChatSocket;
-	}
+		return qmudInvokeMethodOr(this, eCannotCreateChatSocket,
+		                          [this, server, port, zChat] { return chatCall(server, port, zChat); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatCall");
 	const QString trimmed = server.trimmed();
@@ -16866,12 +19003,7 @@ int WorldRuntime::chatCall(const QString &server, long port, bool zChat)
 int WorldRuntime::chatDisconnect(long id)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eChatIDNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, id] { result = chatDisconnect(id); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eChatIDNotFound;
-	}
+		return qmudInvokeMethodOr(this, eChatIDNotFound, [this, id] { return chatDisconnect(id); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatDisconnect");
 	ChatConnection *connection = chatConnectionById(id);
@@ -16886,12 +19018,7 @@ int WorldRuntime::chatDisconnect(long id)
 int WorldRuntime::chatDisconnectAll()
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eOK;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result] { result = chatDisconnectAll(); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eOK;
-	}
+		return qmudInvokeMethodOr(this, eOK, [this] { return chatDisconnectAll(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatDisconnectAll");
 	int count = 0;
@@ -16911,13 +19038,8 @@ int WorldRuntime::chatDisconnectAll()
 int WorldRuntime::chatEverybody(const QString &message, bool emote)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eNoChatConnections;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, message, emote] { result = chatEverybody(message, emote); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eNoChatConnections;
-	}
+		return qmudInvokeMethodOr(this, eNoChatConnections,
+		                          [this, message, emote] { return chatEverybody(message, emote); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatEverybody");
 	const QString bold    = QString::fromLatin1(ansiCode(kAnsiBold));
@@ -16951,13 +19073,8 @@ int WorldRuntime::chatEverybody(const QString &message, bool emote)
 long WorldRuntime::chatGetId(const QString &who) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		long       result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, who] { result = chatGetId(who); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0L,
+		                          [this, who] { return chatGetId(who); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatGetId");
 	QString const trimmed = who.trimmed();
@@ -16991,13 +19108,8 @@ long WorldRuntime::chatGetId(const QString &who) const
 int WorldRuntime::chatGroup(const QString &group, const QString &message, bool emote)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eNoChatConnections;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, group, message, emote] { result = chatGroup(group, message, emote); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eNoChatConnections;
-	}
+		return qmudInvokeMethodOr(this, eNoChatConnections,
+		                          [this, group, message, emote] { return chatGroup(group, message, emote); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatGroup");
 	if (group.trimmed().isEmpty())
@@ -17037,13 +19149,8 @@ int WorldRuntime::chatGroup(const QString &group, const QString &message, bool e
 int WorldRuntime::chatId(long id, const QString &message, bool emote)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eChatIDNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, id, message, emote] { result = chatId(id, message, emote); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eChatIDNotFound;
-	}
+		return qmudInvokeMethodOr(this, eChatIDNotFound,
+		                          [this, id, message, emote] { return chatId(id, message, emote); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatId");
 	if (id == 0)
@@ -17082,13 +19189,8 @@ int WorldRuntime::chatId(long id, const QString &message, bool emote)
 int WorldRuntime::chatMessage(long id, short message, const QString &text) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eChatIDNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, id, message, text]
-		    { result = chatMessage(id, message, text); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eChatIDNotFound;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), eChatIDNotFound,
+		                          [this, id, message, text] { return chatMessage(id, message, text); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatMessage");
 	ChatConnection *connection = chatConnectionById(id);
@@ -17101,13 +19203,7 @@ int WorldRuntime::chatMessage(long id, short message, const QString &text) const
 int WorldRuntime::chatNameChange(const QString &newName)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eBadParameter;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, newName] { result = chatNameChange(newName); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eBadParameter;
-	}
+		return qmudInvokeMethodOr(this, eBadParameter, [this, newName] { return chatNameChange(newName); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatNameChange");
 	if (newName.trimmed().isEmpty())
@@ -17129,8 +19225,7 @@ void WorldRuntime::chatNote(short noteType, const QString &message)
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(
-		    this, [this, noteType, message] { chatNote(noteType, message); }, Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, noteType, message] { chatNote(noteType, message); });
 		return;
 	}
 
@@ -17201,19 +19296,14 @@ void WorldRuntime::chatNote(short noteType, const QString &message)
 	                                 .arg(backColor.red())
 	                                 .arg(backColor.green())
 	                                 .arg(backColor.blue());
-	const auto reset = QStringLiteral("\x1b[0m");
+	const auto    reset        = QStringLiteral("\x1b[0m");
 	outputAnsiText(colourPrefix + output + reset + QLatin1Char('\n'), true);
 }
 
 int WorldRuntime::chatPasteEverybody()
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eNoChatConnections;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result] { result = chatPasteEverybody(); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eNoChatConnections;
-	}
+		return qmudInvokeMethodOr(this, eNoChatConnections, [this] { return chatPasteEverybody(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatPasteEverybody");
 	const QString contents = QGuiApplication::clipboard()->text();
@@ -17241,12 +19331,7 @@ int WorldRuntime::chatPasteEverybody()
 int WorldRuntime::chatPasteText(long id)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eChatIDNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, id] { result = chatPasteText(id); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eChatIDNotFound;
-	}
+		return qmudInvokeMethodOr(this, eChatIDNotFound, [this, id] { return chatPasteText(id); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatPasteText");
 	if (id == 0)
@@ -17278,13 +19363,8 @@ int WorldRuntime::chatPasteText(long id)
 int WorldRuntime::chatPeekConnections(long id) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eChatIDNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, id] { result = chatPeekConnections(id); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eChatIDNotFound;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), eChatIDNotFound,
+		                          [this, id] { return chatPeekConnections(id); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatPeekConnections");
 	ChatConnection *connection = chatConnectionById(id);
@@ -17297,13 +19377,8 @@ int WorldRuntime::chatPeekConnections(long id) const
 int WorldRuntime::chatPersonal(const QString &who, const QString &message, bool emote)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eChatPersonNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, who, message, emote] { result = chatPersonal(who, message, emote); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eChatPersonNotFound;
-	}
+		return qmudInvokeMethodOr(this, eChatPersonNotFound,
+		                          [this, who, message, emote] { return chatPersonal(who, message, emote); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatPersonal");
 	const QString trimmed = who.trimmed();
@@ -17334,13 +19409,8 @@ int WorldRuntime::chatPersonal(const QString &who, const QString &message, bool 
 int WorldRuntime::chatPing(long id) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eChatIDNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, id] { result = chatPing(id); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eChatIDNotFound;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), eChatIDNotFound,
+		                          [this, id] { return chatPing(id); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatPing");
 	ChatConnection *connection = chatConnectionById(id);
@@ -17357,13 +19427,8 @@ int WorldRuntime::chatPing(long id) const
 int WorldRuntime::chatRequestConnections(long id) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eChatIDNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, id] { result = chatRequestConnections(id); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eChatIDNotFound;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), eChatIDNotFound,
+		                          [this, id] { return chatRequestConnections(id); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatRequestConnections");
 	ChatConnection *connection = chatConnectionById(id);
@@ -17376,13 +19441,7 @@ int WorldRuntime::chatRequestConnections(long id) const
 int WorldRuntime::chatSendFile(long id, const QString &path)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eChatIDNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, id, path] { result = chatSendFile(id, path); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eChatIDNotFound;
-	}
+		return qmudInvokeMethodOr(this, eChatIDNotFound, [this, id, path] { return chatSendFile(id, path); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatSendFile");
 	if (id == 0)
@@ -17454,12 +19513,7 @@ int WorldRuntime::chatSendFile(long id, const QString &path)
 int WorldRuntime::chatStopAcceptingCalls()
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eOK;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result] { result = chatStopAcceptingCalls(); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eOK;
-	}
+		return qmudInvokeMethodOr(this, eOK, [this] { return chatStopAcceptingCalls(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatStopAcceptingCalls");
 	if (m_chatServer)
@@ -17476,12 +19530,7 @@ int WorldRuntime::chatStopAcceptingCalls()
 int WorldRuntime::chatStopFileTransfer(long id)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eChatIDNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, id] { result = chatStopFileTransfer(id); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : eChatIDNotFound;
-	}
+		return qmudInvokeMethodOr(this, eChatIDNotFound, [this, id] { return chatStopFileTransfer(id); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatStopFileTransfer");
 	if (id == 0)
@@ -17504,13 +19553,8 @@ int WorldRuntime::chatStopFileTransfer(long id)
 QVariant WorldRuntime::chatInfo(long id, int infoType) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QVariant   result;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this),
-		    [this, &result, id, infoType] { result = chatInfo(id, infoType); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : QVariant();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QVariant(),
+		                          [this, id, infoType] { return chatInfo(id, infoType); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatInfo");
 	const ChatConnection *connection = chatConnectionById(id);
@@ -17560,17 +19604,17 @@ QVariant WorldRuntime::chatInfo(long id, int infoType) const
 	case 20:
 		return connection->m_lastPingTime;
 	case 21:
-		return connection->m_whenStarted.isValid() ? QVariant(toOleDate(connection->m_whenStarted))
+		return connection->m_whenStarted.isValid() ? QVariant(toLuaSystemTime(connection->m_whenStarted))
 		                                           : QVariant();
 	case 22:
-		return connection->m_lastIncoming.isValid() ? QVariant(toOleDate(connection->m_lastIncoming))
+		return connection->m_lastIncoming.isValid() ? QVariant(toLuaSystemTime(connection->m_lastIncoming))
 		                                            : QVariant();
 	case 23:
-		return connection->m_lastOutgoing.isValid() ? QVariant(toOleDate(connection->m_lastOutgoing))
+		return connection->m_lastOutgoing.isValid() ? QVariant(toLuaSystemTime(connection->m_lastOutgoing))
 		                                            : QVariant();
 	case 24:
 		return connection->m_startedFileTransfer.isValid()
-		           ? QVariant(toOleDate(connection->m_startedFileTransfer))
+		           ? QVariant(toLuaSystemTime(connection->m_startedFileTransfer))
 		           : QVariant();
 	case 25:
 		return connection->m_doingFileTransfer;
@@ -17625,13 +19669,8 @@ QVariant WorldRuntime::chatInfo(long id, int infoType) const
 QList<long> WorldRuntime::chatList() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QList<long> result;
-		const bool  invoked = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &result] { result = chatList(); },
-            Qt::BlockingQueuedConnection);
-		return invoked ? result : QList<long>{};
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QList<long>{},
+		                          [this] { return chatList(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatList");
 	QList<long> result;
@@ -17646,13 +19685,8 @@ QList<long> WorldRuntime::chatList() const
 QVariant WorldRuntime::chatOption(long id, const QString &optionName) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QVariant   result;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, id, optionName]
-		    { result = chatOption(id, optionName); }, Qt::BlockingQueuedConnection);
-		return invoked ? result : QVariant();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QVariant(),
+		                          [this, id, optionName] { return chatOption(id, optionName); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatOption");
 	const ChatConnection *connection = chatConnectionById(id);
@@ -17661,17 +19695,17 @@ QVariant WorldRuntime::chatOption(long id, const QString &optionName) const
 
 	const QString name = optionName.trimmed().toLower();
 	if (name == QStringLiteral("can_send_commands"))
-		return connection->m_canSendCommands;
+		return QVariant::fromValue(static_cast<qlonglong>(connection->m_canSendCommands ? 1 : 0));
 	if (name == QStringLiteral("can_send_files"))
-		return connection->m_canSendFiles;
+		return QVariant::fromValue(static_cast<qlonglong>(connection->m_canSendFiles ? 1 : 0));
 	if (name == QStringLiteral("can_snoop"))
-		return connection->m_canSnoop;
+		return QVariant::fromValue(static_cast<qlonglong>(connection->m_canSnoop ? 1 : 0));
 	if (name == QStringLiteral("ignore"))
-		return connection->m_ignore;
+		return QVariant::fromValue(static_cast<qlonglong>(connection->m_ignore ? 1 : 0));
 	if (name == QStringLiteral("served"))
-		return connection->m_incoming;
+		return QVariant::fromValue(static_cast<qlonglong>(connection->m_incoming ? 1 : 0));
 	if (name == QStringLiteral("private"))
-		return connection->m_private;
+		return QVariant::fromValue(static_cast<qlonglong>(connection->m_private ? 1 : 0));
 	if (name == QStringLiteral("user"))
 		return QVariant::fromValue(static_cast<qlonglong>(connection->m_userOption));
 	if (name == QStringLiteral("server"))
@@ -17690,13 +19724,8 @@ QVariant WorldRuntime::chatOption(long id, const QString &optionName) const
 int WorldRuntime::chatSetOption(long id, const QString &optionName, const QString &value)
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = eChatIDNotFound;
-		const bool invoked = qmudInvokeMethod(
-		    this, [this, &result, id, optionName, value] { result = chatSetOption(id, optionName, value); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : eChatIDNotFound;
-	}
+		return qmudInvokeMethodOr(this, eChatIDNotFound, [this, id, optionName, value]
+		                          { return chatSetOption(id, optionName, value); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::chatSetOption");
 	ChatConnection *connection = chatConnectionById(id);
@@ -17730,7 +19759,7 @@ int WorldRuntime::chatSetOption(long id, const QString &optionName, const QStrin
 	    name == QStringLiteral("user"))
 	{
 		bool       ok      = false;
-		const long numeric = parseBool(ok);
+		const long numeric = name == QStringLiteral("user") ? trimmed.toLong(&ok) : parseBool(ok);
 		if (!ok)
 			return eOptionOutOfRange;
 
@@ -17831,13 +19860,8 @@ int WorldRuntime::chatSetOption(long id, const QString &optionName, const QStrin
 QVariant WorldRuntime::pluginInfo(const QString &pluginId, int infoType) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QVariant   result;
-		const bool resolved = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result, pluginId, infoType]
-		    { result = pluginInfo(pluginId, infoType); }, Qt::BlockingQueuedConnection);
-		return resolved ? result : QVariant();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QVariant(),
+		                          [this, pluginId, infoType] { return pluginInfo(pluginId, infoType); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::pluginInfo");
 	const int index = findPluginIndex(m_plugins, pluginId);
@@ -17916,13 +19940,8 @@ QVariant WorldRuntime::pluginInfo(const QString &pluginId, int infoType) const
 QStringList WorldRuntime::pluginIdList() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList ids;
-		const bool  resolved = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &ids] { ids = pluginIdList(); },
-            Qt::BlockingQueuedConnection);
-		return resolved ? ids : QStringList{};
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QStringList{},
+		                          [this] { return pluginIdList(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::pluginIdList");
 	QStringList ids;
@@ -17938,13 +19957,8 @@ QStringList WorldRuntime::pluginIdList() const
 QString WorldRuntime::pluginVariableValue(const QString &pluginId, const QString &name) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QString    value;
-		const bool resolved = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &value, pluginId, name]
-		    { value = pluginVariableValue(pluginId, name); }, Qt::BlockingQueuedConnection);
-		return resolved ? value : QString();
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QString(),
+		                          [this, pluginId, name] { return pluginVariableValue(pluginId, name); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::pluginVariableValue");
 	QString value;
@@ -17957,14 +19971,17 @@ bool WorldRuntime::findPluginVariable(const QString &pluginId, const QString &na
 {
 	if (QThread::currentThread() != thread())
 	{
-		QString    localValue;
-		bool       found    = false;
-		const bool resolved = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &found, &localValue, pluginId, name]
-		    { found = findPluginVariable(pluginId, name, localValue); }, Qt::BlockingQueuedConnection);
-		if (resolved && found)
-			value = localValue;
-		return resolved && found;
+		const auto resolved =
+		    qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), std::pair<bool, QString>{false, {}},
+		                       [this, pluginId, name]
+		                       {
+			                       QString    localValue;
+			                       const bool found = findPluginVariable(pluginId, name, localValue);
+			                       return std::pair<bool, QString>{found, localValue};
+		                       });
+		if (resolved.first)
+			value = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::findPluginVariable");
@@ -17987,9 +20004,8 @@ void WorldRuntime::setPluginVariableValue(const QString &pluginId, const QString
 {
 	if (QThread::currentThread() != thread())
 	{
-		qmudInvokeMethod(
-		    this, [this, pluginId, name, value] { setPluginVariableValue(pluginId, name, value); },
-		    Qt::BlockingQueuedConnection);
+		qmudInvokeMethodChecked(this, [this, pluginId, name, value]
+		                        { setPluginVariableValue(pluginId, name, value); });
 		return;
 	}
 
@@ -18003,22 +20019,19 @@ void WorldRuntime::setPluginVariableValue(const QString &pluginId, const QString
 		if (it.key().compare(name, Qt::CaseInsensitive) == 0)
 		{
 			it.value() = value;
+			invalidateLuaCallbackDispatchSnapshot();
 			return;
 		}
 	}
 	plugin.variables.insert(name, value);
+	invalidateLuaCallbackDispatchSnapshot();
 }
 
 QStringList WorldRuntime::pluginVariableList(const QString &pluginId) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList names;
-		const bool  resolved = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this),
-            [this, &names, pluginId] { names = pluginVariableList(pluginId); }, Qt::BlockingQueuedConnection);
-		return resolved ? names : QStringList{};
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QStringList{},
+		                          [this, pluginId] { return pluginVariableList(pluginId); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::pluginVariableList");
 	const int index = findPluginIndex(m_plugins, pluginId);
@@ -18028,16 +20041,37 @@ QStringList WorldRuntime::pluginVariableList(const QString &pluginId) const
 	return plugin.variables.keys();
 }
 
+bool WorldRuntime::pluginVariableSnapshot(const QString &pluginId, QMap<QString, QString> &values) const
+{
+	values.clear();
+	if (QThread::currentThread() != thread())
+	{
+		const auto resolved = qmudInvokeMethodOr(
+		    const_cast<WorldRuntime *>(this), std::pair<bool, QMap<QString, QString>>{false, {}},
+		    [this, pluginId]
+		    {
+			    QMap<QString, QString> localValues;
+			    const bool             found = pluginVariableSnapshot(pluginId, localValues);
+			    return std::pair<bool, QMap<QString, QString>>{found, localValues};
+		    });
+		if (resolved.first)
+			values = resolved.second;
+		return resolved.first;
+	}
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::pluginVariableSnapshot");
+	const int index = findPluginIndex(m_plugins, pluginId);
+	if (index < 0)
+		return false;
+	values = m_plugins.at(index).variables;
+	return true;
+}
+
 QStringList WorldRuntime::pluginTriggerList(const QString &pluginId) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList names;
-		const bool  resolved = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this),
-            [this, &names, pluginId] { names = pluginTriggerList(pluginId); }, Qt::BlockingQueuedConnection);
-		return resolved ? names : QStringList{};
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QStringList{},
+		                          [this, pluginId] { return pluginTriggerList(pluginId); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::pluginTriggerList");
 	const int index = findPluginIndex(m_plugins, pluginId);
@@ -18056,13 +20090,8 @@ QStringList WorldRuntime::pluginTriggerList(const QString &pluginId) const
 QStringList WorldRuntime::pluginAliasList(const QString &pluginId) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList names;
-		const bool  resolved = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &names, pluginId] { names = pluginAliasList(pluginId); },
-            Qt::BlockingQueuedConnection);
-		return resolved ? names : QStringList{};
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QStringList{},
+		                          [this, pluginId] { return pluginAliasList(pluginId); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::pluginAliasList");
 	const int index = findPluginIndex(m_plugins, pluginId);
@@ -18081,13 +20110,8 @@ QStringList WorldRuntime::pluginAliasList(const QString &pluginId) const
 QStringList WorldRuntime::pluginTimerList(const QString &pluginId) const
 {
 	if (QThread::currentThread() != thread())
-	{
-		QStringList names;
-		const bool  resolved = qmudInvokeMethod(
-            const_cast<WorldRuntime *>(this), [this, &names, pluginId] { names = pluginTimerList(pluginId); },
-            Qt::BlockingQueuedConnection);
-		return resolved ? names : QStringList{};
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), QStringList{},
+		                          [this, pluginId] { return pluginTimerList(pluginId); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::pluginTimerList");
 	const int index = findPluginIndex(m_plugins, pluginId);
@@ -18136,18 +20160,23 @@ namespace
 } // namespace
 
 void WorldRuntime::callPluginCallbacksWithTwoNumbersAndString(const QString &functionName, long arg1,
-                                                              long arg2, const QString &arg3)
+                                                              long arg2, const QString &arg3,
+                                                              const bool completionBarrier)
 {
-	if (!hasAnyPluginCallback(functionName))
+	const QVector<QSharedPointer<LuaCallbackEngine>> recipients =
+	    collectPluginCallbackRecipients(functionName);
+	if (recipients.isEmpty())
 		return;
-
-	for (auto &plugin : m_plugins)
-	{
-		if (!canExecutePlugin(plugin))
-			continue;
-		m_luaExecutor->callFunctionWithTwoNumbersAndString(plugin.lua.data(), functionName, arg1, arg2, arg3,
-		                                                   nullptr, true);
-	}
+	LuaBatchDispatchRequest request;
+	request.kind                         = LuaBatchDispatchKind::TwoNumbersAndString;
+	request.engines                      = recipients;
+	request.functionName                 = functionName;
+	request.numberArg1                   = arg1;
+	request.numberArg2                   = arg2;
+	request.stringArg2                   = arg3;
+	request.defaultResult                = true;
+	request.revalidateObservedRecipients = true;
+	static_cast<void>(queuePluginCallbackDispatch(request, completionBarrier));
 }
 
 void WorldRuntime::setTriggerWildcards(const QString &triggerName, const QStringList &wildcards,
@@ -18226,16 +20255,17 @@ bool WorldRuntime::pluginTriggerWildcard(const QString &pluginId, const QString 
 {
 	if (QThread::currentThread() != thread())
 	{
-		QString    resolvedValue;
-		bool       found    = false;
-		const bool resolved = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this),
-		    [this, &found, &resolvedValue, pluginId, triggerName, wildcardName]
-		    { found = pluginTriggerWildcard(pluginId, triggerName, wildcardName, resolvedValue); },
-		    Qt::BlockingQueuedConnection);
-		if (resolved && found)
-			value = resolvedValue;
-		return resolved && found;
+		const auto resolved = qmudInvokeMethodOr(
+		    const_cast<WorldRuntime *>(this), std::pair<bool, QString>{false, {}},
+		    [this, pluginId, triggerName, wildcardName]
+		    {
+			    QString    resolvedValue;
+			    const bool found = pluginTriggerWildcard(pluginId, triggerName, wildcardName, resolvedValue);
+			    return std::pair<bool, QString>{found, resolvedValue};
+		    });
+		if (resolved.first)
+			value = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::pluginTriggerWildcard");
@@ -18256,16 +20286,18 @@ bool WorldRuntime::pluginAliasWildcard(const QString &pluginId, const QString &a
 {
 	if (QThread::currentThread() != thread())
 	{
-		QString    resolvedValue;
-		bool       found    = false;
-		const bool resolved = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this),
-		    [this, &found, &resolvedValue, pluginId, aliasName, wildcardName]
-		    { found = pluginAliasWildcard(pluginId, aliasName, wildcardName, resolvedValue); },
-		    Qt::BlockingQueuedConnection);
-		if (resolved && found)
-			value = resolvedValue;
-		return resolved && found;
+		const auto resolved =
+		    qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), std::pair<bool, QString>{false, {}},
+		                       [this, pluginId, aliasName, wildcardName]
+		                       {
+			                       QString    resolvedValue;
+			                       const bool found =
+			                           pluginAliasWildcard(pluginId, aliasName, wildcardName, resolvedValue);
+			                       return std::pair<bool, QString>{found, resolvedValue};
+		                       });
+		if (resolved.first)
+			value = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::pluginAliasWildcard");
@@ -18301,19 +20333,18 @@ int WorldRuntime::savePluginState(const QString &pluginId, bool scripted, QStrin
 {
 	if (QThread::currentThread() != thread())
 	{
-		int        result = ePluginCouldNotSaveState;
-		QString    localError;
-		const bool resolved = qmudInvokeMethod(
-		    this,
-		    [this, &result, &localError, pluginId, scripted, needsError = (error != nullptr)]
-		    {
-			    QString *errorPtr = needsError ? &localError : nullptr;
-			    result            = savePluginState(pluginId, scripted, errorPtr);
-		    },
-		    Qt::BlockingQueuedConnection);
-		if (error && resolved)
-			*error = localError;
-		return resolved ? result : ePluginCouldNotSaveState;
+		const auto resolved = qmudInvokeMethodOr(this, std::pair<int, QString>{ePluginCouldNotSaveState, {}},
+		                                         [this, pluginId, scripted, needsError = (error != nullptr)]
+		                                         {
+			                                         QString   localError;
+			                                         QString  *errorPtr = needsError ? &localError : nullptr;
+			                                         const int result =
+			                                             savePluginState(pluginId, scripted, errorPtr);
+			                                         return std::pair<int, QString>{result, localError};
+		                                         });
+		if (error)
+			*error = resolved.second;
+		return resolved.first;
 	}
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::savePluginState");
@@ -18326,7 +20357,7 @@ int WorldRuntime::savePluginState(const QString &pluginId, bool scripted, QStrin
 	return savePluginStateForPlugin(m_plugins[index], scripted, error);
 }
 
-int WorldRuntime::savePluginStateForPlugin(Plugin &plugin, bool scripted, QString *error) const
+int WorldRuntime::savePluginStateForPlugin(Plugin &plugin, bool scripted, QString *error)
 {
 	if (!scripted && !plugin.saveState)
 		return eOK;
@@ -18350,8 +20381,7 @@ int WorldRuntime::savePluginStateForPlugin(Plugin &plugin, bool scripted, QStrin
 
 	plugin.savingStateNow = true;
 	if (plugin.lua)
-		m_luaExecutor->callFunctionNoArgs(plugin.lua.data(), QStringLiteral("OnPluginSaveState"), nullptr,
-		                                  true);
+		dispatchSingleEngineNoArgCallback(plugin.lua, QStringLiteral("OnPluginSaveState"), true);
 	plugin.savingStateNow = false;
 
 	const QString stateFile = base + worldId + "-" + pluginId + "-state.xml";
@@ -18443,7 +20473,8 @@ void WorldRuntime::addLine(const QString &text, int flags, bool hardReturn, cons
 		entry.elapsed         = fallback;
 	}
 	m_lines.push_back(entry);
-	enforceOutputLineLimit();
+	static_cast<void>(enforceOutputLineLimit());
+	invalidateLuaCallbackLineBufferSnapshot();
 }
 
 void WorldRuntime::addLine(const QString &text, int flags, const QVector<StyleSpan> &spans, bool hardReturn,
@@ -18470,7 +20501,43 @@ void WorldRuntime::addLine(const QString &text, int flags, const QVector<StyleSp
 		entry.elapsed         = fallback;
 	}
 	m_lines.push_back(entry);
-	enforceOutputLineLimit();
+	static_cast<void>(enforceOutputLineLimit());
+	invalidateLuaCallbackLineBufferSnapshot();
+}
+
+bool WorldRuntime::commitPendingIncomingPartialLine()
+{
+	if (QThread::currentThread() != thread())
+		return qmudInvokeMethodOr(this, false, [this] { return commitPendingIncomingPartialLine(); });
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::commitPendingIncomingPartialLine");
+	if (m_partialLineText.isEmpty() && m_partialLineSpans.isEmpty())
+		return false;
+
+	QString            text  = m_partialLineText;
+	QVector<StyleSpan> spans = m_partialLineSpans;
+	m_partialLineText.clear();
+	m_partialLineSpans.clear();
+	m_pendingCarriageReturnOverwrite = false;
+
+	const bool                  serverSideWrapActive = isConnected() && m_telnet.isNawsNegotiated();
+	const FixedColumnWrapConfig wrapConfig =
+	    serverSideWrapActive
+	        ? FixedColumnWrapConfig{}
+	        : localOutputWrapConfig(m_worldAttributes, serverSideWrapActive, m_telnet.windowColumns());
+	if (wrapConfig.enabled && !text.isEmpty())
+	{
+		if (spans.isEmpty())
+			wrapPlainLineForColumn(text, wrapConfig.wrapColumn, wrapConfig.indentParas);
+		else
+			wrapStyledLineForColumn(text, spans, wrapConfig.wrapColumn, wrapConfig.indentParas);
+	}
+
+	if (spans.isEmpty())
+		addLine(text, LineOutput, true);
+	else
+		addLine(text, LineOutput, spans, true);
+	return true;
 }
 
 int WorldRuntime::maxOutputLinesLimit() const
@@ -18482,42 +20549,44 @@ int WorldRuntime::maxOutputLinesLimit() const
 	return qBound(0, configured, 500000);
 }
 
-void WorldRuntime::enforceOutputLineLimit()
+int WorldRuntime::enforceOutputLineLimit()
 {
 	const int maxLines = maxOutputLinesLimit();
 	if (maxLines <= 0 || m_lines.size() <= maxLines)
-		return;
+		return 0;
 
 	const int removed = safeQSizeToInt(m_lines.size() - maxLines);
 	m_lines.erase(m_lines.begin(), m_lines.begin() + removed);
+	invalidateLuaCallbackLineBufferSnapshot();
 
 	if (m_lastGoTo > m_lines.size())
 		m_lastGoTo = qMax(1, safeQSizeToInt(m_lines.size()));
 
 	if (!m_luaContextLineActive)
-		return;
+		return removed;
 
 	if (!m_luaContextLineBuffered)
 	{
 		m_luaContextLineBufferIndex = safeQSizeToInt(m_lines.size() + 1);
-		return;
+		return removed;
 	}
 
 	if (m_luaContextLineBufferIndex > removed)
 	{
 		m_luaContextLineBufferIndex -= removed;
-		return;
+		return removed;
 	}
 
 	if (m_lines.isEmpty())
 	{
 		m_luaContextLineBuffered    = false;
 		m_luaContextLineBufferIndex = 0;
-		return;
+		return removed;
 	}
 
 	m_luaContextLineBufferIndex = 1;
 	m_luaContextLineEntry       = m_lines.first();
+	return removed;
 }
 
 const QVector<WorldRuntime::LineEntry> &WorldRuntime::lines() const
@@ -18528,13 +20597,15 @@ const QVector<WorldRuntime::LineEntry> &WorldRuntime::lines() const
 void WorldRuntime::replaceOutputLines(const QVector<LineEntry> &lines)
 {
 	m_lines = lines;
+	invalidateLuaCallbackLineBufferSnapshot();
 
 	qint64 maxLineNumber = 0;
 	for (const LineEntry &line : m_lines)
 		maxLineNumber = qMax(maxLineNumber, line.lineNumber);
 	m_nextLineNumber = qMax<qint64>(1, maxLineNumber + 1);
 
-	enforceOutputLineLimit();
+	static_cast<void>(enforceOutputLineLimit());
+	invalidateLuaCallbackLineBufferSnapshot();
 	if (m_view)
 		m_view->restoreOutputFromPersistedLines(m_lines);
 }
@@ -18551,6 +20622,7 @@ void WorldRuntime::finalizePendingInputLineHardReturn()
 		return;
 
 	last.hardReturn = true;
+	invalidateLuaCallbackLineBufferSnapshot();
 }
 
 void WorldRuntime::clearLastLineHardReturn()
@@ -18563,6 +20635,7 @@ void WorldRuntime::clearLastLineHardReturn()
 		return;
 
 	last.hardReturn = false;
+	invalidateLuaCallbackLineBufferSnapshot();
 }
 
 void WorldRuntime::beginIncomingLineLuaContext(const QString &text, int flags,
@@ -18592,6 +20665,350 @@ void WorldRuntime::beginIncomingLineLuaContext(const QString &text, int flags,
 	m_luaContextLineCommitted   = false;
 	m_luaContextLineBufferIndex = safeQSizeToInt(m_lines.size() + 1);
 	m_luaContextLineActive      = true;
+	invalidateLuaCallbackLineBufferSnapshot();
+}
+
+bool WorldRuntime::reserveIncomingLineLuaContextInBuffer()
+{
+	if (!m_luaContextLineActive)
+		return false;
+	if (m_luaContextLineBuffered)
+		return true;
+
+	LineEntry entry = m_luaContextLineEntry;
+	if (entry.lineNumber <= 0)
+		entry.lineNumber = m_nextLineNumber;
+	if (entry.lineNumber >= m_nextLineNumber)
+		m_nextLineNumber = entry.lineNumber + 1;
+	m_lines.push_back(entry);
+	m_luaContextLineBuffered    = true;
+	m_luaContextLineBufferIndex = safeQSizeToInt(m_lines.size());
+	m_luaContextLineEntry       = entry;
+	static_cast<void>(enforceOutputLineLimit());
+	invalidateLuaCallbackLineBufferSnapshot();
+	return true;
+}
+
+bool WorldRuntime::updateBufferedIncomingLineLuaContext(const QString &text, int flags,
+                                                        const QVector<StyleSpan> &spans, bool hardReturn)
+{
+	if (!m_luaContextLineActive || !m_luaContextLineBuffered)
+		return false;
+	if (m_luaContextLineBufferIndex <= 0 || m_luaContextLineBufferIndex > m_lines.size())
+		return false;
+
+	LineEntry &entry      = m_lines[m_luaContextLineBufferIndex - 1];
+	const int  entryIndex = m_luaContextLineBufferIndex - 1;
+	entry.text            = text;
+	entry.flags           = flags;
+	entry.spans           = spans;
+	entry.hardReturn      = hardReturn;
+	m_luaContextLineEntry = entry;
+	invalidateLuaCallbackLineBufferSnapshot();
+	notifyOutputViewLineChanged(entryIndex);
+	return true;
+}
+
+bool WorldRuntime::removeBufferedIncomingLineLuaContext()
+{
+	if (!m_luaContextLineActive || !m_luaContextLineBuffered)
+		return false;
+	if (m_luaContextLineBufferIndex <= 0 || m_luaContextLineBufferIndex > m_lines.size())
+		return false;
+
+	const int removedIndex = m_luaContextLineBufferIndex - 1;
+	m_lines.removeAt(removedIndex);
+	m_luaContextLineBuffered    = false;
+	m_luaContextLineBufferIndex = safeQSizeToInt(m_lines.size() + 1);
+	invalidateLuaCallbackLineBufferSnapshot();
+	notifyOutputViewRangeChanged(qMax(0, qMin(removedIndex, safeQSizeToInt(m_lines.size()) - 1)));
+	return true;
+}
+
+bool WorldRuntime::hideBufferedIncomingLineLuaContextForReplacement()
+{
+	if (!m_luaContextLineActive || !m_luaContextLineBuffered)
+		return false;
+	if (m_luaContextLineBufferIndex <= 0 || m_luaContextLineBufferIndex > m_lines.size())
+		return false;
+
+	LineEntry &entry = m_lines[m_luaContextLineBufferIndex - 1];
+	entry.flags |= LineHidden;
+	m_luaContextLineEntry = entry;
+	invalidateLuaCallbackLineBufferSnapshot();
+	notifyOutputViewRangeChanged(m_luaContextLineBufferIndex - 1);
+	return true;
+}
+
+qint64 WorldRuntime::incomingLineLuaContextAbsoluteNumber() const
+{
+	if (!m_luaContextLineActive)
+		return 0;
+	if (m_luaContextLineEntry.lineNumber > 0)
+		return m_luaContextLineEntry.lineNumber;
+	return m_nextLineNumber;
+}
+
+bool WorldRuntime::removeHiddenLuaContextLineByAbsoluteNumber(const qint64 absoluteLineNumber)
+{
+	if (absoluteLineNumber <= 0)
+		return false;
+	for (int i = 0; i < m_lines.size(); ++i)
+	{
+		if (m_lines.at(i).lineNumber != absoluteLineNumber)
+			continue;
+		if ((m_lines.at(i).flags & LineHidden) == 0)
+			return false;
+		m_lines.removeAt(i);
+		if (m_luaContextLineBufferIndex > i + 1)
+			--m_luaContextLineBufferIndex;
+		else if (m_luaContextLineBufferIndex == i + 1)
+			m_luaContextLineBuffered = false;
+		invalidateLuaCallbackLineBufferSnapshot();
+		notifyOutputViewRangeChanged(qMax(0, qMin(i, safeQSizeToInt(m_lines.size()) - 1)));
+		return true;
+	}
+	return false;
+}
+
+void WorldRuntime::notifyOutputViewLineChanged(const int runtimeLineIndex)
+{
+	if (!m_view)
+		return;
+	if (runtimeLineIndex >= 0)
+	{
+		if (m_outputViewMutationBatchDepth > 0)
+		{
+			if (m_outputViewRangeChangedPending)
+			{
+				if (m_outputViewFirstChangedIndex < 0)
+					m_outputViewFirstChangedIndex = runtimeLineIndex;
+				else
+					m_outputViewFirstChangedIndex = qMin(m_outputViewFirstChangedIndex, runtimeLineIndex);
+				return;
+			}
+			if (m_outputViewLineChangedPending && m_outputViewLineChangedIndex >= 0 &&
+			    m_outputViewLineChangedIndex != runtimeLineIndex)
+			{
+				m_outputViewRangeChangedPending = true;
+				m_outputViewFirstChangedIndex   = qMin(m_outputViewLineChangedIndex, runtimeLineIndex);
+				m_outputViewLineChangedIndex    = -1;
+				return;
+			}
+			m_outputViewLineChangedPending = true;
+			m_outputViewLineChangedIndex   = runtimeLineIndex;
+			return;
+		}
+		m_view->notifyRuntimeOutputLineChanged(runtimeLineIndex);
+		return;
+	}
+	if (m_outputViewMutationBatchDepth > 0)
+	{
+		m_outputViewLineChangedPending = true;
+		m_outputViewLineChangedIndex   = -1;
+		return;
+	}
+	m_view->notifyRuntimeOutputLineChanged();
+}
+
+void WorldRuntime::notifyOutputViewRangeChanged(const int runtimeLineIndex)
+{
+	if (!m_view)
+		return;
+	if (m_outputViewMutationBatchDepth > 0)
+	{
+		m_outputViewRangeChangedPending = true;
+		int firstChangedIndex           = runtimeLineIndex;
+		if (m_outputViewLineChangedPending && m_outputViewLineChangedIndex >= 0)
+			firstChangedIndex = qMin(firstChangedIndex, m_outputViewLineChangedIndex);
+		if (m_outputViewFirstChangedIndex < 0)
+			m_outputViewFirstChangedIndex = firstChangedIndex;
+		else
+			m_outputViewFirstChangedIndex = qMin(m_outputViewFirstChangedIndex, firstChangedIndex);
+		m_outputViewLineChangedIndex = -1;
+		return;
+	}
+	m_view->notifyRuntimeOutputRangeChanged(runtimeLineIndex);
+}
+
+void WorldRuntime::flushOutputViewMutationBatch()
+{
+	if (!m_view)
+	{
+		m_outputViewLineChangedPending  = false;
+		m_outputViewLineChangedIndex    = -1;
+		m_outputViewRangeChangedPending = false;
+		m_outputViewFirstChangedIndex   = -1;
+		return;
+	}
+	const bool rangeChanged         = m_outputViewRangeChangedPending;
+	const int  firstChangedIndex    = m_outputViewFirstChangedIndex;
+	const bool changed              = m_outputViewLineChangedPending;
+	const int  changedIndex         = m_outputViewLineChangedIndex;
+	m_outputViewLineChangedPending  = false;
+	m_outputViewLineChangedIndex    = -1;
+	m_outputViewRangeChangedPending = false;
+	m_outputViewFirstChangedIndex   = -1;
+	if (rangeChanged && firstChangedIndex >= 0)
+	{
+		m_view->notifyRuntimeOutputRangeChanged(firstChangedIndex);
+		return;
+	}
+	if (changed)
+	{
+		if (changedIndex >= 0)
+			m_view->notifyRuntimeOutputLineChanged(changedIndex);
+		else
+			m_view->notifyRuntimeOutputLineChanged();
+	}
+}
+
+void WorldRuntime::beginOutputViewMutationBatch()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::beginOutputViewMutationBatch");
+	++m_outputViewMutationBatchDepth;
+}
+
+void WorldRuntime::endOutputViewMutationBatch()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::endOutputViewMutationBatch");
+	if (m_outputViewMutationBatchDepth <= 0)
+		return;
+	--m_outputViewMutationBatchDepth;
+	if (m_outputViewMutationBatchDepth > 0)
+		return;
+	flushOutputViewMutationBatch();
+}
+
+bool WorldRuntime::writeLuaCallbackOutputAtLineAnchor(const qint64 anchorLineNumber,
+                                                      const int    anchorRelativeOffset,
+                                                      const bool replaceAnchor, const QString &text,
+                                                      int flags, const QVector<StyleSpan> &spans,
+                                                      const bool hardReturn)
+{
+	if (text.isEmpty() && spans.isEmpty() && !hardReturn)
+		return false;
+
+	if (anchorLineNumber <= 0 || anchorRelativeOffset < 0)
+		return false;
+
+	QString                     displayText          = text;
+	QVector<StyleSpan>          displaySpans         = spans;
+	const bool                  note                 = (flags & LineNote) != 0;
+	const bool                  serverSideWrapActive = isConnected() && m_telnet.isNawsNegotiated();
+	const FixedColumnWrapConfig wrapConfig =
+	    (!note && serverSideWrapActive)
+	        ? FixedColumnWrapConfig{}
+	        : localOutputWrapConfig(m_worldAttributes, serverSideWrapActive, m_telnet.windowColumns());
+	if (wrapConfig.enabled && !displayText.isEmpty())
+	{
+		if (displaySpans.isEmpty())
+			wrapPlainLineForColumn(displayText, wrapConfig.wrapColumn, wrapConfig.indentParas);
+		else
+			wrapStyledLineForColumn(displayText, displaySpans, wrapConfig.wrapColumn, wrapConfig.indentParas);
+	}
+	const QVector<OutputLineSegment> segments =
+	    splitOutputTextAtLineBreaks(displayText, displaySpans, hardReturn);
+	if (segments.isEmpty())
+		return false;
+	const int segmentCount = safeQSizeToInt(segments.size());
+
+	int       anchorIndex = -1;
+	for (int index = safeQSizeToInt(m_lines.size()) - 1; index >= 0; --index)
+	{
+		if (m_lines.at(index).lineNumber == anchorLineNumber)
+		{
+			anchorIndex = index;
+			break;
+		}
+	}
+	if (anchorIndex < 0)
+	{
+		m_luaCallbackAfterAnchorInsertionOffsets.remove(anchorLineNumber);
+		return false;
+	}
+
+	if (replaceAnchor && (m_lines.at(anchorIndex).flags & LineHidden) == 0)
+		return false;
+
+	const int type = (flags & LineNote) != 0 ? 1 : 0;
+	const int log  = (flags & LineLog) != 0 ? 1 : 0;
+	firePluginScreendraw(type, log, text);
+
+	auto makeInsertedEntry = [&](const OutputLineSegment &segment)
+	{
+		LineEntry entry;
+		entry.text       = segment.text;
+		entry.flags      = flags & ~LineHidden;
+		entry.spans      = segment.spans;
+		entry.hardReturn = segment.hardReturn;
+		entry.time       = QDateTime::currentDateTime();
+		entry.lineNumber = m_nextLineNumber++;
+		if (m_lineTimer.isValid())
+		{
+			entry.ticks   = static_cast<double>(m_lineTimer.nsecsElapsed()) / 1000000000.0;
+			entry.elapsed = entry.ticks;
+		}
+		else
+		{
+			const double fallback = (m_worldStartTime.isValid() && entry.time.isValid())
+			                            ? static_cast<double>(m_worldStartTime.msecsTo(entry.time)) / 1000.0
+			                            : 0.0;
+			entry.ticks           = fallback;
+			entry.elapsed         = fallback;
+		}
+		return entry;
+	};
+
+	if (replaceAnchor)
+	{
+		const OutputLineSegment &firstSegment = segments.first();
+		LineEntry               &entry        = m_lines[anchorIndex];
+		entry.text                            = firstSegment.text;
+		entry.flags                           = flags & ~LineHidden;
+		entry.spans                           = firstSegment.spans;
+		entry.hardReturn                      = firstSegment.hardReturn;
+		for (int index = 1; index < segmentCount; ++index)
+			m_lines.insert(m_lines.begin() + anchorIndex + index, makeInsertedEntry(segments.at(index)));
+		const int insertedCount = segmentCount - 1;
+		if (m_luaContextLineActive && m_luaContextLineBuffered &&
+		    m_luaContextLineBufferIndex > anchorIndex + 1)
+			m_luaContextLineBufferIndex += insertedCount;
+		const int removedHeadCount = enforceOutputLineLimit();
+		invalidateLuaCallbackLineBufferSnapshot();
+		if (!m_lines.isEmpty())
+		{
+			const int notifyIndex =
+			    qBound(0, anchorIndex - removedHeadCount, safeQSizeToInt(m_lines.size()) - 1);
+			notifyOutputViewRangeChanged(notifyIndex);
+		}
+		return true;
+	}
+
+	int effectiveRelativeOffset = anchorRelativeOffset;
+	if (anchorRelativeOffset > 0)
+	{
+		const int nextRelativeOffset =
+		    m_luaCallbackAfterAnchorInsertionOffsets.value(anchorLineNumber, anchorRelativeOffset);
+		effectiveRelativeOffset = qMax(anchorRelativeOffset, nextRelativeOffset);
+		m_luaCallbackAfterAnchorInsertionOffsets.insert(anchorLineNumber,
+		                                                effectiveRelativeOffset + segmentCount);
+		if (m_luaCallbackAfterAnchorInsertionOffsets.size() > 4096)
+			m_luaCallbackAfterAnchorInsertionOffsets.clear();
+	}
+	const int insertIndex = qBound(0, anchorIndex + effectiveRelativeOffset, safeQSizeToInt(m_lines.size()));
+	for (int index = 0; index < segmentCount; ++index)
+		m_lines.insert(m_lines.begin() + insertIndex + index, makeInsertedEntry(segments.at(index)));
+	if (m_luaContextLineActive && m_luaContextLineBuffered && m_luaContextLineBufferIndex > insertIndex)
+		m_luaContextLineBufferIndex += segmentCount;
+	const int removedHeadCount = enforceOutputLineLimit();
+	invalidateLuaCallbackLineBufferSnapshot();
+	if (!m_lines.isEmpty())
+	{
+		const int notifyIndex = qBound(0, insertIndex - removedHeadCount, safeQSizeToInt(m_lines.size()) - 1);
+		notifyOutputViewRangeChanged(notifyIndex);
+	}
+	return true;
 }
 
 void WorldRuntime::endIncomingLineLuaContext()
@@ -18600,16 +21017,25 @@ void WorldRuntime::endIncomingLineLuaContext()
 	m_luaContextLineCommitted   = false;
 	m_luaContextLineBufferIndex = 0;
 	m_luaContextLineActive      = false;
+	invalidateLuaCallbackLineBufferSnapshot();
 }
 
 void WorldRuntime::markIncomingLineLuaContextBuffered()
 {
 	if (!m_luaContextLineActive)
 		return;
+	if (m_luaContextLineBuffered)
+	{
+		if (m_luaContextLineBufferIndex > 0 && m_luaContextLineBufferIndex <= m_lines.size())
+			m_luaContextLineEntry = m_lines.at(m_luaContextLineBufferIndex - 1);
+		invalidateLuaCallbackLineBufferSnapshot();
+		return;
+	}
 	m_luaContextLineBuffered    = true;
 	m_luaContextLineBufferIndex = safeQSizeToInt(m_lines.size());
 	if (m_luaContextLineBufferIndex > 0 && m_luaContextLineBufferIndex <= m_lines.size())
 		m_luaContextLineEntry = m_lines.at(m_luaContextLineBufferIndex - 1);
+	invalidateLuaCallbackLineBufferSnapshot();
 }
 
 void WorldRuntime::markIncomingLineLuaContextCommitted()
@@ -18617,6 +21043,7 @@ void WorldRuntime::markIncomingLineLuaContextCommitted()
 	if (!m_luaContextLineActive)
 		return;
 	m_luaContextLineCommitted = true;
+	invalidateLuaCallbackLineBufferSnapshot();
 }
 
 bool WorldRuntime::luaContextLinePresentInBuffer() const
@@ -18652,16 +21079,49 @@ bool WorldRuntime::luaContextLineEntry(int lineNumber, LineEntry &entry) const
 	return false;
 }
 
+bool WorldRuntime::luaContextLineEntryByAbsoluteNumber(const qint64 absoluteLineNumber,
+                                                       LineEntry   &entry) const
+{
+	if (absoluteLineNumber <= 0)
+		return false;
+
+	if (QThread::currentThread() != thread())
+	{
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), false, [this, absoluteLineNumber, &entry]
+		                          { return luaContextLineEntryByAbsoluteNumber(absoluteLineNumber, entry); });
+	}
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::luaContextLineEntryByAbsoluteNumber");
+	if (const bool pendingLineVisible = m_luaContextLineActive && !m_luaContextLineCommitted;
+	    pendingLineVisible)
+	{
+		qint64 pendingAbsolute = m_luaContextLineEntry.lineNumber;
+		if (pendingAbsolute <= 0)
+			pendingAbsolute = m_nextLineNumber;
+		if (pendingAbsolute == absoluteLineNumber)
+		{
+			entry = m_luaContextLineEntry;
+			if (entry.lineNumber <= 0)
+				entry.lineNumber = pendingAbsolute;
+			return true;
+		}
+	}
+
+	for (const LineEntry &line : m_lines)
+	{
+		if (line.lineNumber != absoluteLineNumber)
+			continue;
+		entry = line;
+		return true;
+	}
+	return false;
+}
+
 int WorldRuntime::luaContextLinesInBufferCount() const
 {
 	if (QThread::currentThread() != thread())
-	{
-		int        result  = 0;
-		const bool invoked = qmudInvokeMethod(
-		    const_cast<WorldRuntime *>(this), [this, &result] { result = luaContextLinesInBufferCount(); },
-		    Qt::BlockingQueuedConnection);
-		return invoked ? result : 0;
-	}
+		return qmudInvokeMethodOr(const_cast<WorldRuntime *>(this), 0,
+		                          [this] { return luaContextLinesInBufferCount(); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::luaContextLinesInBufferCount");
 	const bool pendingLineVisible = m_luaContextLineActive && !m_luaContextLineCommitted;
@@ -18693,19 +21153,9 @@ int WorldRuntime::windowCreate(const QString &name, int left, int top, int width
 	}
 
 	MiniWindow &window = it.value();
-	window.name        = name;
-	window.create(left, top, width, height, position, flags, background);
-	window.creatingPlugin = pluginId;
-	if ((flags & kMiniWindowKeepHotspots) == 0)
-	{
-		window.hotspots.clear();
-		window.callbackPlugin.clear();
-		window.mouseOverHotspot.clear();
-		window.mouseDownHotspot.clear();
-		window.flagsOnMouseDown = 0;
-	}
+	MiniWindowUtils::create(window, name, left, top, width, height, position, flags, background, pluginId);
 
-	emit miniWindowsChanged();
+	emitMiniWindowsChangedCoalesced();
 	return eOK;
 }
 
@@ -18715,7 +21165,7 @@ int WorldRuntime::windowShow(const QString &name, bool show)
 	if (it == m_miniWindows.end())
 		return eNoSuchWindow;
 	it.value().show = show;
-	emit miniWindowsChanged();
+	emitMiniWindowsChangedCoalesced();
 	return eOK;
 }
 
@@ -18727,8 +21177,45 @@ int WorldRuntime::windowDelete(const QString &name)
 	if (it.value().executingScript)
 		return eItemInUse;
 	m_miniWindows.erase(it);
-	emit miniWindowsChanged();
+	emitMiniWindowsChangedCoalesced();
 	return eOK;
+}
+
+void WorldRuntime::beginMiniWindowMutationBatch()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::beginMiniWindowMutationBatch");
+	++m_miniWindowMutationBatchDepth;
+}
+
+void WorldRuntime::endMiniWindowMutationBatch()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::endMiniWindowMutationBatch");
+	if (m_miniWindowMutationBatchDepth <= 0)
+	{
+		m_miniWindowMutationBatchDepth = 0;
+		m_miniWindowsChangedPending    = false;
+		return;
+	}
+	--m_miniWindowMutationBatchDepth;
+	if (m_miniWindowMutationBatchDepth == 0 && m_miniWindowsChangedPending)
+	{
+		m_miniWindowsChangedPending = false;
+		emit miniWindowsChanged();
+	}
+}
+
+void WorldRuntime::emitMiniWindowsChangedCoalesced()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::emitMiniWindowsChangedCoalesced");
+	invalidateLuaCallbackDispatchSnapshot();
+	if (m_suppressMiniWindowsChangedSignal)
+		return;
+	if (m_miniWindowMutationBatchDepth > 0)
+	{
+		m_miniWindowsChangedPending = true;
+		return;
+	}
+	emit miniWindowsChanged();
 }
 
 QStringList WorldRuntime::windowList() const
@@ -18787,7 +21274,7 @@ QVariant WorldRuntime::windowInfo(const QString &name, int infoType) const
 	case 20:
 		return window->mouseDownHotspot;
 	case 21:
-		return window->installedAt.isValid() ? QVariant(toOleDate(window->installedAt)) : QVariant();
+		return window->installedAt.isValid() ? QVariant(toLuaSystemTime(window->installedAt)) : QVariant();
 	case 22:
 		return window->zOrder;
 	case 23:
@@ -19109,241 +21596,27 @@ int WorldRuntime::windowRectOp(const QString &name, int action, int left, int to
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-
-	QImage &surface = window->surface;
-	if (surface.isNull())
-		return eOK;
-
-	const QRect rect = rectFromCoords(*window, left, top, right, bottom);
-	if (rect.width() <= 0 || rect.height() <= 0)
-		return eOK;
-
-	switch (action)
-	{
-	case 1: // frame
-	{
-		QPainter painter(&surface);
-		painter.setPen(QPen(colorFromRef(colour1)));
-		painter.setBrush(Qt::NoBrush);
-		painter.drawRect(rect.adjusted(0, 0, -1, -1));
-		break;
-	}
-	case 2: // fill
-	{
-		QPainter painter(&surface);
-		painter.fillRect(rect, colorFromRef(colour1));
-		break;
-	}
-	case 3: // invert
-	{
-		const QRect clipped = rect.intersected(surface.rect());
-		for (int y = clipped.top(); y <= clipped.bottom(); ++y)
-		{
-			auto *line = reinterpret_cast<QRgb *>(surface.scanLine(y));
-			for (int x = clipped.left(); x <= clipped.right(); ++x)
-			{
-				const QColor current(line[x]);
-				line[x] =
-				    qRgba(255 - current.red(), 255 - current.green(), 255 - current.blue(), current.alpha());
-			}
-		}
-		break;
-	}
-	case 4: // 3D rect
-	{
-		QPainter     painter(&surface);
-		const QColor topLeftColour     = colorFromRef(colour1);
-		const QColor bottomRightColour = colorFromRef(colour2);
-		painter.setPen(topLeftColour);
-		painter.drawLine(rect.topLeft(), rect.topRight());
-		painter.drawLine(rect.topLeft(), rect.bottomLeft());
-		painter.setPen(bottomRightColour);
-		painter.drawLine(rect.bottomLeft(), rect.bottomRight());
-		painter.drawLine(rect.topRight(), rect.bottomRight());
-		break;
-	}
-	case 5: // draw edge
-	{
-		if (colour1 != kEdgeRaised && colour1 != kEdgeEtched && colour1 != kEdgeBump &&
-		    colour1 != kEdgeSunken)
-			return eBadParameter;
-		if ((colour2 & 0xFF) > 0x1F)
-			return eBadParameter;
-
-		const QColor base  = window->background.isValid() ? window->background : QColor(64, 64, 64);
-		QColor       light = base.lighter(150);
-		QColor       dark  = base.darker(150);
-		if (colour1 == kEdgeSunken || colour1 == kEdgeEtched)
-			qSwap(light, dark);
-
-		bool const drawTop    = (colour2 & (kBfTopLeft | kBfTopRight | kBfRect)) != 0;
-		bool const drawBottom = (colour2 & (kBfBottomLeft | kBfBottomRight | kBfRect)) != 0;
-		bool const drawLeft   = (colour2 & (kBfTopLeft | kBfBottomLeft | kBfRect)) != 0;
-		bool const drawRight  = (colour2 & (kBfTopRight | kBfBottomRight | kBfRect)) != 0;
-
-		QPainter   painter(&surface);
-		if (colour2 & kBfMiddle)
-			painter.fillRect(rect.adjusted(1, 1, -1, -1), base);
-
-		if (drawTop)
-		{
-			painter.setPen(light);
-			painter.drawLine(rect.topLeft(), rect.topRight());
-		}
-		if (drawLeft)
-		{
-			painter.setPen(light);
-			painter.drawLine(rect.topLeft(), rect.bottomLeft());
-		}
-		if (drawBottom)
-		{
-			painter.setPen(dark);
-			painter.drawLine(rect.bottomLeft(), rect.bottomRight());
-		}
-		if (drawRight)
-		{
-			painter.setPen(dark);
-			painter.drawLine(rect.topRight(), rect.bottomRight());
-		}
-
-		if (colour1 == kEdgeEtched || colour1 == kEdgeBump)
-		{
-			QRect const inner = rect.adjusted(1, 1, -1, -1);
-			if (inner.width() > 1 && inner.height() > 1)
-			{
-				painter.setPen(dark);
-				painter.drawLine(inner.topLeft(), inner.topRight());
-				painter.drawLine(inner.topLeft(), inner.bottomLeft());
-				painter.setPen(light);
-				painter.drawLine(inner.bottomLeft(), inner.bottomRight());
-				painter.drawLine(inner.topRight(), inner.bottomRight());
-			}
-		}
-		break;
-	}
-	case 6: // flood fill border
-	case 7: // flood fill surface
-	{
-		const QColor borderColour = colorFromRef(colour1);
-		const QColor fillColour   = colorFromRef(colour2);
-		const QPoint start(left, top);
-		if (!surface.rect().contains(start))
-			return eOK;
-
-		const QRgb borderRgb = borderColour.rgb();
-		const QRgb fillRgb   = fillColour.rgb();
-		const QRgb startRgb  = surface.pixel(start);
-		if (action == 7 && (startRgb & 0x00FFFFFF) != (borderRgb & 0x00FFFFFF))
-			return eOK;
-		if (action == 6 && (startRgb & 0x00FFFFFF) == (borderRgb & 0x00FFFFFF))
-			return eOK;
-
-		QVector<QPoint> stack;
-		stack.reserve(surface.width() * surface.height() / 8);
-		stack.push_back(start);
-		while (!stack.isEmpty())
-		{
-			QPoint const p = stack.back();
-			stack.pop_back();
-			if (!surface.rect().contains(p))
-				continue;
-			const QRgb current     = surface.pixel(p);
-			const bool matchBorder = ((current & 0x00FFFFFF) == (borderRgb & 0x00FFFFFF));
-			if (action == 6)
-			{
-				if (matchBorder || (current & 0x00FFFFFF) == (fillRgb & 0x00FFFFFF))
-					continue;
-			}
-			else
-			{
-				if (!matchBorder || (current & 0x00FFFFFF) == (fillRgb & 0x00FFFFFF))
-					continue;
-			}
-			surface.setPixel(p, qRgba(fillColour.red(), fillColour.green(), fillColour.blue(), 0xFF));
-			stack.push_back(QPoint(p.x() + 1, p.y()));
-			stack.push_back(QPoint(p.x() - 1, p.y()));
-			stack.push_back(QPoint(p.x(), p.y() + 1));
-			stack.push_back(QPoint(p.x(), p.y() - 1));
-		}
-		break;
-	}
-	default:
-		return eUnknownOption;
-	}
-
-	emit miniWindowsChanged();
-	return eOK;
+	const int result = MiniWindowUtils::rectOp(*window, action, left, top, right, bottom, colour1, colour2);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowCircleOp(const QString &name, int action, int left, int top, int right, int bottom,
                                  long penColour, long penStyle, int penWidth, long brushColour,
                                  long brushStyle, int extra1, int extra2, int extra3, int extra4)
 {
+	if (name.isEmpty())
+		return eNoNameSpecified;
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-
-	QImage &surface = window->surface;
-	if (surface.isNull())
-		return eOK;
-
-	const QRect rect = rectFromCoords(*window, left, top, right, bottom);
-	if (rect.width() <= 0 || rect.height() <= 0)
-		return eOK;
-
-	if (validatePenStyle(penStyle, penWidth) != eOK)
-		return ePenStyleNotValid;
-	if (validateBrushStyle(brushStyle) != eOK)
-		return eBrushStyleNotValid;
-
-	QPainter painter(&surface);
-	QPen     pen(colorFromRef(penColour));
-	pen.setWidth(qMax(1, penWidth));
-	pen.setStyle(mapPenStyle(penStyle));
-	pen.setCapStyle(mapPenCap(penStyle));
-	pen.setJoinStyle(mapPenJoin(penStyle));
-	painter.setPen(penStyle == 5 ? Qt::NoPen : pen);
-
-	bool         brushOk = true;
-	QBrush const brush   = MiniWindowUtils::makeBrush(brushStyle, penColour, brushColour, &brushOk);
-	if (!brushOk)
-		return eBrushStyleNotValid;
-	painter.setBrush(brush);
-
-	switch (action)
-	{
-	case 1:
-		painter.drawEllipse(rect);
-		break;
-	case 2:
-		painter.drawRect(rect.adjusted(0, 0, -1, -1));
-		break;
-	case 3:
-		painter.drawRoundedRect(rect, extra1, extra2, Qt::AbsoluteSize);
-		break;
-	case 4:
-	case 5:
-	{
-		const QPointF center     = rect.center();
-		const double  startAngle = QLineF(center, QPointF(extra1, extra2)).angle();
-		const double  endAngle   = QLineF(center, QPointF(extra3, extra4)).angle();
-		double        span       = endAngle - startAngle;
-		if (span <= 0)
-			span += 360.0;
-		const int start  = static_cast<int>(startAngle * 16.0);
-		const int span16 = static_cast<int>(span * 16.0);
-		if (action == 4)
-			painter.drawChord(rect, start, span16);
-		else
-			painter.drawPie(rect, start, span16);
-	}
-	break;
-	default:
-		return eUnknownOption;
-	}
-
-	emit miniWindowsChanged();
-	return eOK;
+	const int result =
+	    MiniWindowUtils::circleOp(*window, action, left, top, right, bottom, penColour, penStyle, penWidth,
+	                              brushColour, brushStyle, extra1, extra2, extra3, extra4);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowLine(const QString &name, int x1, int y1, int x2, int y2, long penColour,
@@ -19352,24 +21625,10 @@ int WorldRuntime::windowLine(const QString &name, int x1, int y1, int x2, int y2
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-
-	QImage &surface = window->surface;
-	if (surface.isNull())
-		return eOK;
-
-	if (validatePenStyle(penStyle, penWidth) != eOK)
-		return ePenStyleNotValid;
-
-	QPainter painter(&surface);
-	QPen     pen(colorFromRef(penColour));
-	pen.setWidth(qMax(1, penWidth));
-	pen.setStyle(mapPenStyle(penStyle));
-	pen.setCapStyle(mapPenCap(penStyle));
-	pen.setJoinStyle(mapPenJoin(penStyle));
-	painter.setPen(penStyle == 5 ? Qt::NoPen : pen);
-	painter.drawLine(x1, y1, x2, y2);
-	emit miniWindowsChanged();
-	return eOK;
+	const int result = MiniWindowUtils::line(*window, x1, y1, x2, y2, penColour, penStyle, penWidth);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowArc(const QString &name, int left, int top, int right, int bottom, int x1, int y1,
@@ -19378,34 +21637,11 @@ int WorldRuntime::windowArc(const QString &name, int left, int top, int right, i
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-
-	QImage &surface = window->surface;
-	if (surface.isNull())
-		return eOK;
-
-	if (validatePenStyle(penStyle, penWidth) != eOK)
-		return ePenStyleNotValid;
-
-	const QRect rect = rectFromCoords(*window, left, top, right, bottom);
-	QPainter    painter(&surface);
-	QPen        pen(colorFromRef(penColour));
-	pen.setWidth(qMax(1, penWidth));
-	pen.setStyle(mapPenStyle(penStyle));
-	pen.setCapStyle(mapPenCap(penStyle));
-	pen.setJoinStyle(mapPenJoin(penStyle));
-	painter.setPen(penStyle == 5 ? Qt::NoPen : pen);
-
-	const QPointF center     = rect.center();
-	const int     endX       = window->fixRight(x2);
-	const int     endY       = window->fixBottom(y2);
-	const double  startAngle = QLineF(center, QPointF(x1, y1)).angle();
-	const double  endAngle   = QLineF(center, QPointF(endX, endY)).angle();
-	double        span       = endAngle - startAngle;
-	if (span <= 0)
-		span += 360.0;
-	painter.drawArc(rect, static_cast<int>(startAngle * 16.0), static_cast<int>(span * 16.0));
-	emit miniWindowsChanged();
-	return eOK;
+	const int result = MiniWindowUtils::arc(*window, left, top, right, bottom, x1, y1, x2, y2, penColour,
+	                                        penStyle, penWidth);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowBezier(const QString &name, const QString &points, long penColour, long penStyle,
@@ -19414,37 +21650,10 @@ int WorldRuntime::windowBezier(const QString &name, const QString &points, long 
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-
-	QVector<double>   coords;
-	const QStringList parts = points.split(',', Qt::SkipEmptyParts);
-	coords.reserve(parts.size());
-	for (const QString &part : parts)
-		coords.push_back(part.trimmed().toDouble());
-
-	if (coords.size() < 8 || (coords.size() % 6) != 2)
-		return eInvalidNumberOfPoints;
-
-	if (validatePenStyle(penStyle, penWidth) != eOK)
-		return ePenStyleNotValid;
-
-	QPainter painter(&window->surface);
-	QPen     pen(colorFromRef(penColour));
-	pen.setWidth(qMax(1, penWidth));
-	pen.setStyle(mapPenStyle(penStyle));
-	pen.setCapStyle(mapPenCap(penStyle));
-	pen.setJoinStyle(mapPenJoin(penStyle));
-	painter.setPen(penStyle == 5 ? Qt::NoPen : pen);
-	painter.setBrush(Qt::NoBrush);
-
-	QPainterPath path;
-	path.moveTo(coords[0], coords[1]);
-	for (int i = 2; i + 5 < coords.size(); i += 6)
-	{
-		path.cubicTo(coords[i], coords[i + 1], coords[i + 2], coords[i + 3], coords[i + 4], coords[i + 5]);
-	}
-	painter.drawPath(path);
-	emit miniWindowsChanged();
-	return eOK;
+	const int result = MiniWindowUtils::bezier(*window, points, penColour, penStyle, penWidth);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowPolygon(const QString &name, const QString &points, long penColour, long penStyle,
@@ -19454,45 +21663,11 @@ int WorldRuntime::windowPolygon(const QString &name, const QString &points, long
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-
-	QVector<QPointF>  pts;
-	const QStringList parts = points.split(',', Qt::SkipEmptyParts);
-	if (parts.size() < 4 || (parts.size() % 2) != 0)
-		return eInvalidNumberOfPoints;
-
-	for (int i = 0; i < parts.size(); i += 2)
-	{
-		const double x = parts.at(i).trimmed().toDouble();
-		const double y = parts.at(i + 1).trimmed().toDouble();
-		pts.push_back(QPointF(x, y));
-	}
-
-	if (validatePenStyle(penStyle, penWidth) != eOK)
-		return ePenStyleNotValid;
-	if (validateBrushStyle(brushStyle) != eOK)
-		return eBrushStyleNotValid;
-
-	QPainter painter(&window->surface);
-	QPen     pen(colorFromRef(penColour));
-	pen.setWidth(qMax(1, penWidth));
-	pen.setStyle(mapPenStyle(penStyle));
-	pen.setCapStyle(mapPenCap(penStyle));
-	pen.setJoinStyle(mapPenJoin(penStyle));
-	painter.setPen(penStyle == 5 ? Qt::NoPen : pen);
-	bool         brushOk = true;
-	QBrush const brush   = MiniWindowUtils::makeBrush(brushStyle, penColour, brushColour, &brushOk);
-	if (!brushOk)
-		return eBrushStyleNotValid;
-	painter.setBrush(brush);
-
-	if (closePolygon)
-		painter.drawPolygon(pts.constData(), safeQSizeToInt(pts.size()),
-		                    winding ? Qt::WindingFill : Qt::OddEvenFill);
-	else
-		painter.drawPolyline(pts.constData(), safeQSizeToInt(pts.size()));
-
-	emit miniWindowsChanged();
-	return eOK;
+	const int result = MiniWindowUtils::polygon(*window, points, penColour, penStyle, penWidth, brushColour,
+	                                            brushStyle, closePolygon, winding);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowGradient(const QString &name, int left, int top, int right, int bottom,
@@ -19501,47 +21676,11 @@ int WorldRuntime::windowGradient(const QString &name, int left, int top, int rig
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-
-	QImage &surface = window->surface;
-	if (surface.isNull())
-		return eOK;
-
-	const QRect rect = rectFromCoords(*window, left, top, right, bottom);
-	if (rect.width() <= 0 || rect.height() <= 0)
-		return eOK;
-
-	QPainter painter(&surface);
-	if (mode == 3)
-	{
-		QImage       texture(rect.size(), QImage::Format_ARGB32);
-		const QColor mult = colorFromRef(startColour);
-		for (int y = 0; y < texture.height(); ++y)
-		{
-			auto *line = reinterpret_cast<QRgb *>(texture.scanLine(y));
-			for (int x = 0; x < texture.width(); ++x)
-			{
-				const int c = (x ^ y) & 0xFF;
-				line[x] = qRgb((c * mult.red()) & 0xFF, (c * mult.green()) & 0xFF, (c * mult.blue()) & 0xFF);
-			}
-		}
-		painter.drawImage(rect.topLeft(), texture);
-	}
-	else
-	{
-		const QColor    start = colorFromRef(startColour);
-		const QColor    end   = colorFromRef(endColour);
-		QLinearGradient gradient;
-		if (mode == 2)
-			gradient = QLinearGradient(rect.left(), rect.top(), rect.left(), rect.bottom());
-		else
-			gradient = QLinearGradient(rect.left(), rect.top(), rect.right(), rect.top());
-		gradient.setColorAt(0.0, start);
-		gradient.setColorAt(1.0, end);
-		painter.fillRect(rect, gradient);
-	}
-
-	emit miniWindowsChanged();
-	return eOK;
+	const int result =
+	    MiniWindowUtils::gradient(*window, left, top, right, bottom, startColour, endColour, mode);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowFont(const QString &name, const QString &fontId, const QString &fontName, double size,
@@ -19552,54 +21691,8 @@ int WorldRuntime::windowFont(const QString &name, const QString &fontId, const Q
 	if (!window)
 		return eNoSuchWindow;
 
-	if (fontName.isEmpty() && size == 0.0)
-	{
-		window->fonts.remove(fontId);
-		return eOK;
-	}
-
-	QFont font;
-	if (!fontName.isEmpty())
-		qmudApplyMonospaceFallback(font, fontName);
-	const QString preferredFamily = fontName.isEmpty() ? font.family() : fontName;
-	const QString charsetFamily   = qmudFamilyForCharset(preferredFamily, charset);
-	if (!charsetFamily.isEmpty())
-		qmudApplyMonospaceFallback(font, charsetFamily);
-	const double pointSize = size > 0.0 ? size : 10.0;
-	font.setPointSizeF(pointSize);
-	font.setBold(bold);
-	font.setItalic(italic);
-	font.setUnderline(underline);
-	font.setStrikeOut(strikeout);
-
-	if ((pitchAndFamily & 0x03) == 0x01)
-		font.setFixedPitch(true);
-
-	switch (pitchAndFamily & 0xF0)
-	{
-	case 0x10:
-		font.setStyleHint(QFont::Serif);
-		break;
-	case 0x20:
-		font.setStyleHint(QFont::SansSerif);
-		break;
-	case 0x30:
-		font.setStyleHint(QFont::TypeWriter);
-		break;
-	case 0x40:
-	case 0x50:
-		font.setStyleHint(QFont::Decorative);
-		break;
-	default:
-		font.setStyleHint(QFont::AnyStyle);
-		break;
-	}
-
-	MiniWindowFont entry;
-	entry.font    = font;
-	entry.metrics = QFontMetrics(font);
-	window->fonts.insert(fontId, entry);
-	return eOK;
+	return MiniWindowUtils::font(*window, fontId, fontName, size, bold, italic, underline, strikeout, charset,
+	                             pitchAndFamily);
 }
 
 QVariant WorldRuntime::windowFontInfo(const QString &name, const QString &fontId, int infoType) const
@@ -19607,86 +21700,7 @@ QVariant WorldRuntime::windowFontInfo(const QString &name, const QString &fontId
 	const MiniWindow *window = miniWindow(name);
 	if (!window)
 		return {};
-	const auto it = window->fonts.find(fontId);
-	if (it == window->fonts.end())
-		return {};
-
-	const QFontMetrics &metrics = it.value().metrics;
-	const QFont        &font    = it.value().font;
-
-	switch (infoType)
-	{
-	case 1:
-		return metrics.height();
-	case 2:
-		return metrics.ascent();
-	case 3:
-		return metrics.descent();
-	case 4:
-		return 0;
-	case 5:
-		return metrics.leading();
-	case 6:
-		return metrics.averageCharWidth();
-	case 7:
-		return metrics.maxWidth();
-	case 8:
-		return font.weight();
-	case 9:
-		return 0;
-	case 10:
-		if (const QScreen *screen = QGuiApplication::primaryScreen())
-			return static_cast<int>(screen->logicalDotsPerInchX());
-		return 0;
-	case 11:
-		if (const QScreen *screen = QGuiApplication::primaryScreen())
-			return static_cast<int>(screen->logicalDotsPerInchY());
-		return 0;
-	case 12:
-		return 32;
-	case 13:
-		return 255;
-	case 14:
-		return 63;
-	case 15:
-		return 32;
-	case 16:
-		return font.italic() ? 1 : 0;
-	case 17:
-		return font.underline() ? 1 : 0;
-	case 18:
-		return font.strikeOut() ? 1 : 0;
-	case 19:
-	{
-		const int pitch  = font.fixedPitch() ? 0x01 : 0x02;
-		int       family = 0x00;
-		switch (font.styleHint())
-		{
-		case QFont::Serif:
-			family = 0x10;
-			break;
-		case QFont::SansSerif:
-			family = 0x20;
-			break;
-		case QFont::TypeWriter:
-			family = 0x30;
-			break;
-		case QFont::Decorative:
-			family = 0x50;
-			break;
-		default:
-			family = 0x00;
-			break;
-		}
-		return pitch | family;
-	}
-	case 20:
-		return 0;
-	case 21:
-		return font.family();
-	default:
-		return {};
-	}
+	return MiniWindowUtils::fontInfo(*window, fontId, infoType);
 }
 
 QStringList WorldRuntime::windowFontList(const QString &name) const
@@ -19705,49 +21719,36 @@ int WorldRuntime::windowText(const QString &name, const QString &fontId, const Q
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return -1;
-
-	const auto it = window->fonts.find(fontId);
-	if (it == window->fonts.end())
-		return -2;
-
-	QImage &surface = window->surface;
-	if (surface.isNull())
-		return eOK;
-
-	if (text.isEmpty())
-		return 0;
-
-	const QRect rect = rectFromCoords(*window, left, top, right, bottom);
-	if (rect.width() <= 0 || rect.height() <= 0)
-		return eOK;
-
-	QPainter painter(&surface);
-	painter.setFont(it.value().font);
-	painter.setPen(colorFromRef(colour));
-	painter.setClipRect(rect);
-	painter.drawText(rect, Qt::AlignLeft | Qt::AlignTop, text);
-
-	const int width = it.value().metrics.horizontalAdvance(text);
-	emit      miniWindowsChanged();
-	return qMin(width, rect.width());
+	const int result = MiniWindowUtils::text(*window, fontId, text, left, top, right, bottom, colour);
+	if (result >= 0)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
-int WorldRuntime::windowOutputText(const QString &name, const QString &fontId, const QString &text, int left,
-                                   int top, int right, int bottom, long colour, const QString &mouseUp,
-                                   const QString &hotspotPrefix, const QString &pluginId,
-                                   WindowOutputMetrics *metricsOut)
+int WorldRuntime::windowTextPreviewWidth(const QString &name, const QString &fontId, const QString &text,
+                                         int left, int top, int right, int bottom) const
+{
+	if (name.isEmpty())
+		return -1;
+	const MiniWindow *window = miniWindow(name);
+	if (!window)
+		return -1;
+	return MiniWindowUtils::textPreviewWidth(*window, fontId, text, left, top, right, bottom);
+}
+
+int WorldRuntime::renderWindowOutputText(MiniWindow &targetWindow, const QString &fontId, const QString &text,
+                                         const int left, const int top, const int right, const int bottom,
+                                         const long colour, const QString &mouseUp,
+                                         const QString &hotspotPrefix, const QString &pluginId,
+                                         WindowOutputTextRenderContext renderContext,
+                                         WindowOutputMetrics          *metricsOut)
 {
 	if (metricsOut)
 		*metricsOut = WindowOutputMetrics{};
 
-	if (name.isEmpty())
-		return -1;
+	MiniWindow *window = &targetWindow;
 
-	MiniWindow *window = miniWindow(name);
-	if (!window)
-		return -1;
-
-	const auto fontIt = window->fonts.find(fontId);
+	const auto  fontIt = window->fonts.find(fontId);
 	if (fontIt == window->fonts.end())
 		return -2;
 
@@ -19764,35 +21765,10 @@ int WorldRuntime::windowOutputText(const QString &name, const QString &fontId, c
 
 	const QString normalizedPrefix =
 	    hotspotPrefix.trimmed().isEmpty() ? QStringLiteral("output_link") : hotspotPrefix.trimmed();
-	const QString    scopedPrefix = normalizedPrefix + QLatin1Char('_');
-	QVector<QString> scopedGeneratedIds;
-	scopedGeneratedIds.reserve(window->outputGeneratedHotspots.size());
-	for (const QString &generatedHotspotId : std::as_const(window->outputGeneratedHotspots))
-	{
-		if (!generatedHotspotId.startsWith(scopedPrefix))
-			continue;
-		window->hotspots.remove(generatedHotspotId);
-		if (window->mouseOverHotspot == generatedHotspotId)
-			window->mouseOverHotspot.clear();
-		if (window->mouseDownHotspot == generatedHotspotId)
-			window->mouseDownHotspot.clear();
-		scopedGeneratedIds.push_back(generatedHotspotId);
-	}
-	for (const QString &generatedHotspotId : std::as_const(scopedGeneratedIds))
-	{
-		window->outputGeneratedHotspots.remove(generatedHotspotId);
-	}
-	if (window->hotspots.isEmpty())
-	{
-		window->callbackPlugin.clear();
-		window->outputHotspotSerial = 0;
-	}
+	MiniWindowUtils::clearGeneratedOutputHotspots(*window, normalizedPrefix);
 
 	if (text.isEmpty())
-	{
-		emit miniWindowsChanged();
 		return 0;
-	}
 
 	auto parseColorValue = [](const QString &value) -> QColor
 	{
@@ -19811,87 +21787,34 @@ int WorldRuntime::windowOutputText(const QString &name, const QString &fontId, c
 		return {r, g, b};
 	};
 
-	QVector<QColor> normalAnsi(8);
-	QVector<QColor> boldAnsi(8);
-	QVector<QColor> customText(16);
-	QVector<QColor> customBack(16);
-	normalAnsi[0] = QColor(0, 0, 0);
-	normalAnsi[1] = QColor(128, 0, 0);
-	normalAnsi[2] = QColor(0, 128, 0);
-	normalAnsi[3] = QColor(128, 128, 0);
-	normalAnsi[4] = QColor(0, 0, 128);
-	normalAnsi[5] = QColor(128, 0, 128);
-	normalAnsi[6] = QColor(0, 128, 128);
-	normalAnsi[7] = QColor(192, 192, 192);
-	boldAnsi[0]   = QColor(128, 128, 128);
-	boldAnsi[1]   = QColor(255, 0, 0);
-	boldAnsi[2]   = QColor(0, 255, 0);
-	boldAnsi[3]   = QColor(255, 255, 0);
-	boldAnsi[4]   = QColor(0, 0, 255);
-	boldAnsi[5]   = QColor(255, 0, 255);
-	boldAnsi[6]   = QColor(0, 255, 255);
-	boldAnsi[7]   = QColor(255, 255, 255);
+	QVector<QColor> normalAnsi = renderContext.normalAnsi;
+	QVector<QColor> boldAnsi   = renderContext.boldAnsi;
+	QVector<QColor> customText = renderContext.customText;
+	QVector<QColor> customBack = renderContext.customBack;
+	if (normalAnsi.size() < 8)
+		normalAnsi = defaultAnsiColours(false);
+	if (boldAnsi.size() < 8)
+		boldAnsi = defaultAnsiColours(true);
+	if (customText.size() < 16)
+		customText.resize(16);
+	if (customBack.size() < 16)
+		customBack.resize(16);
 	for (int i = 0; i < customText.size(); ++i)
 	{
-		customText[i] = QColor(255, 255, 255);
-		customBack[i] = QColor(0, 0, 0);
-	}
-	customText[0]  = QColor(255, 128, 128);
-	customText[1]  = QColor(255, 255, 128);
-	customText[2]  = QColor(128, 255, 128);
-	customText[3]  = QColor(128, 255, 255);
-	customText[4]  = QColor(0, 128, 255);
-	customText[5]  = QColor(255, 128, 192);
-	customText[6]  = QColor(255, 0, 0);
-	customText[7]  = QColor(0, 128, 192);
-	customText[8]  = QColor(255, 0, 255);
-	customText[9]  = QColor(128, 64, 64);
-	customText[10] = QColor(255, 128, 64);
-	customText[11] = QColor(0, 128, 128);
-	customText[12] = QColor(0, 64, 128);
-	customText[13] = QColor(255, 0, 128);
-	customText[14] = QColor(0, 128, 0);
-	customText[15] = QColor(0, 0, 255);
-
-	for (const auto &entry : m_colours)
-	{
-		const QString group = entry.group.trimmed().toLower();
-		bool          ok    = false;
-		const int     seq   = entry.attributes.value(QStringLiteral("seq")).toInt(&ok);
-		const int     index = ok ? seq - 1 : -1;
-		if (index < 0)
-			continue;
-		if (group == QStringLiteral("ansi/normal") && index < normalAnsi.size())
-		{
-			const QColor rgb = parseColorValue(entry.attributes.value(QStringLiteral("rgb")));
-			if (rgb.isValid())
-				normalAnsi[index] = rgb;
-		}
-		else if (group == QStringLiteral("ansi/bold") && index < boldAnsi.size())
-		{
-			const QColor rgb = parseColorValue(entry.attributes.value(QStringLiteral("rgb")));
-			if (rgb.isValid())
-				boldAnsi[index] = rgb;
-		}
-		else if ((group == QStringLiteral("custom/custom") || group == QStringLiteral("custom")) &&
-		         index < customText.size())
-		{
-			const QColor textColor = parseColorValue(entry.attributes.value(QStringLiteral("text")));
-			const QColor backColor = parseColorValue(entry.attributes.value(QStringLiteral("back")));
-			if (textColor.isValid())
-				customText[index] = textColor;
-			if (backColor.isValid())
-				customBack[index] = backColor;
-		}
+		if (!customText.at(i).isValid())
+			customText[i] = QColor(255, 255, 255);
+		if (!customBack.at(i).isValid())
+			customBack[i] = QColor(0, 0, 0);
 	}
 
 	const bool custom16Default =
-	    isEnabledFlag(m_worldAttributes.value(QStringLiteral("custom_16_is_default_colour")));
+	    isEnabledFlag(renderContext.worldAttributes.value(QStringLiteral("custom_16_is_default_colour")));
 	const bool ignoreMxpColourChanges =
-	    isEnabledFlag(m_worldAttributes.value(QStringLiteral("ignore_mxp_colour_changes")));
-	QColor defaultForeColor = parseColorValue(m_worldAttributes.value(QStringLiteral("output_text_colour")));
+	    isEnabledFlag(renderContext.worldAttributes.value(QStringLiteral("ignore_mxp_colour_changes")));
+	QColor defaultForeColor =
+	    parseColorValue(renderContext.worldAttributes.value(QStringLiteral("output_text_colour")));
 	QColor defaultBackColor =
-	    parseColorValue(m_worldAttributes.value(QStringLiteral("output_background_colour")));
+	    parseColorValue(renderContext.worldAttributes.value(QStringLiteral("output_background_colour")));
 	if (!defaultForeColor.isValid())
 		defaultForeColor = custom16Default ? customText.value(15) : normalAnsi.value(7);
 	if (!defaultBackColor.isValid())
@@ -19899,42 +21822,42 @@ int WorldRuntime::windowOutputText(const QString &name, const QString &fontId, c
 	const QString defaultFore = defaultForeColor.name();
 	const QString defaultBack = defaultBackColor.name();
 	const bool    useCustomLinkColour =
-	    isEnabledFlag(m_worldAttributes.value(QStringLiteral("use_custom_link_colour")));
+	    isEnabledFlag(renderContext.worldAttributes.value(QStringLiteral("use_custom_link_colour")));
 	const bool underlineHyperlinks =
-	    isEnabledFlag(m_worldAttributes.value(QStringLiteral("underline_hyperlinks")));
+	    isEnabledFlag(renderContext.worldAttributes.value(QStringLiteral("underline_hyperlinks")));
 	const QColor configuredHyperlinkColour =
-	    parseColorValue(m_worldAttributes.value(QStringLiteral("hyperlink_colour")));
+	    parseColorValue(renderContext.worldAttributes.value(QStringLiteral("hyperlink_colour")));
 
-	MxpStyleState          current = m_mxpRenderStyle;
-	QVector<MxpStyleFrame> mxpStyleStack(m_mxpRenderStack);
-	QVector<QByteArray>    mxpBlockStack(m_mxpRenderBlockStack);
-	bool                   mxpLinkOpen = m_mxpRenderLinkOpen;
-	int                    mxpPreDepth = m_mxpRenderPreDepth;
+	MxpStyleState          current = renderContext.mxpStyle;
+	QVector<MxpStyleFrame> mxpStyleStack(renderContext.mxpStyleStack);
+	QVector<QByteArray>    mxpBlockStack(renderContext.mxpBlockStack);
+	bool                   mxpLinkOpen = renderContext.mxpLinkOpen;
+	int                    mxpPreDepth = renderContext.mxpPreDepth;
 	const bool             hasPersistedMxpRenderContext =
 	    !mxpStyleStack.isEmpty() || !mxpBlockStack.isEmpty() || mxpLinkOpen || mxpPreDepth > 0;
 	if (!hasPersistedMxpRenderContext)
 	{
-		current.bold       = m_ansiRenderState.bold;
-		current.underline  = m_ansiRenderState.underline;
-		current.italic     = m_ansiRenderState.italic;
-		current.blink      = m_ansiRenderState.blink;
-		current.strike     = m_ansiRenderState.strike;
-		current.monospace  = m_ansiRenderState.monospace;
-		current.inverse    = m_ansiRenderState.inverse;
-		current.fore       = m_ansiRenderState.fore;
-		current.back       = m_ansiRenderState.back;
-		current.actionType = m_ansiRenderState.actionType;
-		current.action     = m_ansiRenderState.action;
-		current.hint       = m_ansiRenderState.hint;
-		current.variable   = m_ansiRenderState.variable;
-		current.startTag   = m_ansiRenderState.startTag;
+		current.bold       = renderContext.ansiRenderState.bold;
+		current.underline  = renderContext.ansiRenderState.underline;
+		current.italic     = renderContext.ansiRenderState.italic;
+		current.blink      = renderContext.ansiRenderState.blink;
+		current.strike     = renderContext.ansiRenderState.strike;
+		current.monospace  = renderContext.ansiRenderState.monospace;
+		current.inverse    = renderContext.ansiRenderState.inverse;
+		current.fore       = renderContext.ansiRenderState.fore;
+		current.back       = renderContext.ansiRenderState.back;
+		current.actionType = renderContext.ansiRenderState.actionType;
+		current.action     = renderContext.ansiRenderState.action;
+		current.hint       = renderContext.ansiRenderState.hint;
+		current.variable   = renderContext.ansiRenderState.variable;
+		current.startTag   = renderContext.ansiRenderState.startTag;
 	}
 	if (current.fore.isEmpty())
 		current.fore = defaultFore;
 	if (current.back.isEmpty())
 		current.back = defaultBack;
 
-	QMudAnsiStreamState ansiStreamState = m_ansiStreamState;
+	QMudAnsiStreamState ansiStreamState = renderContext.ansiStreamState;
 
 	struct ParsedRun
 	{
@@ -20364,8 +22287,9 @@ int WorldRuntime::windowOutputText(const QString &name, const QString &fontId, c
 		QByteArray                         effectiveTag = tagName;
 		TelnetProcessor::CustomElementInfo customInfo;
 		AtomicTagInfo                      atomicInfo;
-		const bool hasCustomElement = m_telnet.getCustomElementInfo(tagName, customInfo);
-		const bool hasAtomicTag     = lookupAtomicTagInfo(tagName, atomicInfo);
+		const bool                         hasCustomElement =
+		    renderContext.customElementResolver && renderContext.customElementResolver(tagName, customInfo);
+		const bool hasAtomicTag = lookupAtomicTagInfo(tagName, atomicInfo);
 		if (!hasCustomElement && !hasAtomicTag)
 			return;
 
@@ -20373,8 +22297,8 @@ int WorldRuntime::windowOutputText(const QString &name, const QString &fontId, c
 		{
 			const QMap<QByteArray, QByteArray> mergedDefaults =
 			    mergeAttributeDefaultsBytes(customInfo.attributes, parsed.args);
-			const QByteArray resolvedDefinition =
-			    resolveDefinitionEntities(customInfo.definition, mergedDefaults, m_telnet);
+			const QByteArray resolvedDefinition = resolveDefinitionEntities(
+			    customInfo.definition, mergedDefaults, renderContext.entityResolver);
 			QMap<QByteArray, QByteArray> aliasAttributes;
 			QByteArray                   aliasTag;
 			if (parseDefinitionAlias(resolvedDefinition, aliasTag, aliasAttributes))
@@ -20394,7 +22318,7 @@ int WorldRuntime::windowOutputText(const QString &name, const QString &fontId, c
 			for (const QByteArray &rawDefinitionTag : rawTags)
 			{
 				const QByteArray resolved =
-				    resolveDefinitionEntities(rawDefinitionTag, mergedDefaults, m_telnet);
+				    resolveDefinitionEntities(rawDefinitionTag, mergedDefaults, renderContext.entityResolver);
 				const ParsedMxpArguments defParsed = parseMxpArguments(resolved);
 				QByteArray               definitionTagName;
 				QByteArray               definitionTemp = resolved;
@@ -20553,20 +22477,12 @@ int WorldRuntime::windowOutputText(const QString &name, const QString &fontId, c
 			}
 			if (hasLinkAction && !run.style.action.trimmed().isEmpty())
 			{
-				const QString hotspotId =
-				    QStringLiteral("%1_%2").arg(normalizedPrefix).arg(++window->outputHotspotSerial);
-				const int addResult =
-				    windowAddHotspot(name, hotspotId, runLeft, y, runRight, y + lineHeight, QString(),
-				                     QString(), QString(), QString(), mouseUp, QString(), 1, 0, pluginId);
+				const int addResult = MiniWindowUtils::addGeneratedOutputHotspot(
+				    *window, normalizedPrefix, runLeft, y, runRight, y + lineHeight, mouseUp, pluginId,
+				    run.style.actionType, run.style.action);
 				if (addResult == eOK)
 				{
-					if (auto inserted = window->hotspots.find(hotspotId); inserted != window->hotspots.end())
-					{
-						inserted->outputActionType = run.style.actionType;
-						inserted->outputAction     = run.style.action;
-						window->outputGeneratedHotspots.insert(hotspotId);
-						++renderedHotspotCount;
-					}
+					++renderedHotspotCount;
 				}
 				else if (hotspotStatus == eOK)
 					hotspotStatus = addResult;
@@ -20650,7 +22566,6 @@ int WorldRuntime::windowOutputText(const QString &name, const QString &fontId, c
 			break;
 	}
 
-	emit miniWindowsChanged();
 	if (metricsOut && renderedBottom >= rect.top())
 	{
 		metricsOut->left         = renderedLeft;
@@ -20666,6 +22581,106 @@ int WorldRuntime::windowOutputText(const QString &name, const QString &fontId, c
 	if (hotspotStatus != eOK)
 		return hotspotStatus;
 	return qMin(maxDrawnWidth, rect.width());
+}
+
+int WorldRuntime::windowOutputText(const QString &name, const QString &fontId, const QString &text, int left,
+                                   int top, int right, int bottom, long colour, const QString &mouseUp,
+                                   const QString &hotspotPrefix, const QString &pluginId,
+                                   WindowOutputMetrics *metricsOut)
+{
+	if (name.isEmpty())
+	{
+		if (metricsOut)
+			*metricsOut = WindowOutputMetrics{};
+		return -1;
+	}
+
+	MiniWindow *window = miniWindow(name);
+	if (!window)
+	{
+		if (metricsOut)
+			*metricsOut = WindowOutputMetrics{};
+		return -1;
+	}
+
+	WindowOutputTextRenderContext context;
+	context.ansiStreamState = m_ansiStreamState;
+	context.ansiRenderState = m_ansiRenderState;
+	context.mxpStyle        = m_mxpRenderStyle;
+	context.mxpStyleStack   = m_mxpRenderStack;
+	context.mxpBlockStack   = m_mxpRenderBlockStack;
+	context.mxpLinkOpen     = m_mxpRenderLinkOpen;
+	context.mxpPreDepth     = m_mxpRenderPreDepth;
+	context.worldAttributes = m_worldAttributes;
+	context.normalAnsi.resize(8);
+	context.boldAnsi.resize(8);
+	for (int index = 1; index <= 8; ++index)
+	{
+		context.normalAnsi[index - 1] = colorFromRef(normalColour(index));
+		context.boldAnsi[index - 1]   = ansiColour(true, index);
+	}
+	context.customText.resize(MAX_CUSTOM);
+	context.customBack.resize(MAX_CUSTOM);
+	for (int index = 1; index <= MAX_CUSTOM; ++index)
+	{
+		context.customText[index - 1] = colorFromRef(customColourText(index));
+		context.customBack[index - 1] = colorFromRef(customColourBackground(index));
+	}
+	context.customElementResolver = [this](const QByteArray                   &elementName,
+	                                       TelnetProcessor::CustomElementInfo &info) -> bool
+	{ return m_telnet.getCustomElementInfo(elementName, info); };
+	context.entityResolver = [this](const QByteArray &entityName, QByteArray &value) -> bool
+	{ return m_telnet.resolveEntityValue(entityName, value); };
+
+	const int result =
+	    renderWindowOutputText(*window, fontId, text, left, top, right, bottom, colour, mouseUp,
+	                           hotspotPrefix, pluginId, std::move(context), metricsOut);
+	if (result >= 0)
+		emitMiniWindowsChangedCoalesced();
+	return result;
+}
+
+int WorldRuntime::windowOutputTextPreview(const QString &name, const QString &fontId, const QString &text,
+                                          const int left, const int top, const int right, const int bottom,
+                                          const long colour, const QString &mouseUp,
+                                          const QString &hotspotPrefix, const QString &pluginId,
+                                          WindowOutputMetrics *metricsOut)
+{
+	if (metricsOut)
+		*metricsOut = WindowOutputMetrics{};
+	if (name.isEmpty())
+		return -1;
+
+	MiniWindow *window = miniWindow(name);
+	if (!window)
+		return -1;
+
+	const MiniWindow             miniWindowSnapshot        = *window;
+	const QMudAnsiStreamState    ansiStreamStateSnapshot   = m_ansiStreamState;
+	const AnsiRenderState        ansiRenderStateSnapshot   = m_ansiRenderState;
+	const MxpStyleState          mxpRenderStyleSnapshot    = m_mxpRenderStyle;
+	const QVector<MxpStyleFrame> mxpRenderStackSnapshot    = m_mxpRenderStack;
+	const QVector<QByteArray>    mxpRenderBlocksSnapshot   = m_mxpRenderBlockStack;
+	const bool                   mxpRenderLinkSnapshot     = m_mxpRenderLinkOpen;
+	const int                    mxpRenderPreDepthSnapshot = m_mxpRenderPreDepth;
+	const bool                   suppressSignalsSnapshot   = m_suppressMiniWindowsChangedSignal;
+	const auto                   restoreState              = qScopeGuard(
+	    [&]()
+	    {
+		    *window                            = miniWindowSnapshot;
+		    m_ansiStreamState                  = ansiStreamStateSnapshot;
+		    m_ansiRenderState                  = ansiRenderStateSnapshot;
+		    m_mxpRenderStyle                   = mxpRenderStyleSnapshot;
+		    m_mxpRenderStack                   = mxpRenderStackSnapshot;
+		    m_mxpRenderBlockStack              = mxpRenderBlocksSnapshot;
+		    m_mxpRenderLinkOpen                = mxpRenderLinkSnapshot;
+		    m_mxpRenderPreDepth                = mxpRenderPreDepthSnapshot;
+		    m_suppressMiniWindowsChangedSignal = suppressSignalsSnapshot;
+	    });
+
+	m_suppressMiniWindowsChangedSignal = true;
+	return windowOutputText(name, fontId, text, left, top, right, bottom, colour, mouseUp, hotspotPrefix,
+	                        pluginId, metricsOut);
 }
 
 int WorldRuntime::windowTextWidth(const QString &name, const QString &fontId, const QString &text) const
@@ -20691,7 +22706,7 @@ int WorldRuntime::windowSetPixel(const QString &name, int x, int y, long colour)
 		return eOK;
 	const QColor c = colorFromRef(colour);
 	surface.setPixel(x, y, qRgba(c.red(), c.green(), c.blue(), 0xFF));
-	emit miniWindowsChanged();
+	emitMiniWindowsChangedCoalesced();
 	return eOK;
 }
 
@@ -20712,26 +22727,12 @@ QVariant WorldRuntime::windowGetPixel(const QString &name, int x, int y) const
 int WorldRuntime::windowCreateImage(const QString &name, const QString &imageId, long row1, long row2,
                                     long row3, long row4, long row5, long row6, long row7, long row8)
 {
+	if (name.isEmpty())
+		return eNoNameSpecified;
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-
-	const long      rows[8] = {row1, row2, row3, row4, row5, row6, row7, row8};
-	MiniWindowImage img;
-	img.image = QImage(8, 8, QImage::Format_ARGB32);
-	for (int y = 0; y < 8; ++y)
-	{
-		const long row = rows[y];
-		for (int x = 0; x < 8; ++x)
-		{
-			const bool bit = (row >> (7 - x)) & 0x01;
-			img.image.setPixel(x, y, bit ? qRgba(255, 255, 255, 255) : qRgba(0, 0, 0, 255));
-		}
-	}
-
-	img.hasAlpha   = false;
-	img.monochrome = true;
-	window->images.insert(imageId, img);
+	MiniWindowUtils::createImage(*window, imageId, row1, row2, row3, row4, row5, row6, row7, row8);
 	return eOK;
 }
 
@@ -20741,12 +22742,12 @@ int WorldRuntime::windowLoadImage(const QString &name, const QString &imageId, c
 	if (!window)
 		return eNoSuchWindow;
 
+	window->images.remove(imageId);
 	const QString trimmed = filename.trimmed();
 	if (trimmed.isEmpty())
-	{
-		window->images.remove(imageId);
 		return eOK;
-	}
+	if (trimmed.size() < 5)
+		return eBadParameter;
 
 	const QString lower = trimmed.toLower();
 	if (!lower.endsWith(QStringLiteral(".bmp")) && !lower.endsWith(QStringLiteral(".png")))
@@ -20755,52 +22756,20 @@ int WorldRuntime::windowLoadImage(const QString &name, const QString &imageId, c
 	if (!QFileInfo::exists(trimmed))
 		return eFileNotFound;
 
-	QImage image;
-	if (!image.load(trimmed))
+	if (!MiniWindowUtils::loadImage(*window, imageId, trimmed))
 		return eUnableToLoadImage;
-	const bool isMonochrome =
-	    (image.format() == QImage::Format_Mono || image.format() == QImage::Format_MonoLSB);
-
-	MiniWindowImage entry;
-	entry.image      = image.convertToFormat(QImage::Format_ARGB32);
-	entry.source     = trimmed;
-	entry.hasAlpha   = entry.image.hasAlphaChannel();
-	entry.monochrome = isMonochrome;
-	window->images.insert(imageId, entry);
 	return eOK;
 }
 
 int WorldRuntime::windowLoadImageMemory(const QString &name, const QString &imageId, const QByteArray &data,
-                                        bool hasAlpha)
+                                        bool swapAlpha)
 {
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
 
-	QImage image;
-	bool   decodedHasAlpha = false;
-	bool   isMonochrome    = false;
-	if (!qmudLookupMemoryImageDecodeCache(m_memoryImageDecodeCache, data, image, decodedHasAlpha,
-	                                      isMonochrome))
-	{
-		const QImage decoded = QImage::fromData(data);
-		if (decoded.isNull())
-			return eUnableToLoadImage;
-		isMonochrome =
-		    (decoded.format() == QImage::Format_Mono || decoded.format() == QImage::Format_MonoLSB);
-		image           = decoded.convertToFormat(QImage::Format_ARGB32);
-		decodedHasAlpha = image.hasAlphaChannel();
-		qmudInsertMemoryImageDecodeCache(m_memoryImageDecodeCache, m_memoryImageDecodeCacheBytes, data, image,
-		                                 decodedHasAlpha, isMonochrome, kMemoryImageDecodeCacheMaxEntries,
-		                                 kMemoryImageDecodeCacheMaxBytes);
-	}
-
-	MiniWindowImage entry;
-	entry.image      = image;
-	entry.source     = QStringLiteral("<memory>");
-	entry.hasAlpha   = hasAlpha || decodedHasAlpha;
-	entry.monochrome = isMonochrome;
-	window->images.insert(imageId, entry);
+	if (!MiniWindowUtils::loadImageMemory(*window, imageId, data, swapAlpha))
+		return eUnableToLoadImage;
 	return eOK;
 }
 
@@ -20817,33 +22786,19 @@ QVariant WorldRuntime::windowImageInfo(const QString &name, const QString &image
 	const MiniWindow *window = miniWindow(name);
 	if (!window)
 		return {};
+	return MiniWindowUtils::imageInfo(*window, imageId, infoType);
+}
+
+bool WorldRuntime::windowImageHasAlpha(const QString &name, const QString &imageId, bool &hasAlpha) const
+{
+	const MiniWindow *window = miniWindow(name);
+	if (!window)
+		return false;
 	const auto it = window->images.find(imageId);
 	if (it == window->images.end())
-		return {};
-
-	const QImage &image      = it.value().image;
-	const bool    monochrome = it.value().monochrome;
-	switch (infoType)
-	{
-	case 1:
-		return 0;
-	case 2:
-		return image.width();
-	case 3:
-		return image.height();
-	case 4:
-		if (monochrome)
-			return bytesPerLine(image.width(), 1);
-		return image.bytesPerLine();
-	case 5:
-		return 1;
-	case 6:
-		if (monochrome)
-			return 1;
-		return image.depth();
-	default:
-		return {};
-	}
+		return false;
+	hasAlpha = it.value().hasAlpha;
+	return true;
 }
 
 int WorldRuntime::windowImageFromWindow(const QString &name, const QString &imageId,
@@ -20855,13 +22810,7 @@ int WorldRuntime::windowImageFromWindow(const QString &name, const QString &imag
 	const MiniWindow *src = miniWindow(sourceWindow);
 	if (!src)
 		return eNoSuchWindow;
-
-	MiniWindowImage entry;
-	entry.image      = src->surface.copy();
-	entry.source     = sourceWindow;
-	entry.hasAlpha   = entry.image.hasAlphaChannel();
-	entry.monochrome = false;
-	window->images.insert(imageId, entry);
+	MiniWindowUtils::imageFromWindow(*window, imageId, *src);
 	return eOK;
 }
 
@@ -20871,55 +22820,11 @@ int WorldRuntime::windowDrawImage(const QString &name, const QString &imageId, i
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	const auto it = window->images.find(imageId);
-	if (it == window->images.end())
-		return eImageNotInstalled;
-
-	QImage       &surface = window->surface;
-	const QImage &image   = it.value().image;
-	if (surface.isNull() || image.isNull())
-		return eOK;
-
-	QRect source(srcLeft, srcTop, srcRight - srcLeft, srcBottom - srcTop);
-	if (srcRight <= 0)
-		source.setRight(image.width() + srcRight - 1);
-	if (srcBottom <= 0)
-		source.setBottom(image.height() + srcBottom - 1);
-	source = source.intersected(image.rect());
-
-	if (source.width() <= 0 || source.height() <= 0)
-		return eOK;
-
-	QPainter painter(&surface);
-	if (mode == 2)
-	{
-		QRect const target = rectFromCoords(*window, left, top, right, bottom);
-		if (target.width() <= 0 || target.height() <= 0)
-			return eOK;
-		painter.drawImage(target, image, source);
-	}
-	else if (mode == 3)
-	{
-		QImage     copy = image.copy(source).convertToFormat(QImage::Format_ARGB32);
-		const auto key  = QColor(image.pixel(0, 0));
-		for (int y = 0; y < copy.height(); ++y)
-		{
-			auto *line = reinterpret_cast<QRgb *>(copy.scanLine(y));
-			for (int x = 0; x < copy.width(); ++x)
-			{
-				if ((line[x] & 0x00FFFFFF) == (key.rgb() & 0x00FFFFFF))
-					line[x] &= 0x00FFFFFF;
-			}
-		}
-		painter.drawImage(QPoint(left, top), copy);
-	}
-	else if (mode == 1)
-		painter.drawImage(QPoint(left, top), image.copy(source));
-	else
-		return eBadParameter;
-
-	emit miniWindowsChanged();
-	return eOK;
+	const int result = MiniWindowUtils::drawImage(*window, imageId, left, top, right, bottom, mode, srcLeft,
+	                                              srcTop, srcRight, srcBottom);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowDrawImageAlpha(const QString &name, const QString &imageId, int left, int top,
@@ -20928,95 +22833,11 @@ int WorldRuntime::windowDrawImageAlpha(const QString &name, const QString &image
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	const auto it = window->images.find(imageId);
-	if (it == window->images.end())
-		return eImageNotInstalled;
-	if (opacity < 0.0 || opacity > 1.0)
-		return eBadParameter;
-	if (!it.value().hasAlpha)
-		return eImageNotInstalled;
-
-	QImage       &surface = window->surface;
-	const QImage &image   = it.value().image;
-	if (surface.isNull() || image.isNull())
-		return eOK;
-
-	int drawLeft = left;
-	int drawTop  = top;
-
-	int sourceLeft = qMax(0, srcLeft);
-	int sourceTop  = qMax(0, srcTop);
-	int targetWidth{};
-	int targetHeight{};
-
-	if (right == 0)
-		targetWidth = image.width() - sourceLeft;
-	else
-		targetWidth = window->fixRight(right) - left;
-
-	if (bottom == 0)
-		targetHeight = image.height() - sourceTop;
-	else
-		targetHeight = window->fixBottom(bottom) - top;
-
-	if (drawLeft < 0)
-	{
-		sourceLeft -= drawLeft;
-		targetWidth += drawLeft;
-		drawLeft = 0;
-	}
-
-	if (drawTop < 0)
-	{
-		sourceTop -= drawTop;
-		targetHeight += drawTop;
-		drawTop = 0;
-	}
-
-	if (drawLeft >= window->width || drawTop >= window->height)
-		return eOK;
-
-	targetWidth  = qMin(targetWidth, window->width - drawLeft);
-	targetHeight = qMin(targetHeight, window->height - drawTop);
-	if (targetWidth <= 0 || targetHeight <= 0)
-		return eOK;
-
-	QRect source(sourceLeft, sourceTop, targetWidth, targetHeight);
-	source = source.intersected(image.rect());
-	if (source.width() <= 0 || source.height() <= 0)
-		return eOK;
-
-	QImage base = surface.copy(drawLeft, drawTop, source.width(), source.height())
-	                  .convertToFormat(QImage::Format_ARGB32);
-	QImage const overlay = image.copy(source).convertToFormat(QImage::Format_ARGB32);
-	const int    w       = qMin(base.width(), overlay.width());
-	const int    h       = qMin(base.height(), overlay.height());
-	for (int y = 0; y < h; ++y)
-	{
-		auto       *baseLine = reinterpret_cast<QRgb *>(base.scanLine(y));
-		const auto *overLine = reinterpret_cast<const QRgb *>(overlay.constScanLine(y));
-		for (int x = 0; x < w; ++x)
-		{
-			const QColor a        = QColor::fromRgba(overLine[x]);
-			const QColor b        = QColor::fromRgba(baseLine[x]);
-			const int    mask     = a.alpha();
-			const int    blendedR = (a.red() * mask + b.red() * (255 - mask)) / 255;
-			const int    blendedG = (a.green() * mask + b.green() * (255 - mask)) / 255;
-			const int    blendedB = (a.blue() * mask + b.blue() * (255 - mask)) / 255;
-			const int    outR =
-                (opacity < 1.0) ? QMudBlend::simpleOpacity(b.red(), blendedR, opacity) : blendedR;
-			const int outG =
-			    (opacity < 1.0) ? QMudBlend::simpleOpacity(b.green(), blendedG, opacity) : blendedG;
-			const int outB =
-			    (opacity < 1.0) ? QMudBlend::simpleOpacity(b.blue(), blendedB, opacity) : blendedB;
-			baseLine[x] = qRgba(clampByte(outR), clampByte(outG), clampByte(outB), 0xFF);
-		}
-	}
-
-	QPainter painter(&surface);
-	painter.drawImage(QPoint(drawLeft, drawTop), base);
-	emit miniWindowsChanged();
-	return eOK;
+	const int result =
+	    MiniWindowUtils::drawImageAlpha(*window, imageId, left, top, right, bottom, opacity, srcLeft, srcTop);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowImageOp(const QString &name, int action, int left, int top, int right, int bottom,
@@ -21026,63 +22847,12 @@ int WorldRuntime::windowImageOp(const QString &name, int action, int left, int t
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	const auto it = window->images.find(imageId);
-	if (it == window->images.end())
-		return eImageNotInstalled;
-
-	QImage &surface = window->surface;
-	if (surface.isNull())
-		return eOK;
-
-	const QRect rect = rectFromCoords(*window, left, top, right, bottom);
-	if (validatePenStyle(penStyle, penWidth) != eOK)
-		return ePenStyleNotValid;
-
-	QPainter painter(&surface);
-	QPen     pen(colorFromRef(penColour));
-	pen.setWidth(qMax(1, penWidth));
-	pen.setStyle(mapPenStyle(penStyle));
-	pen.setCapStyle(mapPenCap(penStyle));
-	pen.setJoinStyle(mapPenJoin(penStyle));
-	painter.setPen(penStyle == 5 ? Qt::NoPen : pen);
-
-	QImage pattern = it.value().image;
-	if (it.value().monochrome)
-	{
-		const QColor fore = MiniWindowUtils::colorFromRefOrTransparent(brushColour);
-		const QColor back = MiniWindowUtils::colorFromRefOrTransparent(penColour);
-		QImage       recoloured(pattern.size(), QImage::Format_ARGB32);
-		for (int y = 0; y < pattern.height(); ++y)
-		{
-			for (int x = 0; x < pattern.width(); ++x)
-			{
-				const QColor sample(pattern.pixel(x, y));
-				const bool   bit = qGray(sample.rgb()) > 127;
-				recoloured.setPixel(x, y, (bit ? fore : back).rgba());
-			}
-		}
-		pattern = recoloured;
-	}
-	QBrush const brush(QPixmap::fromImage(pattern));
-	painter.setBrush(brush);
-
-	switch (action)
-	{
-	case 1:
-		painter.drawEllipse(rect);
-		break;
-	case 2:
-		painter.drawRect(rect.adjusted(0, 0, -1, -1));
-		break;
-	case 3:
-		painter.drawRoundedRect(rect, ellipseWidth, ellipseHeight, Qt::AbsoluteSize);
-		break;
-	default:
-		return eUnknownOption;
-	}
-
-	emit miniWindowsChanged();
-	return eOK;
+	const int result =
+	    MiniWindowUtils::imageOp(*window, action, left, top, right, bottom, penColour, penStyle, penWidth,
+	                             brushColour, imageId, ellipseWidth, ellipseHeight);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowMergeImageAlpha(const QString &name, const QString &imageId, const QString &maskId,
@@ -21092,100 +22862,11 @@ int WorldRuntime::windowMergeImageAlpha(const QString &name, const QString &imag
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	const auto imageIt = window->images.find(imageId);
-	const auto maskIt  = window->images.find(maskId);
-	if (imageIt == window->images.end() || maskIt == window->images.end())
-		return eImageNotInstalled;
-	if (opacity < 0.0 || opacity > 1.0)
-		return eBadParameter;
-
-	QImage       &surface = window->surface;
-	const QImage &image   = imageIt.value().image;
-	const QImage &mask    = maskIt.value().image;
-
-	if (mode != 0 && mode != 1)
-		return eUnknownOption;
-
-	const int fixedRight   = window->fixRight(right);
-	const int fixedBottom  = window->fixBottom(bottom);
-	const int targetLeft   = qMax(0, left);
-	const int targetTop    = qMax(0, top);
-	const int targetRight  = qMin(fixedRight, window->width);
-	const int targetBottom = qMin(fixedBottom, window->height);
-	const int targetWidth  = targetRight - targetLeft;
-	const int targetHeight = targetBottom - targetTop;
-	if (targetWidth <= 0 || targetHeight <= 0)
-		return eOK;
-
-	int const sourceLeft   = qMax(0, srcLeft);
-	int const sourceTop    = qMax(0, srcTop);
-	int       sourceRight  = srcRight;
-	int       sourceBottom = srcBottom;
-	if (sourceRight <= 0)
-		sourceRight = image.width() + sourceRight;
-	if (sourceBottom <= 0)
-		sourceBottom = image.height() + sourceBottom;
-	sourceRight  = qMin(sourceRight, image.width());
-	sourceBottom = qMin(sourceBottom, image.height());
-
-	const int width  = qMin(targetWidth, sourceRight - sourceLeft);
-	const int height = qMin(targetHeight, sourceBottom - sourceTop);
-	if (width <= 0 || height <= 0)
-		return eOK;
-
-	if (mask.width() < sourceLeft + width || mask.height() < sourceTop + height)
-		return eBadParameter;
-
-	QImage base = surface.copy(targetLeft, targetTop, width, height).convertToFormat(QImage::Format_ARGB32);
-	QImage const src =
-	    image.copy(sourceLeft, sourceTop, width, height).convertToFormat(QImage::Format_ARGB32);
-	QImage const maskCopy =
-	    mask.copy(sourceLeft, sourceTop, width, height).convertToFormat(QImage::Format_ARGB32);
-
-	const QColor opaqueColor(image.pixel(0, 0));
-
-	for (int y = 0; y < height; ++y)
-	{
-		auto       *baseLine = reinterpret_cast<QRgb *>(base.scanLine(y));
-		const auto *srcLine  = reinterpret_cast<const QRgb *>(src.constScanLine(y));
-		const auto *maskLine = reinterpret_cast<const QRgb *>(maskCopy.constScanLine(y));
-		for (int x = 0; x < width; ++x)
-		{
-			QColor const a(srcLine[x]);
-			QColor const b(baseLine[x]);
-			QColor const m(maskLine[x]);
-			int          rA = a.red();
-			int          gA = a.green();
-			int          bA = a.blue();
-			if (mode == 1 && a.red() == opaqueColor.red() && a.green() == opaqueColor.green() &&
-			    a.blue() == opaqueColor.blue())
-			{
-				rA = b.red();
-				gA = b.green();
-				bA = b.blue();
-			}
-
-			const int rM = m.red();
-			const int gM = m.green();
-			const int bM = m.blue();
-
-			auto      blendMask = [](int A, int B, int M) { return (A * M + B * (255 - M)) / 255; };
-
-			const int rawR = blendMask(rA, b.red(), rM);
-			const int rawG = blendMask(gA, b.green(), gM);
-			const int rawB = blendMask(bA, b.blue(), bM);
-
-			const int outR = (opacity < 1.0) ? QMudBlend::simpleOpacity(b.red(), rawR, opacity) : rawR;
-			const int outG = (opacity < 1.0) ? QMudBlend::simpleOpacity(b.green(), rawG, opacity) : rawG;
-			const int outB = (opacity < 1.0) ? QMudBlend::simpleOpacity(b.blue(), rawB, opacity) : rawB;
-			baseLine[x]    = qRgba(clampByte(outR), clampByte(outG), clampByte(outB), 0xFF);
-		}
-	}
-
-	QPainter painter(&surface);
-	painter.drawImage(QPoint(targetLeft, targetTop), base);
-	emit miniWindowsChanged();
-	return eOK;
+	const int result = MiniWindowUtils::mergeImageAlpha(*window, imageId, maskId, left, top, right, bottom,
+	                                                    mode, opacity, srcLeft, srcTop, srcRight, srcBottom);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowGetImageAlpha(const QString &name, const QString &imageId, int left, int top,
@@ -21194,51 +22875,11 @@ int WorldRuntime::windowGetImageAlpha(const QString &name, const QString &imageI
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	const auto it = window->images.find(imageId);
-	if (it == window->images.end())
-		return eImageNotInstalled;
-	if (!it.value().hasAlpha)
-		return eImageNotInstalled;
-
-	QImage       &surface = window->surface;
-	const QImage &image   = it.value().image;
-	if (surface.isNull() || image.isNull())
-		return eOK;
-
-	const int fixedRight   = window->fixRight(right);
-	const int fixedBottom  = window->fixBottom(bottom);
-	const int targetLeft   = qMax(0, left);
-	const int targetTop    = qMax(0, top);
-	const int targetRight  = qMin(fixedRight, window->width);
-	const int targetBottom = qMin(fixedBottom, window->height);
-	const int targetWidth  = targetRight - targetLeft;
-	const int targetHeight = targetBottom - targetTop;
-	if (targetWidth <= 0 || targetHeight <= 0)
-		return eOK;
-
-	QRect source(qMax(0, srcLeft), qMax(0, srcTop), targetWidth, targetHeight);
-	if (srcLeft < 0)
-		source.moveLeft(0);
-	if (srcTop < 0)
-		source.moveTop(0);
-	source = source.intersected(image.rect());
-	if (source.width() <= 0 || source.height() <= 0)
-		return eOK;
-
-	QImage alphaImage(source.size(), QImage::Format_ARGB32);
-	for (int y = 0; y < source.height(); ++y)
-	{
-		for (int x = 0; x < source.width(); ++x)
-		{
-			const int alpha = qAlpha(image.pixel(source.x() + x, source.y() + y));
-			alphaImage.setPixel(x, y, qRgba(alpha, alpha, alpha, 0xFF));
-		}
-	}
-
-	QPainter painter(&surface);
-	painter.drawImage(QPoint(targetLeft, targetTop), alphaImage);
-	emit miniWindowsChanged();
-	return eOK;
+	const int result =
+	    MiniWindowUtils::getImageAlpha(*window, imageId, left, top, right, bottom, srcLeft, srcTop);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowBlendImage(const QString &name, const QString &imageId, int left, int top, int right,
@@ -21248,74 +22889,27 @@ int WorldRuntime::windowBlendImage(const QString &name, const QString &imageId, 
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	const auto it = window->images.find(imageId);
-	if (it == window->images.end())
-		return eImageNotInstalled;
-	if (opacity < 0.0 || opacity > 1.0)
-		return eBadParameter;
-	if (mode < 1 || mode > 64)
-		return eUnknownOption;
+	const int result = MiniWindowUtils::blendImage(*window, imageId, left, top, right, bottom, mode, opacity,
+	                                               srcLeft, srcTop, srcRight, srcBottom, runtimeRandomUnit);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
+}
 
-	QImage       &surface = window->surface;
-	const QImage &image   = it.value().image;
-
-	const int     fixedRight   = window->fixRight(right);
-	const int     fixedBottom  = window->fixBottom(bottom);
-	const int     targetLeft   = qMax(0, left);
-	const int     targetTop    = qMax(0, top);
-	const int     targetRight  = qMin(fixedRight, window->width);
-	const int     targetBottom = qMin(fixedBottom, window->height);
-	const int     targetWidth  = targetRight - targetLeft;
-	const int     targetHeight = targetBottom - targetTop;
-	if (targetWidth <= 0 || targetHeight <= 0)
-		return eOK;
-
-	int const sourceLeft   = qMax(0, srcLeft);
-	int const sourceTop    = qMax(0, srcTop);
-	int       sourceRight  = srcRight;
-	int       sourceBottom = srcBottom;
-	if (sourceRight <= 0)
-		sourceRight = image.width() + sourceRight;
-	if (sourceBottom <= 0)
-		sourceBottom = image.height() + sourceBottom;
-	sourceRight  = qMin(sourceRight, image.width());
-	sourceBottom = qMin(sourceBottom, image.height());
-
-	const int width  = qMin(targetWidth, sourceRight - sourceLeft);
-	const int height = qMin(targetHeight, sourceBottom - sourceTop);
-	if (width <= 0 || height <= 0)
-		return eOK;
-
-	QImage base = surface.copy(targetLeft, targetTop, width, height).convertToFormat(QImage::Format_ARGB32);
-	QImage const blend =
-	    image.copy(sourceLeft, sourceTop, width, height).convertToFormat(QImage::Format_ARGB32);
-
-	for (int y = 0; y < height; ++y)
-	{
-		auto       *baseLine  = reinterpret_cast<QRgb *>(base.scanLine(y));
-		const auto *blendLine = reinterpret_cast<const QRgb *>(blend.constScanLine(y));
-		for (int x = 0; x < width; ++x)
-		{
-			const long blendPixel = static_cast<long>(qRed(blendLine[x])) |
-			                        (static_cast<long>(qGreen(blendLine[x])) << 8) |
-			                        (static_cast<long>(qBlue(blendLine[x])) << 16);
-			const long basePixel = static_cast<long>(qRed(baseLine[x])) |
-			                       (static_cast<long>(qGreen(baseLine[x])) << 8) |
-			                       (static_cast<long>(qBlue(baseLine[x])) << 16);
-			long result = 0;
-			if (!blendPixelInternal(blendPixel, basePixel, static_cast<short>(mode), opacity, result))
-				return eUnknownOption;
-			const int r = lowByteToInt(result);
-			const int g = lowByteToInt(result >> 8);
-			const int b = lowByteToInt(result >> 16);
-			baseLine[x] = qRgba(r, g, b, 0xFF);
-		}
-	}
-
-	QPainter painter(&surface);
-	painter.drawImage(QPoint(targetLeft, targetTop), base);
-	emit miniWindowsChanged();
-	return eOK;
+int WorldRuntime::windowBlendImageWithRandomSeed(const QString &name, const QString &imageId, int left,
+                                                 int top, int right, int bottom, int mode, double opacity,
+                                                 int srcLeft, int srcTop, int srcRight, int srcBottom,
+                                                 quint32 randomSeed)
+{
+	MiniWindow *window = miniWindow(name);
+	if (!window)
+		return eNoSuchWindow;
+	const int result =
+	    MiniWindowUtils::blendImage(*window, imageId, left, top, right, bottom, mode, opacity, srcLeft,
+	                                srcTop, srcRight, srcBottom, seededMiniWindowRandomUnit(randomSeed));
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowFilter(const QString &name, int left, int top, int right, int bottom, int operation,
@@ -21325,146 +22919,25 @@ int WorldRuntime::windowFilter(const QString &name, int left, int top, int right
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
+	const int result =
+	    MiniWindowUtils::filter(*window, left, top, right, bottom, operation, options, runtimeRandomUnit);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
+}
 
-	QImage &surface = window->surface;
-	if (surface.isNull())
-		return eOK;
-
-	const int fixedRight   = window->fixRight(right);
-	const int fixedBottom  = window->fixBottom(bottom);
-	const int targetLeft   = qMax(0, left);
-	const int targetTop    = qMax(0, top);
-	const int targetRight  = qMin(fixedRight, window->width);
-	const int targetBottom = qMin(fixedBottom, window->height);
-	const int width        = targetRight - targetLeft;
-	const int height       = targetBottom - targetTop;
-	if (width <= 0 || height <= 0)
-		return eOK;
-
-	QImage copy = surface.copy(targetLeft, targetTop, width, height).convertToFormat(QImage::Format_ARGB32);
-	const int  bpl = bytesPerLine24(width);
-	QByteArray buffer;
-	imageToBgrBuffer(copy, buffer, width, height, bpl);
-
-	switch (operation)
-	{
-	case 1:
-		noise(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options);
-		break;
-	case 2:
-		monoNoise(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options);
-		break;
-	case 3:
-	{
-		const double matrix[5] = {1, 1, 1, 1, 1};
-		generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, matrix,
-		              5);
-	}
-	break;
-	case 4:
-	{
-		constexpr double matrix[5] = {-1, -1, 7, -1, -1};
-		generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, matrix,
-		              3);
-	}
-	break;
-	case 5:
-	{
-		constexpr double matrix[5] = {0, 2.5, -6, 2.5, 0};
-		generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, matrix,
-		              1);
-	}
-	break;
-	case 6:
-	{
-		constexpr double matrix[5] = {1, 2, 1, -1, -2};
-		generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, matrix,
-		              1);
-	}
-	break;
-	case 7:
-		brightness(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options);
-		break;
-	case 8:
-		contrast(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options);
-		break;
-	case 9:
-		gammaAdjust(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options);
-		break;
-	case 10:
-		colourBrightness(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 2);
-		break;
-	case 11:
-		colourContrast(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 2);
-		break;
-	case 12:
-		colourGamma(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 2);
-		break;
-	case 13:
-		colourBrightness(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 1);
-		break;
-	case 14:
-		colourContrast(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 1);
-		break;
-	case 15:
-		colourGamma(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 1);
-		break;
-	case 16:
-		colourBrightness(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 0);
-		break;
-	case 17:
-		colourContrast(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 0);
-		break;
-	case 18:
-		colourGamma(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 0);
-		break;
-	case 19:
-		makeGreyscale(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, true);
-		break;
-	case 20:
-		makeGreyscale(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, false);
-		break;
-	case 21:
-		brightnessMultiply(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options);
-		break;
-	case 22:
-		colourBrightnessMultiply(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl,
-		                         options, 2);
-		break;
-	case 23:
-		colourBrightnessMultiply(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl,
-		                         options, 1);
-		break;
-	case 24:
-		colourBrightnessMultiply(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl,
-		                         options, 0);
-		break;
-	case 25:
-	{
-		const double matrix[5] = {0, 1, 1, 1, 0};
-		generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, matrix,
-		              3);
-	}
-	break;
-	case 26:
-	{
-		constexpr double matrix[5] = {0, 0.5, 1, 0.5, 0};
-		generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, matrix,
-		              2);
-	}
-	break;
-	case 27:
-		averageBuffer(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl);
-		break;
-	default:
-		return eUnknownOption;
-	}
-
-	bgrBufferToImage(buffer, copy, width, height, bpl);
-	QPainter painter(&surface);
-	painter.drawImage(QPoint(targetLeft, targetTop), copy);
-	emit miniWindowsChanged();
-	return eOK;
+int WorldRuntime::windowFilterWithRandomSeed(const QString &name, int left, int top, int right, int bottom,
+                                             int operation, double options, int extra, quint32 randomSeed)
+{
+	Q_UNUSED(extra);
+	MiniWindow *window = miniWindow(name);
+	if (!window)
+		return eNoSuchWindow;
+	const int result = MiniWindowUtils::filter(*window, left, top, right, bottom, operation, options,
+	                                           seededMiniWindowRandomUnit(randomSeed));
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowTransformImage(const QString &name, const QString &imageId, float left, float top,
@@ -21473,37 +22946,10 @@ int WorldRuntime::windowTransformImage(const QString &name, const QString &image
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	const auto it = window->images.find(imageId);
-	if (it == window->images.end())
-		return eImageNotInstalled;
-
-	QImage       &surface = window->surface;
-	const QImage &image   = it.value().image;
-	if (surface.isNull() || image.isNull())
-		return eOK;
-
-	QPainter         painter(&surface);
-	QTransform const transform(mxx, myx, mxy, myy, left, top);
-	painter.setTransform(transform, true);
-	if (mode == 3)
-	{
-		QImage     copy = image.convertToFormat(QImage::Format_ARGB32);
-		const auto key  = QColor(copy.pixel(0, 0));
-		for (int y = 0; y < copy.height(); ++y)
-		{
-			auto *line = reinterpret_cast<QRgb *>(copy.scanLine(y));
-			for (int x = 0; x < copy.width(); ++x)
-			{
-				if ((line[x] & 0x00FFFFFF) == (key.rgb() & 0x00FFFFFF))
-					line[x] &= 0x00FFFFFF;
-			}
-		}
-		painter.drawImage(QPointF(0, 0), copy);
-	}
-	else
-		painter.drawImage(QPointF(0, 0), image);
-	emit miniWindowsChanged();
-	return eOK;
+	const int result = MiniWindowUtils::transformImage(*window, imageId, left, top, mode, mxx, mxy, myx, myy);
+	if (result == eOK)
+		emitMiniWindowsChangedCoalesced();
+	return result;
 }
 
 int WorldRuntime::windowWrite(const QString &name, const QString &filename)
@@ -21511,15 +22957,28 @@ int WorldRuntime::windowWrite(const QString &name, const QString &filename)
 	const MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	if (filename.isEmpty())
+	const QString trimmedFilename = filename.trimmed();
+	if (trimmedFilename.isEmpty())
 		return eNoNameSpecified;
+	if (trimmedFilename.size() < 5)
+		return eBadParameter;
 
-	const QString lower = filename.toLower();
+	const QString lower = trimmedFilename.toLower();
 	if (!lower.endsWith(QStringLiteral(".bmp")) && !lower.endsWith(QStringLiteral(".png")))
 		return eBadParameter;
 
-	if (!window->surface.save(filename))
+	if (!MiniWindowUtils::saveWindowImage24Bit(*window, trimmedFilename))
 		return eCouldNotOpenFile;
+	return eOK;
+}
+
+int WorldRuntime::windowSnapshotImage(const QString &name, QImage &image) const
+{
+	const MiniWindow *window = miniWindow(name);
+	if (!window)
+		return eNoSuchWindow;
+
+	image = window->surface.copy();
 	return eOK;
 }
 
@@ -21550,38 +23009,22 @@ int WorldRuntime::windowPosition(const QString &name, int left, int top, int pos
 		}
 	}
 
-	window->location = QPoint(left, top);
-	window->position = position;
-	window->flags    = flags;
-	if ((flags & kMiniWindowTransparent) == 0 && !window->transparentSurfaceCache.isNull())
-	{
-		window->transparentSurfaceCache     = QImage();
-		window->transparentSurfaceSourceKey = 0;
-		window->transparentSurfaceKeyRgb    = 0;
-	}
-	emit miniWindowsChanged();
+	MiniWindowUtils::position(*window, left, top, position, flags);
+	emitMiniWindowsChangedCoalesced();
 	return eOK;
 }
 
 int WorldRuntime::windowResize(const QString &name, int width, int height, long colour)
 {
+	if (width < 0 || height < 0)
+		return eBadParameter;
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	if (width < 0 || height < 0)
-		return eBadParameter;
 	if (window->width == width && window->height == height)
 		return eOK;
-
-	QImage       newImage(qMax(1, width), qMax(1, height), QImage::Format_ARGB32);
-	QColor const fill = colorFromRef(colour);
-	newImage.fill(fill);
-	QPainter painter(&newImage);
-	painter.drawImage(0, 0, window->surface);
-	window->surface = newImage;
-	window->width   = width;
-	window->height  = height;
-	emit miniWindowsChanged();
+	MiniWindowUtils::resize(*window, width, height, colour);
+	emitMiniWindowsChangedCoalesced();
 	return eOK;
 }
 
@@ -21590,8 +23033,8 @@ int WorldRuntime::windowSetZOrder(const QString &name, int zOrder)
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	window->zOrder = zOrder;
-	emit miniWindowsChanged();
+	MiniWindowUtils::setZOrder(*window, zOrder);
+	emitMiniWindowsChangedCoalesced();
 	return eOK;
 }
 
@@ -21605,7 +23048,7 @@ int WorldRuntime::windowAddHotspot(const QString &name, const QString &hotspotId
 	if (!window)
 		return eNoSuchWindow;
 
-	static bool s_inWindowAddHotspot = false;
+	static thread_local bool s_inWindowAddHotspot = false;
 	if (s_inWindowAddHotspot)
 		return eItemInUse;
 	struct AddHotspotGuard
@@ -21625,32 +23068,12 @@ int WorldRuntime::windowAddHotspot(const QString &name, const QString &hotspotId
 	    (!mouseUp.isEmpty() && !isValidScriptLabel(mouseUp)))
 		return eInvalidObjectLabel;
 
-	if (!window->callbackPlugin.isEmpty() && window->callbackPlugin != pluginId)
-		return eHotspotPluginChanged;
-	if (window->callbackPlugin.isEmpty())
-		window->callbackPlugin = pluginId;
-
-	const auto existing = window->hotspots.find(hotspotId);
-	if (existing != window->hotspots.end())
-	{
-		if (window->mouseOverHotspot == hotspotId)
-			window->mouseOverHotspot.clear();
-		if (window->mouseDownHotspot == hotspotId)
-			window->mouseDownHotspot.clear();
-	}
-
-	MiniWindowHotspot hotspot;
-	hotspot.rect            = rectFromCoords(*window, left, top, right, bottom);
-	hotspot.mouseOver       = mouseOver;
-	hotspot.cancelMouseOver = cancelMouseOver;
-	hotspot.mouseDown       = mouseDown;
-	hotspot.cancelMouseDown = cancelMouseDown;
-	hotspot.mouseUp         = mouseUp;
-	hotspot.tooltip         = tooltip;
-	hotspot.cursor          = cursor;
-	hotspot.flags           = flags;
-
-	window->hotspots.insert(hotspotId, hotspot);
+	const int result =
+	    MiniWindowUtils::addHotspot(*window, hotspotId, left, top, right, bottom, mouseOver, cancelMouseOver,
+	                                mouseDown, cancelMouseDown, mouseUp, tooltip, cursor, flags, pluginId);
+	if (result != eOK)
+		return result;
+	const MiniWindowHotspot &hotspot = window->hotspots.value(hotspotId);
 	if (m_view && !m_view->isMiniWindowCaptureActive() && m_view->hasLastMousePosition())
 	{
 		const QPoint lastGlobal = m_view->lastMousePosition();
@@ -21665,18 +23088,7 @@ int WorldRuntime::windowDeleteHotspot(const QString &name, const QString &hotspo
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	const auto it = window->hotspots.find(hotspotId);
-	if (it == window->hotspots.end())
-		return eHotspotNotInstalled;
-	window->hotspots.erase(it);
-	window->outputGeneratedHotspots.remove(hotspotId);
-	if (window->mouseOverHotspot == hotspotId)
-		window->mouseOverHotspot.clear();
-	if (window->mouseDownHotspot == hotspotId)
-		window->mouseDownHotspot.clear();
-	if (window->hotspots.isEmpty())
-		window->callbackPlugin.clear();
-	return eOK;
+	return MiniWindowUtils::deleteHotspot(*window, hotspotId);
 }
 
 int WorldRuntime::windowDeleteAllHotspots(const QString &name)
@@ -21684,12 +23096,7 @@ int WorldRuntime::windowDeleteAllHotspots(const QString &name)
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	window->hotspots.clear();
-	window->outputGeneratedHotspots.clear();
-	window->outputHotspotSerial = 0;
-	window->mouseOverHotspot.clear();
-	window->mouseDownHotspot.clear();
-	window->callbackPlugin.clear();
+	MiniWindowUtils::deleteAllHotspots(*window);
 	return eOK;
 }
 
@@ -21706,46 +23113,7 @@ QVariant WorldRuntime::windowHotspotInfo(const QString &name, const QString &hot
 	const MiniWindow *window = miniWindow(name);
 	if (!window)
 		return {};
-	const auto it = window->hotspots.find(hotspotId);
-	if (it == window->hotspots.end())
-		return {};
-
-	const MiniWindowHotspot &hotspot = it.value();
-	switch (infoType)
-	{
-	case 1:
-		return hotspot.rect.left();
-	case 2:
-		return hotspot.rect.top();
-	case 3:
-		return hotspot.rect.right();
-	case 4:
-		return hotspot.rect.bottom();
-	case 5:
-		return hotspot.mouseOver;
-	case 6:
-		return hotspot.cancelMouseOver;
-	case 7:
-		return hotspot.mouseDown;
-	case 8:
-		return hotspot.cancelMouseDown;
-	case 9:
-		return hotspot.mouseUp;
-	case 10:
-		return hotspot.tooltip;
-	case 11:
-		return hotspot.cursor;
-	case 12:
-		return hotspot.flags;
-	case 13:
-		return hotspot.moveCallback;
-	case 14:
-		return hotspot.releaseCallback;
-	case 15:
-		return hotspot.dragFlags;
-	default:
-		return {};
-	}
+	return MiniWindowUtils::hotspotInfo(*window, hotspotId, infoType);
 }
 
 int WorldRuntime::windowOutputActivate(const QString &name, const QString &hotspotId,
@@ -21767,9 +23135,8 @@ int WorldRuntime::windowOutputActivate(const QString &name, const QString &hotsp
 	const QString action     = hotspot.outputAction;
 	if (deferDispatch)
 	{
-		qmudInvokeMethod(
-		    this, [this, actionType, action] { emit miniWindowOutputActionActivated(actionType, action); },
-		    Qt::QueuedConnection);
+		qmudInvokeMethodQueued(this, [this, actionType, action]
+		                       { emit miniWindowOutputActionActivated(actionType, action); });
 	}
 	else
 		emit miniWindowOutputActionActivated(actionType, action);
@@ -21781,11 +23148,7 @@ int WorldRuntime::windowHotspotTooltip(const QString &name, const QString &hotsp
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	const auto it = window->hotspots.find(hotspotId);
-	if (it == window->hotspots.end())
-		return eHotspotNotInstalled;
-	it.value().tooltip = tooltip;
-	return eOK;
+	return MiniWindowUtils::setHotspotTooltip(*window, hotspotId, tooltip);
 }
 
 int WorldRuntime::windowMoveHotspot(const QString &name, const QString &hotspotId, int left, int top,
@@ -21794,11 +23157,7 @@ int WorldRuntime::windowMoveHotspot(const QString &name, const QString &hotspotI
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	const auto it = window->hotspots.find(hotspotId);
-	if (it == window->hotspots.end())
-		return eHotspotNotInstalled;
-	it.value().rect = rectFromCoords(*window, left, top, right, bottom);
-	return eOK;
+	return MiniWindowUtils::moveHotspot(*window, hotspotId, left, top, right, bottom);
 }
 
 int WorldRuntime::windowDragHandler(const QString &name, const QString &hotspotId,
@@ -21811,17 +23170,8 @@ int WorldRuntime::windowDragHandler(const QString &name, const QString &hotspotI
 	if ((!moveCallback.isEmpty() && !isValidScriptLabel(moveCallback)) ||
 	    (!releaseCallback.isEmpty() && !isValidScriptLabel(releaseCallback)))
 		return eInvalidObjectLabel;
-	if (!window->callbackPlugin.isEmpty() && window->callbackPlugin != pluginId)
-		return eHotspotPluginChanged;
-	if (window->callbackPlugin.isEmpty())
-		window->callbackPlugin = pluginId;
-	const auto it = window->hotspots.find(hotspotId);
-	if (it == window->hotspots.end())
-		return eHotspotNotInstalled;
-	it.value().moveCallback    = moveCallback;
-	it.value().releaseCallback = releaseCallback;
-	it.value().dragFlags       = flags;
-	return eOK;
+	return MiniWindowUtils::setHotspotDragHandler(*window, hotspotId, moveCallback, releaseCallback, flags,
+	                                              pluginId);
 }
 
 int WorldRuntime::windowScrollwheelHandler(const QString &name, const QString &hotspotId,
@@ -21832,15 +23182,7 @@ int WorldRuntime::windowScrollwheelHandler(const QString &name, const QString &h
 		return eNoSuchWindow;
 	if (!moveCallback.isEmpty() && !isValidScriptLabel(moveCallback))
 		return eInvalidObjectLabel;
-	if (!window->callbackPlugin.isEmpty() && window->callbackPlugin != pluginId)
-		return eHotspotPluginChanged;
-	if (window->callbackPlugin.isEmpty())
-		window->callbackPlugin = pluginId;
-	const auto it = window->hotspots.find(hotspotId);
-	if (it == window->hotspots.end())
-		return eHotspotNotInstalled;
-	it.value().scrollwheelCallback = moveCallback;
-	return eOK;
+	return MiniWindowUtils::setHotspotScrollwheelHandler(*window, hotspotId, moveCallback, pluginId);
 }
 
 QString WorldRuntime::windowMenu(const QString &name, int left, int top, const QString &items,
@@ -22049,6 +23391,107 @@ WorldView *WorldRuntime::view() const
 	return m_view;
 }
 
+void WorldRuntime::queueDeferredConnectAfterPluginInstall(const QString &host, const quint16 port)
+{
+	if (host.trimmed().isEmpty() || port == 0)
+	{
+		m_deferredConnectAfterPluginInstallPending = false;
+		m_deferredConnectHost.clear();
+		m_deferredConnectPort = 0;
+		return;
+	}
+	m_deferredConnectAfterPluginInstallPending = true;
+	m_deferredConnectHost                      = host;
+	m_deferredConnectPort                      = port;
+}
+
+bool WorldRuntime::pluginInstallViewReady() const
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::pluginInstallViewReady");
+	if (!m_view)
+		return false;
+	if (m_view->outputClientWidth() <= 0 || m_view->outputClientHeight() <= 0)
+		return false;
+	return true;
+}
+
+void WorldRuntime::schedulePendingPluginInstallRetry()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::schedulePendingPluginInstallRetry");
+	if (m_pluginInstallDeferred || m_pluginInstallInProgress)
+		return;
+	if (!hasPendingPluginInstallWork())
+	{
+		flushPluginInstallCommittedCompletions();
+		return;
+	}
+	installPendingPlugins();
+}
+
+bool WorldRuntime::hasPendingPluginInstallWork() const
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::hasPendingPluginInstallWork");
+	return std::ranges::any_of(m_plugins,
+	                           [](const Plugin &plugin)
+	                           {
+		                           return plugin.installPending &&
+		                                  (plugin.enabled || plugin.disableAfterInstall) && plugin.lua &&
+		                                  hasValidPluginId(plugin);
+	                           });
+}
+
+void WorldRuntime::flushPluginInstallCommittedCompletions()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::flushPluginInstallCommittedCompletions");
+	if (m_pluginInstallDeferred || m_pluginInstallInProgress || hasPendingPluginInstallWork())
+		return;
+	if (m_pluginInstallCommittedWaiters.isEmpty())
+		return;
+
+	QVector<std::function<void()>> completions;
+	completions.swap(m_pluginInstallCommittedWaiters);
+	for (auto &completion : completions)
+	{
+		if (completion)
+			completion();
+	}
+}
+
+void WorldRuntime::maybeRunDeferredConnectAfterPluginInstall()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::maybeRunDeferredConnectAfterPluginInstall");
+	if (!m_deferredConnectAfterPluginInstallPending)
+		return;
+	if (m_pluginInstallDeferred || m_pluginInstallInProgress || hasPendingPluginInstallWork())
+		return;
+
+	const QString host                         = m_deferredConnectHost.trimmed();
+	const quint16 port                         = m_deferredConnectPort;
+	m_deferredConnectAfterPluginInstallPending = false;
+	m_deferredConnectHost.clear();
+	m_deferredConnectPort = 0;
+	if (host.isEmpty() || port == 0)
+		return;
+	if (isConnected() || isConnecting())
+		return;
+	static_cast<void>(connectToWorld(host, port));
+}
+
+void WorldRuntime::maybeRunDeferredWorldConnectHandlers()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::maybeRunDeferredWorldConnectHandlers");
+	if (!m_deferredWorldConnectHandlersPending)
+		return;
+	if (!isConnected())
+	{
+		m_deferredWorldConnectHandlersPending = false;
+		return;
+	}
+	if (m_pluginInstallDeferred || m_pluginInstallInProgress || hasPendingPluginInstallWork())
+		return;
+	fireWorldConnectHandlers();
+}
+
 void WorldRuntime::queuePluginInstall(Plugin &plugin)
 {
 	if (!plugin.lua || !hasValidPluginId(plugin))
@@ -22067,110 +23510,212 @@ void WorldRuntime::queuePluginInstall(Plugin &plugin)
 		setInstallPending(true);
 		return;
 	}
-	if (m_loadingDocument || m_pluginInstallDeferred)
+	if (m_loadingDocument || m_pluginInstallDeferred || m_pluginInstallInProgress)
 	{
 		setInstallPending(true);
 		return;
 	}
-	const bool installReady =
-	    m_view && m_view->isVisible() && m_view->outputClientWidth() > 0 && m_view->outputClientHeight() > 0;
-	if (installReady)
-	{
-		setInstallPending(false);
-		runPluginInstallCallback(plugin);
-		invalidatePluginCallbackPresenceCache();
-		notifyWorldOutputResized();
-		notifyDrawOutputWindow(1, 0);
-	}
-	else
-	{
-		setInstallPending(true);
-	}
-}
 
-void WorldRuntime::runPluginInstallCallback(Plugin &plugin)
-{
-	qmudAssertObjectThreadAffinity(this, "WorldRuntime::runPluginInstallCallback");
-	if (!plugin.lua || !hasValidPluginId(plugin))
-		return;
-
-	++m_forceScriptErrorOutputDepth;
-	[[maybe_unused]] const auto restoreScriptErrorOutputBehavior = qScopeGuard(
-	    [this]
-	    {
-		    if (m_forceScriptErrorOutputDepth > 0)
-			    --m_forceScriptErrorOutputDepth;
-	    });
-	m_luaExecutor->callFunctionNoArgs(plugin.lua.data(), QStringLiteral("OnPluginInstall"), nullptr, true);
-	if (plugin.disableAfterInstall)
-	{
-		if (plugin.enabled)
-		{
-			plugin.enabled = false;
-			plugin.attributes.insert(QStringLiteral("enabled"), QStringLiteral("0"));
-			m_luaExecutor->callFunctionNoArgs(plugin.lua.data(), QStringLiteral("OnPluginDisable"), nullptr,
-			                                  true);
-		}
-		else
-		{
-			plugin.attributes.insert(QStringLiteral("enabled"), QStringLiteral("0"));
-		}
-		plugin.disableAfterInstall = false;
-	}
+	setInstallPending(true);
+	installPendingPluginsAsyncDrain();
 }
 
 void WorldRuntime::installPendingPlugins()
 {
-	if (m_pluginInstallDeferred)
+	installPendingPluginsAsyncDrain();
+}
+
+void WorldRuntime::installPendingPluginsAsyncDrain()
+{
+	if (m_pluginInstallDeferred || m_pluginInstallInProgress)
 		return;
-	if (!m_view || !m_view->isVisible() || m_view->outputClientWidth() <= 0 ||
-	    m_view->outputClientHeight() <= 0)
-		return;
-	QVector<int> pendingIndices;
-	pendingIndices.reserve(m_plugins.size());
-	for (int i = 0; i < m_plugins.size(); ++i)
+
+	QVector<QString> pendingPluginIds;
+	pendingPluginIds.reserve(m_plugins.size());
+	for (const Plugin &plugin : m_plugins)
 	{
-		const Plugin &plugin = m_plugins.at(i);
 		if (plugin.installPending && (plugin.enabled || plugin.disableAfterInstall) && plugin.lua &&
 		    hasValidPluginId(plugin))
-			pendingIndices.push_back(i);
+		{
+			const QString pluginId = normalizedPluginId(plugin.attributes.value(QStringLiteral("id")));
+			if (!pluginId.isEmpty())
+				pendingPluginIds.push_back(pluginId);
+		}
 	}
-	if (pendingIndices.isEmpty())
+	if (pendingPluginIds.isEmpty())
+	{
+		maybeRunDeferredConnectAfterPluginInstall();
+		maybeRunDeferredWorldConnectHandlers();
+		flushPluginInstallCommittedCompletions();
+		return;
+	}
+
+	if (!pluginInstallViewReady())
 		return;
 
-	// Preserve startup behavior: once install starts, plugins can see each other
-	// as install-ready during OnPluginInstall callbacks.
-	bool installPendingStateChanged = false;
-	for (const int index : pendingIndices)
-	{
-		if (!m_plugins[index].installPending)
-			continue;
-		m_plugins[index].installPending = false;
-		installPendingStateChanged      = true;
-	}
-	if (installPendingStateChanged)
-		invalidatePluginCallbackPresenceCache();
+	m_pluginInstallInProgress = true;
+	continuePendingPluginInstallAsync(std::move(pendingPluginIds), false);
+}
 
-	bool installedAny = false;
-	for (const int index : pendingIndices)
+void WorldRuntime::continuePendingPluginInstallAsync(QVector<QString> pendingPluginIds,
+                                                     const bool       installedAny)
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::continuePendingPluginInstallAsync");
+	if (!m_pluginInstallInProgress)
+		return;
+
+	while (!pendingPluginIds.isEmpty())
 	{
-		Plugin &plugin = m_plugins[index];
-		if (!plugin.lua)
+		const QString pluginId = pendingPluginIds.takeFirst();
+		const int     index    = findPluginIndex(m_plugins, pluginId);
+		if (index < 0)
 			continue;
-		runPluginInstallCallback(plugin);
-		installedAny = true;
+		Plugin &plugin = m_plugins[index];
+		if (!plugin.lua || (!plugin.enabled && !plugin.disableAfterInstall))
+			continue;
+
+		QSharedPointer<LuaCallbackEngine> installEngine = plugin.lua;
+		pushForceScriptErrorOutputToWorld();
+
+		LuaBatchDispatchRequest installRequest;
+		installRequest.kind          = LuaBatchDispatchKind::NoArgs;
+		installRequest.engines       = {installEngine};
+		installRequest.functionName  = QStringLiteral("OnPluginInstall");
+		installRequest.defaultResult = true;
+
+		queuePluginCallbackDispatchAsync(
+		    installRequest,
+		    [this, pluginId, pendingPluginIds = std::move(pendingPluginIds)](
+		        const LuaBatchDispatchResult & /*unused*/) mutable
+		    {
+			    const int currentIndex = findPluginIndex(m_plugins, pluginId);
+			    if (currentIndex < 0)
+			    {
+				    popForceScriptErrorOutputToWorld();
+				    continuePendingPluginInstallAsync(std::move(pendingPluginIds), true);
+				    return;
+			    }
+
+			    Plugin &currentPlugin       = m_plugins[currentIndex];
+			    auto    clearInstallPending = [this, &currentPlugin]()
+			    {
+				    if (!currentPlugin.installPending)
+					    return;
+				    currentPlugin.installPending = false;
+				    invalidatePluginCallbackPresenceCache();
+			    };
+			    if (!currentPlugin.disableAfterInstall)
+			    {
+				    clearInstallPending();
+				    popForceScriptErrorOutputToWorld();
+				    continuePendingPluginInstallAsync(std::move(pendingPluginIds), true);
+				    return;
+			    }
+
+			    if (!currentPlugin.enabled)
+			    {
+				    currentPlugin.attributes.insert(QStringLiteral("enabled"), QStringLiteral("0"));
+				    currentPlugin.disableAfterInstall = false;
+				    clearInstallPending();
+				    popForceScriptErrorOutputToWorld();
+				    continuePendingPluginInstallAsync(std::move(pendingPluginIds), true);
+				    return;
+			    }
+
+			    currentPlugin.enabled = false;
+			    currentPlugin.attributes.insert(QStringLiteral("enabled"), QStringLiteral("0"));
+			    currentPlugin.disableAfterInstall = false;
+
+			    LuaBatchDispatchRequest disableRequest;
+			    disableRequest.kind          = LuaBatchDispatchKind::NoArgs;
+			    disableRequest.engines       = {currentPlugin.lua};
+			    disableRequest.functionName  = QStringLiteral("OnPluginDisable");
+			    disableRequest.defaultResult = true;
+
+			    queuePluginCallbackDispatchAsync(
+			        disableRequest,
+			        [this, pluginId, pendingPluginIds = std::move(pendingPluginIds)](
+			            const LuaBatchDispatchResult & /*unused*/) mutable
+			        {
+				        if (const int disabledIndex = findPluginIndex(m_plugins, pluginId);
+				            disabledIndex >= 0 && m_plugins[disabledIndex].installPending)
+				        {
+					        m_plugins[disabledIndex].installPending = false;
+					        invalidatePluginCallbackPresenceCache();
+				        }
+				        popForceScriptErrorOutputToWorld();
+				        continuePendingPluginInstallAsync(std::move(pendingPluginIds), true);
+			        });
+		    });
+		return;
 	}
+
+	finishPendingPluginInstallAsync(installedAny);
+}
+
+void WorldRuntime::finishPendingPluginInstallAsync(const bool installedAny)
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::finishPendingPluginInstallAsync");
+	m_pluginInstallInProgress = false;
+
 	if (installedAny)
 	{
 		invalidatePluginCallbackPresenceCache();
 		notifyWorldOutputResized();
 		notifyDrawOutputWindow(1, 0);
 	}
+
+	if (!m_pluginInstallDeferred && hasPendingPluginInstallWork())
+	{
+		installPendingPluginsAsyncDrain();
+		return;
+	}
+
+	maybeRunDeferredConnectAfterPluginInstall();
+	maybeRunDeferredWorldConnectHandlers();
+	flushPluginInstallCommittedCompletions();
+}
+
+void WorldRuntime::installPendingPluginsAsync(std::function<void()>       completion,
+                                              PluginInstallCompletionMode mode)
+{
+	if (QThread::currentThread() != thread())
+	{
+		const bool queued =
+		    qmudInvokeMethodQueued(this, [this, completion = std::move(completion), mode]() mutable
+		                           { installPendingPluginsAsync(std::move(completion), mode); });
+		if (!queued)
+		{
+			qWarning().noquote() << QStringLiteral(
+			    "[QMud][LuaBridge] failed to queue installPendingPluginsAsync to runtime thread");
+		}
+		return;
+	}
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::installPendingPluginsAsync");
+	if (mode == PluginInstallCompletionMode::Committed)
+	{
+		if (completion)
+			m_pluginInstallCommittedWaiters.push_back(std::move(completion));
+		installPendingPlugins();
+		return;
+	}
+
+	installPendingPlugins();
+	if (completion)
+		completion();
 }
 
 void WorldRuntime::setPluginInstallDeferred(bool deferred)
 {
 	m_pluginInstallDeferred = deferred;
+	if (deferred)
+	{
+		m_pluginInstallRetryQueued = false;
+		m_pluginInstallInProgress  = false;
+		return;
+	}
+	installPendingPluginsAsync({}, PluginInstallCompletionMode::Staged);
 }
 
 bool WorldRuntime::pluginInstallDeferred() const

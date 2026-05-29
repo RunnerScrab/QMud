@@ -242,6 +242,11 @@ class TelnetProcessor
 		 */
 		bool                 getCustomEntityValue(const QByteArray &name, QByteArray &value) const;
 		/**
+		 * @brief Returns a snapshot of custom MXP entity definitions.
+		 * @return Custom entity values keyed by normalized entity name.
+		 */
+		[[nodiscard]] QMap<QByteArray, QByteArray> customEntitySnapshot() const;
+		/**
 		 * @brief Resolves an entity using custom and built-in MXP entity tables.
 		 * @param name Entity name.
 		 * @param value Output resolved value.
@@ -476,13 +481,6 @@ class TelnetProcessor
 		 * @return Parsed argument map.
 		 */
 		static QMap<QByteArray, QByteArray> parseTagArguments(QByteArray input);
-		/**
-		 * @brief Emits MXP diagnostic callback when enabled.
-		 * @param level Diagnostic level.
-		 * @param messageNumber Diagnostic message id.
-		 * @param message Diagnostic text.
-		 */
-		void emitMxpDiagnostic(int level, long messageNumber, const QString &message) const;
 		template <typename MessageBuilder>
 		void emitMxpDiagnosticLazy(const int level, const long messageNumber, MessageBuilder &&buildMessage)
 		{

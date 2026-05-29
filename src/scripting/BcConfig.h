@@ -17,13 +17,20 @@
  * Clients of number.c should include config.h before number.h.
  */
 
-#include <limits.h>
+#include <stddef.h>
+// ReSharper disable once CppUnusedIncludeDirective
 #include <string.h>
+
+#if !defined(__cplusplus)
+#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L
+#ifndef nullptr
+#define nullptr NULL
+#endif
+#endif
+#endif
+
 #define NDEBUG 1
 
-#define _zero_ bc_zero
-#define _one_ bc_one
-#define _two_ bc_two
 #define num2str bc_num2str
 #define mul_base_digits bc_mul_base_digits
 

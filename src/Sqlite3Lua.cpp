@@ -7,12 +7,17 @@
  */
 
 #include "LuaHeaders.h"
+#include "LuaSupport.h"
 #include "SqliteCompat.h"
 
+// ReSharper disable once CppUnusedIncludeDirective
 #include <QMetaType>
+#include <QThread>
 #include <QtSql/QSqlError>
 #include <QtSql/QSqlQuery>
 #include <QtSql/QSqlRecord>
+#include <atomic>
+#include <mutex>
 
 namespace
 {
@@ -64,6 +69,15 @@ namespace
 			lua_State     *ownerState{nullptr};
 			int            stmtRef{LUA_NOREF};
 	};
+
+	QString uniqueSqlConnectionName(const QString &prefix)
+	{
+		static std::atomic<quint64> sequence{0};
+		const quint64               id = sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+		const auto tid = static_cast<qulonglong>(reinterpret_cast<quintptr>(QThread::currentThreadId()));
+		return QStringLiteral("%1_%2_%3")
+		    .arg(prefix, QString::number(tid, 16), QString::number(static_cast<qulonglong>(id)));
+	}
 
 	int mapSqlErrorToSqlite(const QSqlError &err)
 	{
@@ -186,6 +200,16 @@ namespace
 		stmt->db = nullptr;
 	}
 
+	void destroyStatement(LuaSqliteStmt *stmt)
+	{
+		if (!stmt)
+			return;
+		invalidateStatement(stmt);
+		releaseDbRef(stmt->ownerState, stmt->dbRef);
+		stmt->ownerState = nullptr;
+		stmt->~LuaSqliteStmt();
+	}
+
 	void invalidateIterator(LuaSqliteIter *iter)
 	{
 		if (!iter)
@@ -198,6 +222,40 @@ namespace
 		iter->columns = 0;
 		untrackIterator(iter->db, iter);
 		iter->db = nullptr;
+	}
+
+	void releaseIterator(LuaSqliteIter *iter)
+	{
+		if (!iter)
+			return;
+		invalidateIterator(iter);
+		releaseDbRef(iter->ownerState, iter->dbRef);
+		iter->ownerState = nullptr;
+	}
+
+	void destroyIterator(LuaSqliteIter *iter)
+	{
+		if (!iter)
+			return;
+		releaseIterator(iter);
+		iter->~LuaSqliteIter();
+	}
+
+	void releaseStatementIterator(LuaSqliteStmtIter *iter)
+	{
+		if (!iter)
+			return;
+		releaseDbRef(iter->ownerState, iter->stmtRef);
+		iter->ownerState = nullptr;
+		iter->stmt       = nullptr;
+	}
+
+	void destroyStatementIterator(LuaSqliteStmtIter *iter)
+	{
+		if (!iter)
+			return;
+		releaseStatementIterator(iter);
+		iter->~LuaSqliteStmtIter();
 	}
 
 	int mapVariantTypeToSqlite(const QVariant &value)
@@ -516,29 +574,29 @@ namespace
 
 	QString sqliteDriverVersion()
 	{
-		static QString cachedVersion;
-		static int     probeCounter = 0;
-
-		if (!cachedVersion.isEmpty())
-			return cachedVersion;
-
-		const QString probeConnection = QStringLiteral("lua_sqlite_probe_%1").arg(++probeCounter);
-		{
-			QSqlDatabase probe = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), probeConnection);
-			probe.setDatabaseName(QStringLiteral(":memory:"));
-			if (probe.open())
-			{
-				if (QSqlQuery query(probe);
-				    query.exec(QStringLiteral("SELECT sqlite_version()")) && query.next())
-					cachedVersion = query.value(0).toString();
-				probe.close();
-			}
-		}
-		QSqlDatabase::removeDatabase(probeConnection);
-
-		if (cachedVersion.isEmpty())
-			cachedVersion = QStringLiteral("unknown");
-
+		static std::once_flag initFlag;
+		static QString        cachedVersion;
+		std::call_once(initFlag,
+		               []
+		               {
+			               const QString probeConnection =
+			                   uniqueSqlConnectionName(QStringLiteral("lua_sqlite_probe"));
+			               {
+				               QSqlDatabase probe =
+				                   QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), probeConnection);
+				               probe.setDatabaseName(QStringLiteral(":memory:"));
+				               if (probe.open())
+				               {
+					               if (QSqlQuery query(probe);
+					                   query.exec(QStringLiteral("SELECT sqlite_version()")) && query.next())
+						               cachedVersion = query.value(0).toString();
+					               probe.close();
+				               }
+			               }
+			               QSqlDatabase::removeDatabase(probeConnection);
+			               if (cachedVersion.isEmpty())
+				               cachedVersion = QStringLiteral("unknown");
+		               });
 		return cachedVersion;
 	}
 
@@ -622,12 +680,24 @@ namespace
 			db->db.close();
 			db->open = false;
 		}
+		const QString connectionName = db->connectionName;
+		db->connectionName.clear();
 		db->db = QSqlDatabase();
-		QSqlDatabase::removeDatabase(db->connectionName);
+		if (!connectionName.isEmpty())
+			QSqlDatabase::removeDatabase(connectionName);
 		db->lastErrCode = SQLITE_OK;
 		db->lastErrMsg.clear();
 		lua_pushnumber(L, SQLITE_OK);
 		return 1;
+	}
+
+	int dbGc(lua_State *L)
+	{
+		LuaSqliteDb *db = checkdb(L);
+		lua_settop(L, 1);
+		static_cast<void>(dbClose(L));
+		db->~LuaSqliteDb();
+		return 0;
 	}
 
 	int dbToString(lua_State *L)
@@ -659,6 +729,12 @@ namespace
 		stmt->ownerState = nullptr;
 		lua_pushnumber(L, SQLITE_OK);
 		return 1;
+	}
+
+	int stmtGc(lua_State *L)
+	{
+		destroyStatement(checkstmt(L));
+		return 0;
 	}
 
 	int stmtReset(lua_State *L)
@@ -1167,23 +1243,13 @@ namespace
 
 	int iterGc(lua_State *L)
 	{
-		if (auto *iter = static_cast<LuaSqliteIter *>(lua_touserdata(L, 1)); iter)
-		{
-			invalidateIterator(iter);
-			releaseDbRef(iter->ownerState, iter->dbRef);
-			iter->ownerState = nullptr;
-		}
+		destroyIterator(static_cast<LuaSqliteIter *>(lua_touserdata(L, 1)));
 		return 0;
 	}
 
 	int stmtIterGc(lua_State *L)
 	{
-		if (auto *iter = static_cast<LuaSqliteStmtIter *>(lua_touserdata(L, 1)); iter)
-		{
-			releaseDbRef(iter->ownerState, iter->stmtRef);
-			iter->ownerState = nullptr;
-			iter->stmt       = nullptr;
-		}
+		destroyStatementIterator(static_cast<LuaSqliteStmtIter *>(lua_touserdata(L, 1)));
 		return 0;
 	}
 
@@ -1206,13 +1272,13 @@ namespace
 			{
 				setDbStatusFromError(iter->db, iter->query.lastError());
 				const QByteArray msg = iter->query.lastError().text().toUtf8();
+				releaseIterator(iter);
 				lua_pushlstring(L, msg.constData(), msg.size());
 				lua_error(L);
 				return 0;
 			}
 			setDbStatus(iter->db, SQLITE_OK, QString());
-			iter->active = false;
-			iter->query.finish();
+			releaseIterator(iter);
 			return 0;
 		}
 		const QSqlRecord record = iter->query.record();
@@ -1265,10 +1331,12 @@ namespace
 			{
 				setDbStatusFromError(iter->stmt->db, iter->stmt->query.lastError());
 				const QByteArray msg = iter->stmt->query.lastError().text().toUtf8();
+				releaseStatementIterator(iter);
 				lua_pushlstring(L, msg.constData(), msg.size());
 				lua_error(L);
 				return 0;
 			}
+			releaseStatementIterator(iter);
 			return 0;
 		}
 		iter->stmt->columns = iter->stmt->query.record().count();
@@ -1324,9 +1392,7 @@ namespace
 		{
 			setDbStatusFromError(db, iter->query.lastError());
 			const QByteArray msg = iter->query.lastError().text().toUtf8();
-			invalidateIterator(iter);
-			releaseDbRef(iter->ownerState, iter->dbRef);
-			iter->ownerState = nullptr;
+			destroyIterator(iter);
 			lua_pop(L, 1);
 			lua_pushlstring(L, msg.constData(), msg.size());
 			lua_error(L);
@@ -1451,7 +1517,7 @@ namespace
 						lua_rawseti(L, -2, i + 1);
 					}
 
-					if (lua_pcall(L, 4, 1, 0) == 0)
+					if (QMudLuaSupport::callLuaProtected(L, 4, 1, 0) == 0)
 					{
 						if (lua_isnumber(L, -1) && lua_tonumber(L, -1) != 0)
 						{
@@ -1509,6 +1575,8 @@ namespace
 		if (!stmt->query.prepare(QString::fromUtf8(sql)))
 		{
 			setDbStatusFromError(db, stmt->query.lastError());
+			stmt->query = QSqlQuery();
+			stmt->~LuaSqliteStmt();
 			lua_pop(L, 1);
 			lua_pushnil(L);
 			lua_pushnumber(L, db->lastErrCode);
@@ -1672,10 +1740,9 @@ namespace
 
 	int luaSqliteDoOpen(lua_State *L, const QString &filename)
 	{
-		static int connectionCounter = 0;
-		auto      *db                = static_cast<LuaSqliteDb *>(lua_newuserdata(L, sizeof(LuaSqliteDb)));
+		auto *db = static_cast<LuaSqliteDb *>(lua_newuserdata(L, sizeof(LuaSqliteDb)));
 		new (db) LuaSqliteDb;
-		db->connectionName = QStringLiteral("lua_sqlite_%1").arg(++connectionCounter);
+		db->connectionName = uniqueSqlConnectionName(QStringLiteral("lua_sqlite"));
 		db->db             = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), db->connectionName);
 		db->db.setDatabaseName(filename);
 		if (!db->db.open())
@@ -1684,6 +1751,7 @@ namespace
 			const QByteArray msg = db->db.lastError().text().toUtf8();
 			db->db               = QSqlDatabase();
 			QSqlDatabase::removeDatabase(db->connectionName);
+			db->~LuaSqliteDb();
 			lua_pop(L, 1);
 			lua_pushnil(L);
 			lua_pushnumber(L, rc);
@@ -1700,6 +1768,7 @@ namespace
 				db->db.close();
 				db->db = QSqlDatabase();
 				QSqlDatabase::removeDatabase(db->connectionName);
+				db->~LuaSqliteDb();
 				lua_pop(L, 1);
 				lua_pushnil(L);
 				lua_pushnumber(L, rc);
@@ -1757,7 +1826,7 @@ extern "C" int luaopen_lsqlite3(lua_State *L)
 	    {"close",             dbClose          },
 	    {"close_vm",          dbCloseVm        },
 	    {"__tostring",        dbToString       },
-	    {"__gc",              dbClose          },
+	    {"__gc",              dbGc             },
 	    {nullptr,             nullptr          }
     };
 
@@ -1791,7 +1860,7 @@ extern "C" int luaopen_lsqlite3(lua_State *L)
 	    {"inames",               stmtGetNames          },
 	    {"itypes",               stmtGetTypes          },
 	    {"__tostring",           stmtToString          },
-	    {"__gc",	             stmtFinalize          },
+	    {"__gc",	             stmtGc                },
 	    {nullptr,                nullptr               }
     };
 

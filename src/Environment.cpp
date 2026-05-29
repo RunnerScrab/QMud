@@ -15,6 +15,9 @@
 #include <QFileInfo>
 #include <QHash>
 // ReSharper disable once CppUnusedIncludeDirective
+#include <QMutexLocker>
+#include <QRecursiveMutex>
+// ReSharper disable once CppUnusedIncludeDirective
 #include <QStringList>
 
 namespace
@@ -78,6 +81,12 @@ namespace
 		return name.trimmed().toUpper();
 	}
 
+	QRecursiveMutex &configStateMutex()
+	{
+		static QRecursiveMutex mutex;
+		return mutex;
+	}
+
 	bool &configFallbackEnabledFlag()
 	{
 		static bool enabled = true;
@@ -110,6 +119,7 @@ namespace
 
 	void resetParsedConfigCache()
 	{
+		QMutexLocker<QRecursiveMutex> lock(&configStateMutex());
 		parsedConfigCache().clear();
 		parsedConfigCacheLoaded() = false;
 	}
@@ -124,6 +134,7 @@ namespace
 
 	const QHash<QString, QString> &qmudVariablesFromSystemConfig()
 	{
+		QMutexLocker<QRecursiveMutex> lock(&configStateMutex());
 		if (!parsedConfigCacheLoaded())
 		{
 			QHash<QString, QString> parsedVariables;
@@ -179,7 +190,8 @@ QString qmudEnvironmentVariable(const QString &name)
 	if (trimmedName.isEmpty())
 		return {};
 
-	const QByteArray utf8Name = trimmedName.toUtf8();
+	QMutexLocker<QRecursiveMutex> lock(&configStateMutex());
+	const QByteArray              utf8Name = trimmedName.toUtf8();
 	if (qEnvironmentVariableIsSet(utf8Name.constData()))
 	{
 		const QString environmentValue = qEnvironmentVariable(utf8Name.constData());
@@ -206,7 +218,8 @@ bool qmudEnvironmentVariableIsSet(const QString &name)
 	if (trimmedName.isEmpty())
 		return false;
 
-	const QByteArray utf8Name = trimmedName.toUtf8();
+	QMutexLocker<QRecursiveMutex> lock(&configStateMutex());
+	const QByteArray              utf8Name = trimmedName.toUtf8();
 	if (qEnvironmentVariableIsSet(utf8Name.constData()))
 		return true;
 	if (!configFallbackEnabledFlag())
@@ -224,11 +237,13 @@ bool qmudEnvironmentVariableIsEmpty(const QString &name)
 
 void qmudSetEnvironmentConfigFallbackEnabled(const bool enabled)
 {
+	QMutexLocker<QRecursiveMutex> lock(&configStateMutex());
 	configFallbackEnabledFlag() = enabled;
 }
 
 void qmudSetEnvironmentConfigSearchPathsForTesting(const QStringList &paths)
 {
+	QMutexLocker<QRecursiveMutex> lock(&configStateMutex());
 	configSearchPathsOverrideEnabledFlag() = true;
 	configSearchPathsOverride()            = paths;
 	resetParsedConfigCache();
@@ -236,6 +251,7 @@ void qmudSetEnvironmentConfigSearchPathsForTesting(const QStringList &paths)
 
 void qmudClearEnvironmentConfigSearchPathsForTesting()
 {
+	QMutexLocker<QRecursiveMutex> lock(&configStateMutex());
 	configSearchPathsOverrideEnabledFlag() = false;
 	configSearchPathsOverride().clear();
 	resetParsedConfigCache();

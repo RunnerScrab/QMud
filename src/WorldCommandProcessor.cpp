@@ -13,7 +13,6 @@
 #include "AppController.h"
 #include "FileExtensions.h"
 #include "HyperlinkActionUtils.h"
-#include "LuaExecutor.h"
 #include "MainWindowHost.h"
 #include "MainWindowHostResolver.h"
 #include "SpeedwalkParser.h"
@@ -24,6 +23,7 @@
 #include "WorldRuleEnableUtils.h"
 #include "WorldRuntime.h"
 #include "WorldView.h"
+#include "helpers/OutputWrapUtils.h"
 #include "scripting/ScriptingErrors.h"
 
 #include <QClipboard>
@@ -37,12 +37,15 @@
 #include <QGuiApplication>
 #include <QInputDialog>
 #include <QMessageBox>
+#include <QMetaObject>
 #include <QPointer>
 #include <QRegularExpression>
+#include <QScopeGuard>
 #include <QUrl>
 #include <algorithm>
 #include <atomic>
 #include <limits>
+#include <memory>
 #ifdef HILITE
 constexpr int kStyleHilite = HILITE;
 #else
@@ -336,153 +339,6 @@ namespace
 		return {span};
 	}
 
-	bool sameStyleForWrap(const WorldRuntime::StyleSpan &a, const WorldRuntime::StyleSpan &b)
-	{
-		return a.fore == b.fore && a.back == b.back && a.bold == b.bold && a.underline == b.underline &&
-		       a.italic == b.italic && a.blink == b.blink && a.strike == b.strike && a.inverse == b.inverse &&
-		       a.changed == b.changed && a.actionType == b.actionType && a.action == b.action &&
-		       a.hint == b.hint && a.variable == b.variable && a.startTag == b.startTag;
-	}
-
-	void wrapStyledLineForColumn(QString &text, QVector<WorldRuntime::StyleSpan> &spans, const int wrapColumn,
-	                             const bool indentParas)
-	{
-		if (wrapColumn <= 0 || text.isEmpty())
-			return;
-
-		QVector<WorldRuntime::StyleSpan> expandedStyles;
-		expandedStyles.reserve(text.size());
-		WorldRuntime::StyleSpan lastStyle;
-		int                     covered = 0;
-		for (const WorldRuntime::StyleSpan &span : spans)
-		{
-			lastStyle     = span;
-			const int len = qMax(0, span.length);
-			for (int i = 0; i < len && covered < text.size(); ++i, ++covered)
-				expandedStyles.push_back(span);
-			if (covered >= text.size())
-				break;
-		}
-		while (expandedStyles.size() < text.size())
-			expandedStyles.push_back(lastStyle);
-
-		QString wrappedText;
-		wrappedText.reserve(safeQSizeToInt(text.size() + text.size() / qMax(1, wrapColumn)));
-		QVector<WorldRuntime::StyleSpan> wrappedStyles;
-		wrappedStyles.reserve(
-		    safeQSizeToInt(expandedStyles.size() + expandedStyles.size() / qMax(1, wrapColumn)));
-
-		int  column             = 0;
-		int  lineStart          = 0;
-		int  lastSpace          = -1;
-		bool lineHasVisibleChar = false;
-
-		auto recomputeLineState = [&]
-		{
-			column             = 0;
-			lineStart          = 0;
-			lastSpace          = -1;
-			lineHasVisibleChar = false;
-			for (int i = safeQSizeToInt(wrappedText.size()) - 1; i >= 0; --i)
-			{
-				if (wrappedText.at(i) == QLatin1Char('\n'))
-				{
-					lineStart = i + 1;
-					break;
-				}
-			}
-			for (int i = lineStart, size = safeQSizeToInt(wrappedText.size()); i < size; ++i)
-			{
-				const QChar ch = wrappedText.at(i);
-				if (ch == QLatin1Char('\n'))
-				{
-					lineStart          = i + 1;
-					column             = 0;
-					lastSpace          = -1;
-					lineHasVisibleChar = false;
-					continue;
-				}
-				if (ch == QLatin1Char(' '))
-					lastSpace = i;
-				if (!ch.isSpace())
-					lineHasVisibleChar = true;
-				++column;
-			}
-		};
-
-		for (int i = 0; i < text.size(); ++i)
-		{
-			const QChar                   ch    = text.at(i);
-			const WorldRuntime::StyleSpan style = expandedStyles.value(i);
-			wrappedText.append(ch);
-			wrappedStyles.push_back(style);
-
-			if (ch == QLatin1Char('\n'))
-			{
-				column             = 0;
-				lineStart          = safeQSizeToInt(wrappedText.size());
-				lastSpace          = -1;
-				lineHasVisibleChar = false;
-				continue;
-			}
-
-			if (ch == QLatin1Char(' '))
-				lastSpace = safeQSizeToInt(wrappedText.size()) - 1;
-			if (!ch.isSpace())
-				lineHasVisibleChar = true;
-
-			++column;
-			if (column < wrapColumn)
-				continue;
-
-			if (!lineHasVisibleChar)
-				continue;
-
-			int insertPos = safeQSizeToInt(wrappedText.size());
-			if (lastSpace >= lineStart)
-			{
-				insertPos = indentParas ? lastSpace : lastSpace + 1;
-
-				// If this wrap point would emit only leading padding, avoid creating
-				// blank-looking lines from server-side wide-table indentation.
-				bool onlyWhitespace = true;
-				for (int j = lineStart, size = safeQSizeToInt(wrappedText.size()); j < insertPos && j < size;
-				     ++j)
-				{
-					if (!wrappedText.at(j).isSpace())
-					{
-						onlyWhitespace = false;
-						break;
-					}
-				}
-				if (onlyWhitespace)
-					insertPos = safeQSizeToInt(wrappedText.size());
-			}
-
-			const WorldRuntime::StyleSpan newlineStyle = insertPos > 0 && insertPos - 1 < wrappedStyles.size()
-			                                                 ? wrappedStyles.at(insertPos - 1)
-			                                                 : style;
-			wrappedText.insert(insertPos, QLatin1Char('\n'));
-			wrappedStyles.insert(insertPos, newlineStyle);
-			recomputeLineState();
-		}
-
-		QVector<WorldRuntime::StyleSpan> rebuilt;
-		rebuilt.reserve(wrappedStyles.size());
-		for (const WorldRuntime::StyleSpan &oneStyle : wrappedStyles)
-		{
-			WorldRuntime::StyleSpan span = oneStyle;
-			span.length                  = 1;
-			if (!rebuilt.isEmpty() && sameStyleForWrap(rebuilt.last(), span))
-				rebuilt.last().length++;
-			else
-				rebuilt.push_back(span);
-		}
-
-		text  = wrappedText;
-		spans = rebuilt;
-	}
-
 	void applyStyleToSpans(QVector<WorldRuntime::StyleSpan> &spans, const int start, const int end,
 	                       const QColor &newFore, const QColor &newBack, const bool changeFore,
 	                       const bool changeBack, const bool makeBold, const bool makeItalic,
@@ -601,20 +457,6 @@ namespace
 		return signature;
 	}
 
-	quint64 triggerOrderSignature(const QList<WorldRuntime::Trigger> &triggers)
-	{
-		quint64 signature = 0x42f0b4a1d2c3e5f7ULL;
-		mixSignature(signature, static_cast<quint64>(triggers.size()));
-		for (const WorldRuntime::Trigger &trigger : triggers)
-		{
-			bool      ok       = false;
-			const int sequence = trigger.attributes.value(QStringLiteral("sequence")).toInt(&ok);
-			mixSignature(signature, static_cast<quint64>(ok ? sequence : 0));
-			mixSignature(signature, qHash(trigger.attributes.value(QStringLiteral("match"))));
-		}
-		return signature;
-	}
-
 	quint64 pluginOrderSignature(const QList<WorldRuntime::Plugin> &plugins)
 	{
 		quint64 signature = 0xc3d2e1f0a5b49786ULL;
@@ -625,6 +467,36 @@ namespace
 			mixSignature(signature, qHash(plugin.attributes.value(QStringLiteral("id"))));
 		}
 		return signature;
+	}
+
+	quint64 paletteSignature(const QMap<QString, QString> &attrs, const QList<WorldRuntime::Colour> &colours)
+	{
+		quint64    signature = 0x6b8f1d2c4a709e35ULL;
+		const auto mixAttr   = [&](const QString &key) { mixSignature(signature, qHash(attrs.value(key))); };
+		mixAttr(QStringLiteral("custom_16_is_default_colour"));
+		mixAttr(QStringLiteral("output_text_colour"));
+		mixAttr(QStringLiteral("output_background_colour"));
+		mixSignature(signature, static_cast<quint64>(colours.size()));
+		for (const WorldRuntime::Colour &colour : colours)
+		{
+			mixSignature(signature, qHash(colour.group));
+			mixSignature(signature, qHash(colour.attributes.value(QStringLiteral("seq"))));
+			mixSignature(signature, qHash(colour.attributes.value(QStringLiteral("rgb"))));
+			mixSignature(signature, qHash(colour.attributes.value(QStringLiteral("text"))));
+			mixSignature(signature, qHash(colour.attributes.value(QStringLiteral("back"))));
+		}
+		return signature;
+	}
+
+	int triggerColourFromCustom(const int customColour)
+	{
+		if (customColour <= 0)
+			return -1;
+		if (customColour == OTHER_CUSTOM + 1)
+			return OTHER_CUSTOM;
+		if (customColour > OTHER_CUSTOM + 1)
+			return -1;
+		return customColour - 1;
 	}
 
 	bool pluginHasValidId(const WorldRuntime::Plugin &plugin)
@@ -1015,10 +887,12 @@ QString WorldCommandProcessor::fixHtmlString(const QString &source)
 
 WorldCommandProcessor::WorldCommandProcessor(QObject *parent) : QObject(parent)
 {
+	connect(this, &WorldCommandProcessor::sendToScriptRequested, this,
+	        &WorldCommandProcessor::dispatchScriptSend, Qt::DirectConnection);
 }
 
 bool WorldCommandProcessor::canExecuteWorldScript(const QString &functionType, const QString &functionName,
-                                                  LuaCallbackEngine *lua, const bool requireFunction) const
+                                                  const LuaCallbackEngine *lua) const
 {
 	if (!m_runtime)
 		return false;
@@ -1042,32 +916,32 @@ bool WorldCommandProcessor::canExecuteWorldScript(const QString &functionType, c
 		return false;
 	}
 
-	const ILuaExecutor *executor = m_runtime ? m_runtime->luaExecutor() : nullptr;
-	const bool          hasFunction =
-        executor ? executor->hasFunction(lua, functionName) : lua->hasFunction(functionName);
-	if (requireFunction && !hasFunction)
-	{
-		if (warn)
-		{
-			m_runtime->outputText(QStringLiteral("%1 function \"%2\" not found or had a previous error.")
-			                          .arg(functionType, functionName),
-			                      true, true);
-		}
-		return false;
-	}
-
 	return true;
+}
+
+void WorldCommandProcessor::warnMissingWorldScriptFunction(const QString &functionType,
+                                                           const QString &functionName) const
+{
+	if (!m_runtime)
+		return;
+	const QMap<QString, QString> &attrs = m_runtime->worldAttributes();
+	if (!isEnabledValue(attrs.value(QStringLiteral("warn_if_scripting_inactive"))))
+		return;
+	m_runtime->outputText(QStringLiteral("%1 function \"%2\" not found or had a previous error.")
+	                          .arg(functionType, functionName),
+	                      true, true);
 }
 
 void WorldCommandProcessor::setRuntime(WorldRuntime *runtime)
 {
 	m_runtime = runtime;
-	m_triggerOrderCache.clear();
+	invalidateTriggerEvaluationCache();
 	m_aliasOrderCache.clear();
 	m_pluginOrderCache = PluginOrderCacheEntry();
 	m_regexCache.clear();
 	m_wildcardRegexCache.clear();
 	m_invalidRegexWarnings.clear();
+	m_paletteCacheValid = false;
 	if (!m_runtime)
 	{
 		if (m_timerCheck)
@@ -1094,12 +968,12 @@ void WorldCommandProcessor::setRuntime(WorldRuntime *runtime)
 	const QString noTranslateIac        = attrs.value(QStringLiteral("do_not_translate_iac_to_iac_iac"));
 	m_doNotTranslateIac                 = isEnabledValue(noTranslateIac);
 	const QString matchEmpty            = attrs.value(QStringLiteral("regexp_match_empty"));
-	m_regexpMatchEmpty                  = !(matchEmpty == QStringLiteral("0") ||
-                           matchEmpty.compare(QStringLiteral("n"), Qt::CaseInsensitive) == 0 ||
-                           matchEmpty.compare(QStringLiteral("no"), Qt::CaseInsensitive) == 0 ||
-                           matchEmpty.compare(QStringLiteral("false"), Qt::CaseInsensitive) == 0);
-	const QString utf8                  = attrs.value(QStringLiteral("utf_8"));
-	m_utf8                              = isEnabledValue(utf8);
+	m_regexpMatchEmpty = !(matchEmpty == QStringLiteral("0") ||
+	                       matchEmpty.compare(QStringLiteral("n"), Qt::CaseInsensitive) == 0 ||
+	                       matchEmpty.compare(QStringLiteral("no"), Qt::CaseInsensitive) == 0 ||
+	                       matchEmpty.compare(QStringLiteral("false"), Qt::CaseInsensitive) == 0);
+	const QString utf8 = attrs.value(QStringLiteral("utf_8"));
+	m_utf8             = isEnabledValue(utf8);
 
 	if (m_speedWalkDelay <= 0 && !m_queuedCommands.isEmpty())
 		processQueuedCommands(true);
@@ -1146,6 +1020,133 @@ const QVector<int> &WorldCommandProcessor::sortedPluginIndices()
 
 	m_pluginOrderCache = rebuilt;
 	return m_pluginOrderCache.indices;
+}
+
+const WorldCommandProcessor::TriggerEvaluationCacheEntry &
+WorldCommandProcessor::decodedTriggerEvaluationCache(const QList<WorldRuntime::Trigger> &triggers)
+{
+	static const TriggerEvaluationCacheEntry kEmpty;
+	if (!m_runtime)
+		return kEmpty;
+
+	const quint64 generation = m_runtime->triggerRuleGeneration();
+	if (m_triggerEvaluationCacheGeneration != generation)
+	{
+		m_triggerEvaluationCache.clear();
+		m_triggerEvaluationCacheGeneration = generation;
+	}
+
+	const auto cacheKey = reinterpret_cast<quintptr>(&triggers);
+	const int  count    = safeQSizeToInt(triggers.size());
+	if (auto cacheIt = m_triggerEvaluationCache.constFind(cacheKey);
+	    cacheIt != m_triggerEvaluationCache.constEnd() && cacheIt->generation == generation &&
+	    cacheIt->count == count)
+	{
+		return cacheIt.value();
+	}
+
+	TriggerEvaluationCacheEntry rebuilt;
+	rebuilt.generation = generation;
+	rebuilt.count      = count;
+	rebuilt.triggers.reserve(count);
+	for (int i = 0; i < count; ++i)
+	{
+		const WorldRuntime::Trigger  &trigger = triggers.at(i);
+		const QMap<QString, QString> &attrs   = trigger.attributes;
+
+		DecodedTrigger                decoded;
+		decoded.index            = i;
+		decoded.matchText        = attrs.value(QStringLiteral("match"));
+		decoded.sendText         = trigger.children.value(QStringLiteral("send"));
+		decoded.sequence         = attrs.value(QStringLiteral("sequence")).toInt();
+		decoded.enabled          = isEnabledValue(attrs.value(QStringLiteral("enabled")));
+		decoded.isRegexp         = isEnabledValue(attrs.value(QStringLiteral("regexp")));
+		decoded.ignoreCase       = isEnabledValue(attrs.value(QStringLiteral("ignore_case")));
+		decoded.multiLine        = isEnabledValue(attrs.value(QStringLiteral("multi_line")));
+		decoded.linesToMatch     = attrs.value(QStringLiteral("lines_to_match")).toInt();
+		decoded.expandVariables  = isEnabledValue(attrs.value(QStringLiteral("expand_variables")));
+		decoded.sendToValue      = attrs.value(QStringLiteral("send_to")).toInt();
+		decoded.matchTextColour  = isEnabledValue(attrs.value(QStringLiteral("match_text_colour")));
+		decoded.matchBack        = isEnabledValue(attrs.value(QStringLiteral("match_back_colour")));
+		decoded.matchBold        = isEnabledValue(attrs.value(QStringLiteral("match_bold")));
+		decoded.matchItalic      = isEnabledValue(attrs.value(QStringLiteral("match_italic")));
+		decoded.matchUnderline   = isEnabledValue(attrs.value(QStringLiteral("match_underline")));
+		decoded.matchInverse     = isEnabledValue(attrs.value(QStringLiteral("match_inverse")));
+		decoded.textColour       = attrs.value(QStringLiteral("text_colour")).toInt();
+		decoded.backColour       = attrs.value(QStringLiteral("back_colour")).toInt();
+		decoded.desiredBold      = isEnabledValue(attrs.value(QStringLiteral("bold")));
+		decoded.desiredItalic    = isEnabledValue(attrs.value(QStringLiteral("italic")));
+		decoded.desiredUnderline = isEnabledValue(attrs.value(QStringLiteral("underline")));
+		decoded.desiredInverse   = isEnabledValue(attrs.value(QStringLiteral("inverse")));
+		decoded.sound            = attrs.value(QStringLiteral("sound")).trimmed();
+		decoded.oneShot          = isEnabledValue(attrs.value(QStringLiteral("one_shot")));
+		decoded.label            = attrs.value(QStringLiteral("name")).trimmed();
+		decoded.scriptLabel      = decoded.label.isEmpty() ? decoded.matchText.trimmed() : decoded.label;
+		decoded.lowerWildcards   = isEnabledValue(attrs.value(QStringLiteral("lowercase_wildcard")));
+		decoded.omitFromLog      = isEnabledValue(attrs.value(QStringLiteral("omit_from_log")));
+		decoded.omitFromOutput   = isEnabledValue(attrs.value(QStringLiteral("omit_from_output")));
+		decoded.variableName     = attrs.value(QStringLiteral("variable"));
+		decoded.scriptName       = attrs.value(QStringLiteral("script"));
+		decoded.colourChange  = triggerColourFromCustom(attrs.value(QStringLiteral("custom_colour")).toInt());
+		decoded.makeBold      = isEnabledValue(attrs.value(QStringLiteral("make_bold")));
+		decoded.makeItalic    = isEnabledValue(attrs.value(QStringLiteral("make_italic")));
+		decoded.makeUnderline = isEnabledValue(attrs.value(QStringLiteral("make_underline")));
+		decoded.changeType    = attrs.value(QStringLiteral("colour_change_type")).toInt();
+		decoded.repeatMatches = decoded.isRegexp && isEnabledValue(attrs.value(QStringLiteral("repeat")));
+		decoded.keepEvaluating  = isEnabledValue(attrs.value(QStringLiteral("keep_evaluating")));
+		decoded.otherTextColour = attrs.value(QStringLiteral("other_text_colour"));
+		decoded.otherBackColour = attrs.value(QStringLiteral("other_back_colour"));
+		decoded.clipboardArg    = attrs.value(QStringLiteral("clipboard_arg")).toInt();
+		rebuilt.triggers.push_back(decoded);
+	}
+
+	std::ranges::stable_sort(rebuilt.triggers,
+	                         [](const DecodedTrigger &left, const DecodedTrigger &right)
+	                         {
+		                         if (left.sequence != right.sequence)
+			                         return left.sequence < right.sequence;
+		                         return left.matchText < right.matchText;
+	                         });
+
+	if (m_triggerEvaluationCache.size() > 2048)
+		m_triggerEvaluationCache.clear();
+	m_triggerEvaluationCache.insert(cacheKey, rebuilt);
+	return m_triggerEvaluationCache[cacheKey];
+}
+
+void WorldCommandProcessor::invalidateTriggerEvaluationCache()
+{
+	m_triggerEvaluationCache.clear();
+	m_triggerEvaluationCacheGeneration = 0;
+}
+
+void WorldCommandProcessor::ensurePaletteCache(const QMap<QString, QString> &attrs) const
+{
+	if (!m_runtime)
+		return;
+
+	const quint64 signature = paletteSignature(attrs, m_runtime->colours());
+	if (m_paletteCacheValid && m_paletteCacheSignature == signature)
+		return;
+
+	const AnsiPalette palette = buildPalette(m_runtime);
+	m_paletteCacheNormal      = palette.normal;
+	m_paletteCacheBold        = palette.bold;
+	m_paletteCacheCustomText  = palette.customText;
+	m_paletteCacheCustomBack  = palette.customBack;
+
+	const bool custom16Default = isEnabledValue(attrs.value(QStringLiteral("custom_16_is_default_colour")));
+	m_paletteCacheDefaultFore  = parseColorValue(attrs.value(QStringLiteral("output_text_colour")));
+	m_paletteCacheDefaultBack  = parseColorValue(attrs.value(QStringLiteral("output_background_colour")));
+	if (!m_paletteCacheDefaultFore.isValid())
+		m_paletteCacheDefaultFore =
+		    custom16Default ? m_paletteCacheCustomText.value(15) : m_paletteCacheNormal.value(7);
+	if (!m_paletteCacheDefaultBack.isValid())
+		m_paletteCacheDefaultBack =
+		    custom16Default ? m_paletteCacheCustomBack.value(15) : m_paletteCacheNormal.value(0);
+
+	m_paletteCacheSignature = signature;
+	m_paletteCacheValid     = true;
 }
 
 void WorldCommandProcessor::setView(WorldView *view)
@@ -1273,14 +1274,9 @@ void WorldCommandProcessor::onIncomingStyledLineReceived(const QString          
 	{
 		if (defaultColorsLoaded || !m_runtime || !attrs)
 			return;
-		const AnsiPalette palette  = buildPalette(m_runtime);
-		const bool custom16Default = isEnabled(attrs->value(QStringLiteral("custom_16_is_default_colour")));
-		defaultFore                = parseColorValue(attrs->value(QStringLiteral("output_text_colour")));
-		defaultBack = parseColorValue(attrs->value(QStringLiteral("output_background_colour")));
-		if (!defaultFore.isValid())
-			defaultFore = custom16Default ? palette.customText.value(15) : palette.normal.value(7);
-		if (!defaultBack.isValid())
-			defaultBack = custom16Default ? palette.customBack.value(15) : palette.normal.value(0);
+		ensurePaletteCache(*attrs);
+		defaultFore         = m_paletteCacheDefaultFore;
+		defaultBack         = m_paletteCacheDefaultBack;
 		defaultColorsLoaded = true;
 	};
 	if (m_runtime)
@@ -1322,7 +1318,18 @@ void WorldCommandProcessor::onIncomingStyledLineReceived(const QString          
 		logOutput = isEnabled(m_runtime->worldAttributes().value(QStringLiteral("log_output")));
 
 	if (m_runtime)
+		m_runtime->beginOutputViewMutationBatch();
+	[[maybe_unused]] const auto flushOutputViewMutations = qScopeGuard(
+	    [this]
+	    {
+		    if (m_runtime)
+			    m_runtime->endOutputViewMutationBatch();
+	    });
+
+	if (m_runtime)
 		m_runtime->beginIncomingLineLuaContext(line, WorldRuntime::LineOutput, normalizedSpans, true);
+	if (m_runtime)
+		m_runtime->reserveIncomingLineLuaContextInBuffer();
 
 	if (m_runtime)
 		m_runtime->setCurrentActionSource(WorldRuntime::eInputFromServer);
@@ -1351,17 +1358,36 @@ void WorldCommandProcessor::onIncomingStyledLineReceived(const QString          
 			{
 				loadDefaultColors();
 				displaySpans = ensureSpansForLine(displayLine, displaySpans, defaultFore, defaultBack);
-				wrapStyledLineForColumn(displayLine, displaySpans, wrapColumn, indentParas);
+				QMudOutputWrapUtils::wrapStyledLineForColumn(displayLine, displaySpans, wrapColumn,
+				                                             indentParas);
 			}
-			if (displaySpans.isEmpty())
+			const bool updatedRuntimeLine =
+			    m_runtime && m_runtime->updateBufferedIncomingLineLuaContext(
+			                     displayLine, WorldRuntime::LineOutput, displaySpans, true);
+			if (!updatedRuntimeLine && displaySpans.isEmpty())
 				m_view->appendOutputText(displayLine);
-			else
+			else if (!updatedRuntimeLine)
 				m_view->appendOutputTextStyled(displayLine, displaySpans);
 			if (m_runtime)
 			{
 				m_runtime->markIncomingLineLuaContextBuffered();
 				m_runtime->firePluginScreendraw(0, logOutput && !triggerResult.omitFromLog ? 1 : 0, line);
 			}
+		}
+		else
+		{
+			const bool hasReplacementOutput =
+			    std::ranges::any_of(triggerResult.deferredScripts, [](const DeferredScript &script)
+			                        { return script.replaceMatchedLineOutput; }) ||
+			    std::ranges::any_of(triggerResult.triggerScripts, [](const TriggerScript &script)
+			                        { return script.replaceMatchedLineOutput; });
+			if (hasReplacementOutput)
+			{
+				if (m_runtime)
+					static_cast<void>(m_runtime->hideBufferedIncomingLineLuaContextForReplacement());
+			}
+			else if (m_runtime)
+				static_cast<void>(m_runtime->removeBufferedIncomingLineLuaContext());
 		}
 	}
 
@@ -1383,77 +1409,75 @@ void WorldCommandProcessor::onIncomingStyledLineReceived(const QString          
 		}
 	}
 
-	QVector<LuaStyleRun> styleRuns;
+	QVector<LuaStyleRun>                       styleRuns;
+	QSharedPointer<const QVector<LuaStyleRun>> styleRunsShared;
 	if (m_runtime && (!triggerResult.deferredScripts.isEmpty() || !triggerResult.triggerScripts.isEmpty()))
 	{
 		loadDefaultColors();
-		styleRuns = buildStyleRuns(line, triggerResult.spans, defaultFore, defaultBack);
+		styleRuns       = buildStyleRuns(line, triggerResult.spans, defaultFore, defaultBack);
+		styleRunsShared = QSharedPointer<QVector<LuaStyleRun>>::create(styleRuns);
 	}
+	const int    triggerMatchedLineBufferIndex = m_runtime ? m_runtime->luaContextLinesInBufferCount() : 0;
+	const qint64 triggerMatchedLineAbsoluteNumber =
+	    m_runtime ? m_runtime->incomingLineLuaContextAbsoluteNumber() : 0;
 
-	for (const auto &[pluginId, scriptText, description] : triggerResult.deferredScripts)
+	for (const auto &[pluginId, scriptText, description, replaceMatchedLineOutput] :
+	     triggerResult.deferredScripts)
 	{
-		WorldRuntime::Plugin *plugin = resolveCapturedPlugin(m_runtime, pluginId);
-		LuaCallbackEngine    *lua =
-            plugin ? plugin->lua.data() : (m_runtime ? m_runtime->luaCallbacks() : nullptr);
-		if (!plugin && !canExecuteWorldScript(QStringLiteral("Script"), description, lua, false))
-			continue;
-		if (!lua)
-			continue;
 		QPointer<WorldRuntime> executionRuntime = m_runtime;
 		if (executionRuntime)
 			executionRuntime->setCurrentActionSource(WorldRuntime::eTriggerFired);
-		const ILuaExecutor *executor = executionRuntime ? executionRuntime->luaExecutor() : nullptr;
-		QMudScriptErrorRouting::executeWithWorldErrorRouting(
-		    executionRuntime != nullptr, plugin != nullptr,
-		    [&]
-		    {
-			    if (executor)
-				    executor->executeScript(lua, scriptText, description, &styleRuns);
-			    else
-				    lua->executeScript(scriptText, description, &styleRuns);
-		    },
-		    [executionRuntime]
-		    {
-			    if (executionRuntime)
-				    executionRuntime->pushForceScriptErrorOutputToWorld();
-		    },
-		    [executionRuntime]
-		    {
-			    if (executionRuntime)
-				    executionRuntime->popForceScriptErrorOutputToWorld();
-		    });
+		emit sendToScriptRequested(pluginId, scriptText, description, &styleRuns, true,
+		                           replaceMatchedLineOutput, triggerMatchedLineBufferIndex,
+		                           triggerMatchedLineAbsoluteNumber);
 		if (executionRuntime)
 			executionRuntime->setCurrentActionSource(WorldRuntime::eUnknownActionSource);
 	}
 
-	for (const auto &[runtimeId, pluginId, label, scriptName, scriptLine, wildcards, namedWildcards] :
-	     triggerResult.triggerScripts)
+	QHash<QString, bool> worldTriggerFunctionPresenceCache;
+	for (const auto &[runtimeId, pluginId, label, scriptName, scriptLine, wildcards, namedWildcards,
+	                  replaceMatchedLineOutput] : triggerResult.triggerScripts)
 	{
 		if (scriptName.isEmpty())
 			continue;
 		WorldRuntime::Trigger *trigger = resolveTriggerByRuntimeId(m_runtime, runtimeId);
 		if (!trigger)
 			continue;
-		WorldRuntime::Plugin *plugin = resolveCapturedPlugin(m_runtime, pluginId);
-		LuaCallbackEngine    *lua =
-            plugin ? plugin->lua.data() : (m_runtime ? m_runtime->luaCallbacks() : nullptr);
-		if (!plugin && !canExecuteWorldScript(QStringLiteral("Trigger"), scriptName, lua, true))
+		WorldRuntime::Plugin             *plugin = resolveCapturedPlugin(m_runtime, pluginId);
+		QSharedPointer<LuaCallbackEngine> luaRef = plugin ? plugin->lua : QSharedPointer<LuaCallbackEngine>{};
+		LuaCallbackEngine *lua = luaRef ? luaRef.data() : (m_runtime ? m_runtime->luaCallbacks() : nullptr);
+		if (!plugin)
+		{
+			if (const auto it = worldTriggerFunctionPresenceCache.constFind(scriptName);
+			    it != worldTriggerFunctionPresenceCache.constEnd() && !it.value())
+			{
+				warnMissingWorldScriptFunction(QStringLiteral("Trigger"), scriptName);
+				continue;
+			}
+		}
+		if (!plugin && !canExecuteWorldScript(QStringLiteral("Trigger"), scriptName, lua))
 			continue;
 		if (!lua)
 			continue;
+		if (!m_runtime)
+			continue;
+		const QSharedPointer<LuaCallbackEngine> dispatchLua =
+		    luaRef ? luaRef : QSharedPointer<LuaCallbackEngine>(lua, [](LuaCallbackEngine * /*unused*/) {});
 		TriggerExecutionScope executionScope(m_runtime, trigger, true);
-		const ILuaExecutor   *executor = m_runtime ? m_runtime->luaExecutor() : nullptr;
-		if (m_runtime)
-			m_runtime->setCurrentActionSource(WorldRuntime::eTriggerFired);
-		if (executor)
+		m_runtime->setCurrentActionSource(WorldRuntime::eTriggerFired);
+		const auto result = m_runtime->dispatchLuaStringsAndWildcards(
+		    dispatchLua, scriptName, {label, scriptLine}, wildcards, namedWildcards, styleRunsShared.data(),
+		    replaceMatchedLineOutput, triggerMatchedLineBufferIndex, triggerMatchedLineAbsoluteNumber);
+		if (!plugin && result.hasFunctionValid)
 		{
-			executor->callFunctionWithStringsAndWildcards(lua, scriptName, {label, scriptLine}, wildcards,
-			                                              namedWildcards, &styleRuns, nullptr);
-		}
-		else
-		{
-			lua->callFunctionWithStringsAndWildcards(scriptName, {label, scriptLine}, wildcards,
-			                                         namedWildcards, &styleRuns);
+			worldTriggerFunctionPresenceCache.insert(scriptName, result.hasFunction);
+			if (!result.hasFunction)
+			{
+				warnMissingWorldScriptFunction(QStringLiteral("Trigger"), scriptName);
+				if (m_runtime)
+					m_runtime->setCurrentActionSource(WorldRuntime::eUnknownActionSource);
+				continue;
+			}
 		}
 		if (m_runtime)
 			m_runtime->setCurrentActionSource(WorldRuntime::eUnknownActionSource);
@@ -1461,10 +1485,13 @@ void WorldCommandProcessor::onIncomingStyledLineReceived(const QString          
 
 	if (m_runtime && !triggerResult.oneShotTriggers.isEmpty())
 	{
+		bool removedTrigger = false;
 		for (const quint64 runtimeId : triggerResult.oneShotTriggers)
 		{
-			removeTriggerByRuntimeId(m_runtime, runtimeId);
+			removedTrigger = removeTriggerByRuntimeId(m_runtime, runtimeId) || removedTrigger;
 		}
+		if (removedTrigger)
+			m_runtime->markTriggerRulesChanged();
 	}
 
 	if (m_runtime && !triggerResult.omitFromOutput)
@@ -1489,7 +1516,42 @@ void WorldCommandProcessor::onIncomingStyledLinePartialReceived(
 {
 	if (!m_view)
 		return;
-	m_view->updatePartialOutputText(line, spans);
+
+	QString                          displayLine  = line;
+	QVector<WorldRuntime::StyleSpan> displaySpans = spans;
+	if (m_runtime && !displayLine.isEmpty())
+	{
+		const QMap<QString, QString> &attrs       = m_runtime->worldAttributes();
+		const bool                    wrapEnabled = isEnabledValue(attrs.value(QStringLiteral("wrap")));
+		const bool autoWrapWindow  = isEnabledValue(attrs.value(QStringLiteral("auto_wrap_window_width")));
+		const bool nawsNegotiated  = m_runtime->isConnected() && m_runtime->isNawsNegotiated();
+		const int  worldWrapColumn = attrs.value(QStringLiteral("wrap_column")).toInt();
+		int        wrapColumn      = worldWrapColumn;
+		if (autoWrapWindow)
+		{
+			const int calculatedColumns = m_runtime->outputWrapColumns();
+			if (worldWrapColumn > 0)
+				wrapColumn =
+				    calculatedColumns > 0 ? qMax(calculatedColumns, worldWrapColumn) : worldWrapColumn;
+			else
+				wrapColumn = calculatedColumns;
+		}
+
+		if (wrapEnabled && !nawsNegotiated && wrapColumn > 0)
+		{
+			const bool indentParas = !(attrs.value(QStringLiteral("indent_paras")) == QStringLiteral("0") ||
+			                           attrs.value(QStringLiteral("indent_paras"))
+			                                   .compare(QStringLiteral("n"), Qt::CaseInsensitive) == 0 ||
+			                           attrs.value(QStringLiteral("indent_paras"))
+			                                   .compare(QStringLiteral("false"), Qt::CaseInsensitive) == 0);
+			ensurePaletteCache(attrs);
+			displaySpans = ensureSpansForLine(displayLine, displaySpans, m_paletteCacheDefaultFore,
+			                                  m_paletteCacheDefaultBack);
+			QMudOutputWrapUtils::wrapStyledLineForColumn(displayLine, displaySpans, wrapColumn, indentParas);
+		}
+	}
+
+	m_view->updatePartialOutputText(displayLine, displaySpans);
 	if (m_runtime)
 		m_runtime->firePluginPartialLine(line);
 }
@@ -1611,8 +1673,8 @@ void WorldCommandProcessor::note(const QString &text, const bool newLine) const
 	{
 		const QString value    = m_runtime->worldAttributes().value(QStringLiteral("log_notes"));
 		const bool    logNotes = value == QStringLiteral("1") ||
-		                      value.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
-		                      value.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
+		                         value.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
+		                         value.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
 		m_runtime->firePluginScreendraw(1, logNotes ? 1 : 0, text);
 	}
 	if (m_view)
@@ -2095,31 +2157,48 @@ bool WorldCommandProcessor::evaluateCommand(const QString &input)
 		return false;
 	}
 
-	for (const auto &[runtimeId, pluginId, label, scriptName, wildcards, namedWildcards] : matchedAliases)
+	QHash<QString, bool> worldAliasFunctionPresenceCache;
+	for (const auto &[runtimeId, pluginId, label, scriptName, scriptLine, wildcards, namedWildcards] :
+	     matchedAliases)
 	{
 		if (scriptName.isEmpty())
 			continue;
 		WorldRuntime::Alias *alias = resolveAliasByRuntimeId(m_runtime, runtimeId);
 		if (!alias)
 			continue;
-		WorldRuntime::Plugin *plugin = resolveCapturedPlugin(m_runtime, pluginId);
-		LuaCallbackEngine    *lua    = plugin      ? plugin->lua.data()
-		                               : m_runtime ? m_runtime->luaCallbacks()
-		                                           : nullptr;
-		if (!plugin && !canExecuteWorldScript(QStringLiteral("Alias"), scriptName, lua, true))
+		WorldRuntime::Plugin             *plugin = resolveCapturedPlugin(m_runtime, pluginId);
+		QSharedPointer<LuaCallbackEngine> luaRef = plugin ? plugin->lua : QSharedPointer<LuaCallbackEngine>{};
+		LuaCallbackEngine *lua = luaRef ? luaRef.data() : (m_runtime ? m_runtime->luaCallbacks() : nullptr);
+		if (!plugin)
+		{
+			if (const auto it = worldAliasFunctionPresenceCache.constFind(scriptName);
+			    it != worldAliasFunctionPresenceCache.constEnd() && !it.value())
+			{
+				warnMissingWorldScriptFunction(QStringLiteral("Alias"), scriptName);
+				continue;
+			}
+		}
+		if (!plugin && !canExecuteWorldScript(QStringLiteral("Alias"), scriptName, lua))
 			continue;
 		if (lua)
 		{
 			AliasExecutionScope executionScope(m_runtime, alias, true);
-			if (const ILuaExecutor *executor = m_runtime ? m_runtime->luaExecutor() : nullptr; executor)
+			if (m_runtime)
 			{
-				executor->callFunctionWithStringsAndWildcards(lua, scriptName, {label, line}, wildcards,
-				                                              namedWildcards, nullptr, nullptr);
-			}
-			else
-			{
-				lua->callFunctionWithStringsAndWildcards(scriptName, {label, line}, wildcards, namedWildcards,
-				                                         nullptr);
+				const QSharedPointer<LuaCallbackEngine> dispatchLua =
+				    luaRef ? luaRef
+				           : QSharedPointer<LuaCallbackEngine>(lua, [](LuaCallbackEngine * /*unused*/) {});
+				const auto result = m_runtime->dispatchLuaStringsAndWildcards(
+				    dispatchLua, scriptName, {label, scriptLine}, wildcards, namedWildcards);
+				if (!plugin && result.hasFunctionValid)
+				{
+					worldAliasFunctionPresenceCache.insert(scriptName, result.hasFunction);
+					if (!result.hasFunction)
+					{
+						warnMissingWorldScriptFunction(QStringLiteral("Alias"), scriptName);
+						continue;
+					}
+				}
 			}
 		}
 	}
@@ -2770,6 +2849,7 @@ bool WorldCommandProcessor::processOneAliasSequence(const QString &currentLine, 
 		ref.pluginId       = pluginIdOf(plugin);
 		ref.label          = scriptLabel;
 		ref.scriptName     = scriptName;
+		ref.line           = currentLine;
 		ref.wildcards      = wildcards;
 		ref.namedWildcards = namedWildcards;
 		matchedAliases.push_back(ref);
@@ -2864,18 +2944,14 @@ WorldCommandProcessor::processTriggersForLine(const QString                     
 	const QVector<WorldRuntime::StyleSpan> &matchInputSpans = spans;
 	const QString trimmedTriggerLine = QMudCommandText::normalizeTriggerMatchLine(matchInputLine, false);
 
-	auto          attrTrue = [](const QString &value)
-	{
-		return value.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 || value == QStringLiteral("1") ||
-		       value.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
-	};
-
 	// Keep original incoming text for multiline trigger history.
 	m_runtime->addRecentLine(matchInputLine);
 	m_runtime->setLineOmittedFromOutput(false);
 
 	const QMap<QString, QString> &worldAttrs = m_runtime->worldAttributes();
 	const bool worldTriggersEnabled = shouldEvaluateRuleCollection(worldAttrs, WorldRuleKind::Trigger, false);
+	const bool worldTriggerSoundsEnabled =
+	    isEnabledValue(worldAttrs.value(QStringLiteral("enable_trigger_sounds")));
 
 	QElapsedTimer timer;
 	timer.start();
@@ -2883,22 +2959,15 @@ WorldCommandProcessor::processTriggersForLine(const QString                     
 	const QString language = worldAttrs.value(QStringLiteral("script_language"));
 
 	bool          paletteReady = false;
-	AnsiPalette   palette;
 	QColor        defaultFore;
 	QColor        defaultBack;
 	auto          ensurePaletteReady = [&]
 	{
 		if (paletteReady)
 			return;
-		palette = buildPalette(m_runtime);
-		const bool custom16Default =
-		    attrTrue(worldAttrs.value(QStringLiteral("custom_16_is_default_colour")));
-		defaultFore = parseColorValue(worldAttrs.value(QStringLiteral("output_text_colour")));
-		defaultBack = parseColorValue(worldAttrs.value(QStringLiteral("output_background_colour")));
-		if (!defaultFore.isValid())
-			defaultFore = custom16Default ? palette.customText.value(15) : palette.normal.value(7);
-		if (!defaultBack.isValid())
-			defaultBack = custom16Default ? palette.customBack.value(15) : palette.normal.value(0);
+		ensurePaletteCache(worldAttrs);
+		defaultFore  = m_paletteCacheDefaultFore;
+		defaultBack  = m_paletteCacheDefaultBack;
 		paletteReady = true;
 	};
 
@@ -2917,9 +2986,9 @@ WorldCommandProcessor::processTriggersForLine(const QString                     
 	auto colourIndexFor = [&](const QColor &colour) -> int
 	{
 		ensurePaletteReady();
-		for (int i = 0; i < palette.normal.size(); ++i)
+		for (int i = 0; i < m_paletteCacheNormal.size(); ++i)
 		{
-			if (colour == palette.normal.at(i) || colour == palette.bold.at(i))
+			if (colour == m_paletteCacheNormal.at(i) || colour == m_paletteCacheBold.at(i))
 				return i;
 		}
 		return -1;
@@ -2961,123 +3030,56 @@ WorldCommandProcessor::processTriggersForLine(const QString                     
 		return false;
 	};
 
-	auto triggerColourFromCustom = [](const int customColour) -> int
-	{
-		if (customColour <= 0)
-			return -1;
-		if (customColour == OTHER_CUSTOM + 1)
-			return OTHER_CUSTOM;
-		if (customColour > OTHER_CUSTOM + 1)
-			return -1;
-		return customColour - 1;
-	};
-
 	auto processSequence = [&](QList<WorldRuntime::Trigger> &triggers, WorldRuntime::Plugin *plugin)
 	{
-		const auto                    cacheKey   = reinterpret_cast<quintptr>(&triggers);
-		const quint64                 signature  = triggerOrderSignature(triggers);
-		const TriggerOrderCacheEntry *cacheEntry = nullptr;
-		const int                     count      = safeQSizeToInt(triggers.size());
-		if (auto cacheIt = m_triggerOrderCache.constFind(cacheKey);
-		    cacheIt != m_triggerOrderCache.constEnd() && cacheIt->count == count &&
-		    cacheIt->signature == signature)
-		{
-			cacheEntry = &cacheIt.value();
-		}
-		else
-		{
-			TriggerOrderCacheEntry rebuilt;
-			rebuilt.count     = count;
-			rebuilt.signature = signature;
-			rebuilt.indices.reserve(count);
-			for (int i = 0; i < count; ++i)
-			{
-				rebuilt.indices.push_back(i);
-			}
-
-			// Legacy behavior: trigger ordering is sequence, then match text.
-			std::ranges::stable_sort(
-			    rebuilt.indices,
-			    [&](const int left, const int right)
-			    {
-				    const WorldRuntime::Trigger &a = triggers.at(left);
-				    const WorldRuntime::Trigger &b = triggers.at(right);
-				    const int seqA                 = a.attributes.value(QStringLiteral("sequence")).toInt();
-				    if (const int seqB = b.attributes.value(QStringLiteral("sequence")).toInt(); seqA != seqB)
-					    return seqA < seqB;
-				    return a.attributes.value(QStringLiteral("match")) <
-				           b.attributes.value(QStringLiteral("match"));
-			    });
-
-			if (m_triggerOrderCache.size() > 2048)
-				m_triggerOrderCache.clear();
-			m_triggerOrderCache.insert(cacheKey, rebuilt);
-			cacheEntry = &m_triggerOrderCache[cacheKey];
-		}
-
-		if (!cacheEntry)
-			return;
-
-		for (int index : cacheEntry->indices)
+		const TriggerEvaluationCacheEntry &cacheEntry = decodedTriggerEvaluationCache(triggers);
+		for (const DecodedTrigger &decoded : cacheEntry.triggers)
 		{
 			if (m_runtime->stopTriggerEvaluation() != WorldRuntime::KeepEvaluating)
 				break;
 
-			WorldRuntime::Trigger &trigger = triggers[index];
-			if (!attrTrue(trigger.attributes.value(QStringLiteral("enabled"))))
+			if (decoded.index < 0 || decoded.index >= safeQSizeToInt(triggers.size()))
+				continue;
+			WorldRuntime::Trigger &trigger = triggers[decoded.index];
+			if (!decoded.enabled)
 				continue;
 
 			m_runtime->incrementTriggersEvaluated();
 			trigger.matchAttempts++;
 
-			QString matchText = trigger.attributes.value(QStringLiteral("match"));
+			QString matchText = decoded.matchText;
 			if (matchText.isEmpty())
 				continue;
 
-			const bool isRegexp   = attrTrue(trigger.attributes.value(QStringLiteral("regexp")));
-			const bool ignoreCase = attrTrue(trigger.attributes.value(QStringLiteral("ignore_case")));
-			const bool multiLine  = attrTrue(trigger.attributes.value(QStringLiteral("multi_line")));
-
-			const bool preserveTrailingWhitespace = isRegexp;
-			QString    target =
-                multiLine ? buildTarget(trigger.attributes.value(QStringLiteral("lines_to_match")).toInt(),
-			                               preserveTrailingWhitespace)
-			                 : (preserveTrailingWhitespace ? matchInputLine : trimmedTriggerLine);
+			const bool preserveTrailingWhitespace = decoded.isRegexp;
+			QString    target = decoded.multiLine
+			                        ? buildTarget(decoded.linesToMatch, preserveTrailingWhitespace)
+			                        : (preserveTrailingWhitespace ? matchInputLine : trimmedTriggerLine);
 			trigger.lastMatchTarget = target;
 
-			if (attrTrue(trigger.attributes.value(QStringLiteral("expand_variables"))) &&
-			    matchText.contains(QLatin1Char('@')))
+			if (decoded.expandVariables && matchText.contains(QLatin1Char('@')))
 			{
-				matchText =
-				    fixSendText(matchText, trigger.attributes.value(QStringLiteral("send_to")).toInt(),
-				                QStringList(), QMap<QString, QString>(), language, false, true, false, true,
-				                isRegexp, false, QString(), plugin, nullptr);
+				matchText = fixSendText(matchText, decoded.sendToValue, QStringList(),
+				                        QMap<QString, QString>(), language, false, true, false, true,
+				                        decoded.isRegexp, false, QString(), plugin, nullptr);
 			}
 
-			const QString          pattern = isRegexp ? matchText : wildcardToRegexCached(matchText);
+			const QString          pattern = decoded.isRegexp ? matchText : wildcardToRegexCached(matchText);
 			QStringList            wildcards;
 			QMap<QString, QString> namedWildcards;
 			int                    startCol = 0;
 			int                    endCol   = 0;
-			if (!regexMatch(pattern, target, ignoreCase, wildcards, namedWildcards, &startCol, &endCol, 0,
-			                multiLine))
+			if (!regexMatch(pattern, target, decoded.ignoreCase, wildcards, namedWildcards, &startCol,
+			                &endCol, 0, decoded.multiLine))
 			{
 				continue;
 			}
 
-			if (!multiLine)
+			if (!decoded.multiLine)
 			{
-				const bool matchTextColour =
-				    attrTrue(trigger.attributes.value(QStringLiteral("match_text_colour")));
-				const bool matchBack =
-				    attrTrue(trigger.attributes.value(QStringLiteral("match_back_colour")));
-				const bool matchBold   = attrTrue(trigger.attributes.value(QStringLiteral("match_bold")));
-				const bool matchItalic = attrTrue(trigger.attributes.value(QStringLiteral("match_italic")));
-				const bool matchUnderline =
-				    attrTrue(trigger.attributes.value(QStringLiteral("match_underline")));
-				const bool matchInverse = attrTrue(trigger.attributes.value(QStringLiteral("match_inverse")));
-				const bool requiresStyleState = matchTextColour || matchBack || matchBold || matchItalic ||
-				                                matchUnderline || matchInverse;
+				const bool requiresStyleState = decoded.matchTextColour || decoded.matchBack ||
+				                                decoded.matchBold || decoded.matchItalic ||
+				                                decoded.matchUnderline || decoded.matchInverse;
 
 				if (requiresStyleState)
 				{
@@ -3093,54 +3095,44 @@ WorldCommandProcessor::processTriggersForLine(const QString                     
 					if (inverse)
 						qSwap(fore, back);
 
-					if (matchTextColour)
+					if (decoded.matchTextColour)
 					{
-						if (const int expected =
-						        trigger.attributes.value(QStringLiteral("text_colour")).toInt();
-						    colourIndexFor(fore) != expected)
+						if (colourIndexFor(fore) != decoded.textColour)
 						{
 							continue;
 						}
 					}
-					if (matchBack)
+					if (decoded.matchBack)
 					{
-						if (const int expected =
-						        trigger.attributes.value(QStringLiteral("back_colour")).toInt();
-						    colourIndexFor(back) != expected)
+						if (colourIndexFor(back) != decoded.backColour)
 						{
 							continue;
 						}
 					}
-					if (matchBold)
+					if (decoded.matchBold)
 					{
-						if (const bool desired = attrTrue(trigger.attributes.value(QStringLiteral("bold")));
-						    bold != desired)
+						if (bold != decoded.desiredBold)
 						{
 							continue;
 						}
 					}
-					if (matchItalic)
+					if (decoded.matchItalic)
 					{
-						if (const bool desired = attrTrue(trigger.attributes.value(QStringLiteral("italic")));
-						    italic != desired)
+						if (italic != decoded.desiredItalic)
 						{
 							continue;
 						}
 					}
-					if (matchUnderline)
+					if (decoded.matchUnderline)
 					{
-						if (const bool desired =
-						        attrTrue(trigger.attributes.value(QStringLiteral("underline")));
-						    underline != desired)
+						if (underline != decoded.desiredUnderline)
 						{
 							continue;
 						}
 					}
-					if (matchInverse)
+					if (decoded.matchInverse)
 					{
-						if (const bool desired =
-						        attrTrue(trigger.attributes.value(QStringLiteral("inverse")));
-						    inverse != desired)
+						if (inverse != decoded.desiredInverse)
 						{
 							continue;
 						}
@@ -3151,102 +3143,73 @@ WorldCommandProcessor::processTriggersForLine(const QString                     
 			trigger.matched++;
 			trigger.lastMatched = QDateTime::currentDateTime();
 			m_runtime->incrementTriggersMatched();
-			const quint64 triggerRuntimeId    = ensureTriggerRuntimeId(m_runtime, &trigger);
-			const bool    triggerSoundEnabled = QMudTriggerSound::shouldPlayTriggerSound(
-                plugin != nullptr,
-                attrTrue(m_runtime->worldAttributes().value(QStringLiteral("enable_trigger_sounds"))));
-			if (const QString triggerSound = trigger.attributes.value(QStringLiteral("sound")).trimmed();
-			    !triggerSound.isEmpty() &&
-			    triggerSound.compare(QStringLiteral("(No sound)"), Qt::CaseInsensitive) != 0 &&
+			const quint64 triggerRuntimeId = ensureTriggerRuntimeId(m_runtime, &trigger);
+			const bool    triggerSoundEnabled =
+			    QMudTriggerSound::shouldPlayTriggerSound(plugin != nullptr, worldTriggerSoundsEnabled);
+			if (!decoded.sound.isEmpty() &&
+			    decoded.sound.compare(QStringLiteral("(No sound)"), Qt::CaseInsensitive) != 0 &&
 			    triggerSoundEnabled)
 			{
-				const bool soundIfInactive =
-				    attrTrue(trigger.attributes.value(QStringLiteral("sound_if_inactive")));
-				if (!soundIfInactive || !m_runtime->isActive())
-					m_runtime->playSound(0, triggerSound, false, 0.0, 0.0);
+				if (!isEnabledValue(trigger.attributes.value(QStringLiteral("sound_if_inactive"))) ||
+				    !m_runtime->isActive())
+					m_runtime->playSound(0, decoded.sound, false, 0.0, 0.0);
 			}
 
-			if (attrTrue(trigger.attributes.value(QStringLiteral("one_shot"))))
+			if (decoded.oneShot)
 			{
 				result.oneShotTriggers.push_back(triggerRuntimeId);
 			}
 
-			const QString label = trigger.attributes.value(QStringLiteral("name")).trimmed();
-			const QString scriptLabel =
-			    label.isEmpty() ? trigger.attributes.value(QStringLiteral("match")).trimmed() : label;
-			if (label.isEmpty())
-				emitTrace(QStringLiteral("Matched trigger \"%1\"")
-				              .arg(trigger.attributes.value(QStringLiteral("match"))));
+			if (decoded.label.isEmpty())
+				emitTrace(QStringLiteral("Matched trigger \"%1\"").arg(decoded.matchText));
 			else
-				emitTrace(QStringLiteral("Matched trigger %1").arg(label));
+				emitTrace(QStringLiteral("Matched trigger %1").arg(decoded.label));
 
-			const int  sendToValue = trigger.attributes.value(QStringLiteral("send_to")).toInt();
-			const bool lowerWildcards =
-			    attrTrue(trigger.attributes.value(QStringLiteral("lowercase_wildcard")));
-			const bool expandVariables =
-			    attrTrue(trigger.attributes.value(QStringLiteral("expand_variables")));
-			const bool omitFromLog = attrTrue(trigger.attributes.value(QStringLiteral("omit_from_log")));
-			const bool omitFromOutput =
-			    attrTrue(trigger.attributes.value(QStringLiteral("omit_from_output")));
-			const QString variableName = trigger.attributes.value(QStringLiteral("variable"));
-			const QString scriptName   = trigger.attributes.value(QStringLiteral("script"));
-			const int     colourChange =
-			    triggerColourFromCustom(trigger.attributes.value(QStringLiteral("custom_colour")).toInt());
-			const bool makeBold      = attrTrue(trigger.attributes.value(QStringLiteral("make_bold")));
-			const bool makeItalic    = attrTrue(trigger.attributes.value(QStringLiteral("make_italic")));
-			const bool makeUnderline = attrTrue(trigger.attributes.value(QStringLiteral("make_underline")));
-			const int  changeType    = trigger.attributes.value(QStringLiteral("colour_change_type")).toInt();
-			const bool repeatMatches =
-			    isRegexp && attrTrue(trigger.attributes.value(QStringLiteral("repeat")));
-			const bool keepEvaluating = attrTrue(trigger.attributes.value(QStringLiteral("keep_evaluating")));
-			const QString otherTextColour = trigger.attributes.value(QStringLiteral("other_text_colour"));
-			const QString otherBackColour = trigger.attributes.value(QStringLiteral("other_back_colour"));
-
-			QStringList   fixedWildcards = wildcards;
+			QStringList fixedWildcards = wildcards;
 			for (QString &fixed : fixedWildcards)
-				fixed = fixWildcard(fixed, lowerWildcards, sendToValue, language);
+				fixed = fixWildcard(fixed, decoded.lowerWildcards, decoded.sendToValue, language);
 			QMap<QString, QString> fixedNamed = namedWildcards;
 			for (auto it = fixedNamed.begin(); it != fixedNamed.end(); ++it)
-				it.value() = fixWildcard(it.value(), lowerWildcards, sendToValue, language);
+				it.value() = fixWildcard(it.value(), decoded.lowerWildcards, decoded.sendToValue, language);
 
-			if (m_runtime && !scriptLabel.isEmpty())
+			if (m_runtime && !decoded.scriptLabel.isEmpty())
 			{
 				if (plugin)
 					m_runtime->setPluginTriggerWildcards(plugin->attributes.value(QStringLiteral("id")),
-					                                     scriptLabel, fixedWildcards, fixedNamed);
+					                                     decoded.scriptLabel, fixedWildcards, fixedNamed);
 				else
-					m_runtime->setTriggerWildcards(scriptLabel, fixedWildcards, fixedNamed);
+					m_runtime->setTriggerWildcards(decoded.scriptLabel, fixedWildcards, fixedNamed);
 			}
 
-			if (const int clipboardArg = trigger.attributes.value(QStringLiteral("clipboard_arg")).toInt();
-			    clipboardArg > 0 && clipboardArg < fixedWildcards.size())
+			if (decoded.clipboardArg > 0 && decoded.clipboardArg < fixedWildcards.size())
 			{
 				if (QClipboard *clipboard = QGuiApplication::clipboard())
-					clipboard->setText(fixedWildcards.at(clipboardArg));
+					clipboard->setText(fixedWildcards.at(decoded.clipboardArg));
 			}
 
-			QString sendText = trigger.children.value(QStringLiteral("send"));
-			sendText = fixSendText(fixupEscapeSequences(sendText), sendToValue, wildcards, namedWildcards,
-			                       language, lowerWildcards, expandVariables, true, false, false, false,
-			                       scriptLabel, plugin, nullptr);
+			QString sendText = decoded.sendText;
+			sendText = fixSendText(fixupEscapeSequences(sendText), decoded.sendToValue, wildcards,
+			                       namedWildcards, language, decoded.lowerWildcards, decoded.expandVariables,
+			                       true, false, false, false, decoded.scriptLabel, plugin, nullptr);
 
-			if (!multiLine)
+			if (!decoded.multiLine)
 			{
-				if (omitFromLog)
+				if (decoded.omitFromLog)
 					result.omitFromLog = true;
-				if (omitFromOutput)
+				if (decoded.omitFromOutput)
 					result.omitFromOutput = true;
 			}
 
-			if (sendToValue == eSendToScriptAfterOmit)
+			if (decoded.sendToValue == eSendToScriptAfterOmit)
 			{
 				DeferredScript deferred;
-				deferred.pluginId    = pluginIdOf(plugin);
-				deferred.scriptText  = sendText;
-				deferred.description = QStringLiteral("Trigger: %1").arg(scriptLabel);
+				deferred.pluginId                 = pluginIdOf(plugin);
+				deferred.scriptText               = sendText;
+				deferred.description              = QStringLiteral("Trigger: %1").arg(decoded.scriptLabel);
+				deferred.replaceMatchedLineOutput = decoded.omitFromOutput;
 				result.deferredScripts.push_back(deferred);
 			}
-			else if (sendToValue == eSendToOutput)
+			else if (decoded.sendToValue == eSendToOutput)
 			{
 				if (!sendText.isEmpty())
 				{
@@ -3264,26 +3227,44 @@ WorldCommandProcessor::processTriggersForLine(const QString                     
 					previousActionSource = m_runtime->currentActionSource();
 					m_runtime->setCurrentActionSource(WorldRuntime::eTriggerFired);
 				}
-				sendTo(sendToValue, sendText, omitFromOutput, omitFromLog, variableName,
-				       QStringLiteral("Trigger: %1").arg(scriptLabel), plugin);
+				if (decoded.sendToValue == eSendToScript)
+				{
+					ensurePaletteReady();
+					const QVector<WorldRuntime::StyleSpan> &sourceSpans =
+					    workingSpans.isEmpty() ? matchInputSpans : workingSpans;
+					const QVector<LuaStyleRun> triggerStyleRuns =
+					    buildStyleRuns(matchInputLine, sourceSpans, defaultFore, defaultBack);
+					sendTo(decoded.sendToValue, sendText, decoded.omitFromOutput, decoded.omitFromLog,
+					       decoded.variableName, QStringLiteral("Trigger: %1").arg(decoded.scriptLabel),
+					       plugin, &triggerStyleRuns, true, false, m_runtime->luaContextLinesInBufferCount(),
+					       m_runtime->incomingLineLuaContextAbsoluteNumber());
+				}
+				else
+				{
+					sendTo(decoded.sendToValue, sendText, decoded.omitFromOutput, decoded.omitFromLog,
+					       decoded.variableName, QStringLiteral("Trigger: %1").arg(decoded.scriptLabel),
+					       plugin);
+				}
 				if (m_runtime)
 					m_runtime->setCurrentActionSource(previousActionSource);
 			}
 
-			if (!scriptName.isEmpty())
+			if (!decoded.scriptName.isEmpty())
 			{
 				TriggerScript script;
-				script.runtimeId      = triggerRuntimeId;
-				script.pluginId       = pluginIdOf(plugin);
-				script.label          = scriptLabel;
-				script.scriptName     = scriptName;
-				script.line           = matchInputLine;
-				script.wildcards      = wildcards;
-				script.namedWildcards = namedWildcards;
+				script.runtimeId                = triggerRuntimeId;
+				script.pluginId                 = pluginIdOf(plugin);
+				script.label                    = decoded.scriptLabel;
+				script.scriptName               = decoded.scriptName;
+				script.line                     = matchInputLine;
+				script.wildcards                = wildcards;
+				script.namedWildcards           = namedWildcards;
+				script.replaceMatchedLineOutput = decoded.omitFromOutput;
 				result.triggerScripts.push_back(script);
 			}
 
-			if (!multiLine && (colourChange >= 0 || makeBold || makeItalic || makeUnderline))
+			if (!decoded.multiLine && (decoded.colourChange >= 0 || decoded.makeBold || decoded.makeItalic ||
+			                           decoded.makeUnderline))
 			{
 				if (workingSpans.isEmpty())
 				{
@@ -3299,37 +3280,37 @@ WorldCommandProcessor::processTriggersForLine(const QString                     
 					QColor newBack;
 					bool   changeFore = false;
 					bool   changeBack = false;
-					if (colourChange >= 0)
+					if (decoded.colourChange >= 0)
 					{
 						ensurePaletteReady();
-						if (colourChange == OTHER_CUSTOM)
+						if (decoded.colourChange == OTHER_CUSTOM)
 						{
-							newFore = parseColorValue(otherTextColour);
-							newBack = parseColorValue(otherBackColour);
+							newFore = parseColorValue(decoded.otherTextColour);
+							newBack = parseColorValue(decoded.otherBackColour);
 						}
-						else if (colourChange < palette.customText.size())
+						else if (decoded.colourChange < m_paletteCacheCustomText.size())
 						{
-							newFore = palette.customText.at(colourChange);
-							newBack = palette.customBack.at(colourChange);
+							newFore = m_paletteCacheCustomText.at(decoded.colourChange);
+							newBack = m_paletteCacheCustomBack.at(decoded.colourChange);
 						}
-						if (changeType == TRIGGER_COLOUR_CHANGE_BOTH ||
-						    changeType == TRIGGER_COLOUR_CHANGE_FOREGROUND)
+						if (decoded.changeType == TRIGGER_COLOUR_CHANGE_BOTH ||
+						    decoded.changeType == TRIGGER_COLOUR_CHANGE_FOREGROUND)
 							changeFore = true;
-						if (changeType == TRIGGER_COLOUR_CHANGE_BOTH ||
-						    changeType == TRIGGER_COLOUR_CHANGE_BACKGROUND)
+						if (decoded.changeType == TRIGGER_COLOUR_CHANGE_BOTH ||
+						    decoded.changeType == TRIGGER_COLOUR_CHANGE_BACKGROUND)
 							changeBack = true;
 					}
 					applyStyleToSpans(workingSpans, sCol, eCol, newFore, newBack, changeFore, changeBack,
-					                  makeBold, makeItalic, makeUnderline);
+					                  decoded.makeBold, decoded.makeItalic, decoded.makeUnderline);
 				};
 
 				applyColour(startCol, endCol);
 
-				if (repeatMatches)
+				if (decoded.repeatMatches)
 				{
 					int offset = endCol;
-					while (regexMatch(pattern, target, ignoreCase, wildcards, namedWildcards, &startCol,
-					                  &endCol, offset, multiLine))
+					while (regexMatch(pattern, target, decoded.ignoreCase, wildcards, namedWildcards,
+					                  &startCol, &endCol, offset, decoded.multiLine))
 					{
 						if (endCol <= offset)
 							break;
@@ -3339,7 +3320,7 @@ WorldCommandProcessor::processTriggersForLine(const QString                     
 				}
 			}
 
-			if (!keepEvaluating)
+			if (!decoded.keepEvaluating)
 				break;
 		}
 	};
@@ -3408,7 +3389,7 @@ void WorldCommandProcessor::checkTimers()
 	const QDateTime now       = QDateTime::currentDateTime();
 	const bool      connected = m_runtime->connectPhase() == WorldRuntime::eConnectConnectedToMud;
 
-	auto            processTimers = [&](const QString &contextPluginId)
+	auto            processTimers = [&](const QString &contextPluginId) -> bool
 	{
 		constexpr int kMaxRescansPerTick = 2;
 		int           rescanCount        = 0;
@@ -3428,7 +3409,7 @@ void WorldCommandProcessor::checkTimers()
 				    m_runtime ? m_runtime->pluginForId(contextPluginId) : nullptr;
 				if (!activePlugin || !pluginHasValidId(*activePlugin) || !activePlugin->enabled ||
 				    activePlugin->installPending)
-					return;
+					return false;
 				plugin = activePlugin;
 				timers = &activePlugin->timers;
 			}
@@ -3452,7 +3433,7 @@ void WorldCommandProcessor::checkTimers()
 				if (!timer)
 				{
 					if (pluginScoped)
-						return;
+						return false;
 					rescanNeeded = true;
 					break;
 				}
@@ -3489,7 +3470,7 @@ void WorldCommandProcessor::checkTimers()
 				if (serialAfterSend != serialBeforeSend)
 				{
 					if (pluginScoped)
-						return;
+						return false;
 					rescanNeeded = true;
 					break;
 				}
@@ -3497,37 +3478,28 @@ void WorldCommandProcessor::checkTimers()
 				if (scriptName.isEmpty())
 					continue;
 
-				LuaCallbackEngine *lua = plugin ? plugin->lua.data() : m_runtime->luaCallbacks();
-				if (!plugin && !canExecuteWorldScript(QStringLiteral("Timer"), scriptName, lua, true))
+				const QSharedPointer<LuaCallbackEngine> luaRef =
+				    plugin ? plugin->lua : QSharedPointer<LuaCallbackEngine>{};
+				LuaCallbackEngine *lua = luaRef ? luaRef.data() : m_runtime->luaCallbacks();
+				if (!plugin && !canExecuteWorldScript(QStringLiteral("Timer"), scriptName, lua))
 					continue;
 				if (!lua)
 					continue;
-				const ILuaExecutor *executor = m_runtime ? m_runtime->luaExecutor() : nullptr;
+				if (!m_runtime)
+					continue;
 
-				const quint64       serialBeforeScript = m_runtime->timerStructureMutationSerial();
+				const QSharedPointer<LuaCallbackEngine> dispatchLua =
+				    luaRef ? luaRef
+				           : QSharedPointer<LuaCallbackEngine>(lua, [](LuaCallbackEngine * /*unused*/) {});
+				const bool worldScript = plugin == nullptr;
 				{
 					TimerExecutionScope executionScope(m_runtime, timer, true);
 					m_runtime->setCurrentActionSource(WorldRuntime::eTimerFired);
-					if (executor)
-					{
-						executor->callFunctionWithStringsAndWildcards(lua, scriptName, {label}, QStringList(),
-						                                              QMap<QString, QString>(), nullptr,
-						                                              nullptr);
-					}
-					else
-					{
-						lua->callFunctionWithStringsAndWildcards(scriptName, {label}, QStringList(),
-						                                         QMap<QString, QString>(), nullptr);
-					}
+					const LuaBatchDispatchResult result = m_runtime->dispatchLuaStringsAndWildcards(
+					    dispatchLua, scriptName, {label}, {}, {}, nullptr);
+					if (worldScript && result.hasFunctionValid && !result.hasFunction)
+						warnMissingWorldScriptFunction(QStringLiteral("Timer"), scriptName);
 					m_runtime->setCurrentActionSource(WorldRuntime::eUnknownActionSource);
-				}
-				const quint64 serialAfterScript = m_runtime->timerStructureMutationSerial();
-				if (serialAfterScript != serialBeforeScript)
-				{
-					if (pluginScoped)
-						return;
-					rescanNeeded = true;
-					break;
 				}
 			}
 
@@ -3535,10 +3507,14 @@ void WorldCommandProcessor::checkTimers()
 				break;
 			++rescanCount;
 		}
+		return false;
 	};
 
 	if (worldTimersEnabled)
-		processTimers(QString());
+	{
+		if (processTimers(QString()))
+			return;
+	}
 
 	QStringList pluginIds;
 	for (const auto &plugin : m_runtime->plugins())
@@ -3553,13 +3529,18 @@ void WorldCommandProcessor::checkTimers()
 		WorldRuntime::Plugin *plugin = m_runtime->pluginForId(pluginId);
 		if (!plugin || !pluginHasValidId(*plugin) || !plugin->enabled || plugin->installPending)
 			continue;
-		processTimers(pluginId);
+		if (processTimers(pluginId))
+			return;
 	}
 }
 
 void WorldCommandProcessor::sendTo(const int sendTo, const QString &text, const bool omitFromOutput,
                                    const bool omitFromLog, const QString &variableName,
-                                   const QString &description, const WorldRuntime::Plugin *plugin)
+                                   const QString &description, const WorldRuntime::Plugin *plugin,
+                                   const QVector<LuaStyleRun> *styleRuns, const bool hasTriggerContext,
+                                   const bool   replaceMatchedLineOutput,
+                                   const int    triggerMatchedLineBufferIndex,
+                                   const qint64 triggerMatchedLineAbsoluteNumber)
 {
 	const bool canSendEmpty = sendTo == eSendToNotepad || sendTo == eAppendToNotepad ||
 	                          sendTo == eReplaceNotepad || sendTo == eSendToOutput ||
@@ -3663,77 +3644,98 @@ void WorldCommandProcessor::sendTo(const int sendTo, const QString &text, const 
 		break;
 	case eSendToScript:
 	case eSendToScriptAfterOmit:
-	{
-		LuaCallbackEngine *lua = nullptr;
-		if (plugin)
-		{
-			lua = plugin->lua.data();
-		}
-		else if (m_runtime)
-		{
-			const QString enableScripts = attrs.value(QStringLiteral("enable_scripts"));
-			const QString language      = attrs.value(QStringLiteral("script_language"));
-			const bool    scriptingEnabled =
-			    isEnabled(enableScripts) && language.compare(QStringLiteral("Lua"), Qt::CaseInsensitive) == 0;
-			if (!scriptingEnabled)
-			{
-				if (const QString warn = attrs.value(QStringLiteral("warn_if_scripting_inactive"));
-				    isEnabled(warn))
-				{
-					const QString name = description.isEmpty() ? QStringLiteral("(unnamed)") : description;
-					m_runtime->outputText(
-					    QStringLiteral(
-					        "Script function \"%1\" cannot execute - scripting disabled/parse error.")
-					        .arg(name),
-					    true, true);
-				}
-				break;
-			}
-			lua = m_runtime->luaCallbacks();
-			if (!lua)
-			{
-				if (const QString warn = attrs.value(QStringLiteral("warn_if_scripting_inactive"));
-				    isEnabled(warn))
-				{
-					const QString name = description.isEmpty() ? QStringLiteral("(unnamed)") : description;
-					m_runtime->outputText(
-					    QStringLiteral(
-					        "Script function \"%1\" cannot execute - scripting disabled/parse error.")
-					        .arg(name),
-					    true, true);
-				}
-				break;
-			}
-		}
-		if (lua)
-		{
-			QPointer<WorldRuntime> executionRuntime = m_runtime;
-			const ILuaExecutor    *executor = executionRuntime ? executionRuntime->luaExecutor() : nullptr;
-			QMudScriptErrorRouting::executeWithWorldErrorRouting(
-			    executionRuntime != nullptr, plugin != nullptr,
-			    [&]
-			    {
-				    if (executor)
-					    executor->executeScript(lua, text, description, nullptr);
-				    else
-					    lua->executeScript(text, description, nullptr);
-			    },
-			    [executionRuntime]
-			    {
-				    if (executionRuntime)
-					    executionRuntime->pushForceScriptErrorOutputToWorld();
-			    },
-			    [executionRuntime]
-			    {
-				    if (executionRuntime)
-					    executionRuntime->popForceScriptErrorOutputToWorld();
-			    });
-		}
-	}
-	break;
+		emit sendToScriptRequested(pluginIdOf(plugin), text, description, styleRuns, hasTriggerContext,
+		                           replaceMatchedLineOutput, triggerMatchedLineBufferIndex,
+		                           triggerMatchedLineAbsoluteNumber);
+		break;
 	default:
 		break;
 	}
+}
+
+void WorldCommandProcessor::dispatchScriptSend(
+    const QString &pluginId, const QString &text, const QString &description,
+    const QVector<LuaStyleRun> *styleRuns, const bool hasTriggerContext, const bool replaceMatchedLineOutput,
+    const int triggerMatchedLineBufferIndex, const qint64 triggerMatchedLineAbsoluteNumber) const
+{
+	if (!m_runtime)
+		return;
+
+	QSharedPointer<LuaCallbackEngine> luaRef;
+	LuaCallbackEngine                *lua         = nullptr;
+	bool                              pluginScope = false;
+	if (!pluginId.isEmpty())
+	{
+		if (const WorldRuntime::Plugin *plugin = m_runtime->pluginForId(pluginId);
+		    plugin && pluginHasValidId(*plugin) && plugin->enabled && !plugin->installPending)
+		{
+			luaRef      = plugin->lua;
+			lua         = luaRef.data();
+			pluginScope = true;
+		}
+	}
+	else
+	{
+		const QMap<QString, QString> &attrs = m_runtime->worldAttributes();
+		const bool scriptingEnabled = isEnabledValue(attrs.value(QStringLiteral("enable_scripts"))) &&
+		                              attrs.value(QStringLiteral("script_language"))
+		                                      .compare(QStringLiteral("Lua"), Qt::CaseInsensitive) == 0;
+		if (!scriptingEnabled)
+		{
+			if (isEnabledValue(attrs.value(QStringLiteral("warn_if_scripting_inactive"))))
+			{
+				const QString name = description.isEmpty() ? QStringLiteral("(unnamed)") : description;
+				m_runtime->outputText(
+				    QStringLiteral("Script function \"%1\" cannot execute - scripting disabled/parse error.")
+				        .arg(name),
+				    true, true);
+			}
+			return;
+		}
+		lua = m_runtime->luaCallbacks();
+		if (!lua)
+		{
+			if (isEnabledValue(attrs.value(QStringLiteral("warn_if_scripting_inactive"))))
+			{
+				const QString name = description.isEmpty() ? QStringLiteral("(unnamed)") : description;
+				m_runtime->outputText(
+				    QStringLiteral("Script function \"%1\" cannot execute - scripting disabled/parse error.")
+				        .arg(name),
+				    true, true);
+			}
+			return;
+		}
+		luaRef = QSharedPointer<LuaCallbackEngine>(lua, [](LuaCallbackEngine * /*unused*/) {});
+	}
+
+	if (!lua)
+		return;
+
+	QPointer<WorldRuntime> executionRuntime = m_runtime;
+	if (!executionRuntime)
+		return;
+	const bool forceWorldErrorOutput =
+	    QMudScriptErrorRouting::shouldForceWorldErrorOutput(executionRuntime != nullptr, pluginScope);
+	if (forceWorldErrorOutput)
+		executionRuntime->pushForceScriptErrorOutputToWorld();
+	if (hasTriggerContext)
+	{
+		static_cast<void>(executionRuntime->dispatchLuaExecuteScript(
+		    luaRef, text, description, styleRuns, hasTriggerContext, replaceMatchedLineOutput,
+		    triggerMatchedLineBufferIndex, triggerMatchedLineAbsoluteNumber));
+		if (forceWorldErrorOutput && executionRuntime)
+			executionRuntime->popForceScriptErrorOutputToWorld();
+		return;
+	}
+
+	executionRuntime->dispatchLuaExecuteScriptAsync(
+	    luaRef, text, description, styleRuns, hasTriggerContext, replaceMatchedLineOutput,
+	    triggerMatchedLineBufferIndex, triggerMatchedLineAbsoluteNumber,
+	    [executionRuntime, forceWorldErrorOutput](bool)
+	    {
+		    if (forceWorldErrorOutput && executionRuntime)
+			    executionRuntime->popForceScriptErrorOutputToWorld();
+	    });
 }
 
 void WorldCommandProcessor::sendMsg(const QString &text, const bool echo, const bool queueIt, bool logIt)

@@ -351,6 +351,7 @@ const InternalFunctionMetadata kInternalFunctionMetadataTable[] = {
     {"SendToNotepad",             "( Title , Contents )"                                                                },
     {"SetAliasOption",            "( AliasName , OptionName , Value )"                                                  },
     {"SetAlphaOption",            "( OptionName , Value )"                                                              },
+    {"SetAsyncResultFilter",      "( Filters )"                                                                         },
     {"SetBackgroundColour",       "( Colour )"                                                                          },
     {"SetBackgroundImage",        "( FileName , Mode )"                                                                 },
     {"SetBoldColour",             "( )"                                                                                 },

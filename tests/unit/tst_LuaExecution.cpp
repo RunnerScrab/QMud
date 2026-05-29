@@ -6,6 +6,7 @@
  * Role: Consolidated unit coverage for Lua execution helpers and compatibility shims.
  */
 
+#include "LuaExecutorWorker.h"
 #include "LuaSupport.h"
 #include "helpers/LuaExecutionUtils.h"
 
@@ -14,19 +15,66 @@
 // ReSharper disable once CppUnusedIncludeDirective
 #include <QPointer>
 // ReSharper disable once CppUnusedIncludeDirective
+#include <QDir>
+// ReSharper disable once CppUnusedIncludeDirective
+#include <QTemporaryDir>
 #include <QThread>
 #include <QtTest/QTest>
 
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
+#include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
-Q_DECLARE_METATYPE(LuaExecutorBackendMode)
+extern "C" int         luaopen_lsqlite3(lua_State *L);
 
-extern "C" int luaopen_lsqlite3(lua_State *L);
+LuaBatchDispatchResult ILuaExecutor::dispatchBatch(const LuaBatchDispatchRequest &request) const
+{
+	LuaBatchDispatchResult result;
+	if (request.kind == LuaBatchDispatchKind::HasFunction)
+	{
+		result.hasFunction      = false;
+		result.hasFunctionValid = true;
+	}
+	return result;
+}
+
+void ILuaExecutor::dispatchBatchAsync(const LuaBatchDispatchRequest &request) const
+{
+	static_cast<void>(dispatchBatch(request));
+}
+
+void ILuaExecutor::dispatchBatchAsync(
+    const LuaBatchDispatchRequest &request, QObject *completionTarget,
+    const std::function<void(const LuaBatchDispatchResult &)> &completion) const
+{
+	const LuaBatchDispatchResult result = dispatchBatch(request);
+	if (!completion)
+		return;
+	if (!completionTarget || completionTarget->thread() == QThread::currentThread())
+	{
+		completion(result);
+		return;
+	}
+	const QPointer<QObject> targetGuard(completionTarget);
+	auto completionState = std::make_shared<std::function<void(const LuaBatchDispatchResult &)>>(completion);
+	const bool queued    = QMetaObject::invokeMethod(
+        completionTarget,
+        [targetGuard, completionState, result]() mutable
+        {
+            if (!targetGuard || !completionState || !*completionState)
+                return;
+            (*completionState)(result);
+        },
+        Qt::QueuedConnection);
+	if (!queued && completionState && *completionState)
+		(*completionState)(result);
+}
 
 namespace
 {
@@ -184,108 +232,19 @@ class tst_LuaExecution : public QObject
 
 		// NOLINTBEGIN(readability-convert-member-functions-to-static)
 	private slots:
-		void threadedRequestRecognition_data()
+		void luaBridgeTimeoutOverrideRoundTrip()
 		{
-			QTest::addColumn<QByteArray>("envValue");
-			QTest::addColumn<bool>("expected");
+			const int  originalTimeoutMs = qmudLuaBridgeInvokeTimeoutMs();
+			const auto restoreTimeout =
+			    qScopeGuard([originalTimeoutMs] { qmudSetLuaBridgeInvokeTimeoutMs(originalTimeoutMs); });
 
-			QTest::newRow("empty") << QByteArray() << false;
-			QTest::newRow("direct") << QByteArray("direct") << false;
-			QTest::newRow("threaded lower") << QByteArray("threaded") << true;
-			QTest::newRow("threaded upper") << QByteArray("THREADED") << true;
-			QTest::newRow("worker mixed") << QByteArray("WoRkEr") << true;
-			QTest::newRow("trimmed threaded") << QByteArray("  threaded  ") << true;
-			QTest::newRow("unknown") << QByteArray("custom") << false;
-		}
+			QVERIFY(originalTimeoutMs > 0);
+			qmudSetLuaBridgeInvokeTimeoutMs(1234);
+			QCOMPARE(qmudLuaBridgeInvokeTimeoutMs(), 1234);
 
-		void threadedRequestRecognition()
-		{
-			QFETCH(QByteArray, envValue);
-			QFETCH(bool, expected);
-			QCOMPARE(qmudIsThreadedLuaExecutorRequested(envValue), expected);
-		}
-
-		void resolveModeRespectsAvailability()
-		{
-			QCOMPARE(qmudResolveLuaExecutorBackendMode("threaded", true), LuaExecutorBackendMode::Threaded);
-			QCOMPARE(qmudResolveLuaExecutorBackendMode("worker", true), LuaExecutorBackendMode::Threaded);
-			QCOMPARE(qmudResolveLuaExecutorBackendMode("threaded", false), LuaExecutorBackendMode::Direct);
-			QCOMPARE(qmudResolveLuaExecutorBackendMode("worker", false), LuaExecutorBackendMode::Direct);
-		}
-
-		void resolveModeDefaultsToDirect()
-		{
-			QCOMPARE(qmudResolveLuaExecutorBackendMode({}, true), LuaExecutorBackendMode::Direct);
-			QCOMPARE(qmudResolveLuaExecutorBackendMode("direct", true), LuaExecutorBackendMode::Direct);
-			QCOMPARE(qmudResolveLuaExecutorBackendMode("custom", true), LuaExecutorBackendMode::Direct);
-		}
-
-		void bridgePolicyClassifiesWorkerLocalOperations()
-		{
-			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::SetWorldRuntime),
-			         LuaExecutorBridgePolicy::WorkerLocal);
-			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::LoadScript),
-			         LuaExecutorBridgePolicy::WorkerLocal);
-			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::RefreshLuaCallbackCatalogNow),
-			         LuaExecutorBridgePolicy::WorkerLocal);
-			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::LuaState),
-			         LuaExecutorBridgePolicy::WorkerLocal);
-		}
-
-		void bridgePolicyClassifiesUiSyncOperations()
-		{
-			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::CallFunctionNoArgs),
-			         LuaExecutorBridgePolicy::UiSync);
-			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::CallProcedureWithString),
-			         LuaExecutorBridgePolicy::UiSync);
-			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::CallMxpStartTag),
-			         LuaExecutorBridgePolicy::UiSync);
-			QCOMPARE(qmudLuaExecutorBridgePolicy(LuaExecutorOperation::ExecuteScript),
-			         LuaExecutorBridgePolicy::UiSync);
-		}
-
-		void bridgePolicyClassificationIsExhaustive()
-		{
-			constexpr std::array workerLocalOperations{
-			    LuaExecutorOperation::SetWorldRuntime,
-			    LuaExecutorOperation::SetPluginInfo,
-			    LuaExecutorOperation::SetScriptText,
-			    LuaExecutorOperation::ResetState,
-			    LuaExecutorOperation::TeardownEngine,
-			    LuaExecutorOperation::ApplyPackageRestrictions,
-			    LuaExecutorOperation::SetObservedPluginCallbacks,
-			    LuaExecutorOperation::HasObservedPluginCallback,
-			    LuaExecutorOperation::SetCallbackCatalogObserver,
-			    LuaExecutorOperation::LoadScript,
-			    LuaExecutorOperation::HasFunction,
-			    LuaExecutorOperation::RefreshLuaCallbackCatalogNow,
-			    LuaExecutorOperation::LuaState,
-			};
-			for (const LuaExecutorOperation operation : workerLocalOperations)
-				QCOMPARE(qmudLuaExecutorBridgePolicy(operation), LuaExecutorBridgePolicy::WorkerLocal);
-
-			constexpr std::array uiSyncOperations{
-			    LuaExecutorOperation::CallFunctionNoArgs,
-			    LuaExecutorOperation::CallFunctionWithString,
-			    LuaExecutorOperation::CallFunctionWithBytes,
-			    LuaExecutorOperation::CallFunctionWithBytesInOut,
-			    LuaExecutorOperation::CallFunctionWithStringInOut,
-			    LuaExecutorOperation::CallFunctionWithNumberAndString,
-			    LuaExecutorOperation::CallFunctionWithTwoNumbersAndString,
-			    LuaExecutorOperation::CallFunctionWithNumberAndBytes,
-			    LuaExecutorOperation::CallFunctionWithNumberAndUtf8Strings,
-			    LuaExecutorOperation::CallProcedureWithString,
-			    LuaExecutorOperation::CallMxpError,
-			    LuaExecutorOperation::CallMxpStartUp,
-			    LuaExecutorOperation::CallMxpShutDown,
-			    LuaExecutorOperation::CallMxpStartTag,
-			    LuaExecutorOperation::CallMxpEndTag,
-			    LuaExecutorOperation::CallMxpSetVariable,
-			    LuaExecutorOperation::CallFunctionWithStringsAndWildcards,
-			    LuaExecutorOperation::ExecuteScript,
-			};
-			for (const LuaExecutorOperation operation : uiSyncOperations)
-				QCOMPARE(qmudLuaExecutorBridgePolicy(operation), LuaExecutorBridgePolicy::UiSync);
+			qmudSetLuaBridgeInvokeTimeoutMs(0);
+			QVERIFY(qmudLuaBridgeInvokeTimeoutMs() > 0);
+			QVERIFY(qmudLuaBridgeInvokeTimeoutMs() != 1234);
 		}
 
 		void luaBridgeRejectsInvalidInputs()
@@ -312,6 +271,28 @@ class tst_LuaExecution : public QObject
 			QVERIFY(qmudLuaBridgeInvokeOnObjectThread(&target, [&invoked] { invoked = true; }));
 			QVERIFY(invoked);
 			QVERIFY(qmudLuaBridgeLastError().isEmpty());
+		}
+
+		void luaWorkerCallbackDispatchClearsInFlightBeforeResultConsumption()
+		{
+			bool             workerInFlight        = true;
+			bool             nestedDispatchAllowed = false;
+			std::vector<int> order;
+
+			qmudCompleteLuaWorkerCallbackDispatch(
+			    workerInFlight,
+			    [&]
+			    {
+				    order.push_back(1);
+				    nestedDispatchAllowed = !workerInFlight;
+			    },
+			    [&] { order.push_back(2); });
+
+			QVERIFY(!workerInFlight);
+			QVERIFY(nestedDispatchAllowed);
+			QCOMPARE(order.size(), static_cast<size_t>(2));
+			QCOMPARE(order.at(0), 1);
+			QCOMPARE(order.at(1), 2);
 		}
 
 		void luaBridgeInvokesOnWorkerThread()
@@ -405,10 +386,271 @@ class tst_LuaExecution : public QObject
 			QVERIFY(nestedInvokeOk.load());
 		}
 
+		void luaBridgeWaitWorkPumpBreaksWorkerMainWaitCycle()
+		{
+			QObject  mainTarget;
+			QThread *mainThread = QThread::currentThread();
+
+			QThread  workerThread;
+			workerThread.setObjectName(QStringLiteral("tst_LuaBridgeWaitWorkPumpWorker"));
+			QObject workerTarget;
+			workerTarget.moveToThread(&workerThread);
+			workerThread.start();
+			const auto stopWorker = qScopeGuard(
+			    [&]()
+			    {
+				    if (workerTarget.thread() == &workerThread)
+				    {
+					    static_cast<void>(
+					        qmudLuaBridgeInvokeOnObjectThread(&workerTarget, [&workerTarget, mainThread]
+					                                          { workerTarget.moveToThread(mainThread); }));
+				    }
+				    workerThread.quit();
+				    static_cast<void>(workerThread.wait());
+			    });
+
+			QVERIFY(qmudLuaBridgeEnsureObjectThreadReady(&workerTarget));
+			QVERIFY(qmudLuaBridgeEnsureObjectThreadReady(&mainTarget));
+
+			std::mutex                        workMutex;
+			std::deque<std::function<void()>> workQueue;
+			std::mutex                        doneMutex;
+			std::condition_variable           doneCv;
+			bool                              workDone = false;
+
+			QVERIFY(qmudLuaBridgeInvokeOnObjectThread(&workerTarget,
+			                                          [&]()
+			                                          {
+				                                          qmudLuaBridgeSetCurrentThreadWaitWorkPump(
+				                                              [&]() -> bool
+				                                              {
+					                                              std::function<void()> work;
+					                                              {
+						                                              std::lock_guard lock(workMutex);
+						                                              if (workQueue.empty())
+							                                              return false;
+						                                              work = std::move(workQueue.front());
+						                                              workQueue.pop_front();
+					                                              }
+					                                              if (work)
+						                                              work();
+					                                              return true;
+				                                              });
+			                                          }));
+			const auto clearPump = qScopeGuard(
+			    [&]()
+			    {
+				    static_cast<void>(qmudLuaBridgeInvokeOnObjectThread(
+				        &workerTarget, [] { qmudLuaBridgeClearCurrentThreadWaitWorkPump(); }));
+			    });
+
+			bool outerInvokeOk = false;
+			bool innerInvokeOk = false;
+			bool waitSucceeded = false;
+			outerInvokeOk      = qmudLuaBridgeInvokeOnObjectThread(
+                &workerTarget,
+                [&]()
+                {
+                    innerInvokeOk = qmudLuaBridgeInvokeOnObjectThread(
+                        &mainTarget,
+                        [&]()
+                        {
+                            {
+                                std::lock_guard lock(workMutex);
+                                workQueue.emplace_back(
+                                    [&]()
+                                    {
+                                        std::lock_guard doneLock(doneMutex);
+                                        workDone = true;
+                                        doneCv.notify_all();
+                                    });
+                            }
+                            qmudLuaBridgeNotifyThreadWake(&workerThread);
+                            std::unique_lock waitLock(doneMutex);
+                            waitSucceeded = doneCv.wait_for(waitLock, std::chrono::milliseconds(1000),
+					                                             [&]() { return workDone; });
+                        });
+                });
+
+			QVERIFY(outerInvokeOk);
+			QVERIFY(innerInvokeOk);
+			QVERIFY(waitSucceeded);
+			QVERIFY(workDone);
+		}
+
+		void luaExecutorWorkerReentrantDispatchPreservesQueueOrder()
+		{
+			LuaExecutorWorker executor;
+			QObject           mainTarget;
+			QThread          *mainThread = QThread::currentThread();
+
+			QThread           workerThread;
+			workerThread.setObjectName(QStringLiteral("tst_LuaExecutorWorkerReentrantWorker"));
+			QObject workerTarget;
+			workerTarget.moveToThread(&workerThread);
+			workerThread.start();
+			const auto stopWorker = qScopeGuard(
+			    [&]()
+			    {
+				    if (workerTarget.thread() == &workerThread)
+				    {
+					    static_cast<void>(
+					        qmudLuaBridgeInvokeOnObjectThread(&workerTarget, [&workerTarget, mainThread]
+					                                          { workerTarget.moveToThread(mainThread); }));
+				    }
+				    workerThread.quit();
+				    static_cast<void>(workerThread.wait());
+			    });
+
+			QVERIFY(qmudLuaBridgeEnsureObjectThreadReady(&workerTarget));
+			QVERIFY(qmudLuaBridgeEnsureObjectThreadReady(&mainTarget));
+
+			LuaBatchDispatchRequest asyncRequest;
+			asyncRequest.kind = LuaBatchDispatchKind::HasFunction;
+			LuaBatchDispatchRequest syncRequest;
+			syncRequest.kind = LuaBatchDispatchKind::HasFunction;
+
+			std::mutex      orderMutex;
+			std::deque<int> order;
+			const bool      invokeOk = qmudLuaBridgeInvokeOnObjectThread(
+                &workerTarget,
+                [&]()
+                {
+                    const bool innerOk = qmudLuaBridgeInvokeOnObjectThread(
+                        &mainTarget,
+                        [&]()
+                        {
+                            executor.dispatchBatchAsync(asyncRequest, nullptr,
+					                                         [&](const LuaBatchDispatchResult &)
+					                                         {
+                                                            std::scoped_lock lock(orderMutex);
+                                                            order.push_back(1);
+                                                        });
+                            static_cast<void>(executor.dispatchBatch(syncRequest));
+                            std::scoped_lock lock(orderMutex);
+                            order.push_back(2);
+                        });
+                    QVERIFY(innerOk);
+                });
+			QVERIFY(invokeOk);
+
+			QTRY_VERIFY_WITH_TIMEOUT(
+			    [&]()
+			    {
+				    std::scoped_lock lock(orderMutex);
+				    return order.size() == 2;
+			    }(),
+			    2000);
+
+			std::scoped_lock lock(orderMutex);
+			QCOMPARE(order.size(), static_cast<size_t>(2));
+			QCOMPARE(order.at(0), 1);
+			QCOMPARE(order.at(1), 2);
+		}
+
+		void luaExecutorWorkerShutdownDrainsAsyncCompletions()
+		{
+			constexpr int   requestCount = 128;
+			std::atomic_int completionCount{0};
+			QObject         completionTarget;
+
+			{
+				auto                    executor = std::make_unique<LuaExecutorWorker>();
+				LuaBatchDispatchRequest request;
+				request.kind = LuaBatchDispatchKind::HasFunction;
+				for (int i = 0; i < requestCount; ++i)
+				{
+					executor->dispatchBatchAsync(request, &completionTarget,
+					                             [&](const LuaBatchDispatchResult &)
+					                             { completionCount.fetch_add(1); });
+				}
+				executor.reset();
+			}
+
+			QTRY_COMPARE_WITH_TIMEOUT(completionCount.load(), requestCount, 3000);
+		}
+
+		void luaExecutorQueuedMiniWindowSnapshotOutlivesProducerScope()
+		{
+			QObject          completionTarget;
+
+			std::atomic_bool completed{false};
+			QString          observedWindowName;
+			int              observedWidth  = 0;
+			bool             observedLookup = false;
+
+			{
+				auto snapshot = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+				snapshot->windowNames.push_back(QStringLiteral("Map"));
+				LuaCallbackMiniWindowSnapshot::WindowInfoSnapshot info;
+				info.width  = 123;
+				info.height = 45;
+				info.show   = true;
+				snapshot->windowInfoByWindow.insert(QStringLiteral("Map"), info);
+				snapshot->hotspotIdsByWindow.insert(QStringLiteral("Map"), {QStringLiteral("move")});
+				snapshot->rebuildMiniWindowLookupCaches();
+
+				LuaBatchDispatchRequest request;
+				request.kind                  = LuaBatchDispatchKind::HasFunction;
+				request.miniWindowSnapshotArg = snapshot;
+				LuaExecutorWorker executor;
+				executor.dispatchBatchAsync(
+				    request, &completionTarget,
+				    [snapshot = request.miniWindowSnapshotArg, &completed, &observedWindowName,
+				     &observedWidth, &observedLookup](const LuaBatchDispatchResult &)
+				    {
+					    observedWindowName = snapshot->windowNames.value(0);
+					    observedWidth      = snapshot->windowInfoByWindow.value(QStringLiteral("Map")).width;
+					    observedLookup =
+					        snapshot->normalizedMiniWindowHotspotKeys.contains(QStringLiteral("map|move"));
+					    completed.store(true);
+				    });
+			}
+
+			QTRY_VERIFY_WITH_TIMEOUT(completed.load(), 3000);
+			QCOMPARE(observedWindowName, QStringLiteral("Map"));
+			QCOMPARE(observedWidth, 123);
+			QVERIFY(observedLookup);
+		}
+
+		void luaBridgeRejectsExceptionFromSameThreadCallback()
+		{
+			QObject target;
+			QVERIFY(!qmudLuaBridgeInvokeOnObjectThread(&target, [] { throw std::runtime_error("boom"); }));
+			QCOMPARE(qmudLuaBridgeLastStatus(), LuaBridgeInvokeStatus::UnknownFailure);
+			QVERIFY(qmudLuaBridgeLastError().contains(QStringLiteral("threw exception")));
+		}
+
+		void luaBridgeRejectsExceptionFromWorkerThreadCallback()
+		{
+			QThread workerThread;
+			workerThread.setObjectName(QStringLiteral("tst_LuaBridgeThrowWorker"));
+			QObject  target;
+			QThread *mainThread = QThread::currentThread();
+			target.moveToThread(&workerThread);
+			workerThread.start();
+			const auto stopWorker = qScopeGuard(
+			    [&]()
+			    {
+				    if (target.thread() == &workerThread)
+				    {
+					    static_cast<void>(qmudLuaBridgeInvokeOnObjectThread(
+					        &target, [&target, mainThread] { target.moveToThread(mainThread); }));
+				    }
+				    workerThread.quit();
+				    static_cast<void>(workerThread.wait());
+			    });
+
+			QVERIFY(qmudLuaBridgeEnsureObjectThreadReady(&target));
+			QVERIFY(!qmudLuaBridgeInvokeOnObjectThread(&target, [] { throw std::runtime_error("boom"); }));
+			QCOMPARE(qmudLuaBridgeLastStatus(), LuaBridgeInvokeStatus::UnknownFailure);
+			QVERIFY(qmudLuaBridgeLastError().contains(QStringLiteral("threw exception")));
+		}
+
 		void luaBridgeEnsureReadyFailsForNonRunningThread()
 		{
 			QThread  workerThread;
-			QObject *target     = new QObject();
+			auto    *target     = new QObject();
 			QThread *mainThread = QThread::currentThread();
 			target->moveToThread(&workerThread);
 
@@ -513,7 +755,7 @@ class tst_LuaExecution : public QObject
 			std::atomic_bool             wrongThread{false};
 			std::atomic_int              totalInvokes{0};
 			std::mutex                   orderMutex;
-			std::array<int, callerCount> lastSeenByCaller;
+			std::array<int, callerCount> lastSeenByCaller{};
 			lastSeenByCaller.fill(-1);
 			bool                     orderOk = true;
 
@@ -1371,6 +1613,69 @@ class tst_LuaExecution : public QObject
 			QCOMPARE(result.value, QStringLiteral("true|shim-ok|299|ssl-real"));
 		}
 
+		void callLuaProtectedReturnsRuntimeErrorWithoutStackCorruption()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			QString execError;
+			QVERIFY2(executeLuaChunk(state.get(),
+			                         QByteArrayLiteral("function __qmud_test_explode()\n"
+			                                           "  error('boom-callLuaProtected')\n"
+			                                           "end"),
+			                         execError),
+			         qPrintable(execError));
+
+			lua_getglobal(state.get(), "__qmud_test_explode");
+			QVERIFY(lua_isfunction(state.get(), -1));
+			const int status = QMudLuaSupport::callLuaProtected(state.get(), 0, 0, 0);
+			QVERIFY(status != 0);
+			QVERIFY(lua_isstring(state.get(), -1));
+			const QString errorText = QString::fromUtf8(lua_tostring(state.get(), -1));
+			QVERIFY(errorText.contains(QStringLiteral("boom-callLuaProtected")));
+			lua_pop(state.get(), 1);
+			QCOMPARE(lua_gettop(state.get()), 0);
+		}
+
+		void sqliteExecuteCallbackRuntimeErrorDoesNotAbortOrCorruptLuaState()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			QString sqliteError;
+			QVERIFY2(openSqliteModule(state.get(), sqliteError), qPrintable(sqliteError));
+
+			const auto result = evaluateLuaToString(
+			    state.get(),
+			    QByteArrayLiteral(
+			        "local db = assert(sqlite3.open_memory())\n"
+			        "assert(db:execute([["
+			        "CREATE TABLE t(v INTEGER);"
+			        "INSERT INTO t(v) VALUES (1);"
+			        "INSERT INTO t(v) VALUES (2);"
+			        "]]))\n"
+			        "local calls = 0\n"
+			        "local rc = db:execute('SELECT v FROM t ORDER BY v', function(_, ncols, row, cols)\n"
+			        "  calls = calls + 1\n"
+			        "  if calls == 1 then\n"
+			        "    error('boom-sqlite-callback')\n"
+			        "  end\n"
+			        "  return 0\n"
+			        "end)\n"
+			        "db:close()\n"
+			        "return tostring(rc) .. ':' .. tostring(calls)"));
+			QVERIFY2(result.ok, qPrintable(result.error));
+			const QStringList parts = result.value.split(':');
+			QCOMPARE(parts.size(), 2);
+			QString rcText = parts.at(0);
+			rcText.replace(',', '.');
+			bool         okRc = false;
+			const double rc   = rcText.toDouble(&okRc);
+			QVERIFY(okRc);
+			QVERIFY(qAbs(rc) < 0.000001);
+			QCOMPARE(parts.at(1), QStringLiteral("2"));
+		}
+
 		void sqliteNamedRowsAllowsNestedIteratorsOnSameConnection()
 		{
 			LuaStateOwner state = makeCompatLuaState();
@@ -1406,6 +1711,52 @@ class tst_LuaExecution : public QObject
 			        "return tostring(collected['A1'] ~= nil) .. ':' .. tostring(next(collected) ~= nil)"));
 			QVERIFY2(result.ok, qPrintable(result.error));
 			QCOMPARE(result.value, QStringLiteral("true:true"));
+		}
+
+		void sqliteFileWritePersistsAfterLuaStateShutdown()
+		{
+			QTemporaryDir tempDir(QDir::current().filePath(QStringLiteral("tst_LuaExecution_sqlite_XXXXXX")));
+			QVERIFY(tempDir.isValid());
+			const QString dbPath = QDir(tempDir.path()).filePath(QStringLiteral("plugin_state.sqlite"));
+
+			{
+				LuaStateOwner state = makeCompatLuaState();
+				QVERIFY(state);
+				QString sqliteError;
+				QVERIFY2(openSqliteModule(state.get(), sqliteError), qPrintable(sqliteError));
+
+				const QByteArray script =
+				    QStringLiteral("local db = assert(sqlite3.open([[%1]]))\n"
+				                   "assert(db:execute([["
+				                   "CREATE TABLE plugin_state(k TEXT PRIMARY KEY, v TEXT);"
+				                   "INSERT INTO plugin_state(k, v) VALUES ('mini_rect', '44,55,64,40');"
+				                   "]]))\n"
+				                   "assert(db:close())\n")
+				        .arg(dbPath)
+				        .toUtf8();
+				QString execError;
+				QVERIFY2(executeLuaChunk(state.get(), script, execError), qPrintable(execError));
+			}
+
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+			QString sqliteError;
+			QVERIFY2(openSqliteModule(state.get(), sqliteError), qPrintable(sqliteError));
+
+			const QByteArray verifyScript =
+			    QStringLiteral(
+			        "local db = assert(sqlite3.open([[%1]]))\n"
+			        "local value = nil\n"
+			        "for row in db:nrows(\"SELECT v FROM plugin_state WHERE k = 'mini_rect'\") do\n"
+			        "  value = row.v\n"
+			        "end\n"
+			        "assert(db:close())\n"
+			        "return value or ''\n")
+			        .arg(dbPath)
+			        .toUtf8();
+			const auto result = evaluateLuaToString(state.get(), verifyScript);
+			QVERIFY2(result.ok, qPrintable(result.error));
+			QCOMPARE(result.value, QStringLiteral("44,55,64,40"));
 		}
 		// NOLINTEND(readability-convert-member-functions-to-static)
 };

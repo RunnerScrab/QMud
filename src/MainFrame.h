@@ -15,6 +15,7 @@
 #include <QDockWidget>
 #include <QElapsedTimer>
 #include <QLabel>
+#include <QList>
 #include <QMainWindow>
 #include <QMap>
 #include <QRect>
@@ -479,6 +480,11 @@ class MainWindow : public QMainWindow, public MainWindowHost
 		 * @return Descriptor list for open world windows.
 		 */
 		[[nodiscard]] QVector<WorldWindowDescriptor> worldWindowDescriptors() const override;
+		/**
+		 * @brief Returns open notepad child windows in MDI creation order.
+		 * @return Ordered notepad child window pointers.
+		 */
+		[[nodiscard]] QList<TextChildWindow *>       notepadWindows() const;
 		/**
 		 * @brief Clears info bar contents.
 		 */

@@ -1,0 +1,1017 @@
+/*
+ * QMud Project
+ * Copyright (c) 2026 Panagiotis Kalogiratos (Nodens)
+ *
+ * File: tst_LuaCallbackEngine.cpp
+ * Role: Unit coverage for Lua callback-engine dispatch, catalog, and callback-context semantics.
+ */
+
+#include "AppController.h"
+#include "LuaCallbackEngine.h"
+#include "LuaExecutor.h"
+#include "LuaExecutorWorker.h"
+#include "LuaSupport.h"
+#include "TelnetProcessor.h"
+#include "WorldRuntime.h"
+#include "WorldView.h"
+#include "helpers/LuaExecutionUtils.h"
+
+#include <QtTest/QTest>
+
+#include <atomic>
+#include <limits>
+#include <memory>
+
+extern "C"
+{
+#include <lauxlib.h>
+#include <lua.h>
+#include <lualib.h>
+}
+
+AppController *AppController::instance()
+{
+	return nullptr;
+}
+
+// NOLINTBEGIN(readability-convert-member-functions-to-static,readability-make-member-function-const,readability-non-const-parameter)
+QVariant AppController::getGlobalOption(const QString &name) const
+{
+	Q_UNUSED(name);
+	return {};
+}
+
+TelnetProcessor::TelnetProcessor() = default;
+
+namespace
+{
+	struct RuntimeStubState
+	{
+			int                                  outputBatchDepth     = 0;
+			int                                  miniWindowBatchDepth = 0;
+			int                                  savePluginStateCalls = 0;
+			unsigned short                       noteStyle            = 0;
+			int                                  noteTextColour       = 0;
+			long                                 noteColourFore       = 0xFFFFFF;
+			long                                 noteColourBack       = 0;
+			bool                                 notesInRgb           = false;
+			QStringList                          outputLines;
+			QList<bool>                          outputNewLines;
+			QStringList                          windowNames;
+			QHash<QString, QHash<int, QVariant>> windowInfo;
+			QHash<QString, QStringList>          hotspotIds;
+	};
+
+	QHash<const WorldRuntime *, RuntimeStubState> &runtimeStubStates()
+	{
+		static QHash<const WorldRuntime *, RuntimeStubState> states;
+		return states;
+	}
+
+	RuntimeStubState &runtimeStubState(const WorldRuntime *runtime)
+	{
+		return runtimeStubStates()[runtime];
+	}
+
+	int safeQSizeToInt(const qsizetype size)
+	{
+		if (size <= 0)
+			return 0;
+		constexpr qsizetype kMaxInt = std::numeric_limits<int>::max();
+		return size > kMaxInt ? std::numeric_limits<int>::max() : static_cast<int>(size);
+	}
+} // namespace
+
+WorldRuntime::WorldRuntime(QObject *parent) : QObject(parent)
+{
+	runtimeStubStates().insert(this, RuntimeStubState{});
+}
+
+WorldRuntime::~WorldRuntime()
+{
+	runtimeStubStates().remove(this);
+}
+
+void WorldRuntime::addScriptTime(qint64 nanos)
+{
+	Q_UNUSED(nanos);
+}
+
+WorldRuntime::RuntimeCountersSnapshot WorldRuntime::runtimeCountersSnapshot(bool includeStrings) const
+{
+	Q_UNUSED(includeStrings);
+	RuntimeCountersSnapshot snapshot;
+	const RuntimeStubState &state = runtimeStubState(this);
+	snapshot.notesInRgb           = state.notesInRgb;
+	snapshot.noteStyle            = state.noteStyle;
+	snapshot.noteTextColour       = state.noteTextColour;
+	snapshot.noteColourFore       = state.noteColourFore;
+	snapshot.noteColourBack       = state.noteColourBack;
+	snapshot.outputLineCount      = safeQSizeToInt(state.outputLines.size());
+	return snapshot;
+}
+
+void WorldRuntime::beginOutputViewMutationBatch()
+{
+	++runtimeStubState(this).outputBatchDepth;
+}
+
+void WorldRuntime::endOutputViewMutationBatch()
+{
+	--runtimeStubState(this).outputBatchDepth;
+}
+
+bool WorldRuntime::luaContextLineEntry(int lineNumber, LineEntry &entry) const
+{
+	Q_UNUSED(lineNumber);
+	Q_UNUSED(entry);
+	return false;
+}
+
+int WorldRuntime::luaContextLinesInBufferCount() const
+{
+	return 0;
+}
+
+void WorldRuntime::beginMiniWindowMutationBatch()
+{
+	++runtimeStubState(this).miniWindowBatchDepth;
+}
+
+void WorldRuntime::endMiniWindowMutationBatch()
+{
+	--runtimeStubState(this).miniWindowBatchDepth;
+}
+
+QString WorldRuntime::startupDirectory() const
+{
+	return {};
+}
+
+QString WorldRuntime::defaultLogDirectory() const
+{
+	return {};
+}
+
+QString WorldRuntime::worldAttributeValue(const QString &key) const
+{
+	Q_UNUSED(key);
+	return {};
+}
+
+unsigned short WorldRuntime::noteStyle() const
+{
+	return runtimeStubState(this).noteStyle;
+}
+
+bool WorldRuntime::notesInRgb() const
+{
+	return runtimeStubState(this).notesInRgb;
+}
+
+int WorldRuntime::noteTextColour() const
+{
+	return runtimeStubState(this).noteTextColour;
+}
+
+void WorldRuntime::setNoteTextColour(int value)
+{
+	RuntimeStubState &state = runtimeStubState(this);
+	state.noteTextColour    = value;
+	state.notesInRgb        = false;
+}
+
+long WorldRuntime::noteColourFore() const
+{
+	return runtimeStubState(this).noteColourFore;
+}
+
+void WorldRuntime::setNoteColourFore(long value)
+{
+	runtimeStubState(this).noteColourFore = value & 0x00FFFFFF;
+	runtimeStubState(this).notesInRgb     = true;
+}
+
+long WorldRuntime::noteColourBack() const
+{
+	return runtimeStubState(this).noteColourBack;
+}
+
+void WorldRuntime::setNoteColourBack(long value)
+{
+	runtimeStubState(this).noteColourBack = value & 0x00FFFFFF;
+	runtimeStubState(this).notesInRgb     = true;
+}
+
+void WorldRuntime::outputText(const QString &text, bool note, bool newLine)
+{
+	Q_UNUSED(note);
+	RuntimeStubState &state = runtimeStubState(this);
+	state.outputLines.push_back(text);
+	state.outputNewLines.push_back(newLine);
+}
+
+void WorldRuntime::outputStyledText(const QString &text, const QVector<StyleSpan> &spans, bool note,
+                                    bool newLine)
+{
+	Q_UNUSED(spans);
+	Q_UNUSED(note);
+	RuntimeStubState &state = runtimeStubState(this);
+	state.outputLines.push_back(text);
+	state.outputNewLines.push_back(newLine);
+}
+
+bool WorldRuntime::writeLuaCallbackOutputAtLineAnchor(qint64 anchorLineNumber, int anchorRelativeOffset,
+                                                      bool replaceAnchor, const QString &text, int flags,
+                                                      const QVector<StyleSpan> &spans, bool hardReturn)
+{
+	Q_UNUSED(anchorLineNumber);
+	Q_UNUSED(anchorRelativeOffset);
+	Q_UNUSED(replaceAnchor);
+	Q_UNUSED(flags);
+	Q_UNUSED(spans);
+	RuntimeStubState &state = runtimeStubState(this);
+	state.outputLines.push_back(text);
+	state.outputNewLines.push_back(hardReturn);
+	return true;
+}
+
+int WorldRuntime::savePluginState(const QString &pluginId, bool scripted, QString *error)
+{
+	Q_UNUSED(pluginId);
+	Q_UNUSED(scripted);
+	if (error)
+		error->clear();
+	++runtimeStubState(this).savePluginStateCalls;
+	return 0;
+}
+
+int WorldRuntime::windowCreate(const QString &name, int left, int top, int width, int height, int position,
+                               int flags, const QColor &background, const QString &pluginId)
+{
+	Q_UNUSED(background);
+	Q_UNUSED(pluginId);
+	RuntimeStubState &state = runtimeStubState(this);
+	if (!state.windowNames.contains(name))
+		state.windowNames.push_back(name);
+	state.windowInfo[name][1] = left;
+	state.windowInfo[name][2] = top;
+	state.windowInfo[name][3] = width;
+	state.windowInfo[name][4] = height;
+	state.windowInfo[name][7] = position;
+	state.windowInfo[name][8] = flags;
+	return 0;
+}
+
+QStringList WorldRuntime::windowList() const
+{
+	return runtimeStubState(this).windowNames;
+}
+
+QVariant WorldRuntime::windowInfo(const QString &name, int infoType) const
+{
+	return runtimeStubState(this).windowInfo.value(name).value(infoType);
+}
+
+int WorldRuntime::windowPosition(const QString &name, int left, int top, int position, int flags)
+{
+	RuntimeStubState &state   = runtimeStubState(this);
+	state.windowInfo[name][1] = left;
+	state.windowInfo[name][2] = top;
+	state.windowInfo[name][7] = position;
+	state.windowInfo[name][8] = flags;
+	return 0;
+}
+
+int WorldRuntime::windowResize(const QString &name, int width, int height, long colour)
+{
+	Q_UNUSED(colour);
+	RuntimeStubState &state   = runtimeStubState(this);
+	state.windowInfo[name][3] = width;
+	state.windowInfo[name][4] = height;
+	return 0;
+}
+
+int WorldRuntime::windowAddHotspot(const QString &name, const QString &hotspotId, int left, int top,
+                                   int right, int bottom, const QString &mouseOver,
+                                   const QString &cancelMouseOver, const QString &mouseDown,
+                                   const QString &cancelMouseDown, const QString &mouseUp,
+                                   const QString &tooltip, int cursor, int flags, const QString &pluginId)
+{
+	Q_UNUSED(left);
+	Q_UNUSED(top);
+	Q_UNUSED(right);
+	Q_UNUSED(bottom);
+	Q_UNUSED(mouseOver);
+	Q_UNUSED(cancelMouseOver);
+	Q_UNUSED(mouseDown);
+	Q_UNUSED(cancelMouseDown);
+	Q_UNUSED(mouseUp);
+	Q_UNUSED(tooltip);
+	Q_UNUSED(cursor);
+	Q_UNUSED(flags);
+	Q_UNUSED(pluginId);
+	RuntimeStubState &state = runtimeStubState(this);
+	if (!state.hotspotIds[name].contains(hotspotId))
+		state.hotspotIds[name].push_back(hotspotId);
+	return 0;
+}
+
+QStringList WorldRuntime::windowHotspotList(const QString &name) const
+{
+	return runtimeStubState(this).hotspotIds.value(name);
+}
+
+QVariant WorldRuntime::windowHotspotInfo(const QString &name, const QString &hotspotId, int infoType) const
+{
+	Q_UNUSED(name);
+	Q_UNUSED(hotspotId);
+	Q_UNUSED(infoType);
+	return {};
+}
+
+bool WorldRuntime::suppressScriptErrorOutputToWorld() const
+{
+	return false;
+}
+
+bool WorldRuntime::forceScriptErrorOutputToWorld() const
+{
+	return false;
+}
+// NOLINTEND(readability-convert-member-functions-to-static,readability-make-member-function-const,readability-non-const-parameter)
+
+QColor WorldView::parseColor(const QString &value)
+{
+	return {value};
+}
+
+namespace
+{
+	class tst_LuaCallbackEngine final : public QObject
+	{
+			Q_OBJECT
+
+		private slots:
+			// NOLINTBEGIN(readability-convert-member-functions-to-static)
+			void directCallbackShapesRoundTrip();
+			void wildcardAndStyleCallbackReceivesContextTables();
+			void mxpCallbacksMarshalArguments();
+			void callbackCatalogObserverTracksFunctionPresence();
+			void packageRestrictionsAreAppliedToExistingState();
+			void deferredRuntimeMutationBatchesPreserveOrderAndOwnership();
+			void directExecutorDispatchesRealEngines();
+			void callPluginMarshallingUsesTargetEngineState();
+			void workerDispatchesPluginLifecycleCallbacksOnRealEngines();
+			void workerCallbackBatchCapturesOutputMiniWindowAndSaveStateMutations();
+			void workerColourOutputMatchesMushclientGroupingAndNewlineSemantics();
+			void callbackSnapshotSuppliesGetInfoAndMiniWindowReads();
+			void deferredRuntimeMutationSkipsDestroyedRuntime();
+			// NOLINTEND(readability-convert-member-functions-to-static)
+	};
+
+	void setEngineScript(LuaCallbackEngine &engine, const QString &script)
+	{
+		engine.setPluginInfo(QStringLiteral("Plugin.Id"), QStringLiteral("Plugin Name"),
+		                     QStringLiteral("/tmp/plugin"));
+		engine.setScriptText(script);
+		QVERIFY(engine.loadScript());
+	}
+
+	bool luaGlobalBoolean(lua_State *state, const char *name)
+	{
+		lua_getglobal(state, name);
+		const bool value = lua_toboolean(state, -1) != 0;
+		lua_pop(state, 1);
+		return value;
+	}
+
+	QString luaGlobalString(lua_State *state, const char *name)
+	{
+		lua_getglobal(state, name);
+		const QString value = QString::fromUtf8(lua_tostring(state, -1));
+		lua_pop(state, 1);
+		return value;
+	}
+
+	struct LuaStateDeleterForTest
+	{
+			/**
+			 * @brief Closes Lua state owned by a test helper.
+			 * @param state Lua state pointer.
+			 */
+			void operator()(lua_State *state) const
+			{
+				if (state)
+					lua_close(state);
+			}
+	};
+
+	using LuaStatePtr = std::unique_ptr<lua_State, LuaStateDeleterForTest>;
+
+	LuaStatePtr makeLuaState()
+	{
+		LuaStatePtr state(luaL_newstate());
+		luaL_openlibs(state.get());
+		QMudLuaSupport::applyLua51Compat(state.get());
+		return state;
+	}
+
+	void dispatchWorkerAndWait(const LuaExecutorWorker &executor, const LuaBatchDispatchRequest &request,
+	                           LuaBatchDispatchResult &result)
+	{
+		QObject          completionTarget;
+		std::atomic_bool completed{false};
+		executor.dispatchBatchAsync(request, &completionTarget,
+		                            [&](const LuaBatchDispatchResult &dispatchResult)
+		                            {
+			                            result = dispatchResult;
+			                            completed.store(true, std::memory_order_release);
+		                            });
+		QTRY_VERIFY_WITH_TIMEOUT(completed.load(std::memory_order_acquire), 3000);
+	}
+
+	void dispatchWorkerAndWait(const LuaExecutorWorker &executor, const LuaBatchDispatchRequest &request)
+	{
+		LuaBatchDispatchResult unusedResult;
+		dispatchWorkerAndWait(executor, request, unusedResult);
+	}
+
+	void executeDeferredMutations(LuaBatchDispatchResult &result)
+	{
+		for (LuaDeferredRuntimeMutationBatch &batch : result.deferredRuntimeMutationBatches)
+		{
+			for (std::function<void()> &mutation : batch.mutations)
+				mutation();
+		}
+	}
+} // namespace
+
+// NOLINTBEGIN(readability-convert-member-functions-to-static)
+void tst_LuaCallbackEngine::directCallbackShapesRoundTrip()
+{
+	LuaCallbackEngine engine;
+	setEngineScript(engine, QStringLiteral(R"lua(
+seen = {}
+function cb_no_args()
+  return true
+end
+function cb_string(value)
+  seen.string = value
+  return value == "abc"
+end
+function cb_bytes(value)
+  seen.bytes = value
+  return value == "bin"
+end
+function cb_bytes_inout(value)
+  return value .. ":out"
+end
+function cb_string_inout(value)
+  return value .. ":out"
+end
+function cb_num_string(number, value)
+  seen.num_string = tostring(number) .. ":" .. value
+  return number == 7 and value == "arg"
+end
+function cb_num_strings(number, one, two, three)
+  seen.num_strings = tostring(number) .. ":" .. one .. two .. three
+  return number == 4 and one .. two .. three == "abc"
+end
+function cb_two_nums(one, two, value)
+  seen.two_nums = tostring(one) .. ":" .. tostring(two) .. ":" .. value
+  return one == 2 and two == 3 and value == "go"
+end
+function cb_num_bytes(number, value)
+  seen.num_bytes = tostring(number) .. ":" .. value
+  return number == 9 and value == "bytes"
+end
+function cb_proc(value)
+  seen.proc = value
+end
+)lua"));
+
+	bool hasFunction = false;
+	QVERIFY(engine.callFunctionNoArgs(QStringLiteral("cb_no_args"), &hasFunction, false));
+	QVERIFY(hasFunction);
+	QVERIFY(engine.callFunctionWithString(QStringLiteral("cb_string"), QStringLiteral("abc"), &hasFunction,
+	                                      false));
+	QVERIFY(hasFunction);
+	QVERIFY(engine.callFunctionWithBytes(QStringLiteral("cb_bytes"), QByteArray("bin"), &hasFunction, false));
+	QVERIFY(hasFunction);
+
+	QByteArray bytes = QByteArray("bytes");
+	QVERIFY(engine.callFunctionWithBytesInOut(QStringLiteral("cb_bytes_inout"), bytes, &hasFunction));
+	QVERIFY(hasFunction);
+	QCOMPARE(bytes, QByteArray("bytes:out"));
+
+	QString text = QStringLiteral("text");
+	QVERIFY(engine.callFunctionWithStringInOut(QStringLiteral("cb_string_inout"), text, &hasFunction));
+	QVERIFY(hasFunction);
+	QCOMPARE(text, QStringLiteral("text:out"));
+
+	QVERIFY(engine.callFunctionWithNumberAndString(QStringLiteral("cb_num_string"), 7, QStringLiteral("arg"),
+	                                               &hasFunction, false));
+	QVERIFY(hasFunction);
+	QVERIFY(engine.callFunctionWithNumberAndStrings(QStringLiteral("cb_num_strings"), 4, QStringLiteral("a"),
+	                                                QStringLiteral("b"), QStringLiteral("c"), &hasFunction,
+	                                                false));
+	QVERIFY(hasFunction);
+	QVERIFY(engine.callFunctionWithTwoNumbersAndString(QStringLiteral("cb_two_nums"), 2, 3,
+	                                                   QStringLiteral("go"), &hasFunction, false));
+	QVERIFY(hasFunction);
+	QVERIFY(engine.callFunctionWithNumberAndBytes(QStringLiteral("cb_num_bytes"), 9, QByteArray("bytes"),
+	                                              &hasFunction, false));
+	QVERIFY(hasFunction);
+	QVERIFY(
+	    engine.callProcedureWithString(QStringLiteral("cb_proc"), QStringLiteral("procedure"), &hasFunction));
+	QVERIFY(hasFunction);
+
+	QVERIFY(engine.executeScript(QStringLiteral(R"lua(
+assert(seen.string == "abc")
+assert(seen.bytes == "bin")
+assert(seen.num_string == "7:arg")
+assert(seen.num_strings == "4:abc")
+assert(seen.two_nums == "2:3:go")
+assert(seen.num_bytes == "9:bytes")
+assert(seen.proc == "procedure")
+)lua"),
+	                             QStringLiteral("verify direct callback shapes")));
+	QCOMPARE(lua_gettop(engine.luaState()), 0);
+}
+
+void tst_LuaCallbackEngine::wildcardAndStyleCallbackReceivesContextTables()
+{
+	LuaCallbackEngine engine;
+	setEngineScript(engine, QStringLiteral(R"lua(
+function trigger_cb(first, second, wildcards, styles)
+  trigger_seen = first .. "|" .. second .. "|" .. wildcards[0] .. "|" ..
+                 wildcards.named .. "|" .. styles[1].text .. "|" ..
+                 tostring(styles[2].style)
+end
+)lua"));
+
+	QVector<LuaStyleRun> styleRuns;
+	styleRuns.push_back({QStringLiteral("room"), 10, 11, 1});
+	styleRuns.push_back({QStringLiteral(" exits"), 12, 13, 4});
+	const QStringList            args{QStringLiteral("line"), QStringLiteral("match")};
+	const QStringList            wildcards{QStringLiteral("whole"), QStringLiteral("capture")};
+	const QMap<QString, QString> namedWildcards{
+	    {QStringLiteral("named"), QStringLiteral("value")}
+    };
+
+	bool hasFunction = false;
+	QVERIFY(engine.callFunctionWithStringsAndWildcards(QStringLiteral("trigger_cb"), args, wildcards,
+	                                                   namedWildcards, &styleRuns, nullptr, &hasFunction, 6,
+	                                                   true, 12, 345));
+	QVERIFY(hasFunction);
+	QCOMPARE(luaGlobalString(engine.luaState(), "trigger_seen"),
+	         QStringLiteral("line|match|whole|value|room|4.0"));
+
+	QVERIFY(engine.executeScript(QStringLiteral(R"lua(
+assert(TriggerStyleRuns == nil)
+)lua"),
+	                             QStringLiteral("style table remains callback-local")));
+}
+
+void tst_LuaCallbackEngine::mxpCallbacksMarshalArguments()
+{
+	LuaCallbackEngine engine;
+	setEngineScript(engine, QStringLiteral(R"lua(
+mxp_seen = {}
+function mxp_error(level, number, line, message)
+  mxp_seen.error = tostring(level) .. ":" .. tostring(number) .. ":" ..
+                   tostring(line) .. ":" .. message
+  return false
+end
+function mxp_start()
+  mxp_seen.start = true
+end
+function mxp_shutdown()
+  mxp_seen.shutdown = true
+end
+function mxp_start_tag(name, args, attrs)
+  mxp_seen.start_tag = name .. ":" .. args .. ":" .. attrs.href
+  return true
+end
+function mxp_end_tag(name, text)
+  mxp_seen.end_tag = name .. ":" .. text
+end
+function mxp_set_variable(name, contents)
+  mxp_seen.variable = name .. ":" .. contents
+end
+)lua"));
+
+	QVERIFY(!engine.callMxpError(QStringLiteral("mxp_error"), 2, 42, 7, QStringLiteral("bad tag")));
+	engine.callMxpStartUp(QStringLiteral("mxp_start"));
+	engine.callMxpShutDown(QStringLiteral("mxp_shutdown"));
+	QVERIFY(engine.callMxpStartTag(QStringLiteral("mxp_start_tag"), QStringLiteral("send"),
+	                               QStringLiteral("href='look'"),
+	                               {
+	                                   {QStringLiteral("href"), QStringLiteral("look")}
+    }));
+	engine.callMxpEndTag(QStringLiteral("mxp_end_tag"), QStringLiteral("send"), QStringLiteral("Look"));
+	engine.callMxpSetVariable(QStringLiteral("mxp_set_variable"), QStringLiteral("room"),
+	                          QStringLiteral("Dock"));
+
+	QVERIFY(engine.executeScript(QStringLiteral(R"lua(
+assert(mxp_seen.error == "2:42:7:bad tag")
+assert(mxp_seen.start == true)
+assert(mxp_seen.shutdown == true)
+assert(mxp_seen.start_tag == "send:href='look':look")
+assert(mxp_seen.end_tag == "send:Look")
+assert(mxp_seen.variable == "room:Dock")
+)lua"),
+	                             QStringLiteral("verify mxp callbacks")));
+}
+
+void tst_LuaCallbackEngine::callbackCatalogObserverTracksFunctionPresence()
+{
+	LuaCallbackEngine engine;
+	engine.setPluginInfo(QStringLiteral("PLUGIN.ID"), QStringLiteral("Plugin"));
+
+	QString       observedPluginId;
+	QSet<QString> observedPresent;
+	QSet<QString> observedFunctions;
+	int           observerCalls = 0;
+	engine.setCallbackCatalogObserver(
+	    [&](const QString &pluginId, const QSet<QString> &presentCallbacks, const QSet<QString> &allFunctions)
+	    {
+		    observedPluginId  = pluginId;
+		    observedPresent   = presentCallbacks;
+		    observedFunctions = allFunctions;
+		    ++observerCalls;
+	    });
+	engine.setObservedPluginCallbacks({QStringLiteral("on_one"), QStringLiteral("missing")});
+	engine.setScriptText(QStringLiteral(R"lua(
+function on_one()
+end
+function helper()
+end
+)lua"));
+	QVERIFY(engine.loadScript());
+
+	QCOMPARE(observedPluginId, QStringLiteral("plugin.id"));
+	QVERIFY(observedPresent.contains(QStringLiteral("on_one")));
+	QVERIFY(!observedPresent.contains(QStringLiteral("missing")));
+	QVERIFY(observedFunctions.contains(QStringLiteral("on_one")));
+	QVERIFY(observedFunctions.contains(QStringLiteral("helper")));
+	QVERIFY(engine.hasObservedPluginCallback(QStringLiteral("on_one")));
+	QVERIFY(!engine.hasObservedPluginCallback(QStringLiteral("missing")));
+	QVERIFY(observerCalls >= 2);
+
+	engine.setScriptText(QString());
+	QVERIFY(observedPresent.isEmpty());
+	QVERIFY(observedFunctions.isEmpty());
+}
+
+void tst_LuaCallbackEngine::packageRestrictionsAreAppliedToExistingState()
+{
+	LuaCallbackEngine engine;
+	setEngineScript(engine, QStringLiteral(R"lua(
+package.loaders = { "loader1", "loader2", "loader3", "loader4" }
+restricted_seen = false
+)lua"));
+
+	engine.applyPackageRestrictions(false);
+	QVERIFY(engine.executeScript(QStringLiteral(R"lua(
+restricted_seen = package.loadlib == nil and
+                  package.searchers[3] == nil and package.searchers[4] == nil and
+                  package.loaders[3] == nil and package.loaders[4] == nil
+)lua"),
+	                             QStringLiteral("package restrictions")));
+	QVERIFY(luaGlobalBoolean(engine.luaState(), "restricted_seen"));
+}
+
+void tst_LuaCallbackEngine::deferredRuntimeMutationBatchesPreserveOrderAndOwnership()
+{
+	LuaCallbackEngine engine;
+	int               value   = 0;
+	auto             *runtime = reinterpret_cast<WorldRuntime *>(static_cast<quintptr>(1));
+	engine.appendDeferredRuntimeMutationBatch(runtime, {std::function<void()>([&value] { value += 1; }),
+	                                                    std::function<void()>([&value] { value *= 10; })});
+
+	QVector<LuaDeferredRuntimeMutationBatch> batches = engine.takeDeferredRuntimeMutationBatches();
+	QCOMPARE(batches.size(), 1);
+	QVERIFY(batches.first().runtime == runtime);
+	QCOMPARE(batches.first().mutations.size(), 2);
+	for (auto &mutation : batches.first().mutations)
+		mutation();
+	QCOMPARE(value, 10);
+	QVERIFY(engine.takeDeferredRuntimeMutationBatches().isEmpty());
+
+	LuaDeferredRuntimeMutationBatch nested;
+	nested.runtime = runtime;
+	nested.mutations.push_back([&value] { value += 5; });
+	QVERIFY(!LuaCallbackEngine::appendDeferredRuntimeMutationBatchToActiveCallback(nested));
+	QCOMPARE(nested.mutations.size(), 1);
+}
+
+void tst_LuaCallbackEngine::directExecutorDispatchesRealEngines()
+{
+	auto engine = QSharedPointer<LuaCallbackEngine>::create();
+	setEngineScript(*engine, QStringLiteral(R"lua(
+function stop_false(value)
+  return value ~= "stop"
+end
+function string_handled(value)
+  handled_value = value
+  return false
+end
+function bytes_inout(value)
+  return value .. ":bytes"
+end
+function string_inout(value)
+  return value .. ":string"
+end
+function count_utf8(number, one, two, three)
+  count_seen = tostring(number) .. ":" .. one .. two .. three
+  return true
+end
+)lua"));
+
+	LuaExecutorDirect       executor;
+	LuaBatchDispatchRequest request;
+	request.engines               = {engine};
+	request.kind                  = LuaBatchDispatchKind::StringStopOnFalse;
+	request.functionName          = QStringLiteral("stop_false");
+	request.stringArg             = QStringLiteral("stop");
+	request.defaultResult         = true;
+	LuaBatchDispatchResult result = executor.dispatchBatch(request);
+	QVERIFY(result.boolResultValid);
+	QVERIFY(!result.boolResult);
+
+	request.kind      = LuaBatchDispatchKind::StringHandled;
+	request.stringArg = QStringLiteral("handled");
+	result            = executor.dispatchBatch(request);
+	QVERIFY(result.boolResultValid);
+	QVERIFY(result.boolResult);
+
+	request.kind     = LuaBatchDispatchKind::BytesInOut;
+	request.bytesArg = QByteArray("payload");
+	request.stringArg.clear();
+	request.functionName = QStringLiteral("bytes_inout");
+	result               = executor.dispatchBatch(request);
+	QCOMPARE(result.bytesResult, QByteArray("payload:bytes"));
+
+	request.kind         = LuaBatchDispatchKind::StringInOut;
+	request.functionName = QStringLiteral("string_inout");
+	request.stringArg    = QStringLiteral("payload");
+	result               = executor.dispatchBatch(request);
+	QCOMPARE(result.stringResult, QStringLiteral("payload:string"));
+
+	request.kind         = LuaBatchDispatchKind::NumberAndUtf8StringsCount;
+	request.functionName = QStringLiteral("count_utf8");
+	request.numberArg1   = 3;
+	request.bytesArg     = QByteArray("a");
+	request.bytesArg2    = QByteArray("b");
+	request.bytesArg3    = QByteArray("c");
+	result               = executor.dispatchBatch(request);
+	QVERIFY(result.countResultValid);
+	QCOMPARE(result.countResult, 1);
+	QCOMPARE(luaGlobalString(engine->luaState(), "count_seen"), QStringLiteral("3:abc"));
+}
+
+void tst_LuaCallbackEngine::callPluginMarshallingUsesTargetEngineState()
+{
+	LuaCallbackEngine target;
+	setEngineScript(target, QStringLiteral(R"lua(
+plugin = {}
+function plugin.echo(value, number)
+  return value .. ":" .. tostring(number), true
+end
+)lua"));
+
+	LuaStatePtr caller = makeLuaState();
+	lua_pushstring(caller.get(), "input");
+	lua_pushnumber(caller.get(), 42);
+	const CallPluginLuaMarshallingResult result =
+	    target.callPluginLuaWithMarshalling(caller.get(), QStringLiteral("plugin.echo"), 1);
+	QCOMPARE(result.error, CallPluginLuaMarshallingError::None);
+	QCOMPARE(result.returnCount, 2);
+	QCOMPARE(lua_gettop(caller.get()), 4);
+	QCOMPARE(QString::fromUtf8(lua_tostring(caller.get(), 3)), QStringLiteral("input:42.0"));
+	QVERIFY(lua_toboolean(caller.get(), 4) != 0);
+}
+
+void tst_LuaCallbackEngine::workerDispatchesPluginLifecycleCallbacksOnRealEngines()
+{
+	auto engine = QSharedPointer<LuaCallbackEngine>::create();
+	setEngineScript(*engine, QStringLiteral(R"lua(
+lifecycle = {}
+function OnPluginInstall()
+  table.insert(lifecycle, "install")
+end
+function OnPluginEnable()
+  table.insert(lifecycle, "enable")
+end
+function OnPluginDisable()
+  table.insert(lifecycle, "disable")
+end
+function OnPluginClose()
+  table.insert(lifecycle, "close")
+end
+function lifecycle_join(value)
+  return table.concat(lifecycle, ",")
+end
+)lua"));
+
+	LuaExecutorWorker       executor;
+	LuaBatchDispatchRequest request;
+	request.engines = {engine};
+	request.kind    = LuaBatchDispatchKind::NoArgs;
+	for (const QString &functionName : {QStringLiteral("OnPluginInstall"), QStringLiteral("OnPluginEnable"),
+	                                    QStringLiteral("OnPluginDisable"), QStringLiteral("OnPluginClose")})
+	{
+		request.functionName = functionName;
+		dispatchWorkerAndWait(executor, request);
+	}
+
+	request.kind         = LuaBatchDispatchKind::StringInOut;
+	request.functionName = QStringLiteral("lifecycle_join");
+	request.stringArg    = QStringLiteral("ignored");
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	QCOMPARE(result.stringResult, QStringLiteral("install,enable,disable,close"));
+
+	request.kind    = LuaBatchDispatchKind::TeardownEnginesMany;
+	request.engines = {engine};
+	dispatchWorkerAndWait(executor, request);
+	QVERIFY(engine->luaState() == nullptr);
+}
+
+void tst_LuaCallbackEngine::workerCallbackBatchCapturesOutputMiniWindowAndSaveStateMutations()
+{
+	WorldRuntime runtime;
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QStringLiteral(R"lua(
+batch_seen = ""
+function OnPluginEnable()
+  Note("batch-note")
+  local create_status = WindowCreate("batch", 10, 20, 40, 50, 0, 0, 0)
+  local resize_status = WindowResize("batch", 64, 32, 0)
+  local position_status = WindowPosition("batch", 12, 24, 0, 0)
+  local hotspot_status = WindowAddHotspot("batch", "drag", 1, 2, 9, 10, "", "", "", "", "", "tip", 0, 0)
+  local save_status, save_request_id = SaveState()
+  batch_seen = table.concat({
+    tostring(create_status == eOK),
+    tostring(resize_status == eOK),
+    tostring(position_status == eOK),
+    tostring(hotspot_status == eOK),
+    tostring(save_status == eOK),
+    tostring(save_request_id ~= nil)
+  }, "|")
+end
+function batch_status(value)
+  return batch_seen
+end
+)lua"));
+
+	LuaExecutorWorker       executor;
+	LuaBatchDispatchRequest request;
+	request.engines      = {engine};
+	request.kind         = LuaBatchDispatchKind::NoArgs;
+	request.functionName = QStringLiteral("OnPluginEnable");
+	LuaBatchDispatchResult callbackResult;
+	dispatchWorkerAndWait(executor, request, callbackResult);
+
+	int mutationCount = 0;
+	for (const LuaDeferredRuntimeMutationBatch &batch : callbackResult.deferredRuntimeMutationBatches)
+		mutationCount += safeQSizeToInt(batch.mutations.size());
+	QVERIFY2(mutationCount >= 1, qPrintable(QString::number(mutationCount)));
+
+	request.kind         = LuaBatchDispatchKind::StringInOut;
+	request.functionName = QStringLiteral("batch_status");
+	request.stringArg    = QStringLiteral("ignored");
+	LuaBatchDispatchResult statusResult;
+	dispatchWorkerAndWait(executor, request, statusResult);
+	QCOMPARE(statusResult.stringResult, QStringLiteral("true|true|true|true|true|true"));
+
+	executeDeferredMutations(callbackResult);
+	const RuntimeStubState &state = runtimeStubState(&runtime);
+	QVERIFY(state.outputLines.contains(QStringLiteral("batch-note")));
+	QVERIFY(state.windowNames.contains(QStringLiteral("batch")));
+	QCOMPARE(state.windowInfo.value(QStringLiteral("batch")).value(1).toInt(), 12);
+	QCOMPARE(state.windowInfo.value(QStringLiteral("batch")).value(2).toInt(), 24);
+	QCOMPARE(state.windowInfo.value(QStringLiteral("batch")).value(3).toInt(), 64);
+	QCOMPARE(state.windowInfo.value(QStringLiteral("batch")).value(4).toInt(), 32);
+	QVERIFY(state.hotspotIds.value(QStringLiteral("batch")).contains(QStringLiteral("drag")));
+	QCOMPARE(state.savePluginStateCalls, 1);
+}
+
+void tst_LuaCallbackEngine::workerColourOutputMatchesMushclientGroupingAndNewlineSemantics()
+{
+	WorldRuntime runtime;
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QStringLiteral(R"lua(
+function OnPluginEnable()
+  ColourNote("red", "black", "note-a",
+             "green", "black", "note-b",
+             "blue", "black", "note-c")
+  ColourTell("cyan", "black", "tell-a",
+             "yellow", "black", "tell-b")
+end
+)lua"));
+
+	LuaExecutorWorker       executor;
+	LuaBatchDispatchRequest request;
+	request.engines      = {engine};
+	request.kind         = LuaBatchDispatchKind::NoArgs;
+	request.functionName = QStringLiteral("OnPluginEnable");
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	executeDeferredMutations(result);
+
+	const RuntimeStubState &state = runtimeStubState(&runtime);
+	QCOMPARE(state.outputLines,
+	         QStringList({QStringLiteral("note-a"), QStringLiteral("note-b"), QStringLiteral("note-c"),
+	                      QStringLiteral("tell-a"), QStringLiteral("tell-b")}));
+	QCOMPARE(state.outputNewLines, QList<bool>({false, false, true, false, false}));
+}
+
+void tst_LuaCallbackEngine::callbackSnapshotSuppliesGetInfoAndMiniWindowReads()
+{
+	WorldRuntime runtime;
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QStringLiteral(R"lua(
+snapshot_seen = ""
+function OnPluginEnable()
+  snapshot_seen = string.format("%s|%dx%d|%d,%d|%s|%s",
+    tostring(GetInfo(86)),
+    WindowInfo("map", 3) or -1,
+    WindowInfo("map", 4) or -1,
+    WindowInfo("map", 14) or -1,
+    WindowInfo("map", 15) or -1,
+    table.concat(WindowList() or {}, ","),
+    table.concat(WindowHotspotList("map") or {}, ","))
+end
+function snapshot_status(value)
+  return snapshot_seen
+end
+)lua"));
+
+	auto snapshot                   = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+	snapshot->hasCommandUiSnapshot  = true;
+	snapshot->commandUiHasFrameData = true;
+	snapshot->commandUiValues[QStringLiteral("selectedWord")]         = QStringLiteral("sextant");
+	snapshot->commandUiValues[QStringLiteral("selectedWordResolved")] = true;
+	snapshot->windowNames.push_back(QStringLiteral("map"));
+	LuaCallbackMiniWindowSnapshot::WindowInfoSnapshot windowInfo;
+	windowInfo.width                                    = 120;
+	windowInfo.height                                   = 80;
+	windowInfo.lastMouseX                               = 33;
+	windowInfo.lastMouseY                               = 44;
+	snapshot->windowInfoByWindow[QStringLiteral("map")] = windowInfo;
+	snapshot->hotspotIdsByWindow[QStringLiteral("map")] = {QStringLiteral("move")};
+	snapshot->rebuildMiniWindowLookupCaches();
+
+	LuaExecutorDirect       executor;
+	LuaBatchDispatchRequest request;
+	request.engines               = {engine};
+	request.kind                  = LuaBatchDispatchKind::NoArgs;
+	request.functionName          = QStringLiteral("OnPluginEnable");
+	request.miniWindowSnapshotArg = snapshot;
+	static_cast<void>(executor.dispatchBatch(request));
+
+	request.kind                        = LuaBatchDispatchKind::StringInOut;
+	request.functionName                = QStringLiteral("snapshot_status");
+	request.stringArg                   = QStringLiteral("ignored");
+	const LuaBatchDispatchResult result = executor.dispatchBatch(request);
+	QCOMPARE(result.stringResult, QStringLiteral("sextant|120x80|33,44|map|move"));
+}
+
+void tst_LuaCallbackEngine::deferredRuntimeMutationSkipsDestroyedRuntime()
+{
+	auto runtime = std::make_unique<WorldRuntime>();
+	auto engine  = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(runtime.get());
+	setEngineScript(*engine, QStringLiteral(R"lua(
+function OnPluginEnable()
+  SaveState()
+end
+)lua"));
+
+	LuaExecutorWorker       executor;
+	LuaBatchDispatchRequest request;
+	request.engines      = {engine};
+	request.kind         = LuaBatchDispatchKind::NoArgs;
+	request.functionName = QStringLiteral("OnPluginEnable");
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+
+	QVERIFY(!result.deferredRuntimeMutationBatches.isEmpty());
+	runtime.reset();
+	for (const LuaDeferredRuntimeMutationBatch &batch : result.deferredRuntimeMutationBatches)
+	{
+		for (const std::function<void()> &mutation : batch.mutations)
+			mutation();
+	}
+}
+// NOLINTEND(readability-convert-member-functions-to-static)
+
+QTEST_GUILESS_MAIN(tst_LuaCallbackEngine)
+
+#include "tst_LuaCallbackEngine.moc"

@@ -10,19 +10,24 @@
 #ifndef QMUD_LUACALLBACKENGINE_H
 #define QMUD_LUACALLBACKENGINE_H
 
+#include "LuaExecutor.h"
+
 // ReSharper disable once CppUnusedIncludeDirective
 #include <QByteArray>
 // ReSharper disable once CppUnusedIncludeDirective
 #include <QHash>
 #include <QSet>
+#include <QSharedPointer>
 #include <QString>
 #include <QThread>
+// ReSharper disable once CppUnusedIncludeDirective
 #include <QVector>
 #include <functional>
 #include <memory>
 
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 struct lua_State;
+struct CallPluginLuaMarshallingResult;
 
 struct LuaStateDeleter
 {
@@ -45,6 +50,8 @@ struct LuaStyleRun
 		int     style{0};
 };
 
+struct LuaCallbackMiniWindowSnapshot;
+
 /**
  * @brief Lua VM integration layer for world/plugin callback execution.
  *
@@ -54,7 +61,8 @@ struct LuaStyleRun
 class LuaCallbackEngine
 {
 	public:
-		using CallbackCatalogObserver = std::function<void()>;
+		using CallbackCatalogObserver =
+		    std::function<void(const QString &, const QSet<QString> &, const QSet<QString> &)>;
 
 		/**
 		 * @brief Constructs callback engine with no loaded script.
@@ -90,38 +98,58 @@ class LuaCallbackEngine
 		 * @brief Sets plugin identity metadata used by callback context.
 		 * @param id Plugin id.
 		 * @param name Plugin display name.
+		 * @param directory Plugin directory (legacy type-20 GetPluginInfo value).
 		 */
-		void                              setPluginInfo(const QString &id, const QString &name);
+		void setPluginInfo(const QString &id, const QString &name, const QString &directory = QString());
 		/**
 		 * @brief Returns bound plugin id.
 		 * @return Plugin id.
 		 */
-		[[nodiscard]] QString             pluginId() const;
+		[[nodiscard]] QString pluginId() const;
 		/**
 		 * @brief Returns bound plugin display name.
 		 * @return Plugin display name.
 		 */
-		[[nodiscard]] QString             pluginName() const;
+		[[nodiscard]] QString pluginName() const;
+		/**
+		 * @brief Returns bound plugin directory (legacy type-20 GetPluginInfo value).
+		 * @return Plugin directory with trailing separator when known.
+		 */
+		[[nodiscard]] QString pluginDirectory() const;
+		/**
+		 * @brief Pushes per-call caller plugin context for `GetPluginInfo(..., 23)`.
+		 * @param pluginId Calling plugin id for the current call scope.
+		 */
+		void                  pushCallingPluginId(const QString &pluginId);
+		/**
+		 * @brief Pops per-call caller plugin context.
+		 */
+		void                  popCallingPluginId();
+		/**
+		 * @brief Returns current per-call caller plugin context.
+		 * @return Calling plugin id for the active call scope, or empty when not in such scope.
+		 */
+		[[nodiscard]] QString currentCallingPluginId() const;
 		/**
 		 * @brief Replaces current Lua script source text.
 		 * @param script Lua script source text.
 		 */
-		void                              setScriptText(const QString &script);
+		void                  setScriptText(const QString &script);
 		/**
 		 * @brief Loads/compiles current script text into Lua state.
 		 * @return `true` on successful load/compile.
 		 */
-		bool                              loadScript();
+		bool                  loadScript();
 		/**
 		 * @brief Resets VM and callback state while keeping metadata.
 		 */
-		void                              resetState();
+		void                  resetState();
 		/**
 		 * @brief Checks whether Lua function exists in current state.
 		 * @param functionName Lua function name.
 		 * @return `true` when function exists.
 		 */
-		bool                              hasFunction(const QString &functionName);
+		bool                  hasFunction(const QString &functionName);
 		/**
 		 * @brief Calls MXP error callback with protocol diagnostics.
 		 * @param functionName Callback function name.
@@ -185,6 +213,25 @@ class LuaCallbackEngine
 		 */
 		bool callProcedureWithString(const QString &functionName, const QString &arg,
 		                             bool *hasFunction = nullptr);
+		/**
+		 * @brief Calls a dotted Lua routine and marshals arguments/returns to another Lua state.
+		 *
+		 * Executes under callback script scope so callback-path deferred runtime mutation semantics
+		 * are preserved for cross-plugin `CallPlugin` flows.
+		 *
+		 * @param callerState Caller Lua state receiving marshaled return values.
+		 * @param routine Dotted routine name.
+		 * @param firstArg 1-based stack index for first routine argument in caller state.
+		 * @param miniWindowNamesSnapshot Optional miniwindow-name snapshot used to seed callback
+		 * existence cache for bridge-forbidden callback contexts when full snapshot is unavailable.
+		 * @param miniWindowSnapshot Optional full callback dispatch snapshot used to seed
+		 * callback-scope API read caches.
+		 * @return Marshaling/invocation result classification.
+		 */
+		CallPluginLuaMarshallingResult callPluginLuaWithMarshalling(
+		    lua_State *callerState, const QString &routine, int firstArg,
+		    const QStringList                                         &miniWindowNamesSnapshot = {},
+		    const QSharedPointer<const LuaCallbackMiniWindowSnapshot> &miniWindowSnapshot      = {});
 		/**
 		 * @brief Calls function with one string argument.
 		 * @param functionName Callback function name.
@@ -294,23 +341,36 @@ class LuaCallbackEngine
 		 * @param wildcards Positional wildcard values.
 		 * @param namedWildcards Named wildcard values.
 		 * @param styleRuns Optional style-run list.
+		 * @param miniWindowSnapshot Optional runtime-thread miniwindow snapshot for callback cache seeding.
 		 * @param hasFunction Optional output flag indicating function existence.
+		 * @param actionSourceOverride Optional callback-local action source, or `-1` to use runtime state.
+		 * @param triggerOutputReplacesMatchedLine Whether trigger output should replace the matched line.
+		 * @param triggerMatchedLineBufferIndex Buffer index of the trigger-matched line.
+		 * @param triggerMatchedLineAbsoluteNumber Absolute line number of the trigger-matched line.
 		 * @return Callback result.
 		 */
-		bool callFunctionWithStringsAndWildcards(const QString &functionName, const QStringList &args,
-		                                         const QStringList            &wildcards,
-		                                         const QMap<QString, QString> &namedWildcards,
-		                                         const QVector<LuaStyleRun>   *styleRuns,
-		                                         bool                         *hasFunction = nullptr);
+		bool callFunctionWithStringsAndWildcards(
+		    const QString &functionName, const QStringList &args, const QStringList &wildcards,
+		    const QMap<QString, QString> &namedWildcards, const QVector<LuaStyleRun> *styleRuns,
+		    const LuaCallbackMiniWindowSnapshot *miniWindowSnapshot, bool *hasFunction = nullptr,
+		    int actionSourceOverride = -1, bool triggerOutputReplacesMatchedLine = false,
+		    int triggerMatchedLineBufferIndex = 0, qint64 triggerMatchedLineAbsoluteNumber = 0);
 		/**
 		 * @brief Executes arbitrary Lua code chunk.
 		 * @param code Lua code text.
 		 * @param description Description used for diagnostics.
 		 * @param styleRuns Optional style-run context.
+		 * @param hasTriggerContext Whether the script executes with trigger-line context.
+		 * @param triggerOutputReplacesMatchedLine Whether trigger output should replace the matched line.
+		 * @param triggerMatchedLineBufferIndex Buffer index of the trigger-matched line.
+		 * @param triggerMatchedLineAbsoluteNumber Absolute line number of the trigger-matched line.
 		 * @return `true` on successful execution.
 		 */
 		bool executeScript(const QString &code, const QString &description,
-		                   const QVector<LuaStyleRun> *styleRuns = nullptr);
+		                   const QVector<LuaStyleRun> *styleRuns = nullptr, bool hasTriggerContext = false,
+		                   bool   triggerOutputReplacesMatchedLine = false,
+		                   int    triggerMatchedLineBufferIndex    = 0,
+		                   qint64 triggerMatchedLineAbsoluteNumber = 0);
 		/**
 		 * @brief Enables/disables package loading restrictions.
 		 * @param enablePackage Enable package access when `true`.
@@ -370,28 +430,65 @@ class LuaCallbackEngine
 		 * @brief Clears execution-thread affinity marker after coordinated teardown.
 		 */
 		void                               clearExecutionThreadAffinity() const;
+		/**
+		 * @brief Pushes per-dispatch miniwindow snapshot used by callback-scope read caches.
+		 * @param snapshot Snapshot captured on runtime thread for the active dispatch.
+		 */
+		void
+		pushDispatchMiniWindowSnapshot(const QSharedPointer<const LuaCallbackMiniWindowSnapshot> &snapshot);
+		/**
+		 * @brief Pops per-dispatch miniwindow snapshot.
+		 */
+		void                                               popDispatchMiniWindowSnapshot();
+		/**
+		 * @brief Returns active per-dispatch miniwindow snapshot.
+		 * @return Snapshot pointer, or `nullptr` when unset.
+		 */
+		[[nodiscard]] const LuaCallbackMiniWindowSnapshot *currentDispatchMiniWindowSnapshot() const;
+		/**
+		 * @brief Appends a deferred runtime mutation journal produced by callback scope teardown.
+		 * @param runtime Runtime that owns the mutations.
+		 * @param mutations Ordered mutation callables to execute on the runtime thread.
+		 */
+		void appendDeferredRuntimeMutationBatch(class WorldRuntime              *runtime,
+		                                        QVector<std::function<void()>> &&mutations);
+		/**
+		 * @brief Moves a nested callback mutation journal into the active outer callback result.
+		 * @param batch Batch produced by a nested callback dispatch. Consumed on success.
+		 * @return `true` when an active callback accepted the batch.
+		 */
+		static bool
+		appendDeferredRuntimeMutationBatchToActiveCallback(LuaDeferredRuntimeMutationBatch &batch);
+		/**
+		 * @brief Takes and clears deferred runtime mutation journals produced by the last dispatch.
+		 * @return Ordered mutation batches for runtime-thread application.
+		 */
+		[[nodiscard]] QVector<LuaDeferredRuntimeMutationBatch> takeDeferredRuntimeMutationBatches();
 
 	private:
 		/**
 		 * @brief Ensures Lua state exists and is initialized.
 		 * @return `true` when Lua state is ready.
 		 */
-		bool                ensureState();
+		bool                                                         ensureState();
 		/**
 		 * @brief Registers world/runtime bindings into Lua globals.
 		 */
-		void                registerWorldBindings();
+		void                                                         registerWorldBindings();
 
-		QString             m_script;
-		bool                m_scriptLoaded{false};
-		bool                m_worldBindingsReady{false};
-		bool                m_allowPackage{true};
-		class WorldRuntime *m_worldRuntime{nullptr};
-		QString             m_pluginId;
-		QString             m_pluginName;
-		int                 m_scriptExecutionDepth{0};
-		mutable QThread    *m_executionThread{nullptr};
-		mutable bool        m_reportedRuntimeThreadMismatch{false};
+		QString                                                      m_script;
+		bool                                                         m_scriptLoaded{false};
+		bool                                                         m_worldBindingsReady{false};
+		bool                                                         m_allowPackage{true};
+		class WorldRuntime                                          *m_worldRuntime{nullptr};
+		QString                                                      m_pluginId;
+		QString                                                      m_pluginName;
+		QString                                                      m_pluginDirectory;
+		QVector<QString>                                             m_callingPluginIdStack;
+		QVector<QSharedPointer<const LuaCallbackMiniWindowSnapshot>> m_dispatchMiniWindowSnapshotStack;
+		int                                                          m_scriptExecutionDepth{0};
+		mutable QThread                                             *m_executionThread{nullptr};
+		mutable bool                                                 m_reportedRuntimeThreadMismatch{false};
 
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 		std::unique_ptr<lua_State, LuaStateDeleter> m_ownedState;
@@ -399,10 +496,11 @@ class LuaCallbackEngine
 		bool                                        m_packageRestrictionsApplied{false};
 		bool                                        m_packageRestrictionsAppliedValue{true};
 #endif
-		QSet<QString>           m_luaFunctionsSet;
-		QSet<QString>           m_observedPluginCallbacks;
-		QHash<QString, bool>    m_observedPluginCallbackPresence;
-		CallbackCatalogObserver m_callbackCatalogObserver;
+		QSet<QString>                            m_luaFunctionsSet;
+		QSet<QString>                            m_observedPluginCallbacks;
+		QHash<QString, bool>                     m_observedPluginCallbackPresence;
+		CallbackCatalogObserver                  m_callbackCatalogObserver;
+		QVector<LuaDeferredRuntimeMutationBatch> m_deferredRuntimeMutationBatches;
 };
 
 #endif // QMUD_LUACALLBACKENGINE_H

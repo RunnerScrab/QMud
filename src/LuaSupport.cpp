@@ -17,6 +17,9 @@
 #include <QStringList>
 
 #include <cstdlib>
+#include <mutex>
+#include <new>
+#include <unordered_map>
 
 // Lua allocator callback signature is fixed by Lua's C API (lua_Alloc).
 // ReSharper disable once CppParameterMayBeConstPtrOrRef
@@ -138,6 +141,195 @@ LuaStateOwner::operator bool() const
 	return m_state != nullptr;
 }
 
+namespace
+{
+	constexpr char kLuaNativeCallBoundaryEnabledRegistryKey = 0;
+
+	void           setLuaNativeCallBoundaryEnabled(lua_State *L, const bool enabled)
+	{
+		if (!L)
+			return;
+		lua_pushboolean(L, enabled ? 1 : 0);
+		lua_rawsetp(L, LUA_REGISTRYINDEX, &kLuaNativeCallBoundaryEnabledRegistryKey);
+	}
+
+	bool isLuaNativeCallBoundaryEnabled(lua_State *L)
+	{
+		lua_rawgetp(L, LUA_REGISTRYINDEX, &kLuaNativeCallBoundaryEnabledRegistryKey);
+		const bool enabled = lua_toboolean(L, -1) != 0;
+		lua_pop(L, 1);
+		return enabled;
+	}
+
+	std::recursive_mutex g_luaNativeCallBoundaryMutex;
+
+	struct LuaNativeCallBoundaryHookState
+	{
+			lua_Hook previousHook{nullptr};
+			int      previousMask{0};
+			int      previousCount{0};
+			int      cCallDepth{0};
+			int      scopeDepth{0};
+			bool     lockHeld{false};
+	};
+
+	thread_local std::unordered_map<const lua_State *, LuaNativeCallBoundaryHookState *>
+	                                g_luaNativeCallBoundaryStates;
+
+	LuaNativeCallBoundaryHookState *luaNativeCallBoundaryHookStateFor(const lua_State *L)
+	{
+		if (const auto it = g_luaNativeCallBoundaryStates.find(L); it != g_luaNativeCallBoundaryStates.end())
+		{
+			return it->second;
+		}
+		return nullptr;
+	}
+
+	bool hookMaskIncludesEvent(const int mask, const int event)
+	{
+		switch (event)
+		{
+		case LUA_HOOKCALL:
+			return (mask & LUA_MASKCALL) != 0;
+		case LUA_HOOKRET:
+			return (mask & LUA_MASKRET) != 0;
+#ifdef LUA_HOOKTAILCALL
+		case LUA_HOOKTAILCALL:
+			return (mask & LUA_MASKCALL) != 0;
+#endif
+		case LUA_HOOKLINE:
+			return (mask & LUA_MASKLINE) != 0;
+		case LUA_HOOKCOUNT:
+			return (mask & LUA_MASKCOUNT) != 0;
+		default:
+			return false;
+		}
+	}
+
+	bool hookEventTargetsLuaCFunction(lua_State &L, lua_Debug &ar)
+	{
+		if (lua_getinfo(&L, "S", &ar) == 0)
+			return false;
+		return ar.what && ar.what[0] == 'C';
+	}
+
+	void releaseLuaNativeCallBoundaryLock(LuaNativeCallBoundaryHookState &state)
+	{
+		state.cCallDepth = 0;
+		if (!state.lockHeld)
+			return;
+		state.lockHeld = false;
+		g_luaNativeCallBoundaryMutex.unlock();
+	}
+
+	void luaNativeCallBoundaryHook(lua_State *L, lua_Debug *ar)
+	{
+		auto *state = luaNativeCallBoundaryHookStateFor(L);
+		if (!state || !ar)
+			return;
+
+		if (ar->event == LUA_HOOKCALL || ar->event == LUA_HOOKRET
+#ifdef LUA_HOOKTAILCALL
+		    || ar->event == LUA_HOOKTAILCALL
+#endif
+		)
+		{
+			if (hookEventTargetsLuaCFunction(*L, *ar))
+			{
+				const bool entering = ar->event == LUA_HOOKCALL
+#ifdef LUA_HOOKTAILCALL
+				                      || ar->event == LUA_HOOKTAILCALL
+#endif
+				    ;
+				if (entering)
+				{
+					if (state->cCallDepth == 0 && !state->lockHeld)
+					{
+						g_luaNativeCallBoundaryMutex.lock();
+						state->lockHeld = true;
+					}
+					++state->cCallDepth;
+				}
+				else if (state->cCallDepth > 0)
+				{
+					--state->cCallDepth;
+					if (state->cCallDepth == 0 && state->lockHeld)
+					{
+						state->lockHeld = false;
+						g_luaNativeCallBoundaryMutex.unlock();
+					}
+				}
+			}
+		}
+
+		if (state->previousHook && hookMaskIncludesEvent(state->previousMask, ar->event))
+			state->previousHook(L, ar);
+	}
+
+	class ScopedLuaNativeCallBoundaryHook
+	{
+		public:
+			explicit ScopedLuaNativeCallBoundaryHook(lua_State *L) : m_state(L)
+			{
+				if (!m_state)
+					return;
+
+				if (const auto it = g_luaNativeCallBoundaryStates.find(m_state);
+				    it != g_luaNativeCallBoundaryStates.end())
+				{
+					m_hookState = it->second;
+					if (m_hookState)
+					{
+						++m_hookState->scopeDepth;
+						return;
+					}
+				}
+
+				m_hookState = new (std::nothrow) LuaNativeCallBoundaryHookState;
+				if (!m_hookState)
+					return;
+
+				m_hookState->previousHook  = lua_gethook(m_state);
+				m_hookState->previousMask  = lua_gethookmask(m_state);
+				m_hookState->previousCount = lua_gethookcount(m_state);
+				m_hookState->scopeDepth    = 1;
+
+				g_luaNativeCallBoundaryStates[m_state] = m_hookState;
+				const int mask = m_hookState->previousMask | LUA_MASKCALL | LUA_MASKRET;
+				lua_sethook(m_state, luaNativeCallBoundaryHook, mask, m_hookState->previousCount);
+			}
+
+			~ScopedLuaNativeCallBoundaryHook()
+			{
+				if (!m_state || !m_hookState)
+					return;
+
+				if (--m_hookState->scopeDepth > 0)
+					return;
+
+				releaseLuaNativeCallBoundaryLock(*m_hookState);
+				if (lua_gethook(m_state) == luaNativeCallBoundaryHook)
+				{
+					lua_sethook(m_state, m_hookState->previousHook, m_hookState->previousMask,
+					            m_hookState->previousCount);
+				}
+				if (const auto it = g_luaNativeCallBoundaryStates.find(m_state);
+				    it != g_luaNativeCallBoundaryStates.end() && it->second == m_hookState)
+				{
+					g_luaNativeCallBoundaryStates.erase(it);
+				}
+				delete m_hookState;
+			}
+
+			ScopedLuaNativeCallBoundaryHook(const ScopedLuaNativeCallBoundaryHook &)            = delete;
+			ScopedLuaNativeCallBoundaryHook &operator=(const ScopedLuaNativeCallBoundaryHook &) = delete;
+
+		private:
+			lua_State                      *m_state{nullptr};
+			LuaNativeCallBoundaryHookState *m_hookState{nullptr};
+	};
+} // namespace
+
 static void pushTracebackFunction(lua_State *L)
 {
 	lua_getglobal(L, LUA_DBLIBNAME);
@@ -152,6 +344,22 @@ static void pushTracebackFunction(lua_State *L)
 	lua_pushnil(L);
 }
 
+int QMudLuaSupport::callLuaProtected(lua_State *L, const int arguments, const int returnsCount,
+                                     const int errorFunctionIndex)
+{
+	if (!L)
+		return LUA_ERRRUN;
+	if (!isLuaNativeCallBoundaryEnabled(L))
+		return lua_pcall(L, arguments, returnsCount, errorFunctionIndex);
+	ScopedLuaNativeCallBoundaryHook nativeCallBoundary(L);
+	return lua_pcall(L, arguments, returnsCount, errorFunctionIndex);
+}
+
+void QMudLuaSupport::setNativeCallBoundaryLockEnabled(lua_State *L, const bool enabled)
+{
+	setLuaNativeCallBoundaryEnabled(L, enabled);
+}
+
 int QMudLuaSupport::callLuaWithTraceback(lua_State *L, const int arguments, const int returnsCount)
 {
 	const int base = lua_gettop(L) - arguments;
@@ -160,12 +368,12 @@ int QMudLuaSupport::callLuaWithTraceback(lua_State *L, const int arguments, cons
 	if (lua_isnil(L, -1))
 	{
 		lua_pop(L, 1);
-		error = lua_pcall(L, arguments, returnsCount, 0);
+		error = callLuaProtected(L, arguments, returnsCount, 0);
 	}
 	else
 	{
 		lua_insert(L, base);
-		error = lua_pcall(L, arguments, returnsCount, base);
+		error = callLuaProtected(L, arguments, returnsCount, base);
 		lua_remove(L, base);
 	}
 	return error;
@@ -174,7 +382,7 @@ int QMudLuaSupport::callLuaWithTraceback(lua_State *L, const int arguments, cons
 void QMudLuaSupport::callLuaCFunction(lua_State *L, const lua_CFunction fn)
 {
 	lua_pushcfunction(L, fn);
-	if (lua_pcall(L, 0, 0, 0) != 0)
+	if (callLuaProtected(L, 0, 0, 0) != 0)
 	{
 		const char *err = lua_tostring(L, -1);
 		qWarning() << "Lua C function failed:" << (err ? err : "<unknown>");
@@ -613,7 +821,7 @@ bool QMudLuaSupport::callLuaNamedProcedureWithString(lua_State *L, const QString
 	const QByteArray argBytes = arg.toUtf8();
 	lua_pushlstring(L, argBytes.constData(), argBytes.size());
 
-	if (lua_pcall(L, 1, 1, 0) != 0)
+	if (callLuaProtected(L, 1, 1, 0) != 0)
 	{
 		const char *err = lua_tostring(L, -1);
 		if (luaError)
@@ -644,18 +852,47 @@ void QMudLuaSupport::applyLuaPackageRestrictions(lua_State *L, const bool enable
 		lua_pushnil(L);
 		lua_setfield(L, -2, "loadlib");
 
-		lua_getfield(L, -1, "loaders");
-		if (!lua_istable(L, -1))
+		auto clearNativeSearchSlots = [](lua_State *state, const int tableIndex)
 		{
-			qWarning() << "Lua package.loaders missing or invalid; skipping DLL restrictions.";
+			const int resolvedTableIndex = lua_absindex(state, tableIndex);
+			lua_pushnil(state);
+			lua_rawseti(state, resolvedTableIndex, 4);
+			lua_pushnil(state);
+			lua_rawseti(state, resolvedTableIndex, 3);
+		};
+
+		bool clearedSearchers = false;
+		lua_getfield(L, -1, "searchers");
+		if (lua_istable(L, -1))
+		{
+			clearNativeSearchSlots(L, -1);
+			clearedSearchers = true;
+		}
+		lua_pop(L, 1);
+
+		bool clearedLoaders = false;
+		lua_getfield(L, -1, "loaders");
+		if (lua_istable(L, -1))
+		{
+			bool sameAsSearchers = false;
+			if (clearedSearchers)
+			{
+				lua_getfield(L, -2, "searchers");
+				sameAsSearchers = lua_rawequal(L, -1, -2) != 0;
+				lua_pop(L, 1);
+			}
+			if (!sameAsSearchers)
+				clearNativeSearchSlots(L, -1);
+			clearedLoaders = true;
+		}
+		lua_pop(L, 1);
+
+		if (!clearedSearchers && !clearedLoaders)
+		{
+			qWarning() << "Lua package.loaders/searchers missing or invalid; skipping DLL restrictions.";
 			lua_settop(L, 0);
 			return;
 		}
-
-		lua_pushnil(L);
-		lua_rawseti(L, -2, 4);
-		lua_pushnil(L);
-		lua_rawseti(L, -2, 3);
 
 		lua_settop(L, 0);
 	}

@@ -128,12 +128,6 @@ void WorldChildWindow::initializeWorldUi(const QString &title)
 		        if (MainWindowHost *main = resolveMainWindowHost(window()))
 			        main->updateEditActions();
 	        });
-	connect(m_view, &WorldView::outputScrollChanged, this,
-	        [this]
-	        {
-		        if (MainWindowHost *main = resolveMainWindowHost(window()))
-			        main->updateStatusBar();
-	        });
 	connect(m_view, &WorldView::freezeStateChanged, this,
 	        [this](const bool)
 	        {
@@ -196,7 +190,7 @@ void WorldChildWindow::bindRuntime(WorldRuntime *worldRuntime, const RuntimeBind
 		        [this](const QString &, const QVector<WorldRuntime::StyleSpan> &)
 		        {
 			        if (MainWindowHost *main = resolveMainWindowHost(window()))
-				        main->requestDeferredUiRefresh(true, true, true);
+				        main->requestDeferredUiRefresh(false, true, true);
 		        });
 		connect(worldRuntime, &WorldRuntime::logStateChanged, this,
 		        [this](bool)
@@ -446,10 +440,10 @@ void WorldChildWindow::bindRuntime(WorldRuntime *worldRuntime, const RuntimeBind
 				    const QString receivedPlural = received == 1 ? QString() : QStringLiteral("s");
 				    const QString sentPlural     = sent == 1 ? QString() : QStringLiteral("s");
 				    const QString info           = QStringLiteral("--- Received %1 line%2, sent %3 line%4.")
-				                             .arg(received)
-				                             .arg(receivedPlural)
-				                             .arg(sent)
-				                             .arg(sentPlural);
+				                                       .arg(received)
+				                                       .arg(receivedPlural)
+				                                       .arg(sent)
+				                                       .arg(sentPlural);
 				    m_commandProcessor->note(info, true);
 
 				    const int maxLines =
@@ -781,7 +775,7 @@ bool WorldChildWindow::event(QEvent *event)
 		else if (event->type() == QEvent::WindowStateChange)
 		{
 			if (m_view)
-				m_view->refreshMiniWindows();
+				m_view->refreshMiniWindows(true);
 			runtime->notifyWorldOutputResized();
 		}
 	}
@@ -792,7 +786,7 @@ void WorldChildWindow::showEvent(QShowEvent *event)
 {
 	QMdiSubWindow::showEvent(event);
 	if (m_view)
-		m_view->refreshMiniWindows();
+		m_view->refreshMiniWindows(true);
 	if (WorldRuntime *runtime = m_runtime)
 		runtime->notifyWorldOutputResized();
 	tryInstallPendingPlugins();
@@ -802,7 +796,7 @@ void WorldChildWindow::resizeEvent(QResizeEvent *event)
 {
 	QMdiSubWindow::resizeEvent(event);
 	if (m_view)
-		m_view->refreshMiniWindows();
+		m_view->refreshMiniWindows(true);
 	if (WorldRuntime *runtime = m_runtime)
 		runtime->notifyWorldOutputResized();
 	tryInstallPendingPlugins();

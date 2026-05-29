@@ -16,6 +16,7 @@
 #include <QDateTime>
 #include <QHash>
 #include <QMap>
+#include <QMutex>
 #include <QObject>
 #include <QPageLayout>
 #include <QPointer>
@@ -97,68 +98,78 @@ class AppController : public QObject
 		/**
 		 * @brief Starts initialization path with splash-screen flow.
 		 */
-		void                            startWithSplash();
+		void                         startWithSplash();
 		/**
 		 * @brief Binds top-level main window.
 		 * @param window Main window pointer.
 		 */
-		void                            setMainWindow(MainWindow *window);
+		void                         setMainWindow(MainWindow *window);
 		/**
 		 * @brief Returns bound main window.
 		 * @return Bound main window pointer, or `nullptr`.
 		 */
-		[[nodiscard]] MainWindow       *mainWindow() const;
+		[[nodiscard]] MainWindow    *mainWindow() const;
 		/**
 		 * @brief Performs startup initialization sequence.
 		 * @return `true` when initialization succeeds.
 		 */
-		bool                            initialize();
+		bool                         initialize();
 		/**
 		 * @brief Applies global preferences to runtime UI/components.
 		 */
-		void                            applyGlobalPreferences();
+		void                         applyGlobalPreferences();
 		/**
 		 * @brief Reloads Lua-visible globals after preference changes.
 		 */
-		void                            reloadGlobalPreferencesForLua();
+		void                         reloadGlobalPreferencesForLua();
 		/**
 		 * @brief Triggers immediate manual check for application updates.
 		 * @param uiParent Preferred parent for any immediate update-check UI.
 		 */
-		void                            checkForUpdatesNow(QWidget *uiParent = nullptr);
+		void                         checkForUpdatesNow(QWidget *uiParent = nullptr);
 		/**
 		 * @brief Returns whether the update-check/update-install mechanism is available.
 		 * @return `true` when update checks are enabled for this runtime.
 		 */
-		[[nodiscard]] static bool       isUpdateMechanismAvailable();
+		[[nodiscard]] static bool    isUpdateMechanismAvailable();
 		/**
 		 * @brief Returns a user-facing reason when update mechanism is unavailable.
 		 * @return Empty when updates are available, otherwise unavailable reason.
 		 */
-		[[nodiscard]] static QString    updateMechanismUnavailableReason();
+		[[nodiscard]] static QString updateMechanismUnavailableReason();
 		/**
 		 * @brief Registers OS-level file associations.
 		 * @param errorMessage Optional output error message.
 		 * @return `true` on successful registration.
 		 */
-		static bool                     registerFileAssociations(QString *errorMessage = nullptr);
+		static bool                  registerFileAssociations(QString *errorMessage = nullptr);
 		/**
 		 * @brief Saves main window placement settings.
 		 */
-		void                            saveWindowPlacement() const;
+		void                         saveWindowPlacement() const;
 		/**
 		 * @brief Saves view-related preference values.
 		 */
-		void                            saveViewPreferences();
+		void                         saveViewPreferences();
 		/**
 		 * @brief Saves session-state data for reopen flows.
 		 */
-		void                            saveSessionState() const;
+		void                         saveSessionState() const;
+		/**
+		 * @brief Persists open-world autosave and session state before normal shutdown.
+		 *
+		 * This helper does not close windows; it only writes state that must survive even if a
+		 * later connected-world close confirmation cancels shutdown.
+		 *
+		 * @param errorMessage Optional output error text when persistence fails.
+		 * @return `true` when all open-world shutdown state was saved successfully.
+		 */
+		[[nodiscard]] bool           saveOpenWorldStateBeforeShutdown(QString *errorMessage = nullptr) const;
 		/**
 		 * @brief Sets activity document model instance.
 		 * @param doc Activity document pointer.
 		 */
-		void                            setActivityDocument(ActivityDocument *doc);
+		void                         setActivityDocument(ActivityDocument *doc);
 		/**
 		 * @brief Returns current activity document model.
 		 * @return Activity document pointer, or `nullptr`.
@@ -275,50 +286,55 @@ class AppController : public QObject
 		 */
 		[[nodiscard]] QString              mapDirectionReverse(const QString &direction) const;
 		/**
+		 * @brief Returns a snapshot of configured movement directions.
+		 * @return Direction mapping keyed by normalized direction token.
+		 */
+		[[nodiscard]] QHash<QString, MapDirection> mapDirectionSnapshot() const;
+		/**
 		 * @brief Resolves potentially relative path to absolute path.
 		 * @param fileName Relative or absolute path.
 		 * @return Absolute path.
 		 */
-		[[nodiscard]] QString              makeAbsolutePath(const QString &fileName) const;
+		[[nodiscard]] QString                      makeAbsolutePath(const QString &fileName) const;
 		/**
 		 * @brief Returns absolute paths for currently open world log files.
 		 * @return Absolute open log file paths for active worlds.
 		 */
-		[[nodiscard]] QStringList          activeOpenWorldLogFiles() const;
+		[[nodiscard]] QStringList                  activeOpenWorldLogFiles() const;
 		/**
 		 * @brief Applies configured default world options to runtime.
 		 * @param runtime Runtime instance to initialize.
 		 */
-		void                               applyConfiguredWorldDefaults(WorldRuntime *runtime) const;
+		void                                       applyConfiguredWorldDefaults(WorldRuntime *runtime) const;
 		/**
 		 * @brief Returns next monotonically increasing unique number.
 		 * @return Unique number value.
 		 */
-		qint64                             nextUniqueNumber();
+		qint64                                     nextUniqueNumber();
 		/**
 		 * @brief Seeds shared random generator.
 		 * @param seed Seed value.
 		 */
-		void                               seedRandom(quint32 seed);
+		void                                       seedRandom(quint32 seed);
 		/**
 		 * @brief Seeds random generator from seed array.
 		 * @param values Seed values.
 		 */
-		void                               seedRandomFromArray(const QVector<quint32> &values);
+		void                                       seedRandomFromArray(const QVector<quint32> &values);
 		/**
 		 * @brief Returns random value in [0,1).
 		 * @return Random unit value.
 		 */
-		double                             nextRandomUnit();
+		double                                     nextRandomUnit();
 		/**
 		 * @brief Creates activity document if not already present.
 		 */
-		void                               ensureActivityDocument();
+		void                                       ensureActivityDocument();
 		/**
 		 * @brief Reacts to world script-file change notification.
 		 * @param runtime Runtime that reported script file change.
 		 */
-		void                               processScriptFileChange(WorldRuntime *runtime);
+		void                                       processScriptFileChange(WorldRuntime *runtime);
 		/**
 		 * @brief Result summary returned by XML import operations.
 		 */
@@ -338,45 +354,84 @@ class AppController : public QObject
 		};
 
 		/**
+		 * @brief Result payload for command-line spell-check replacement decisions.
+		 */
+		struct SpellCommandResult
+		{
+				/**
+				 * @brief Result status: `-1` unavailable/error, `0` unchanged, `1` replacement available.
+				 */
+				int     status{-1};
+				/**
+				 * @brief Replacement text when `status` is `1`.
+				 */
+				QString replacement;
+		};
+
+		/**
 		 * @brief Imports selected XML file into current world.
 		 * @param path XML file path.
 		 * @param mask Import mask.
 		 * @return Import result payload.
 		 */
-		ImportResult             importXmlFromFile(const QString &path, unsigned long mask);
+		ImportResult importXmlFromFile(const QString &path, unsigned long mask);
 		/**
 		 * @brief Imports XML text payload into current world.
 		 * @param xml XML payload text.
 		 * @param mask Import mask.
 		 * @return Import result payload.
 		 */
-		ImportResult             importXmlFromText(const QString &xml, unsigned long mask);
+		ImportResult importXmlFromText(const QString &xml, unsigned long mask);
 		/**
 		 * @brief Returns true when spell-check subsystem is available.
 		 * @return `true` when spell checker is available.
 		 */
-		bool                     isSpellCheckerAvailable();
-		/**
-		 * @brief Returns translator Lua state pointer.
-		 * @return Translator Lua state pointer, or `nullptr`.
-		 */
-		[[nodiscard]] lua_State *translatorLuaState() const;
+		bool         isSpellCheckerAvailable();
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 		/**
 		 * @brief Loads spell-check Lua subsystem if needed.
 		 * @return `true` when spell checker is loaded/available.
 		 */
-		bool                     ensureSpellCheckerLoaded();
+		bool               ensureSpellCheckerLoaded();
 		/**
-		 * @brief Returns spell-check Lua state pointer.
-		 * @return Spell-check Lua state pointer, or `nullptr`.
+		 * @brief Adds or updates a spell-check dictionary entry through the owned Lua state.
+		 * @param original Original word bytes.
+		 * @param action Dictionary action bytes.
+		 * @param replacement Replacement word bytes.
+		 * @return Scripting API status code.
 		 */
-		[[nodiscard]] lua_State *spellCheckerLuaState() const;
+		int                addSpellCheckWord(const QByteArray &original, const QByteArray &action,
+		                                     const QByteArray &replacement);
+		/**
+		 * @brief Runs the spell-check string helper through the owned Lua state.
+		 * @param text Text to check.
+		 * @param errorContext User-facing error context.
+		 * @return Invalid variant on unavailable/error, otherwise number, string, or string-list result.
+		 */
+		QVariant           spellCheckString(const QString &text, const QString &errorContext);
+		/**
+		 * @brief Runs the command-line spell-check replacement decision helper.
+		 * @param selectedText Text selected for replacement.
+		 * @param all Whether the whole input was selected.
+		 * @return Spell-check command decision result.
+		 */
+		SpellCommandResult spellCheckCommandText(const QString &selectedText, bool all);
 		/**
 		 * @brief Closes and resets spell-check Lua subsystem.
 		 */
-		void                     closeSpellChecker();
+		void               closeSpellChecker();
 #endif
+		/**
+		 * @brief Runs the localization debug hook through the owned translator Lua state.
+		 * @param message Debug message payload.
+		 * @return Legacy TranslateDebug status code.
+		 */
+		int                translateDebugMessage(const QString &message) const;
+		/**
+		 * @brief Returns whether the translator Lua state is loaded.
+		 * @return `true` when Lua translation support is active.
+		 */
+		[[nodiscard]] bool isTranslatorLuaAvailable() const;
 
 	public slots:
 		/**
@@ -612,7 +667,7 @@ class AppController : public QObject
 		 */
 		[[nodiscard]] QVector<WorldRuntime *> activeWorldRuntimes() const;
 		/**
-		 * @brief Saves dirty worlds that have save-on-close enabled before reload/restart.
+		 * @brief Saves dirty worlds that have save-on-close enabled before shutdown/restart.
 		 *
 		 * This helper does not close windows; it only persists eligible world files.
 		 *
@@ -627,7 +682,7 @@ class AppController : public QObject
 		 */
 		[[nodiscard]] bool closeOpenWorldLogsBeforeRestart(QString *errorMessage = nullptr) const;
 		/**
-		 * @brief Saves per-world output/history session-state files before reload/restart.
+		 * @brief Saves per-world output/history session-state files before shutdown/restart.
 		 * @param errorMessage Optional output error text when persistence fails.
 		 * @return `true` when all eligible worlds were persisted successfully.
 		 */
@@ -639,53 +694,54 @@ class AppController : public QObject
 		 */
 		[[nodiscard]] bool saveOpenWorldPluginStatesBeforeRestart(QString *errorMessage = nullptr) const;
 		/**
-		 * @brief Loads global plugins into runtime context.
+		 * @brief Loads global plugins into runtime context asynchronously.
 		 * @param runtime Runtime receiving global plugin state.
+		 * @param completion Completion callback invoked after load sequence finishes.
 		 */
-		void               loadGlobalPlugins(WorldRuntime *runtime) const;
+		void        loadGlobalPlugins(WorldRuntime *runtime, const std::function<void()> &completion) const;
 		/**
 		 * @brief Startup UX helpers.
 		 */
-		void               showTipDialog() const;
+		void        showTipDialog() const;
 		/**
 		 * @brief Displays startup tip if enabled.
 		 */
-		void               showTipAtStartup() const;
+		void        showTipAtStartup() const;
 		/**
 		 * @brief Shows getting-started page when appropriate.
 		 */
-		void               showGettingStartedIfNeeded() const;
+		void        showGettingStartedIfNeeded() const;
 		/**
 		 * @brief Shows upgrade welcome dialog when required.
 		 */
-		void               showUpgradeWelcomeIfNeeded() const;
+		void        showUpgradeWelcomeIfNeeded() const;
 		/**
 		 * @brief Shows deferred upgrade dialog after scrollback restore counter reaches zero.
 		 */
-		void               maybeShowDeferredUpgradeWelcomeAfterStartupRestores() const;
+		void        maybeShowDeferredUpgradeWelcomeAfterStartupRestores() const;
 		/**
 		 * @brief Performs data backup when upgrading older installs.
 		 * @param previousVersion Previously stored application version.
 		 * @param firstTime `true` when this is first launch after install/migration.
 		 */
-		void               backupDataOnUpgradeIfNeeded(int previousVersion, bool firstTime) const;
+		void        backupDataOnUpgradeIfNeeded(int previousVersion, bool firstTime) const;
 		/**
 		 * @brief Finalizes startup once all prerequisites are complete.
 		 */
-		void               finalizeStartupIfReady();
+		void        finalizeStartupIfReady();
 		/**
 		 * @brief Parses reload startup arguments from process command line.
 		 */
-		void               detectReloadStartupArguments();
+		void        detectReloadStartupArguments();
 		/**
 		 * @brief Deletes stale reload state file when startup is not reload-mode.
 		 */
-		void               cleanupReloadStateOnNormalStartup() const;
+		void        cleanupReloadStateOnNormalStartup() const;
 		/**
 		 * @brief Executes startup recovery for reload-mode launches.
 		 * @return `true` when recovery path completed.
 		 */
-		bool               recoverReloadStartupState();
+		bool        recoverReloadStartupState();
 		/**
 		 * @brief Opens one runtime/window pair from serialized reload world state.
 		 * @param worldState Serialized world state.
@@ -694,34 +750,34 @@ class AppController : public QObject
 		 * @param view Optional output world view pointer.
 		 * @return `true` when world opening succeeds.
 		 */
-		bool               openWorldForReloadRecovery(const ReloadWorldState &worldState, bool activateWindow,
-		                                              WorldRuntime **runtime, WorldView **view = nullptr);
+		bool        openWorldForReloadRecovery(const ReloadWorldState &worldState, bool activateWindow,
+		                                       WorldRuntime **runtime, WorldView **view = nullptr);
 		/**
 		 * @brief Reconnects recovered runtime for `park_reconnect` fallback.
 		 * @param runtime Runtime to reconnect.
 		 * @param worldState Serialized host/port policy data.
 		 * @param closeSocketFirst Close inherited socket before reconnect when `true`.
 		 */
-		static void        reconnectRecoveredWorld(WorldRuntime *runtime, const ReloadWorldState &worldState,
-		                                           bool closeSocketFirst);
+		static void reconnectRecoveredWorld(WorldRuntime *runtime, const ReloadWorldState &worldState,
+		                                    bool closeSocketFirst);
 		/**
 		 * @brief Creates and shows splash screen.
 		 */
-		void               showSplashScreen();
+		void        showSplashScreen();
 		/**
 		 * @brief Hides splash screen.
 		 */
-		void               hideSplashScreen();
+		void        hideSplashScreen();
 		/**
 		 * @brief Synchronizes AppImage payload skeleton files.
 		 * @param startupDir Startup directory path.
 		 */
-		static void        syncAppImageSkeleton(const QString &startupDir);
+		static void syncAppImageSkeleton(const QString &startupDir);
 		/**
 		 * @brief Synchronizes macOS bundle payload files.
 		 * @param startupDir Startup directory path.
 		 */
-		static void        syncMacBundlePayload(const QString &startupDir);
+		static void syncMacBundlePayload(const QString &startupDir);
 
 		/**
 		 * @brief Low-level preferences DB helpers.
@@ -729,7 +785,7 @@ class AppController : public QObject
 		 * @param showError Show query errors in UI/log when `true`.
 		 * @return SQLite-style result code.
 		 */
-		[[nodiscard]] int  dbExecute(const QString &sql, bool showError = false) const;
+		[[nodiscard]] int dbExecute(const QString &sql, bool showError = false) const;
 		/**
 		 * @brief Executes simple SQL query returning one string.
 		 * @param sql SQL query text.
@@ -738,8 +794,8 @@ class AppController : public QObject
 		 * @param defaultValue Value to use when query returns empty/missing data.
 		 * @return SQLite-style result code.
 		 */
-		int                dbSimpleQuery(const QString &sql, QString &result, bool showError = false,
-		                                 const QString &defaultValue = QString()) const;
+		int               dbSimpleQuery(const QString &sql, QString &result, bool showError = false,
+		                                const QString &defaultValue = QString()) const;
 		/**
 		 * @brief Reads integer value from preferences DB.
 		 * @param section Preferences section name.
@@ -747,7 +803,7 @@ class AppController : public QObject
 		 * @param defaultValue Value returned when key is missing.
 		 * @return Stored integer value, or `defaultValue`.
 		 */
-		[[nodiscard]] int  dbGetInt(const QString &section, const QString &entry, int defaultValue = 0) const;
+		[[nodiscard]] int dbGetInt(const QString &section, const QString &entry, int defaultValue = 0) const;
 		/**
 		 * @brief Writes integer value to preferences DB.
 		 * @param section Preferences section name.
@@ -755,7 +811,7 @@ class AppController : public QObject
 		 * @param value Integer value to store.
 		 * @return SQLite-style result code.
 		 */
-		[[nodiscard]] int  dbWriteInt(const QString &section, const QString &entry, int value) const;
+		[[nodiscard]] int dbWriteInt(const QString &section, const QString &entry, int value) const;
 		/**
 		 * @brief Reads string value from preferences DB.
 		 * @param section Preferences section name.
@@ -898,8 +954,8 @@ class AppController : public QObject
 		 * @param view World view.
 		 * @param completion Completion callback executed on the GUI thread.
 		 */
-		void                  saveWorldSessionStateAsync(const WorldRuntime *runtime, const WorldView *view,
-		                                                 std::function<void(bool, const QString &)> completion) const;
+		void saveWorldSessionStateAsync(const WorldRuntime *runtime, const WorldView *view,
+		                                std::function<void(bool, const QString &)> completion) const;
 		/**
 		 * @brief Loads one world's session state on a worker thread and applies it.
 		 * @param runtime World runtime.
@@ -919,31 +975,34 @@ class AppController : public QObject
 		 * persistence toggles.
 		 * @return `true` on success.
 		 */
-		[[nodiscard]] bool               restoreWorldSessionStateSync(WorldRuntime *runtime, WorldView *view,
-		                                                              QString *errorMessage = nullptr,
-		                                                              bool     forceReadSessionState = false) const;
+		[[nodiscard]] bool restoreWorldSessionStateSync(WorldRuntime *runtime, WorldView *view,
+		                                                QString *errorMessage          = nullptr,
+		                                                bool     forceReadSessionState = false) const;
 		/**
-		 * @brief Emits startup banner and loads/installs global plugins after session-state restore.
+		 * @brief Emits startup banner and runs async plugin startup pipeline after session-state restore.
 		 * @param runtime World runtime.
+		 * @param completion Completion callback invoked after startup pipeline finishes.
+		 * @param waitForPluginInstallCommit Wait for pending plugin installs to commit before completion.
 		 */
-		void                             runWorldStartupPostRestore(WorldRuntime *runtime) const;
+		void               runWorldStartupPostRestore(WorldRuntime *runtime, std::function<void()> completion,
+		                                              bool waitForPluginInstallCommit = true) const;
 		/**
 		 * @brief Auto-connects runtime when settings request it.
 		 * @param runtime Runtime to auto-connect.
 		 */
-		void                             maybeAutoConnectWorld(WorldRuntime *runtime) const;
-		void                             beginRestoreScrollbackStatus() const;
-		void                             preseedRestoreScrollbackStatus(int count) const;
-		void                             endRestoreScrollbackStatus() const;
-		MainWindow                      *m_mainWindow{nullptr};
-		QDateTime                        m_whenClientStarted;
-		QString                          m_version;
-		QString                          m_workingDir;
-		QString                          m_fileBrowsingDir;
-		QString                          m_preferencesDatabaseName;
-		QString                          m_locale;
-		QString                          m_translatorFile;
-		QMap<QString, int>               m_globalIntPrefs;
+		void               maybeAutoConnectWorld(WorldRuntime *runtime) const;
+		void               beginRestoreScrollbackStatus() const;
+		void               preseedRestoreScrollbackStatus(int count) const;
+		void               endRestoreScrollbackStatus() const;
+		MainWindow        *m_mainWindow{nullptr};
+		QDateTime          m_whenClientStarted;
+		QString            m_version;
+		QString            m_workingDir;
+		QString            m_fileBrowsingDir;
+		QString            m_preferencesDatabaseName;
+		QString            m_locale;
+		QString            m_translatorFile;
+		QMap<QString, int> m_globalIntPrefs;
 		QMap<QString, QString>           m_globalStringPrefs;
 		QString                          m_luaScript;
 		QString                          m_pluginsDirectory;
@@ -995,6 +1054,9 @@ class AppController : public QObject
 		lua_State *m_spellCheckerLua{nullptr};
 		bool       m_spellCheckOk{false};
 #endif
+		mutable QRecursiveMutex          m_luaStateMutex;
+		mutable QRecursiveMutex          m_globalPrefsMutex;
+		mutable QRecursiveMutex          m_sharedLookupMutex;
 		QVector<QMudColorRef>            m_xterm256Colours = QVector<QMudColorRef>(256);
 		QHash<QString, MapDirection>     m_mapDirections;
 		QScopedPointer<NameGenerator>    m_nameGenerator;
@@ -1003,6 +1065,7 @@ class AppController : public QObject
 		ActivityDocument                *m_activityDoc{nullptr};
 		std::atomic<qint64>              m_uniqueNumber{0};
 		QRandomGenerator                 m_rng{1u};
+		mutable QMutex                   m_rngMutex;
 		mutable int                      m_restoreScrollbackInFlight{0};
 		mutable int                      m_restoreScrollbackPreseedBudget{0};
 		mutable QPointer<WorldRuntime>   m_restoreScrollbackStatusRuntime;

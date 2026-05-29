@@ -3,14 +3,17 @@
  * Copyright (c) 2026 Panagiotis Kalogiratos (Nodens)
  *
  * File: MainFrameMdiUtils.h
- * Role: Pure helpers for MDI active-window fallback and non-activating add restore behavior.
+ * Role: Pure helpers for main-frame MDI state and shutdown preparation behavior.
  */
 
 #ifndef QMUD_MAINFRAMEMDIUTILS_H
 #define QMUD_MAINFRAMEMDIUTILS_H
 
 class QMdiSubWindow;
+class QString;
 template <typename T> class QList;
+
+#include <functional>
 
 namespace QMudMainFrameMdiUtils
 {
@@ -35,6 +38,16 @@ namespace QMudMainFrameMdiUtils
 	QMdiSubWindow *resolveBackgroundAddRestoreTarget(QMdiSubWindow *active, QMdiSubWindow *lastActive,
 	                                                 const QList<QMdiSubWindow *> &creationOrder,
 	                                                 const QMdiSubWindow          *addedSubWindow);
+
+	/**
+	 * @brief Runs open-world persistence before child windows are closed.
+	 * @param saveOpenWorldState Persistence callback, or empty when no controller is available.
+	 * @param errorMessage Optional output error text when persistence fails.
+	 * @return `true` when shutdown can continue to child-window close.
+	 */
+	[[nodiscard]] bool
+	prepareOpenWorldStateBeforeChildClose(const std::function<bool(QString *)> &saveOpenWorldState,
+	                                      QString                              *errorMessage = nullptr);
 } // namespace QMudMainFrameMdiUtils
 
 #endif // QMUD_MAINFRAMEMDIUTILS_H
