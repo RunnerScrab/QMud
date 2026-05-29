@@ -1898,7 +1898,7 @@ static const struct
     {"EnableSpellCheck",                1                       },
     {"AllowLoadingDlls",                1                       },
     {"F1macro",                         0                       },
-    {"DisableWindowScaler",             0                       },
+    {"DisableWindowScaler",             1                       },
     {"FixedFontForEditing",             1                       },
     {"NotepadWordWrap",                 1                       },
     {"NotifyIfCannotConnect",           1                       },
