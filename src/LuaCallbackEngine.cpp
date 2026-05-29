@@ -5829,7 +5829,7 @@ namespace
 	{
 		MiniWindow &window = upsertCallbackMiniWindowShadow(engine, windowName);
 		MiniWindowUtils::create(window, windowName, left, top, width, height, position, flags, background,
-		                        pluginId);
+		                        pluginId, window.devicePixelRatio);
 		cacheCallbackMiniWindowInfoFromShadow(engine, window);
 	}
 
@@ -6170,14 +6170,6 @@ namespace
 		if (!window || !source)
 			return;
 		MiniWindowUtils::imageFromWindow(*window, imageId, *source);
-		cacheCallbackMiniWindowImageListFromShadow(engine, windowName);
-		return;
-		MiniWindowImage entry;
-		entry.image      = source->surface.copy();
-		entry.source     = sourceWindow;
-		entry.hasAlpha   = entry.image.hasAlphaChannel();
-		entry.monochrome = false;
-		window->images.insert(imageId, entry);
 		cacheCallbackMiniWindowImageListFromShadow(engine, windowName);
 	}
 
@@ -42152,7 +42144,10 @@ static int luaWindowWrite(lua_State *L)
 			return 1;
 		}
 		MiniWindow snapshotWindow;
-		snapshotWindow.surface = snapshot;
+		snapshotWindow.width = qMax(1, static_cast<int>(std::ceil(snapshot.deviceIndependentSize().width())));
+		snapshotWindow.height =
+		    qMax(1, static_cast<int>(std::ceil(snapshot.deviceIndependentSize().height())));
+		snapshotWindow.setBackingSurface(snapshot);
 		lua_pushnumber(L, MiniWindowUtils::saveWindowImage24Bit(snapshotWindow, trimmedFileName)
 		                      ? eOK
 		                      : eCouldNotOpenFile);

@@ -73,7 +73,7 @@ class tst_MiniWindowUtils : public QObject
 			MiniWindow window;
 			MiniWindowUtils::create(window, QStringLiteral("geom"), 5, 7, 32, 24, 0, 0, QColor(Qt::black),
 			                        QString());
-			window.surface.fill(QColor(Qt::red));
+			MiniWindowUtils::rectOp(window, 2, 0, 0, 0, 0, MiniWindowUtils::colorToRef(QColor(Qt::red)), 0);
 
 			MiniWindowUtils::position(window, 40, 50, 4, kMiniWindowAbsoluteLocation);
 			MiniWindowUtils::resize(window, 48, 36, 0x000000);
@@ -83,8 +83,62 @@ class tst_MiniWindowUtils : public QObject
 			QCOMPARE(window.flags, kMiniWindowAbsoluteLocation);
 			QCOMPARE(window.width, 48);
 			QCOMPARE(window.height, 36);
-			QCOMPARE(window.surface.size(), QSize(48, 36));
-			QCOMPARE(window.surface.pixelColor(0, 0), QColor(Qt::red));
+			QCOMPARE(window.backingSurfaceSize(), QSize(48, 36));
+			QCOMPARE(window.backingSurface().pixelColor(0, 0), QColor(Qt::red));
+		}
+
+		void highDpiCreateKeepsLogicalGeometryAndUsesPhysicalBacking()
+		{
+			MiniWindow window;
+			MiniWindowUtils::create(window, QStringLiteral("hidpi"), 5, 7, 32, 24, 0, 0, QColor(Qt::black),
+			                        QString(), 1.5);
+
+			QCOMPARE(window.width, 32);
+			QCOMPARE(window.height, 24);
+			QCOMPARE(window.backingSurfaceSize(), QSize(48, 36));
+			QCOMPARE(window.backingSurfaceDevicePixelRatio(), 1.5);
+		}
+
+		void setBackingSurfaceNormalizesImageDevicePixelRatio()
+		{
+			MiniWindow window;
+			QImage     backing(QSize(8, 6), QImage::Format_ARGB32);
+			backing.setDevicePixelRatio(0.5);
+
+			window.setBackingSurface(backing);
+
+			QCOMPARE(window.devicePixelRatio, 1.0);
+			QCOMPARE(window.backingSurfaceDevicePixelRatio(), 1.0);
+			QCOMPARE(window.backingSurface().devicePixelRatio(), 1.0);
+		}
+
+		void highDpiLogicalPixelAccessUsesApiCoordinates()
+		{
+			MiniWindow window;
+			MiniWindowUtils::create(window, QStringLiteral("hidpi-pixel"), 0, 0, 16, 12, 0, 0,
+			                        QColor(Qt::black), QString(), 2.0);
+
+			MiniWindowUtils::setPixel(window, 2, 3, MiniWindowUtils::colorToRef(QColor(Qt::red)));
+
+			QCOMPARE(MiniWindowUtils::pixelValue(window, 2, 3), MiniWindowUtils::colorToRef(QColor(Qt::red)));
+			QCOMPARE(window.backingSurface().pixelColor(4, 6), QColor(Qt::red));
+		}
+
+		void highDpiResizeKeepsDpiAndLogicalContent()
+		{
+			MiniWindow window;
+			MiniWindowUtils::create(window, QStringLiteral("hidpi-resize"), 0, 0, 16, 12, 0, 0,
+			                        QColor(Qt::black), QString(), 1.5);
+			MiniWindowUtils::setPixel(window, 1, 1, MiniWindowUtils::colorToRef(QColor(Qt::green)));
+
+			MiniWindowUtils::resize(window, 20, 14, MiniWindowUtils::colorToRef(QColor(Qt::black)));
+
+			QCOMPARE(window.width, 20);
+			QCOMPARE(window.height, 14);
+			QCOMPARE(window.backingSurfaceSize(), QSize(30, 21));
+			QCOMPARE(window.backingSurfaceDevicePixelRatio(), 1.5);
+			QCOMPARE(MiniWindowUtils::pixelValue(window, 1, 1),
+			         MiniWindowUtils::colorToRef(QColor(Qt::green)));
 		}
 
 		void detachedImageCopyPreservesCanonicalGeometryState()
@@ -95,7 +149,7 @@ class tst_MiniWindowUtils : public QObject
 			MiniWindowUtils::position(window, 44, 55, 4, kMiniWindowAbsoluteLocation);
 			MiniWindowUtils::resize(window, 64, 40, 0x000000);
 			window.rect = QRect(window.location, QSize(window.width, window.height));
-			window.surface.fill(QColor(Qt::blue));
+			MiniWindowUtils::rectOp(window, 2, 0, 0, 0, 0, MiniWindowUtils::colorToRef(QColor(Qt::blue)), 0);
 
 			const MiniWindow copy = window.detachedImageCopy();
 
@@ -106,9 +160,9 @@ class tst_MiniWindowUtils : public QObject
 			QCOMPARE(copy.width, 64);
 			QCOMPARE(copy.height, 40);
 			QCOMPARE(copy.rect, QRect(44, 55, 64, 40));
-			QCOMPARE(copy.surface.size(), QSize(64, 40));
-			QCOMPARE(copy.surface.pixelColor(0, 0), QColor(Qt::blue));
-			QVERIFY(copy.surface.constBits() != window.surface.constBits());
+			QCOMPARE(copy.backingSurfaceSize(), QSize(64, 40));
+			QCOMPARE(copy.backingSurface().pixelColor(0, 0), QColor(Qt::blue));
+			QVERIFY(copy.backingSurface().constBits() != window.backingSurface().constBits());
 		}
 
 		void detachedImageCopySurvivesSourceMutationAndClear()
@@ -116,7 +170,7 @@ class tst_MiniWindowUtils : public QObject
 			MiniWindow window;
 			MiniWindowUtils::create(window, QStringLiteral("snapshot-copy"), 1, 2, 16, 12, 0, 0,
 			                        QColor(Qt::black), QStringLiteral("plugin-id"));
-			window.surface.fill(QColor(Qt::green));
+			MiniWindowUtils::rectOp(window, 2, 0, 0, 0, 0, MiniWindowUtils::colorToRef(QColor(Qt::green)), 0);
 			MiniWindowImage image;
 			image.image = QImage(8, 6, QImage::Format_ARGB32_Premultiplied);
 			image.image.fill(QColor(Qt::yellow));
@@ -124,16 +178,63 @@ class tst_MiniWindowUtils : public QObject
 
 			const MiniWindow copy = window.detachedImageCopy();
 
-			window.surface.fill(QColor(Qt::red));
+			MiniWindowUtils::rectOp(window, 2, 0, 0, 0, 0, MiniWindowUtils::colorToRef(QColor(Qt::red)), 0);
 			window.images.clear();
 			window.width  = 0;
 			window.height = 0;
 
 			QCOMPARE(copy.width, 16);
 			QCOMPARE(copy.height, 12);
-			QCOMPARE(copy.surface.pixelColor(0, 0), QColor(Qt::green));
+			QCOMPARE(copy.backingSurface().pixelColor(0, 0), QColor(Qt::green));
 			QVERIFY(copy.images.contains(QStringLiteral("img")));
 			QCOMPARE(copy.images.value(QStringLiteral("img")).image.pixelColor(0, 0), QColor(Qt::yellow));
+		}
+
+		void highDpiFloodFillStopsAtLogicalBorder()
+		{
+			MiniWindow window;
+			MiniWindowUtils::create(window, QStringLiteral("flood-border"), 0, 0, 8, 8, 0, 0,
+			                        QColor(Qt::black), QString(), 2.0);
+			const long red   = MiniWindowUtils::colorToRef(QColor(Qt::red));
+			const long green = MiniWindowUtils::colorToRef(QColor(Qt::green));
+			for (int x = 1; x <= 6; ++x)
+			{
+				MiniWindowUtils::setPixel(window, x, 1, red);
+				MiniWindowUtils::setPixel(window, x, 6, red);
+			}
+			for (int y = 1; y <= 6; ++y)
+			{
+				MiniWindowUtils::setPixel(window, 1, y, red);
+				MiniWindowUtils::setPixel(window, 6, y, red);
+			}
+
+			QCOMPARE(MiniWindowUtils::rectOp(window, 6, 2, 2, 0, 0, red, green), eOK);
+
+			QCOMPARE(MiniWindowUtils::pixelValue(window, 2, 2), green);
+			QCOMPARE(MiniWindowUtils::pixelValue(window, 5, 5), green);
+			QCOMPARE(MiniWindowUtils::pixelValue(window, 1, 1), red);
+			QCOMPARE(MiniWindowUtils::pixelValue(window, 0, 0),
+			         MiniWindowUtils::colorToRef(QColor(Qt::black)));
+		}
+
+		void highDpiFloodFillActionSevenOnlyReplacesBorderColourRuns()
+		{
+			MiniWindow window;
+			MiniWindowUtils::create(window, QStringLiteral("flood-border-only"), 0, 0, 8, 8, 0, 0,
+			                        QColor(Qt::black), QString(), 2.0);
+			const long red  = MiniWindowUtils::colorToRef(QColor(Qt::red));
+			const long blue = MiniWindowUtils::colorToRef(QColor(Qt::blue));
+			MiniWindowUtils::setPixel(window, 2, 2, red);
+			MiniWindowUtils::setPixel(window, 3, 2, red);
+			MiniWindowUtils::setPixel(window, 4, 2, red);
+
+			QCOMPARE(MiniWindowUtils::rectOp(window, 7, 2, 2, 0, 0, red, blue), eOK);
+
+			QCOMPARE(MiniWindowUtils::pixelValue(window, 2, 2), blue);
+			QCOMPARE(MiniWindowUtils::pixelValue(window, 3, 2), blue);
+			QCOMPARE(MiniWindowUtils::pixelValue(window, 4, 2), blue);
+			QCOMPARE(MiniWindowUtils::pixelValue(window, 5, 2),
+			         MiniWindowUtils::colorToRef(QColor(Qt::black)));
 		}
 
 		void bezierRejectsLegacyInvalidPointList()

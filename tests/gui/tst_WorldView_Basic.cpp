@@ -478,9 +478,9 @@ namespace
 		window.width           = rect.width();
 		window.height          = rect.height();
 		window.rect            = rect;
-		window.surface =
-		    QImage(qMax(1, rect.width()), qMax(1, rect.height()), QImage::Format_ARGB32_Premultiplied);
-		window.surface.fill(fill);
+		QImage surface(qMax(1, rect.width()), qMax(1, rect.height()), QImage::Format_ARGB32_Premultiplied);
+		surface.fill(fill);
+		window.setBackingSurface(surface);
 		g_testMiniWindows.push_back(window);
 		return g_testMiniWindows.last();
 	}
@@ -917,8 +917,9 @@ bool WorldRuntime::callWorldHotspotFunction(const QString &functionName, long fl
 			window.width        = width;
 			window.height       = height;
 			window.rect.setSize(QSize(width, height));
-			window.surface = QImage(width, height, QImage::Format_ARGB32_Premultiplied);
-			window.surface.fill(QColor(40, 90, 210, 255));
+			QImage surface(width, height, QImage::Format_ARGB32_Premultiplied);
+			surface.fill(QColor(40, 90, 210, 255));
+			window.setBackingSurface(surface);
 			if (g_runtimeView)
 				g_runtimeView->onMiniWindowsChanged();
 			break;

@@ -149,6 +149,13 @@ namespace
 		return c >= 0x20 && c < 0x7F;
 	}
 
+	double miniWindowDevicePixelRatioForView(const WorldView *view)
+	{
+		if (!view)
+			return 1.0;
+		return MiniWindow::normalizedDevicePixelRatio(view->devicePixelRatioF());
+	}
+
 	bool isAsciiAlnumByte(const unsigned char c)
 	{
 		return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
@@ -21153,7 +21160,8 @@ int WorldRuntime::windowCreate(const QString &name, int left, int top, int width
 	}
 
 	MiniWindow &window = it.value();
-	MiniWindowUtils::create(window, name, left, top, width, height, position, flags, background, pluginId);
+	MiniWindowUtils::create(window, name, left, top, width, height, position, flags, background, pluginId,
+	                        miniWindowDevicePixelRatioForView(m_view));
 
 	emitMiniWindowsChangedCoalesced();
 	return eOK;
@@ -21755,7 +21763,7 @@ int WorldRuntime::renderWindowOutputText(MiniWindow &targetWindow, const QString
 	if (!mouseUp.isEmpty() && !isValidScriptLabel(mouseUp))
 		return eInvalidObjectLabel;
 
-	QImage &surface = window->surface;
+	QImage &surface = window->mutableBackingSurface();
 	if (surface.isNull())
 		return eOK;
 
@@ -22701,11 +22709,7 @@ int WorldRuntime::windowSetPixel(const QString &name, int x, int y, long colour)
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
-	QImage &surface = window->surface;
-	if (!surface.rect().contains(x, y))
-		return eOK;
-	const QColor c = colorFromRef(colour);
-	surface.setPixel(x, y, qRgba(c.red(), c.green(), c.blue(), 0xFF));
+	MiniWindowUtils::setPixel(*window, x, y, colour);
 	emitMiniWindowsChangedCoalesced();
 	return eOK;
 }
@@ -22717,11 +22721,7 @@ QVariant WorldRuntime::windowGetPixel(const QString &name, int x, int y) const
 	const MiniWindow *window = miniWindow(name);
 	if (!window)
 		return {static_cast<qlonglong>(-2)};
-	const QImage &surface = window->surface;
-	if (!surface.rect().contains(x, y))
-		return {static_cast<qlonglong>(-1)};
-	const QColor colour(surface.pixel(x, y));
-	return {static_cast<qlonglong>(colorToRef(colour))};
+	return {static_cast<qlonglong>(MiniWindowUtils::pixelValue(*window, x, y))};
 }
 
 int WorldRuntime::windowCreateImage(const QString &name, const QString &imageId, long row1, long row2,
@@ -22978,7 +22978,7 @@ int WorldRuntime::windowSnapshotImage(const QString &name, QImage &image) const
 	if (!window)
 		return eNoSuchWindow;
 
-	image = window->surface.copy();
+	image = window->backingSurface().copy();
 	return eOK;
 }
 
@@ -23384,6 +23384,26 @@ void WorldRuntime::setView(WorldView *view)
 			                                    m_viewDestroyedConnection = QMetaObject::Connection{};
 		                                    });
 	}
+	else
+	{
+		return;
+	}
+
+	const double ratio = miniWindowDevicePixelRatioForView(m_view);
+	bool         changed{false};
+	for (MiniWindow &window : m_miniWindows)
+	{
+		const QSize physicalSize = MiniWindow::backingStoreSize(window.width, window.height, ratio);
+		if (!qFuzzyCompare(window.devicePixelRatio, ratio) ||
+		    !qFuzzyCompare(window.backingSurfaceDevicePixelRatio(), ratio) ||
+		    window.backingSurfaceSize() != physicalSize)
+		{
+			MiniWindowUtils::setDevicePixelRatio(window, ratio);
+			changed = true;
+		}
+	}
+	if (changed)
+		emitMiniWindowsChangedCoalesced();
 }
 
 WorldView *WorldRuntime::view() const

@@ -263,6 +263,80 @@ namespace
 		return static_cast<double>(value);
 	}
 
+	double surfaceDevicePixelRatio(const MiniWindow &window)
+	{
+		if (!window.backingSurfaceIsNull())
+			return window.backingSurfaceDevicePixelRatio();
+		return MiniWindow::normalizedDevicePixelRatio(window.devicePixelRatio);
+	}
+
+	[[nodiscard]] QRect logicalSurfaceRect(const MiniWindow &window)
+	{
+		return window.logicalRect();
+	}
+
+	[[nodiscard]] QRect physicalRectForLogicalRect(const MiniWindow &window, const QRect &logicalRect)
+	{
+		const QRect bounded = logicalRect.intersected(logicalSurfaceRect(window));
+		if (bounded.isEmpty() || window.backingSurfaceIsNull())
+			return {};
+
+		const double ratio  = surfaceDevicePixelRatio(window);
+		const int    left   = static_cast<int>(std::floor(static_cast<double>(bounded.left()) * ratio));
+		const int    top    = static_cast<int>(std::floor(static_cast<double>(bounded.top()) * ratio));
+		const int    right  = static_cast<int>(std::ceil(static_cast<double>(bounded.right() + 1) * ratio));
+		const int    bottom = static_cast<int>(std::ceil(static_cast<double>(bounded.bottom() + 1) * ratio));
+		return QRect(left, top, right - left, bottom - top).intersected(window.backingSurface().rect());
+	}
+
+	[[nodiscard]] QPoint physicalPointForLogicalPixel(const MiniWindow &window, const int x, const int y)
+	{
+		const double ratio = surfaceDevicePixelRatio(window);
+		return {static_cast<int>(std::floor((static_cast<double>(x) + 0.5) * ratio)),
+		        static_cast<int>(std::floor((static_cast<double>(y) + 0.5) * ratio))};
+	}
+
+	[[nodiscard]] QImage physicalLayerForImage(const QImage &image, const QRect &source,
+	                                           const QSize &logicalSize, const double ratio)
+	{
+		const QSize physicalSize =
+		    MiniWindow::backingStoreSize(logicalSize.width(), logicalSize.height(), ratio);
+		QImage layer(physicalSize, QImage::Format_ARGB32);
+		layer.setDevicePixelRatio(MiniWindow::normalizedDevicePixelRatio(ratio));
+		layer.fill(Qt::transparent);
+		QPainter painter(&layer);
+		painter.drawImage(QRect(QPoint(0, 0), logicalSize), image, source);
+		return layer;
+	}
+
+	[[nodiscard]] QImage surfaceLogicalImage(const MiniWindow &window)
+	{
+		QImage image(qMax(1, window.width), qMax(1, window.height), QImage::Format_ARGB32);
+		image.fill(Qt::transparent);
+		if (window.backingSurfaceIsNull())
+			return image;
+		QPainter painter(&image);
+		painter.drawImage(QPoint(0, 0), window.backingSurface());
+		return image;
+	}
+
+	[[nodiscard]] QImage copySurfacePhysicalLayer(const MiniWindow &window, const QRect &logicalRect)
+	{
+		const QRect physicalRect = physicalRectForLogicalRect(window, logicalRect);
+		if (physicalRect.isEmpty())
+			return {};
+		QImage copy = window.backingSurface().copy(physicalRect).convertToFormat(QImage::Format_ARGB32);
+		copy.setDevicePixelRatio(surfaceDevicePixelRatio(window));
+		return copy;
+	}
+
+	void clearTransparentSurfaceCache(MiniWindow &window)
+	{
+		window.transparentSurfaceCache     = QImage();
+		window.transparentSurfaceSourceKey = 0;
+		window.transparentSurfaceKeyRgb    = 0;
+	}
+
 	double defaultRandomUnit()
 	{
 		return QRandomGenerator::global()->generateDouble();
@@ -971,6 +1045,14 @@ namespace
 
 } // namespace
 
+namespace MiniWindowUtils::Internal
+{
+	QImage &mutableBackingSurface(MiniWindow &window)
+	{
+		return window.mutableBackingSurface();
+	}
+} // namespace MiniWindowUtils::Internal
+
 namespace MiniWindowUtils
 {
 	QColor colorFromRef(const long value)
@@ -1121,7 +1203,7 @@ namespace MiniWindowUtils
 		const auto it = window.fonts.constFind(fontId);
 		if (it == window.fonts.constEnd())
 			return -2;
-		if (window.surface.isNull())
+		if (window.backingSurfaceIsNull())
 			return eOK;
 		if (text.isEmpty())
 			return 0;
@@ -1263,32 +1345,36 @@ namespace MiniWindowUtils
 
 	long pixelValue(const MiniWindow &window, const int x, const int y)
 	{
-		if (!window.surface.rect().contains(x, y))
+		if (!logicalSurfaceRect(window).contains(x, y))
 			return -1;
-		return colorToRef(QColor(window.surface.pixel(x, y)));
+		const QPoint physicalPoint = physicalPointForLogicalPixel(window, x, y);
+		if (!window.backingSurface().rect().contains(physicalPoint))
+			return -1;
+		return colorToRef(QColor(window.backingSurface().pixel(physicalPoint)));
 	}
 
 	bool saveWindowImage24Bit(const MiniWindow &window, const QString &filename)
 	{
-		if (window.surface.isNull())
+		if (window.backingSurfaceIsNull())
 			return false;
-		return window.surface.convertToFormat(QImage::Format_RGB888).save(filename);
+		return surfaceLogicalImage(window).convertToFormat(QImage::Format_RGB888).save(filename);
 	}
 
 	void setPixel(MiniWindow &window, const int x, const int y, const long colour)
 	{
-		if (!window.surface.rect().contains(x, y))
+		if (!logicalSurfaceRect(window).contains(x, y))
 			return;
 		const QColor c = colorFromRef(colour);
-		window.surface.setPixel(x, y, qRgba(c.red(), c.green(), c.blue(), 0xFF));
+		QPainter     painter(&Internal::mutableBackingSurface(window));
+		painter.fillRect(QRect(x, y, 1, 1), c);
 	}
 
 	void create(MiniWindow &window, const QString &name, const int left, const int top, const int width,
 	            const int height, const int position, const int flags, const QColor &background,
-	            const QString &pluginId)
+	            const QString &pluginId, const double devicePixelRatio)
 	{
 		window.name = name;
-		window.create(left, top, width, height, position, flags, background);
+		window.create(left, top, width, height, position, flags, background, devicePixelRatio);
 		window.creatingPlugin = pluginId;
 		if ((flags & kMiniWindowKeepHotspots) == 0)
 		{
@@ -1300,6 +1386,27 @@ namespace MiniWindowUtils
 			window.outputGeneratedHotspots.clear();
 			window.outputHotspotSerial = 0;
 		}
+	}
+
+	void setDevicePixelRatio(MiniWindow &window, const double devicePixelRatio)
+	{
+		const double normalizedRatio = MiniWindow::normalizedDevicePixelRatio(devicePixelRatio);
+		const QSize physicalSize = MiniWindow::backingStoreSize(window.width, window.height, normalizedRatio);
+		if (qFuzzyCompare(window.devicePixelRatio, normalizedRatio) &&
+		    qFuzzyCompare(window.backingSurfaceDevicePixelRatio(), normalizedRatio) &&
+		    window.backingSurfaceSize() == physicalSize)
+			return;
+
+		QImage newSurface(physicalSize, QImage::Format_ARGB32);
+		newSurface.setDevicePixelRatio(normalizedRatio);
+		newSurface.fill(window.background.isValid() ? window.background : QColor(0, 0, 0));
+		if (!window.backingSurfaceIsNull())
+		{
+			QPainter painter(&newSurface);
+			painter.drawImage(QPoint(0, 0), window.backingSurface());
+		}
+		window.setBackingSurface(newSurface);
+		clearTransparentSurfaceCache(window);
 	}
 
 	int font(MiniWindow &window, const QString &fontId, const QString &fontName, const double size,
@@ -1360,7 +1467,7 @@ namespace MiniWindowUtils
 	int rectOp(MiniWindow &window, const int action, const int left, const int top, const int right,
 	           const int bottom, const long colour1, const long colour2)
 	{
-		QImage     &surface = window.surface;
+		QImage     &surface = Internal::mutableBackingSurface(window);
 		const QRect rect    = rectFromCoords(window, left, top, right, bottom);
 		switch (action)
 		{
@@ -1386,7 +1493,7 @@ namespace MiniWindowUtils
 		{
 			if (surface.isNull())
 				return eOK;
-			const QRect clipped = rect.intersected(surface.rect());
+			const QRect clipped = physicalRectForLogicalRect(window, rect);
 			if (clipped.isEmpty())
 				return eOK;
 			for (int y = clipped.top(); y <= clipped.bottom(); ++y)
@@ -1477,7 +1584,9 @@ namespace MiniWindowUtils
 				return eOK;
 			const QColor borderColour = colorFromRef(colour1);
 			const QColor fillColour   = colorFromRef(colour2);
-			const QPoint start(left, top);
+			if (!logicalSurfaceRect(window).contains(left, top))
+				return eOK;
+			const QPoint start = physicalPointForLogicalPixel(window, left, top);
 			if (!surface.rect().contains(start))
 				return eOK;
 			const QRgb borderRgb = borderColour.rgb();
@@ -1487,32 +1596,63 @@ namespace MiniWindowUtils
 				return eOK;
 			if (action == 6 && (startRgb & 0x00FFFFFF) == (borderRgb & 0x00FFFFFF))
 				return eOK;
-			QVector<QPoint> stack;
-			stack.reserve(surface.width() * surface.height() / 8);
-			stack.push_back(start);
-			while (!stack.isEmpty())
+			auto isFillCandidate = [action, borderRgb, fillRgb](const QRgb current)
 			{
-				const QPoint p = stack.back();
-				stack.pop_back();
+				const QRgb currentRgb  = current & 0x00FFFFFF;
+				const QRgb borderRgb24 = borderRgb & 0x00FFFFFF;
+				const QRgb fillRgb24   = fillRgb & 0x00FFFFFF;
+				if (action == 6)
+					return currentRgb != borderRgb24 && currentRgb != fillRgb24;
+				return currentRgb == borderRgb24 && currentRgb != fillRgb24;
+			};
+			auto enqueueRowRuns = [&surface, &isFillCandidate](QVector<QPoint> &seeds, const int y,
+			                                                   const int left, const int right)
+			{
+				if (y < 0 || y >= surface.height())
+					return;
+				const auto *line = reinterpret_cast<const QRgb *>(surface.constScanLine(y));
+				bool        inRun{false};
+				for (int x = qMax(0, left); x <= qMin(right, surface.width() - 1); ++x)
+				{
+					if (isFillCandidate(line[x]))
+					{
+						if (!inRun)
+							seeds.push_back(QPoint(x, y));
+						inRun = true;
+					}
+					else
+					{
+						inRun = false;
+					}
+				}
+			};
+
+			QVector<QPoint> seeds;
+			seeds.reserve(qMin(surface.width(), 256));
+			seeds.push_back(start);
+			const QRgb replacementRgb = qRgba(fillColour.red(), fillColour.green(), fillColour.blue(), 0xFF);
+			while (!seeds.isEmpty())
+			{
+				const QPoint p = seeds.back();
+				seeds.pop_back();
 				if (!surface.rect().contains(p))
 					continue;
-				const QRgb current     = surface.pixel(p);
-				const bool matchBorder = ((current & 0x00FFFFFF) == (borderRgb & 0x00FFFFFF));
-				if (action == 6)
-				{
-					if (matchBorder || (current & 0x00FFFFFF) == (fillRgb & 0x00FFFFFF))
-						continue;
-				}
-				else
-				{
-					if (!matchBorder || (current & 0x00FFFFFF) == (fillRgb & 0x00FFFFFF))
-						continue;
-				}
-				surface.setPixel(p, qRgba(fillColour.red(), fillColour.green(), fillColour.blue(), 0xFF));
-				stack.push_back(QPoint(p.x() + 1, p.y()));
-				stack.push_back(QPoint(p.x() - 1, p.y()));
-				stack.push_back(QPoint(p.x(), p.y() + 1));
-				stack.push_back(QPoint(p.x(), p.y() - 1));
+				auto *line = reinterpret_cast<QRgb *>(surface.scanLine(p.y()));
+				if (!isFillCandidate(line[p.x()]))
+					continue;
+
+				int leftEdge = p.x();
+				while (leftEdge > 0 && isFillCandidate(line[leftEdge - 1]))
+					--leftEdge;
+				int rightEdge = p.x();
+				while (rightEdge + 1 < surface.width() && isFillCandidate(line[rightEdge + 1]))
+					++rightEdge;
+
+				for (int x = leftEdge; x <= rightEdge; ++x)
+					line[x] = replacementRgb;
+
+				enqueueRowRuns(seeds, p.y() - 1, leftEdge, rightEdge);
+				enqueueRowRuns(seeds, p.y() + 1, leftEdge, rightEdge);
 			}
 			return eOK;
 		}
@@ -1530,11 +1670,11 @@ namespace MiniWindowUtils
 			return ePenStyleNotValid;
 		if (validateBrushStyle(brushStyle) != eOK)
 			return eBrushStyleNotValid;
-		if (window.surface.isNull())
+		if (window.backingSurfaceIsNull())
 			return eOK;
 
 		const QRect rect = rectFromCoords(window, left, top, right, bottom);
-		QPainter    painter(&window.surface);
+		QPainter    painter(&Internal::mutableBackingSurface(window));
 		painter.setPen(penStyle == 5 ? Qt::NoPen : makePen(penColour, penStyle, penWidth));
 		bool         brushOk = true;
 		const QBrush brush   = makeBrush(brushStyle, penColour, brushColour, &brushOk);
@@ -1579,9 +1719,9 @@ namespace MiniWindowUtils
 	{
 		if (validatePenStyle(penStyle, penWidth) != eOK)
 			return ePenStyleNotValid;
-		if (window.surface.isNull())
+		if (window.backingSurfaceIsNull())
 			return eOK;
-		QPainter painter(&window.surface);
+		QPainter painter(&Internal::mutableBackingSurface(window));
 		painter.setPen(penStyle == 5 ? Qt::NoPen : makePen(penColour, penStyle, penWidth));
 		painter.drawLine(x1, y1, x2, y2);
 		return eOK;
@@ -1593,10 +1733,10 @@ namespace MiniWindowUtils
 	{
 		if (validatePenStyle(penStyle, penWidth) != eOK)
 			return ePenStyleNotValid;
-		if (window.surface.isNull())
+		if (window.backingSurfaceIsNull())
 			return eOK;
 		const QRect rect = rectFromCoords(window, left, top, right, bottom);
-		QPainter    painter(&window.surface);
+		QPainter    painter(&Internal::mutableBackingSurface(window));
 		painter.setPen(penStyle == 5 ? Qt::NoPen : makePen(penColour, penStyle, penWidth));
 		const QPointF center     = rect.center();
 		const int     endX       = window.fixRight(x2);
@@ -1690,7 +1830,7 @@ namespace MiniWindowUtils
 		QVector<QPointF> pts;
 		if (const int result = parseLegacyPointPairs(points, 8, 6, 2, pts); result != eOK)
 			return result;
-		QPainter painter(&window.surface);
+		QPainter painter(&Internal::mutableBackingSurface(window));
 		painter.setPen(penStyle == 5 ? Qt::NoPen : makePen(penColour, penStyle, penWidth));
 		painter.setBrush(Qt::NoBrush);
 		QPainterPath path;
@@ -1716,7 +1856,7 @@ namespace MiniWindowUtils
 		const QBrush brush   = makeBrush(brushStyle, penColour, brushColour, &brushOk);
 		if (!brushOk)
 			return eBrushStyleNotValid;
-		QPainter painter(&window.surface);
+		QPainter painter(&Internal::mutableBackingSurface(window));
 		painter.setPen(penStyle == 5 ? Qt::NoPen : makePen(penColour, penStyle, penWidth));
 		painter.setBrush(brush);
 		if (closePolygon)
@@ -1730,14 +1870,14 @@ namespace MiniWindowUtils
 	int gradient(MiniWindow &window, const int left, const int top, const int right, const int bottom,
 	             const long startColour, const long endColour, const int mode)
 	{
-		if (window.surface.isNull())
+		if (window.backingSurfaceIsNull())
 			return eOK;
 		const QRect rect = rectFromCoords(window, left, top, right, bottom);
 		if (rect.width() <= 0 || rect.height() <= 0)
 			return eOK;
 		if (mode < 1 || mode > 3)
 			return eUnknownOption;
-		QPainter painter(&window.surface);
+		QPainter painter(&Internal::mutableBackingSurface(window));
 		if (mode == 3)
 		{
 			QImage       texture(rect.size(), QImage::Format_ARGB32);
@@ -1772,14 +1912,14 @@ namespace MiniWindowUtils
 		const auto it = window.fonts.constFind(fontId);
 		if (it == window.fonts.constEnd())
 			return -2;
-		if (window.surface.isNull())
+		if (window.backingSurfaceIsNull())
 			return eOK;
 		if (text.isEmpty())
 			return 0;
 		const QRect rect = rectFromCoords(window, left, top, right, bottom);
 		if (rect.width() <= 0 || rect.height() <= 0)
 			return eOK;
-		QPainter painter(&window.surface);
+		QPainter painter(&Internal::mutableBackingSurface(window));
 		painter.setFont(it.value().font);
 		painter.setPen(colorFromRef(colour));
 		painter.setClipRect(rect);
@@ -1881,7 +2021,7 @@ namespace MiniWindowUtils
 	void imageFromWindow(MiniWindow &window, const QString &imageId, const MiniWindow &sourceWindow)
 	{
 		MiniWindowImage entry;
-		entry.image  = sourceWindow.surface.copy();
+		entry.image  = surfaceLogicalImage(sourceWindow);
 		entry.source = sourceWindow.name;
 		setImageBitmapMetadata(entry, 24, bitmapWidthBytes(entry.image.width(), 24));
 		window.images.insert(imageId, entry);
@@ -1894,7 +2034,7 @@ namespace MiniWindowUtils
 		const auto it = window.images.constFind(imageId);
 		if (it == window.images.constEnd())
 			return eImageNotInstalled;
-		if (window.surface.isNull() || it.value().image.isNull())
+		if (window.backingSurfaceIsNull() || it.value().image.isNull())
 			return eOK;
 		const QImage &image = it.value().image;
 		QRect         source(srcLeft, srcTop, srcRight - srcLeft, srcBottom - srcTop);
@@ -1905,7 +2045,7 @@ namespace MiniWindowUtils
 		source = source.intersected(image.rect());
 		if (source.width() <= 0 || source.height() <= 0)
 			return eOK;
-		QPainter painter(&window.surface);
+		QPainter painter(&Internal::mutableBackingSurface(window));
 		if (mode == 2)
 		{
 			const QRect target = rectFromCoords(window, left, top, right, bottom);
@@ -1946,7 +2086,7 @@ namespace MiniWindowUtils
 			return eImageNotInstalled;
 		if (!it.value().hasAlpha)
 			return eImageNotInstalled;
-		if (window.surface.isNull() || it.value().image.isNull())
+		if (window.backingSurfaceIsNull() || it.value().image.isNull())
 			return eOK;
 		const QImage &image      = it.value().image;
 		int           drawLeft   = left;
@@ -1975,11 +2115,13 @@ namespace MiniWindowUtils
 		source = source.intersected(image.rect());
 		if (source.width() <= 0 || source.height() <= 0)
 			return eOK;
-		QImage       base    = window.surface.copy(drawLeft, drawTop, source.width(), source.height())
-		                           .convertToFormat(QImage::Format_ARGB32);
-		const QImage overlay = image.copy(source).convertToFormat(QImage::Format_ARGB32);
-		const int    w       = qMin(base.width(), overlay.width());
-		const int    h       = qMin(base.height(), overlay.height());
+		const QSize logicalSize(source.width(), source.height());
+		QImage      base =
+		    copySurfacePhysicalLayer(window, QRect(drawLeft, drawTop, source.width(), source.height()));
+		const QImage overlay =
+		    physicalLayerForImage(image, source, logicalSize, surfaceDevicePixelRatio(window));
+		const int w = qMin(base.width(), overlay.width());
+		const int h = qMin(base.height(), overlay.height());
 		for (int y = 0; y < h; ++y)
 		{
 			auto       *baseLine = reinterpret_cast<QRgb *>(base.scanLine(y));
@@ -2001,7 +2143,7 @@ namespace MiniWindowUtils
 				baseLine[x] = qRgba(clampByte(outR), clampByte(outG), clampByte(outB), 0xFF);
 			}
 		}
-		QPainter painter(&window.surface);
+		QPainter painter(&Internal::mutableBackingSurface(window));
 		painter.drawImage(QPoint(drawLeft, drawTop), base);
 		return eOK;
 	}
@@ -2016,7 +2158,7 @@ namespace MiniWindowUtils
 			return eImageNotInstalled;
 		if (validatePenStyle(penStyle, penWidth) != eOK)
 			return ePenStyleNotValid;
-		if (window.surface.isNull())
+		if (window.backingSurfaceIsNull())
 			return eOK;
 		QImage pattern = it.value().image;
 		if (pattern.isNull())
@@ -2037,7 +2179,7 @@ namespace MiniWindowUtils
 			}
 			pattern = recoloured;
 		}
-		QPainter painter(&window.surface);
+		QPainter painter(&Internal::mutableBackingSurface(window));
 		painter.setPen(penStyle == 5 ? Qt::NoPen : makePen(penColour, penStyle, penWidth));
 		painter.setBrush(QBrush(QPixmap::fromImage(pattern)));
 		const QRect rect = rectFromCoords(window, left, top, right, bottom);
@@ -2068,7 +2210,7 @@ namespace MiniWindowUtils
 		const auto maskIt  = window.images.constFind(maskId);
 		if (imageIt == window.images.constEnd() || maskIt == window.images.constEnd())
 			return eImageNotInstalled;
-		if (window.surface.isNull())
+		if (window.backingSurfaceIsNull())
 			return eOK;
 		const QImage &image        = imageIt.value().image;
 		const QImage &mask         = maskIt.value().image;
@@ -2096,19 +2238,22 @@ namespace MiniWindowUtils
 			return eBadParameter;
 		if (mode != 0 && mode != 1)
 			return eUnknownOption;
-		QImage base =
-		    window.surface.copy(targetLeft, targetTop, width, height).convertToFormat(QImage::Format_ARGB32);
+		const QSize  logicalSize(width, height);
+		QImage       base = copySurfacePhysicalLayer(window, QRect(targetLeft, targetTop, width, height));
+		const QRect  sourceRect(sourceLeft, sourceTop, width, height);
 		const QImage src =
-		    image.copy(sourceLeft, sourceTop, width, height).convertToFormat(QImage::Format_ARGB32);
+		    physicalLayerForImage(image, sourceRect, logicalSize, surfaceDevicePixelRatio(window));
 		const QImage maskCopy =
-		    mask.copy(sourceLeft, sourceTop, width, height).convertToFormat(QImage::Format_ARGB32);
+		    physicalLayerForImage(mask, sourceRect, logicalSize, surfaceDevicePixelRatio(window));
 		const QColor opaqueColor(image.pixel(0, 0));
-		for (int y = 0; y < height; ++y)
+		const int    physicalWidth  = qMin(base.width(), qMin(src.width(), maskCopy.width()));
+		const int    physicalHeight = qMin(base.height(), qMin(src.height(), maskCopy.height()));
+		for (int y = 0; y < physicalHeight; ++y)
 		{
 			auto       *baseLine = reinterpret_cast<QRgb *>(base.scanLine(y));
 			const auto *srcLine  = reinterpret_cast<const QRgb *>(src.constScanLine(y));
 			const auto *maskLine = reinterpret_cast<const QRgb *>(maskCopy.constScanLine(y));
-			for (int x = 0; x < width; ++x)
+			for (int x = 0; x < physicalWidth; ++x)
 			{
 				const QColor a(srcLine[x]);
 				const QColor b(baseLine[x]);
@@ -2134,7 +2279,7 @@ namespace MiniWindowUtils
 				baseLine[x]    = qRgba(clampByte(outR), clampByte(outG), clampByte(outB), 0xFF);
 			}
 		}
-		QPainter painter(&window.surface);
+		QPainter painter(&Internal::mutableBackingSurface(window));
 		painter.drawImage(QPoint(targetLeft, targetTop), base);
 		return eOK;
 	}
@@ -2147,7 +2292,7 @@ namespace MiniWindowUtils
 			return eImageNotInstalled;
 		if (!it.value().hasAlpha)
 			return eImageNotInstalled;
-		if (window.surface.isNull() || it.value().image.isNull())
+		if (window.backingSurfaceIsNull() || it.value().image.isNull())
 			return eOK;
 		const int fixedRight   = window.fixRight(right);
 		const int fixedBottom  = window.fixBottom(bottom);
@@ -2176,7 +2321,7 @@ namespace MiniWindowUtils
 				alphaImage.setPixel(x, y, qRgba(alpha, alpha, alpha, 0xFF));
 			}
 		}
-		QPainter painter(&window.surface);
+		QPainter painter(&Internal::mutableBackingSurface(window));
 		painter.drawImage(QPoint(targetLeft, targetTop), alphaImage);
 		return eOK;
 	}
@@ -2191,7 +2336,7 @@ namespace MiniWindowUtils
 		if (opacity < 0.0 || opacity > 1.0)
 			return eBadParameter;
 
-		QImage       &surface = window.surface;
+		QImage       &surface = Internal::mutableBackingSurface(window);
 		const QImage &image   = it.value().image;
 		if (surface.isNull() || image.isNull())
 			return eOK;
@@ -2225,16 +2370,18 @@ namespace MiniWindowUtils
 		if (mode < 1 || mode > 64)
 			return eUnknownOption;
 
-		QImage base =
-		    surface.copy(targetLeft, targetTop, width, height).convertToFormat(QImage::Format_ARGB32);
-		const QImage blend =
-		    image.copy(sourceLeft, sourceTop, width, height).convertToFormat(QImage::Format_ARGB32);
+		const QSize  logicalSize(width, height);
+		QImage       base  = copySurfacePhysicalLayer(window, QRect(targetLeft, targetTop, width, height));
+		const QImage blend = physicalLayerForImage(image, QRect(sourceLeft, sourceTop, width, height),
+		                                           logicalSize, surfaceDevicePixelRatio(window));
 
-		for (int y = 0; y < height; ++y)
+		const int    physicalWidth  = qMin(base.width(), blend.width());
+		const int    physicalHeight = qMin(base.height(), blend.height());
+		for (int y = 0; y < physicalHeight; ++y)
 		{
 			auto       *baseLine  = reinterpret_cast<QRgb *>(base.scanLine(y));
 			const auto *blendLine = reinterpret_cast<const QRgb *>(blend.constScanLine(y));
-			for (int x = 0; x < width; ++x)
+			for (int x = 0; x < physicalWidth; ++x)
 			{
 				const long blendPixel = static_cast<long>(qRed(blendLine[x])) |
 				                        (static_cast<long>(qGreen(blendLine[x])) << 8) |
@@ -2259,7 +2406,7 @@ namespace MiniWindowUtils
 	int filter(MiniWindow &window, const int left, const int top, const int right, const int bottom,
 	           const int operation, const double options, const RandomUnit &randomUnit)
 	{
-		QImage &surface = window.surface;
+		QImage &surface = Internal::mutableBackingSurface(window);
 		if (surface.isNull())
 			return eOK;
 
@@ -2274,131 +2421,145 @@ namespace MiniWindowUtils
 		if (width <= 0 || height <= 0)
 			return eOK;
 
-		QImage copy =
-		    surface.copy(targetLeft, targetTop, width, height).convertToFormat(QImage::Format_ARGB32);
-		const int  bpl = bytesPerLine24(width);
+		QImage     copy = copySurfacePhysicalLayer(window, QRect(targetLeft, targetTop, width, height));
+		const int  physicalWidth  = copy.width();
+		const int  physicalHeight = copy.height();
+		const int  bpl            = bytesPerLine24(physicalWidth);
 		QByteArray buffer;
-		imageToBgrBuffer(copy, buffer, width, height, bpl);
+		imageToBgrBuffer(copy, buffer, physicalWidth, physicalHeight, bpl);
 
 		switch (operation)
 		{
 		case 1:
-			noise(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, randomUnit);
+			noise(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight, bpl,
+			      options, randomUnit);
 			break;
 		case 2:
-			monoNoise(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options,
-			          randomUnit);
+			monoNoise(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight, bpl,
+			          options, randomUnit);
 			break;
 		case 3:
 		{
 			const double matrix[5] = {1, 1, 1, 1, 1};
-			generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options,
-			              matrix, 5);
+			generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			              bpl, options, matrix, 5);
 			break;
 		}
 		case 4:
 		{
 			constexpr double matrix[5] = {-1, -1, 7, -1, -1};
-			generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options,
-			              matrix, 3);
+			generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			              bpl, options, matrix, 3);
 			break;
 		}
 		case 5:
 		{
 			constexpr double matrix[5] = {0, 2.5, -6, 2.5, 0};
-			generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options,
-			              matrix, 1);
+			generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			              bpl, options, matrix, 1);
 			break;
 		}
 		case 6:
 		{
 			constexpr double matrix[5] = {1, 2, 1, -1, -2};
-			generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options,
-			              matrix, 1);
+			generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			              bpl, options, matrix, 1);
 			break;
 		}
 		case 7:
-			brightness(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options);
+			brightness(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight, bpl,
+			           options);
 			break;
 		case 8:
-			contrast(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options);
+			contrast(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight, bpl,
+			         options);
 			break;
 		case 9:
-			gammaAdjust(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options);
+			gammaAdjust(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight, bpl,
+			            options);
 			break;
 		case 10:
-			colourBrightness(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options,
-			                 2);
+			colourBrightness(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			                 bpl, options, 2);
 			break;
 		case 11:
-			colourContrast(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 2);
+			colourContrast(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			               bpl, options, 2);
 			break;
 		case 12:
-			colourGamma(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 2);
+			colourGamma(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight, bpl,
+			            options, 2);
 			break;
 		case 13:
-			colourBrightness(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options,
-			                 1);
+			colourBrightness(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			                 bpl, options, 1);
 			break;
 		case 14:
-			colourContrast(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 1);
+			colourContrast(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			               bpl, options, 1);
 			break;
 		case 15:
-			colourGamma(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 1);
+			colourGamma(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight, bpl,
+			            options, 1);
 			break;
 		case 16:
-			colourBrightness(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options,
-			                 0);
+			colourBrightness(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			                 bpl, options, 0);
 			break;
 		case 17:
-			colourContrast(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 0);
+			colourContrast(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			               bpl, options, 0);
 			break;
 		case 18:
-			colourGamma(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options, 0);
+			colourGamma(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight, bpl,
+			            options, 0);
 			break;
 		case 19:
-			makeGreyscale(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, true);
+			makeGreyscale(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			              bpl, true);
 			break;
 		case 20:
-			makeGreyscale(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, false);
+			makeGreyscale(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			              bpl, false);
 			break;
 		case 21:
-			brightnessMultiply(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options);
+			brightnessMultiply(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth,
+			                   physicalHeight, bpl, options);
 			break;
 		case 22:
-			colourBrightnessMultiply(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl,
-			                         options, 2);
+			colourBrightnessMultiply(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth,
+			                         physicalHeight, bpl, options, 2);
 			break;
 		case 23:
-			colourBrightnessMultiply(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl,
-			                         options, 1);
+			colourBrightnessMultiply(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth,
+			                         physicalHeight, bpl, options, 1);
 			break;
 		case 24:
-			colourBrightnessMultiply(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl,
-			                         options, 0);
+			colourBrightnessMultiply(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth,
+			                         physicalHeight, bpl, options, 0);
 			break;
 		case 25:
 		{
 			const double matrix[5] = {0, 1, 1, 1, 0};
-			generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options,
-			              matrix, 3);
+			generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			              bpl, options, matrix, 3);
 			break;
 		}
 		case 26:
 		{
 			constexpr double matrix[5] = {0, 0.5, 1, 0.5, 0};
-			generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), width, height, bpl, options,
-			              matrix, 2);
+			generalFilter(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight,
+			              bpl, options, matrix, 2);
 			break;
 		}
 		case 27:
-			averageBuffer(reinterpret_cast<unsigned char *>(buffer.data()), width, height);
+			averageBuffer(reinterpret_cast<unsigned char *>(buffer.data()), physicalWidth, physicalHeight);
 			break;
 		default:
 			return eUnknownOption;
 		}
 
-		bgrBufferToImage(buffer, copy, width, height, bpl);
+		bgrBufferToImage(buffer, copy, physicalWidth, physicalHeight, bpl);
 		QPainter painter(&surface);
 		painter.drawImage(QPoint(targetLeft, targetTop), copy);
 		return eOK;
@@ -2410,7 +2571,7 @@ namespace MiniWindowUtils
 		const auto it = window.images.constFind(imageId);
 		if (it == window.images.constEnd())
 			return eImageNotInstalled;
-		if (window.surface.isNull() || it.value().image.isNull())
+		if (window.backingSurfaceIsNull() || it.value().image.isNull())
 			return eOK;
 		if (mode != 1 && mode != 3)
 			return eBadParameter;
@@ -2429,7 +2590,7 @@ namespace MiniWindowUtils
 				}
 			}
 		}
-		QPainter painter(&window.surface);
+		QPainter painter(&Internal::mutableBackingSurface(window));
 		painter.setTransform(QTransform(mxx, myx, mxy, myy, left, top), true);
 		painter.drawImage(QPointF(0, 0), image);
 		return eOK;
@@ -2439,14 +2600,17 @@ namespace MiniWindowUtils
 	{
 		if (window.width == width && window.height == height)
 			return;
-		QImage       newImage(qMax(1, width), qMax(1, height), QImage::Format_ARGB32);
+		const double ratio = surfaceDevicePixelRatio(window);
+		QImage       newImage(MiniWindow::backingStoreSize(width, height, ratio), QImage::Format_ARGB32);
+		newImage.setDevicePixelRatio(ratio);
 		const QColor fill = colorFromRef(colour);
 		newImage.fill(fill);
 		QPainter painter(&newImage);
-		painter.drawImage(0, 0, window.surface);
-		window.surface = newImage;
-		window.width   = width;
-		window.height  = height;
+		painter.drawImage(0, 0, window.backingSurface());
+		window.setBackingSurface(newImage);
+		window.width  = width;
+		window.height = height;
+		clearTransparentSurfaceCache(window);
 	}
 
 	void position(MiniWindow &window, const int left, const int top, const int position, const int flags)
@@ -2455,11 +2619,7 @@ namespace MiniWindowUtils
 		window.position = position;
 		window.flags    = flags;
 		if ((flags & kMiniWindowTransparent) == 0 && !window.transparentSurfaceCache.isNull())
-		{
-			window.transparentSurfaceCache     = QImage();
-			window.transparentSurfaceSourceKey = 0;
-			window.transparentSurfaceKeyRgb    = 0;
-		}
+			clearTransparentSurfaceCache(window);
 	}
 
 	void setZOrder(MiniWindow &window, const int zOrder)

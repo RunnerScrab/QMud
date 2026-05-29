@@ -402,6 +402,7 @@ namespace
 		if (source.isNull())
 			return source;
 		QImage image = source.convertToFormat(QImage::Format_ARGB32);
+		image.setDevicePixelRatio(source.devicePixelRatio());
 		for (int y = 0; y < image.height(); ++y)
 		{
 			auto *line = reinterpret_cast<QRgb *>(image.scanLine(y));
@@ -412,6 +413,15 @@ namespace
 			}
 		}
 		return image;
+	}
+
+	[[nodiscard]] QSize imageLogicalSize(const QImage &image)
+	{
+		if (image.isNull())
+			return {};
+		const QSizeF logicalSize = image.deviceIndependentSize();
+		return {qMax(1, static_cast<int>(std::ceil(logicalSize.width()))),
+		        qMax(1, static_cast<int>(std::ceil(logicalSize.height())))};
 	}
 
 	[[nodiscard]] bool traceOutputBackfillEnabled()
@@ -1768,7 +1778,7 @@ WorldView::MiniWindowPaintBoundsSnapshot WorldView::miniWindowPaintBoundsSnapsho
 			if (!window || !window->show || window->temporarilyHide)
 				continue;
 			const bool drawUnder = (window->flags & kMiniWindowDrawUnderneath) != 0;
-			if (drawUnder != underneath || window->surface.isNull())
+			if (drawUnder != underneath || window->backingSurfaceIsNull())
 				continue;
 
 			QRect windowBounds;
@@ -1784,7 +1794,7 @@ WorldView::MiniWindowPaintBoundsSnapshot WorldView::miniWindowPaintBoundsSnapsho
 			}
 			else
 			{
-				windowBounds = QRect(window->rect.topLeft(), window->surface.size());
+				windowBounds = QRect(window->rect.topLeft(), imageLogicalSize(window->backingSurface()));
 			}
 
 			windowBounds = windowBounds.intersected(clientRect);
@@ -9500,8 +9510,9 @@ void WorldView::paintNativeOutputBackground(QPainter *painter, const QRegion &up
 	{
 		if (image.isNull())
 			return;
-		const int tileWidth  = image.width();
-		const int tileHeight = image.height();
+		const QSize tileSize   = imageLogicalSize(image);
+		const int   tileWidth  = tileSize.width();
+		const int   tileHeight = tileSize.height();
 		if (tileWidth <= 0 || tileHeight <= 0)
 			return;
 		const QRect paintBounds =
@@ -9582,8 +9593,9 @@ void WorldView::paintMiniWindows(QPainter *painter, bool underneath, const QRegi
 	{
 		if (image.isNull())
 			return;
-		const int tileWidth  = image.width();
-		const int tileHeight = image.height();
+		const QSize tileSize   = imageLogicalSize(image);
+		const int   tileWidth  = tileSize.width();
+		const int   tileHeight = tileSize.height();
 		if (tileWidth <= 0 || tileHeight <= 0)
 			return;
 		const QRect paintBounds =
@@ -9629,17 +9641,17 @@ void WorldView::paintMiniWindows(QPainter *painter, bool underneath, const QRegi
 		if (drawUnder != underneath)
 			continue;
 
-		const QImage *imagePtr = &window->surface;
+		const QImage *imagePtr = &window->backingSurface();
 		if ((window->flags & kMiniWindowTransparent) != 0)
 		{
 			const QRgb keyRgb =
 			    qRgb(window->background.red(), window->background.green(), window->background.blue());
-			const auto sourceKey = window->surface.cacheKey();
+			const auto sourceKey = window->backingSurface().cacheKey();
 			if (window->transparentSurfaceCache.isNull() ||
 			    window->transparentSurfaceSourceKey != sourceKey ||
 			    window->transparentSurfaceKeyRgb != keyRgb)
 			{
-				window->transparentSurfaceCache     = transparentColorKeyedCopy(window->surface, keyRgb);
+				window->transparentSurfaceCache = transparentColorKeyedCopy(window->backingSurface(), keyRgb);
 				window->transparentSurfaceSourceKey = sourceKey;
 				window->transparentSurfaceKeyRgb    = keyRgb;
 			}
@@ -9671,7 +9683,7 @@ void WorldView::paintMiniWindows(QPainter *painter, bool underneath, const QRegi
 				}
 				else
 				{
-					const QRect imageRect(window->rect.topLeft(), image.size());
+					const QRect imageRect(window->rect.topLeft(), imageLogicalSize(image));
 					if (imageRect.intersects(clippedUpdateRect))
 						painter->drawImage(window->rect.topLeft(), image);
 				}

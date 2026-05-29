@@ -44,7 +44,9 @@ namespace MiniWindowUtils
 	[[nodiscard]] bool     saveWindowImage24Bit(const MiniWindow &window, const QString &filename);
 	void                   setPixel(MiniWindow &window, int x, int y, long colour);
 	void create(MiniWindow &window, const QString &name, int left, int top, int width, int height,
-	            int position, int flags, const QColor &background, const QString &pluginId);
+	            int position, int flags, const QColor &background, const QString &pluginId,
+	            double devicePixelRatio = 1.0);
+	void setDevicePixelRatio(MiniWindow &window, double devicePixelRatio);
 	int  font(MiniWindow &window, const QString &fontId, const QString &fontName, double size, bool bold,
 	          bool italic, bool underline, bool strikeout, int charset, int pitchAndFamily);
 	int  rectOp(MiniWindow &window, int action, int left, int top, int right, int bottom, long colour1,
