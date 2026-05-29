@@ -2,7 +2,7 @@
  * QMud Project
  * Copyright (c) 2026 Panagiotis Kalogiratos (Nodens)
  *
- * File: Number.c
+ * File: Number.cpp
  * Role: Arbitrary-precision number implementation used by the embedded bc engine in scripting workflows.
  */
 
@@ -44,10 +44,10 @@
 
 #include "Number.h"
 #include "BcConfig.h"
-#include <assert.h>
-#include <ctype.h>/* Prototypes needed for external utility routines. */
-#include <stdio.h>
-#include <stdlib.h>
+#include <cassert>
+#include <cctype> /* Prototypes needed for external utility routines. */
+#include <cstdlib>
+#include <cstring>
 
 /* Storage used for special numbers. */
 QMUD_BC_THREAD_LOCAL bc_num bc_zero;
@@ -58,14 +58,14 @@ QMUD_BC_THREAD_LOCAL bc_num bc_two;
 
 bc_num                      bc_new_num(int length, int scale)
 {
-	bc_num temp = (bc_num)malloc(sizeof(bc_struct));
+	auto temp = static_cast<bc_num>(malloc(sizeof(bc_struct)));
 	if (temp == nullptr)
 		bc_out_of_memory();
 	temp->n_sign  = PLUS;
 	temp->n_len   = length;
 	temp->n_scale = scale;
 	temp->n_refs  = 1;
-	temp->n_ptr   = (char *)malloc(length + scale);
+	temp->n_ptr   = static_cast<char *>(malloc(length + scale));
 	if (temp->n_ptr == nullptr)
 		bc_out_of_memory();
 	temp->n_value = temp->n_ptr;
@@ -97,7 +97,7 @@ void bc_free_num(bc_num *num)
 
 /* Intitialize the number package! */
 
-void bc_init_numbers(void)
+void bc_init_numbers()
 {
 	if (bc_zero != nullptr && bc_one != nullptr && bc_two != nullptr)
 		return;
@@ -109,7 +109,7 @@ void bc_init_numbers(void)
 	bc_two->n_value[0] = 2;
 }
 
-static void bc_ensure_numbers_initialized(void)
+static void bc_ensure_numbers_initialized()
 {
 	if (bc_zero == nullptr || bc_one == nullptr || bc_two == nullptr)
 		bc_init_numbers();
@@ -259,7 +259,7 @@ int bc_compare(bc_num n1, bc_num n2)
 
 char bc_is_neg(bc_num num)
 {
-	return (char)(num->n_sign == MINUS);
+	return static_cast<char>(num->n_sign == MINUS);
 }
 
 /* In some places we need to check if the number NUM is zero. */
@@ -320,7 +320,7 @@ static bc_num bc_do_add_internal(bc_num n1, bc_num n2, int scale_min)
 	/* Zero extra digits made by scale_min. */
 	if (scale_min > sum_scale)
 	{
-		char *sumptr = (char *)(sum->n_value + sum_scale + sum_digits);
+		char *sumptr = sum->n_value + sum_scale + sum_digits;
 		for (int count = scale_min - sum_scale; count > 0; count--)
 			*sumptr++ = 0;
 	}
@@ -328,9 +328,9 @@ static bc_num bc_do_add_internal(bc_num n1, bc_num n2, int scale_min)
 	/* Start with the fraction part.  Initialize the pointers. */
 	int   n1bytes = n1->n_scale;
 	int   n2bytes = n2->n_scale;
-	char *n1ptr   = (char *)(n1->n_value + n1->n_len + n1bytes - 1);
-	char *n2ptr   = (char *)(n2->n_value + n2->n_len + n2bytes - 1);
-	char *sumptr  = (char *)(sum->n_value + sum_scale + sum_digits - 1);
+	char *n1ptr   = n1->n_value + n1->n_len + n1bytes - 1;
+	char *n2ptr   = n2->n_value + n2->n_len + n2bytes - 1;
+	char *sumptr  = sum->n_value + sum_scale + sum_digits - 1;
 	int   carry   = 0;
 
 	/* Add the fraction part.  First copy the longer fraction.*/
@@ -355,7 +355,7 @@ static bc_num bc_do_add_internal(bc_num n1, bc_num n2, int scale_min)
 	n2bytes += n2->n_len;
 	while ((n1bytes > 0) && (n2bytes > 0))
 	{
-		*sumptr = (char)(*n1ptr-- + *n2ptr-- + carry);
+		*sumptr = static_cast<char>(*n1ptr-- + *n2ptr-- + carry);
 		if (*sumptr > (BASE - 1))
 		{
 			carry = 1;
@@ -376,7 +376,7 @@ static bc_num bc_do_add_internal(bc_num n1, bc_num n2, int scale_min)
 	}
 	while (n1bytes-- > 0)
 	{
-		*sumptr = (char)(*n1ptr-- + carry);
+		*sumptr = static_cast<char>(*n1ptr-- + carry);
 		if (*sumptr > (BASE - 1))
 		{
 			carry = 1;
@@ -408,9 +408,9 @@ static bc_num bc_do_sub_internal(bc_num n1, bc_num n2, int scale_min)
 	const int min_len    = MIN(n1->n_len, n2->n_len);
 	const int min_scale  = MIN(n1->n_scale, n2->n_scale);
 	bc_num    diff       = bc_new_num(diff_len, MAX(diff_scale, scale_min));
-	char     *n1ptr      = (char *)(n1->n_value + n1->n_len + n1->n_scale - 1);
-	char     *n2ptr      = (char *)(n2->n_value + n2->n_len + n2->n_scale - 1);
-	char     *diffptr    = (char *)(diff->n_value + diff_len + diff_scale - 1);
+	char     *n1ptr      = n1->n_value + n1->n_len + n1->n_scale - 1;
+	char     *n2ptr      = n2->n_value + n2->n_len + n2->n_scale - 1;
+	char     *diffptr    = diff->n_value + diff_len + diff_scale - 1;
 	int       borrow     = 0;
 	int       count;
 	int       val;
@@ -418,7 +418,7 @@ static bc_num bc_do_sub_internal(bc_num n1, bc_num n2, int scale_min)
 	/* Zero extra digits made by scale_min. */
 	if (scale_min > diff_scale)
 	{
-		char *scaleptr = (char *)(diff->n_value + diff_len + diff_scale);
+		char *scaleptr = diff->n_value + diff_len + diff_scale;
 		for (count = scale_min - diff_scale; count > 0; count--)
 			*scaleptr++ = 0;
 	}
@@ -443,7 +443,7 @@ static bc_num bc_do_sub_internal(bc_num n1, bc_num n2, int scale_min)
 			}
 			else
 				borrow = 0;
-			*diffptr-- = (char)val;
+			*diffptr-- = static_cast<char>(val);
 		}
 	}
 
@@ -458,7 +458,7 @@ static bc_num bc_do_sub_internal(bc_num n1, bc_num n2, int scale_min)
 		}
 		else
 			borrow = 0;
-		*diffptr-- = (char)val;
+		*diffptr-- = static_cast<char>(val);
 	}
 
 	/* If n1 has more digits than n2, we now do that subtract. */
@@ -474,7 +474,7 @@ static bc_num bc_do_sub_internal(bc_num n1, bc_num n2, int scale_min)
 			}
 			else
 				borrow = 0;
-			*diffptr-- = (char)val;
+			*diffptr-- = static_cast<char>(val);
 		}
 	}
 
@@ -584,7 +584,7 @@ int mul_base_digits = MUL_BASE_DIGITS;
 
 static bc_num new_sub_num(int length, char *value)
 {
-	bc_num temp = (bc_num)malloc(sizeof(bc_struct));
+	auto temp = static_cast<bc_num>(malloc(sizeof(bc_struct)));
 	if (temp == nullptr)
 		bc_out_of_memory();
 	temp->n_sign  = PLUS;
@@ -603,21 +603,21 @@ static void bc_simp_mul_internal(bc_num n1, int n1len, bc_num n2, int n2len, bc_
 
 	*prod = bc_new_num(prodlen, 0);
 
-	char *n1end = (char *)(n1->n_value + n1len - 1); /* To the end of n1 and n2. */
-	char *n2end = (char *)(n2->n_value + n2len - 1);
-	char *pvptr = (char *)((*prod)->n_value + prodlen - 1);
+	char *n1end = n1->n_value + n1len - 1; /* To the end of n1 and n2. */
+	char *n2end = n2->n_value + n2len - 1;
+	char *pvptr = (*prod)->n_value + prodlen - 1;
 
 	/* Here is the loop... */
 	for (int indx = 0; indx < prodlen - 1; indx++)
 	{
-		char *n1ptr = (char *)(n1end - MAX(0, indx - n2len + 1));
-		char *n2ptr = (char *)(n2end - MIN(indx, n2len - 1));
+		char *n1ptr = n1end - MAX(0, indx - n2len + 1);
+		char *n2ptr = n2end - MIN(indx, n2len - 1);
 		while ((n1ptr >= n1->n_value) && (n2ptr <= n2end))
 			sum += *n1ptr-- * *n2ptr++;
-		*pvptr-- = (char)(sum % BASE);
+		*pvptr-- = static_cast<char>(sum % BASE);
 		sum      = sum / BASE;
 	}
-	*pvptr = (char)sum;
+	*pvptr = static_cast<char>(sum);
 }
 
 /* A special adder/subtractor for the recursive divide and conquer
@@ -632,17 +632,17 @@ static void bc_shift_addsub_internal(bc_num accum, bc_num val, int shift, int su
 	assert(accum->n_len + accum->n_scale >= shift + count);
 
 	/* Set up pointers and others */
-	signed char *accp  = (signed char *)(accum->n_value + accum->n_len + accum->n_scale - shift - 1);
-	signed char *valp  = (signed char *)(val->n_value + val->n_len - 1);
-	int          carry = 0;
+	auto *accp  = reinterpret_cast<signed char *>(accum->n_value + accum->n_len + accum->n_scale - shift - 1);
+	auto *valp  = reinterpret_cast<signed char *>(val->n_value + val->n_len - 1);
+	int   carry = 0;
 
 	if (sub)
 	{
 		/* Subtraction, carry is really borrow. */
 		while (count--)
 		{
-			const int updated = (int)(*accp) - (int)(*valp--) - carry;
-			*accp             = (signed char)updated;
+			const int updated = static_cast<int>(*accp) - static_cast<int>(*valp--) - carry;
+			*accp             = static_cast<signed char>(updated);
 			if (*accp < 0)
 			{
 				carry = 1;
@@ -656,8 +656,8 @@ static void bc_shift_addsub_internal(bc_num accum, bc_num val, int shift, int su
 		}
 		while (carry)
 		{
-			const int updated = (int)(*accp) - carry;
-			*accp             = (signed char)updated;
+			const int updated = static_cast<int>(*accp) - carry;
+			*accp             = static_cast<signed char>(updated);
 			if (*accp < 0)
 				*accp-- += BASE;
 			else
@@ -669,8 +669,8 @@ static void bc_shift_addsub_internal(bc_num accum, bc_num val, int shift, int su
 		/* Addition */
 		while (count--)
 		{
-			const int updated = (int)(*accp) + (int)(*valp--) + carry;
-			*accp             = (signed char)updated;
+			const int updated = static_cast<int>(*accp) + static_cast<int>(*valp--) + carry;
+			*accp             = static_cast<signed char>(updated);
 			if (*accp > (BASE - 1))
 			{
 				carry = 1;
@@ -684,8 +684,8 @@ static void bc_shift_addsub_internal(bc_num accum, bc_num val, int shift, int su
 		}
 		while (carry)
 		{
-			const int updated = (int)(*accp) + carry;
-			*accp             = (signed char)updated;
+			const int updated = static_cast<int>(*accp) + carry;
+			*accp             = static_cast<signed char>(updated);
 			if (*accp > (BASE - 1))
 				*accp-- -= BASE;
 			else
@@ -838,8 +838,8 @@ static void bc_onemult(unsigned char *num, int size, int digit, unsigned char *r
 		else
 		{
 			/* Initialize */
-			unsigned char *nptr  = (unsigned char *)(num + size - 1);
-			unsigned char *rptr  = (unsigned char *)(result + size - 1);
+			auto          *nptr  = const_cast<unsigned char *>(num + size - 1);
+			unsigned char *rptr  = result + size - 1;
 			int            carry = 0;
 
 			while (size-- > 0)
@@ -887,21 +887,21 @@ int bc_divide(bc_num n1, bc_num n2, bc_num *quot, int scale)
 	/* Set up the divide.  Move the decimal point on n1 by n2's scale.
 	 Remember, zeros on the end of num2 are wasted effort for dividing. */
 	int            scale2 = n2->n_scale;
-	unsigned char *n2ptr  = (unsigned char *)n2->n_value + n2->n_len + scale2 - 1;
+	unsigned char *n2ptr  = reinterpret_cast<unsigned char *>(n2->n_value) + n2->n_len + scale2 - 1;
 	while ((scale2 > 0) && (*n2ptr-- == 0))
 		scale2--;
 
-	const int      len1   = n1->n_len + scale2;
-	const int      scale1 = n1->n_scale - scale2;
-	const int      extra  = (scale1 < scale) ? (scale - scale1) : 0;
-	unsigned char *num1   = (unsigned char *)malloc(n1->n_len + n1->n_scale + extra + 2);
+	const int len1   = n1->n_len + scale2;
+	const int scale1 = n1->n_scale - scale2;
+	const int extra  = (scale1 < scale) ? (scale - scale1) : 0;
+	auto     *num1   = static_cast<unsigned char *>(malloc(n1->n_len + n1->n_scale + extra + 2));
 	if (num1 == nullptr)
 		bc_out_of_memory();
 	memset(num1, 0, n1->n_len + n1->n_scale + extra + 2);
 	memcpy(num1 + 1, n1->n_value, n1->n_len + n1->n_scale);
 
-	int            len2 = n2->n_len + scale2;
-	unsigned char *num2 = (unsigned char *)malloc(len2 + 1);
+	int   len2 = n2->n_len + scale2;
+	auto *num2 = static_cast<unsigned char *>(malloc(len2 + 1));
 	if (num2 == nullptr)
 		bc_out_of_memory();
 	memcpy(num2, n2->n_value, len2);
@@ -933,7 +933,7 @@ int bc_divide(bc_num n1, bc_num n2, bc_num *quot, int scale)
 	memset(qval->n_value, 0, qdigits);
 
 	/* Allocate storage for the temporary storage mval. */
-	unsigned char *mval = (unsigned char *)malloc(len2 + 1);
+	auto *mval = static_cast<unsigned char *>(malloc(len2 + 1));
 	if (mval == nullptr)
 		bc_out_of_memory();
 
@@ -941,7 +941,7 @@ int bc_divide(bc_num n1, bc_num n2, bc_num *quot, int scale)
 	if (!zero)
 	{
 		/* Normalize */
-		const int norm = 10 / ((int)*n2ptr + 1);
+		const int norm = 10 / (static_cast<int>(*n2ptr) + 1);
 		if (norm != 1)
 		{
 			bc_onemult(num1, len1 + scale1 + extra + 1, norm, num1);
@@ -949,8 +949,8 @@ int bc_divide(bc_num n1, bc_num n2, bc_num *quot, int scale)
 		}
 
 		/* Initialize divide loop. */
-		unsigned char *qptr =
-		    (len2 > len1) ? (unsigned char *)qval->n_value + len2 - len1 : (unsigned char *)qval->n_value;
+		unsigned char *qptr = (len2 > len1) ? reinterpret_cast<unsigned char *>(qval->n_value) + len2 - len1
+		                                    : reinterpret_cast<unsigned char *>(qval->n_value);
 
 		/* Loop */
 		for (int qdig = 0; qdig <= len1 + scale - len2; qdig++)
@@ -975,11 +975,11 @@ int bc_divide(bc_num n1, bc_num n2, bc_num *quot, int scale)
 			{
 				*mval = 0;
 				bc_onemult(n2ptr, len2, qguess, mval + 1);
-				unsigned char *ptr1 = (unsigned char *)num1 + qdig + len2;
-				unsigned char *ptr2 = (unsigned char *)mval + len2;
+				unsigned char *ptr1 = static_cast<unsigned char *>(num1) + qdig + len2;
+				unsigned char *ptr2 = static_cast<unsigned char *>(mval) + len2;
 				for (int count = 0; count < len2 + 1; count++)
 				{
-					int digit = (int)*ptr1 - (int)*ptr2-- - borrow;
+					int digit = static_cast<int>(*ptr1) - static_cast<int>(*ptr2--) - borrow;
 					if (digit < 0)
 					{
 						digit += 10;
@@ -995,12 +995,12 @@ int bc_divide(bc_num n1, bc_num n2, bc_num *quot, int scale)
 			if (borrow == 1)
 			{
 				qguess--;
-				unsigned char *ptr1  = (unsigned char *)num1 + qdig + len2;
-				unsigned char *ptr2  = (unsigned char *)n2ptr + len2 - 1;
+				unsigned char *ptr1  = static_cast<unsigned char *>(num1) + qdig + len2;
+				unsigned char *ptr2  = n2ptr + len2 - 1;
 				int            carry = 0;
 				for (int count = 0; count < len2; count++)
 				{
-					int digit = (int)*ptr1 + (int)*ptr2-- + carry;
+					int digit = static_cast<int>(*ptr1) + static_cast<int>(*ptr2--) + carry;
 					if (digit > 9)
 					{
 						digit -= 10;
@@ -1345,13 +1345,13 @@ void bc_int2num(bc_num *num, int val)
 
 	/* Get things going. */
 	char *bptr = buffer;
-	*bptr++    = (char)(val % BASE);
+	*bptr++    = static_cast<char>(val % BASE);
 	val        = val / BASE;
 
 	/* Extract remaining digits. */
 	while (val != 0)
 	{
-		*bptr++ = (char)(val % BASE);
+		*bptr++ = static_cast<char>(val % BASE);
 		val     = val / BASE;
 		ix++; /* Count the digits. */
 	}
@@ -1379,9 +1379,9 @@ char *num2str(bc_num num)
 
 	/* Allocate the string memory. */
 	if (num->n_scale > 0)
-		str = (char *)malloc(num->n_len + num->n_scale + 2 + signch);
+		str = static_cast<char *>(malloc(num->n_len + num->n_scale + 2 + signch));
 	else
-		str = (char *)malloc(num->n_len + 1 + signch);
+		str = static_cast<char *>(malloc(num->n_len + 1 + signch));
 	if (str == nullptr)
 		bc_out_of_memory();
 
@@ -1424,11 +1424,11 @@ void bc_str2num(bc_num *num, char *str, int scale)
 		ptr++; /* Sign */
 	while (*ptr == '0')
 		ptr++; /* Skip leading zeros. */
-	while (isdigit((int)*ptr))
+	while (isdigit(static_cast<int>(*ptr)))
 		ptr++, digits++; /* digits */
 	if (*ptr == '.')
 		ptr++; /* decimal point */
-	while (isdigit((int)*ptr))
+	while (isdigit(static_cast<int>(*ptr)))
 		ptr++, strscale++; /* digits */
 	if ((*ptr != '\0') || (digits + strscale == 0))
 	{
@@ -1480,7 +1480,7 @@ void bc_str2num(bc_num *num, char *str, int scale)
 
 /* Added by NJG to remove a memory leak */
 
-void bc_free_numbers(void)
+void bc_free_numbers()
 {
 	bc_free_num(&bc_zero);
 	bc_free_num(&bc_one);

@@ -546,12 +546,8 @@ if (QMUD_ENABLE_LUA_SCRIPTING)
     else ()
         set(QMUD_RESOLVED_BC_PROVIDER "BUNDLED")
         message(STATUS "System bc not found, building bundled bc fallback")
-        target_sources(QMud PRIVATE src/scripting/Number.c)
-        target_sources(QMud PRIVATE src/scripting/Lbc.c)
-        set_source_files_properties(
-                src/scripting/Number.c
-                PROPERTIES COMPILE_OPTIONS "-Wno-old-style-definition;-Wno-unknown-pragmas;-Wno-unused-but-set-variable;-Wno-unused-parameter"
-        )
+        target_sources(QMud PRIVATE src/scripting/Number.cpp)
+        target_sources(QMud PRIVATE src/scripting/Lbc.cpp)
         target_compile_definitions(QMud PRIVATE QMUD_BUNDLED_BC=1)
     endif ()
 

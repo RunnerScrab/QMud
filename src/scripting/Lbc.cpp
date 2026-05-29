@@ -2,7 +2,7 @@
  * QMud Project
  * Copyright (c) 2026 Panagiotis Kalogiratos (Nodens)
  *
- * File: Lbc.c
+ * File: Lbc.cpp
  * Role: Embedded bc calculator core implementation used by scripting functions requiring arbitrary-precision
  * arithmetic.
  */
@@ -39,18 +39,16 @@
 //   bc.trunc
 //   bc.version
 
-#include <ctype.h>
-#include <errno.h>
-#include <limits.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cctype>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
 
 #include "BcConfig.h"
 #include "Number.h"
 
 #include "LuaHeaders.h"
-
-#define lua_boxpointer(L, u) (*(void **)(lua_newuserdata(L, sizeof(void *))) = (u))
 
 #define MYNAME "bc"
 #define MYVERSION                                                                                            \
@@ -66,23 +64,28 @@
 #endif
 #endif
 
-static QMUD_BC_THREAD_LOCAL lua_State *g_bcCurrentLuaState   = nullptr;
-static constexpr char                  g_bcDigitsRegistryKey = 0;
+static QMUD_BC_THREAD_LOCAL lua_State *g_bcCurrentLuaState = nullptr;
+static char                            g_bcDigitsRegistryKey;
 
-static int                             bcDigits(lua_State *L)
+static void                            luaBoxPointer(lua_State *L, void *pointer)
+{
+	*static_cast<void **>(lua_newuserdata(L, sizeof(void *))) = pointer;
+}
+
+static int bcDigits(lua_State *L)
 {
 	int digits = 0;
-	lua_pushlightuserdata(L, (void *)&g_bcDigitsRegistryKey);
+	lua_pushlightuserdata(L, static_cast<void *>(&g_bcDigitsRegistryKey));
 	lua_gettable(L, LUA_REGISTRYINDEX);
 	if (lua_isnumber(L, -1))
-		digits = (int)lua_tointeger(L, -1);
+		digits = static_cast<int>(lua_tointeger(L, -1));
 	lua_pop(L, 1);
 	return digits;
 }
 
 static void bcSetDigits(lua_State *L, int digits)
 {
-	lua_pushlightuserdata(L, (void *)&g_bcDigitsRegistryKey);
+	lua_pushlightuserdata(L, static_cast<void *>(&g_bcDigitsRegistryKey));
 	lua_pushinteger(L, digits);
 	lua_settable(L, LUA_REGISTRYINDEX);
 }
@@ -101,20 +104,21 @@ static int bcParseExponentOrZero(const char *text)
 		return INT_MAX;
 	if ((errno == ERANGE && value == LONG_MIN) || value < INT_MIN)
 		return INT_MIN;
-	return (int)value;
+	return static_cast<int>(value);
 }
 
-void bc_error(const char *mesg)
+[[noreturn]] void bc_error(const char *mesg)
 {
 	lua_State *L = g_bcCurrentLuaState;
 	if (L == nullptr)
-		abort();
+		std::abort();
 	luaL_error(L, "(bc) %s", mesg ? mesg : "not enough memory");
+	std::abort();
 }
 
 static void Bnew(lua_State *L, bc_num x)
 {
-	lua_boxpointer(L, x);
+	luaBoxPointer(L, x);
 	luaL_getmetatable(L, MYTYPE);
 	lua_setmetatable(L, -2);
 }
@@ -132,7 +136,7 @@ static bc_num Bget(lua_State *L, int i)
 		const char *s = luaL_checkstring(L, i);
 		for (; isspace(*s); s++)
 			; /* bc_str2num chokes on spaces */
-		bc_str2num(&x, (char *)s, digits);
+		bc_str2num(&x, const_cast<char *>(s), digits);
 		if (bc_is_zero(x)) /* bc_str2num chokes on sci notation */
 		{
 			const char *t = strchr(s, 'e');
@@ -140,13 +144,12 @@ static bc_num Bget(lua_State *L, int i)
 				t = strchr(s, 'E');
 			if (t != nullptr)
 			{
-				bc_num       y = nullptr, n = nullptr;
-				const size_t mantissaLength = (size_t)(t - s);
-				char        *mantissa       = (char *)malloc(mantissaLength + 1);
+				bc_num     y = nullptr, n = nullptr;
+				const auto mantissaLength = static_cast<size_t>(t - s);
+				char      *mantissa       = static_cast<char *>(malloc(mantissaLength + 1));
 				if (mantissa == nullptr)
 				{
 					bc_out_of_memory();
-					return x;
 				}
 				memcpy(mantissa, s, mantissaLength);
 				mantissa[mantissaLength] = '\0';
@@ -165,7 +168,7 @@ static bc_num Bget(lua_State *L, int i)
 		return x;
 	}
 	default:
-		return *((void **)luaL_checkudata(L, i, MYTYPE));
+		return static_cast<bc_num>(*static_cast<void **>(luaL_checkudata(L, i, MYTYPE)));
 	}
 	// return nullptr;
 }
@@ -187,7 +190,7 @@ static int Bdigits(lua_State *L) /** digits([n]) */
 {
 	const int digits = bcDigits(L);
 	lua_pushinteger(L, digits);
-	bcSetDigits(L, (int)luaL_optinteger(L, 1, digits));
+	bcSetDigits(L, static_cast<int>(luaL_optinteger(L, 1, digits)));
 	return 1;
 }
 
@@ -343,7 +346,7 @@ static int Btrunc(lua_State *L) /** trunc(x,[n]) */
 {
 	bc_num a = Bget(L, 1);
 	bc_num c = nullptr;
-	bc_divide(a, bc_one, &c, (int)luaL_optinteger(L, 2, 0));
+	bc_divide(a, bc_one, &c, static_cast<int>(luaL_optinteger(L, 2, 0)));
 	Bnew(L, c);
 	return 1;
 }
@@ -406,19 +409,22 @@ static const luaL_Reg R[] = {
     {nullptr,      nullptr  }
 };
 
-LUALIB_API int luaopen_bc(lua_State *L)
+extern "C"
 {
-	// bc_init_numbers();      // done once in MUSHclient.cpp
+	LUALIB_API int luaopen_bc(lua_State *L)
+	{
+		// bc_init_numbers();      // done once in MUSHclient.cpp
 
-	luaL_newmetatable(L, MYTYPE);
-	luaL_setfuncs(L, R, 0);
-	lua_pushvalue(L, -1);
-	lua_setglobal(L, MYNAME);
-	lua_pushliteral(L, "version"); /** version */
-	lua_pushliteral(L, MYVERSION);
-	lua_settable(L, -3);
-	lua_pushliteral(L, "__index");
-	lua_pushvalue(L, -2);
-	lua_settable(L, -3);
-	return 1;
+		luaL_newmetatable(L, MYTYPE);
+		luaL_setfuncs(L, R, 0);
+		lua_pushvalue(L, -1);
+		lua_setglobal(L, MYNAME);
+		lua_pushliteral(L, "version"); /** version */
+		lua_pushliteral(L, MYVERSION);
+		lua_settable(L, -3);
+		lua_pushliteral(L, "__index");
+		lua_pushvalue(L, -2);
+		lua_settable(L, -3);
+		return 1;
+	}
 }
