@@ -23389,6 +23389,15 @@ void WorldRuntime::setView(WorldView *view)
 		return;
 	}
 
+	syncMiniWindowDevicePixelRatioForView();
+}
+
+bool WorldRuntime::syncMiniWindowDevicePixelRatioForView()
+{
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::syncMiniWindowDevicePixelRatioForView");
+	if (!m_view)
+		return false;
+
 	const double ratio = miniWindowDevicePixelRatioForView(m_view);
 	bool         changed{false};
 	for (MiniWindow &window : m_miniWindows)
@@ -23404,6 +23413,7 @@ void WorldRuntime::setView(WorldView *view)
 	}
 	if (changed)
 		emitMiniWindowsChangedCoalesced();
+	return changed;
 }
 
 WorldView *WorldRuntime::view() const

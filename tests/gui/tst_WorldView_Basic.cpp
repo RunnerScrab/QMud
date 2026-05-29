@@ -9,6 +9,7 @@
 #include "AcceleratorUtils.h"
 #include "AnsiSgrParseUtils.h"
 #include "AppController.h"
+#include "MiniWindowUtils.h"
 #include "OutputWrapUtils.h"
 #include "TelnetProcessor.h"
 #include "WorldView.h"
@@ -833,6 +834,27 @@ void WorldRuntime::setView(WorldView *view)
 	g_runtimeView = view;
 }
 
+bool WorldRuntime::syncMiniWindowDevicePixelRatioForView()
+{
+	if (!g_runtimeView)
+		return false;
+
+	const double ratio = g_runtimeView->devicePixelRatioF();
+	bool         changed{false};
+	for (MiniWindow &window : g_testMiniWindows)
+	{
+		const QSize physicalSize = MiniWindow::backingStoreSize(window.width, window.height, ratio);
+		if (!qFuzzyCompare(window.devicePixelRatio, ratio) ||
+		    !qFuzzyCompare(window.backingSurfaceDevicePixelRatio(), ratio) ||
+		    window.backingSurfaceSize() != physicalSize)
+		{
+			MiniWindowUtils::setDevicePixelRatio(window, ratio);
+			changed = true;
+		}
+	}
+	return changed;
+}
+
 WorldView *WorldRuntime::view() const
 {
 	return g_runtimeView;
@@ -1223,6 +1245,35 @@ class tst_WorldView_Basic : public QObject
 
 			view.setRuntime(nullptr);
 			QCOMPARE(g_runtimeView, nullptr);
+
+			resetTestState();
+		}
+
+		void devicePixelRatioChangeResyncsRuntimeMiniWindowBackingStore()
+		{
+			resetTestState();
+
+			WorldView view;
+			view.resize(640, 360);
+			view.show();
+			view.setRuntime(fakeRuntimePointer());
+			QCoreApplication::processEvents();
+
+			MiniWindow  &window = appendTestMiniWindow(QStringLiteral("dpi-sync"), QRect(10, 10, 80, 40), 0,
+			                                           QColor(10, 20, 30));
+			const double targetRatio = view.devicePixelRatioF();
+			const double staleRatio  = qFuzzyCompare(targetRatio, 1.0) ? 2.0 : 1.0;
+			MiniWindowUtils::setDevicePixelRatio(window, staleRatio);
+			QVERIFY(!qFuzzyCompare(window.devicePixelRatio, targetRatio));
+
+			QEvent event(QEvent::DevicePixelRatioChange);
+			QCoreApplication::sendEvent(&view, &event);
+			QCoreApplication::processEvents();
+
+			QVERIFY(qFuzzyCompare(window.devicePixelRatio, targetRatio));
+			QVERIFY(qFuzzyCompare(window.backingSurfaceDevicePixelRatio(), targetRatio));
+			QCOMPARE(window.backingSurfaceSize(),
+			         MiniWindow::backingStoreSize(window.width, window.height, targetRatio));
 
 			resetTestState();
 		}

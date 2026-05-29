@@ -462,6 +462,12 @@ class WorldView : public QWidget
 
 	protected:
 		/**
+		 * @brief Handles generic widget events, including live DPR changes.
+		 * @param event Event payload.
+		 * @return `true` when the event is consumed.
+		 */
+		bool event(QEvent *event) override;
+		/**
 		 * @brief Qt event handlers for size/show/mouse filtering.
 		 * @param event Resize event payload.
 		 */
@@ -1629,6 +1635,10 @@ class WorldView : public QWidget
 		 * @return Active output view pointer.
 		 */
 		[[nodiscard]] WrapTextBrowser               *activeOutputView() const;
+		/**
+		 * @brief Rebuilds miniwindow backing stores when the view DPR changes.
+		 */
+		void                                         syncMiniWindowDevicePixelRatio() const;
 		QSplitter                                   *m_splitter{nullptr};
 		QSplitter                                   *m_outputSplitter{nullptr};
 		QWidget                                     *m_outputContainer{nullptr};

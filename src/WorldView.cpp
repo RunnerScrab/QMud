@@ -1658,6 +1658,7 @@ void WorldView::setRuntime(WorldRuntime *runtime)
 	applyRuntimeSettings();
 	if (m_runtime)
 		m_runtime->setView(this);
+	syncMiniWindowDevicePixelRatio();
 }
 
 void WorldView::setRuntimeObserver(WorldRuntime *runtime)
@@ -1894,6 +1895,14 @@ void WorldView::onMiniWindowsChanged()
 			    m_runtime->refreshNawsWindowSize();
 	    },
 	    Qt::QueuedConnection);
+}
+
+void WorldView::syncMiniWindowDevicePixelRatio() const
+{
+	if (!m_runtime)
+		return;
+	if (m_runtime->syncMiniWindowDevicePixelRatioForView())
+		refreshMiniWindows(true);
 }
 
 QPoint WorldView::miniWindowGlobalPosition(const MiniWindow *window, int x, int y) const
@@ -11150,6 +11159,15 @@ void WorldView::updateLineInformationTooltip(const QWidget *watched, const QMous
 	scheduleHotspotTooltip(kLineInfoTooltipId, text, event->globalPosition().toPoint());
 }
 
+bool WorldView::event(QEvent *event)
+{
+	const bool devicePixelRatioChanged = event && event->type() == QEvent::DevicePixelRatioChange;
+	const bool handled                 = QWidget::event(event);
+	if (devicePixelRatioChanged)
+		syncMiniWindowDevicePixelRatio();
+	return handled;
+}
+
 void WorldView::resizeEvent(QResizeEvent *event)
 {
 	if (traceOutputBackfillEnabled())
@@ -11206,6 +11224,7 @@ void WorldView::showEvent(QShowEvent *event)
 	syncOutputTextVisibilityForNativeCanvas();
 	applyDefaultInputHeight(true);
 	primeNativeOutputCaches();
+	syncMiniWindowDevicePixelRatio();
 	if (m_runtime)
 	{
 		m_runtime->installPendingPlugins();

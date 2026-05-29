@@ -2283,6 +2283,11 @@ class WorldRuntime : public QObject
 		 */
 		void                     setView(WorldView *view);
 		/**
+		 * @brief Rebuilds miniwindow backing stores for the bound view DPR.
+		 * @return `true` when at least one miniwindow backing store changed.
+		 */
+		bool                     syncMiniWindowDevicePixelRatioForView();
+		/**
 		 * @brief Returns bound world view.
 		 * @return Bound world view pointer.
 		 */
