@@ -8,6 +8,7 @@
 
 #include "WorldSessionRestoreFlowUtils.h"
 
+#include <QElapsedTimer>
 #include <QtTest/QTest>
 
 /**
@@ -155,6 +156,35 @@ class tst_WorldSessionRestoreFlowUtils : public QObject
 			    QStringLiteral("autoconnect"),
 			};
 			QCOMPARE(sequence, expected);
+		}
+
+		void postRestoreFlowThroughputStaysWithinBudget()
+		{
+			constexpr int iterations = 5000;
+			int           startupCount{0};
+			int           autoConnectCount{0};
+			int           errorCount{0};
+
+			QElapsedTimer timer;
+			timer.start();
+			for (int i = 0; i < iterations; ++i)
+			{
+				const bool ok = (i % 2) == 0;
+				QMudWorldSessionRestoreFlow::runPostRestoreFlow(
+				    ok, ok ? QString() : QStringLiteral("restore failed"),
+				    {
+				        [&startupCount] { ++startupCount; },
+				        [&autoConnectCount] { ++autoConnectCount; },
+				        [&errorCount](const QString &) { ++errorCount; },
+				    });
+			}
+			const qint64 elapsedMs = timer.elapsed();
+			QCOMPARE(startupCount, iterations);
+			QCOMPARE(autoConnectCount, iterations);
+			QCOMPARE(errorCount, iterations / 2);
+			QVERIFY2(
+			    elapsedMs < 3000,
+			    qPrintable(QStringLiteral("Post-restore flow throughput regression: %1 ms").arg(elapsedMs)));
 		}
 		// NOLINTEND(readability-convert-member-functions-to-static)
 };

@@ -16,7 +16,18 @@
 #include <QPoint>
 #include <QRect>
 #include <QSet>
+#include <QSize>
 #include <QString>
+
+#include <cmath>
+#include <utility>
+
+struct MiniWindow;
+
+namespace MiniWindowUtils::Internal
+{
+	QImage &mutableBackingSurface(MiniWindow &window);
+}
 
 /**
  * @brief Mouse-interaction callbacks and geometry for one miniwindow hotspot.
@@ -53,6 +64,8 @@ struct MiniWindowFont
 {
 		QFont        font;
 		QFontMetrics metrics{QFont()};
+		int          charset{1};
+		int          pitchAndFamily{0};
 };
 
 /**
@@ -64,6 +77,10 @@ struct MiniWindowImage
 		QString source;
 		bool    hasAlpha{false};
 		bool    monochrome{false};
+		int     bitmapType{0};
+		int     bitmapWidthBytes{0};
+		int     bitmapPlanes{1};
+		int     bitmapBitsPixel{0};
 };
 
 /**
@@ -93,7 +110,7 @@ struct MiniWindow
 		QPoint                           clientMousePosition;
 		QDateTime                        installedAt;
 
-		QImage                           surface;
+		double                           devicePixelRatio{1.0};
 		QImage                           transparentSurfaceCache;
 		qint64                           transparentSurfaceSourceKey{0};
 		QRgb                             transparentSurfaceKeyRgb{0};
@@ -104,22 +121,126 @@ struct MiniWindow
 		quint64                          outputHotspotSerial{0};
 
 		/**
+		 * @brief Returns a copy with independent image backing stores.
+		 *
+		 * Miniwindow callback snapshots can be painted on the Lua executor thread, so image data must not
+		 * share implicit Qt backing storage with the runtime-side miniwindow.
+		 *
+		 * @return Miniwindow copy with detached surface/cache/image resources.
+		 */
+		[[nodiscard]] MiniWindow         detachedImageCopy() const
+		{
+			MiniWindow copy              = *this;
+			copy.m_surface               = m_surface.copy();
+			copy.transparentSurfaceCache = transparentSurfaceCache.copy();
+			for (MiniWindowImage &image : copy.images)
+				image.image = image.image.copy();
+			return copy;
+		}
+
+		/**
+		 * @brief Normalizes a backing-store device pixel ratio.
+		 */
+		[[nodiscard]] static double normalizedDevicePixelRatio(const double ratio)
+		{
+			if (!std::isfinite(ratio) || ratio <= 1.0)
+				return 1.0;
+			return ratio;
+		}
+
+		/**
+		 * @brief Returns the physical backing-store size for a logical miniwindow size.
+		 */
+		[[nodiscard]] static QSize backingStoreSize(const int logicalWidth, const int logicalHeight,
+		                                            const double ratio)
+		{
+			const double normalizedRatio = normalizedDevicePixelRatio(ratio);
+			const int    physicalWidth   = qMax(
+			    1, static_cast<int>(std::ceil(static_cast<double>(qMax(1, logicalWidth)) * normalizedRatio)));
+			const int physicalHeight = qMax(
+			    1,
+			    static_cast<int>(std::ceil(static_cast<double>(qMax(1, logicalHeight)) * normalizedRatio)));
+			return {physicalWidth, physicalHeight};
+		}
+
+		/**
+		 * @brief Returns the logical miniwindow API size.
+		 */
+		[[nodiscard]] QSize logicalSize() const
+		{
+			return {qMax(0, width), qMax(0, height)};
+		}
+
+		/**
+		 * @brief Returns the logical miniwindow API rectangle.
+		 */
+		[[nodiscard]] QRect logicalRect() const
+		{
+			return {QPoint(0, 0), logicalSize()};
+		}
+
+		/**
+		 * @brief Returns the high-DPI backing image for painting/compositing.
+		 */
+		[[nodiscard]] const QImage &backingSurface() const
+		{
+			return m_surface;
+		}
+
+		/**
+		 * @brief Replaces the high-DPI backing image and records its DPR.
+		 */
+		void setBackingSurface(QImage surface)
+		{
+			const double normalizedRatio = normalizedDevicePixelRatio(surface.devicePixelRatio());
+			surface.setDevicePixelRatio(normalizedRatio);
+			devicePixelRatio = normalizedRatio;
+			m_surface        = std::move(surface);
+		}
+
+		/**
+		 * @brief Returns whether the high-DPI backing image is empty.
+		 */
+		[[nodiscard]] bool backingSurfaceIsNull() const
+		{
+			return m_surface.isNull();
+		}
+
+		/**
+		 * @brief Returns the physical high-DPI backing image size.
+		 */
+		[[nodiscard]] QSize backingSurfaceSize() const
+		{
+			return m_surface.size();
+		}
+
+		/**
+		 * @brief Returns the DPR stored on the high-DPI backing image.
+		 */
+		[[nodiscard]] double backingSurfaceDevicePixelRatio() const
+		{
+			return normalizedDevicePixelRatio(m_surface.devicePixelRatio());
+		}
+
+		/**
 		 * @brief Initializes miniwindow geometry, flags, and backing surface.
 		 */
 		void create(int left, int top, int newWidth, int newHeight, int newPosition, int newFlags,
-		            const QColor &newBackground)
+		            const QColor &newBackground, double newDevicePixelRatio = 1.0)
 		{
-			location        = QPoint(left, top);
-			width           = newWidth;
-			height          = newHeight;
-			position        = newPosition;
-			flags           = newFlags;
-			background      = newBackground;
-			rect            = QRect(0, 0, 0, 0);
-			temporarilyHide = false;
-			show            = false;
-			surface         = QImage(qMax(1, width), qMax(1, height), QImage::Format_ARGB32);
-			surface.fill(background.isValid() ? background : QColor(0, 0, 0));
+			location         = QPoint(left, top);
+			width            = newWidth;
+			height           = newHeight;
+			position         = newPosition;
+			flags            = newFlags;
+			background       = newBackground;
+			rect             = QRect(0, 0, 0, 0);
+			temporarilyHide  = false;
+			show             = false;
+			devicePixelRatio = normalizedDevicePixelRatio(newDevicePixelRatio);
+			m_surface = QImage(backingStoreSize(width, height, devicePixelRatio), QImage::Format_ARGB32);
+			m_surface.setDevicePixelRatio(devicePixelRatio);
+			m_surface.fill(background.isValid() ? background : QColor(0, 0, 0));
 			transparentSurfaceCache     = QImage();
 			transparentSurfaceSourceKey = 0;
 			transparentSurfaceKeyRgb    = 0;
@@ -145,6 +266,20 @@ struct MiniWindow
 				return height + bottom;
 			return bottom;
 		}
+
+	private:
+		friend class WorldRuntime;
+		friend QImage        &MiniWindowUtils::Internal::mutableBackingSurface(MiniWindow &window);
+
+		/**
+		 * @brief Returns the high-DPI backing image for trusted drawing operations.
+		 */
+		[[nodiscard]] QImage &mutableBackingSurface()
+		{
+			return m_surface;
+		}
+
+		QImage m_surface;
 };
 
 #endif // QMUD_MINIWINDOW_H

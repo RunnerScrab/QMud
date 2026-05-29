@@ -12,6 +12,7 @@
 
 #include "LuaCallbackEngine.h"
 #include "WorldRuntime.h"
+#include <QColor>
 #include <QElapsedTimer>
 #include <QHash>
 #include <QObject>
@@ -80,6 +81,23 @@ class WorldCommandProcessor : public QObject
 		 */
 		void               sendToFromAccelerator(int sendTo, const QString &text, const QString &description,
 		                                         const WorldRuntime::Plugin *plugin);
+
+	signals:
+		/**
+		 * @brief Requests script-send execution through the processor script dispatch channel.
+		 * @param pluginId Origin plugin ID, or empty for world script context.
+		 * @param text Script text/code to execute.
+		 * @param description Script description for diagnostics.
+		 * @param styleRuns Optional style runs to expose as `TriggerStyleRuns`.
+		 * @param hasTriggerContext Execute with trigger line context when `true`.
+		 * @param replaceMatchedLineOutput First output replaces matched line when `true`.
+		 * @param triggerMatchedLineBufferIndex One-based matched line index captured at dispatch.
+		 * @param triggerMatchedLineAbsoluteNumber Stable matched line number captured at dispatch.
+		 */
+		void sendToScriptRequested(const QString &pluginId, const QString &text, const QString &description,
+		                           const QVector<LuaStyleRun> *styleRuns, bool hasTriggerContext,
+		                           bool replaceMatchedLineOutput, int triggerMatchedLineBufferIndex,
+		                           qint64 triggerMatchedLineAbsoluteNumber);
 
 	public slots:
 		/**
@@ -167,14 +185,6 @@ class WorldCommandProcessor : public QObject
 		 * @return `true` when plugin send occurred.
 		 */
 		bool pluginProcessingSent() const;
-
-	signals:
-		/**
-		 * @brief Requests script send-target processing.
-		 * @param text Script send text.
-		 * @param afterOmit Invoke after omit step when `true`.
-		 */
-		void sendToScriptRequested(const QString &text, bool afterOmit);
 
 	private:
 		/**
@@ -281,12 +291,14 @@ class WorldCommandProcessor : public QObject
 				QString                line;
 				QStringList            wildcards;
 				QMap<QString, QString> namedWildcards;
+				bool                   replaceMatchedLineOutput{false};
 		};
 		struct DeferredScript
 		{
 				QString pluginId;
 				QString scriptText;
 				QString description;
+				bool    replaceMatchedLineOutput{false};
 		};
 		struct TriggerEvaluationResult
 		{
@@ -320,14 +332,60 @@ class WorldCommandProcessor : public QObject
 				QString                pluginId;
 				QString                label;
 				QString                scriptName;
+				QString                line;
 				QStringList            wildcards;
 				QMap<QString, QString> namedWildcards;
 		};
-		struct TriggerOrderCacheEntry
+		struct DecodedTrigger
 		{
-				int          count{0};
-				quint64      signature{0};
-				QVector<int> indices;
+				int     index{0};
+				int     sequence{0};
+				QString matchText;
+				QString sendText;
+				QString sound;
+				QString label;
+				QString scriptLabel;
+				QString variableName;
+				QString scriptName;
+				QString otherTextColour;
+				QString otherBackColour;
+				bool    enabled{false};
+				bool    isRegexp{false};
+				bool    ignoreCase{false};
+				bool    multiLine{false};
+				bool    expandVariables{false};
+				bool    matchTextColour{false};
+				bool    matchBack{false};
+				bool    matchBold{false};
+				bool    matchItalic{false};
+				bool    matchUnderline{false};
+				bool    matchInverse{false};
+				bool    desiredBold{false};
+				bool    desiredItalic{false};
+				bool    desiredUnderline{false};
+				bool    desiredInverse{false};
+				bool    oneShot{false};
+				bool    lowerWildcards{false};
+				bool    omitFromLog{false};
+				bool    omitFromOutput{false};
+				bool    makeBold{false};
+				bool    makeItalic{false};
+				bool    makeUnderline{false};
+				bool    repeatMatches{false};
+				bool    keepEvaluating{false};
+				int     linesToMatch{0};
+				int     sendToValue{0};
+				int     textColour{-1};
+				int     backColour{-1};
+				int     colourChange{-1};
+				int     changeType{0};
+				int     clipboardArg{0};
+		};
+		struct TriggerEvaluationCacheEntry
+		{
+				quint64                 generation{0};
+				int                     count{0};
+				QVector<DecodedTrigger> triggers;
 		};
 		struct AliasOrderCacheEntry
 		{
@@ -346,6 +404,22 @@ class WorldCommandProcessor : public QObject
 		 * @return Ordered plugin index list.
 		 */
 		const QVector<int> &sortedPluginIndices();
+		/**
+		 * @brief Returns decoded trigger evaluation data for a trigger list.
+		 * @param triggers Trigger list.
+		 * @return Cached decoded trigger data.
+		 */
+		const TriggerEvaluationCacheEntry      &
+        decodedTriggerEvaluationCache(const QList<WorldRuntime::Trigger> &triggers);
+		/**
+		 * @brief Clears cached decoded trigger evaluation data.
+		 */
+		void invalidateTriggerEvaluationCache();
+		/**
+		 * @brief Ensures cached palette/default output colours match runtime settings.
+		 * @param attrs World attributes used by output rendering.
+		 */
+		void ensurePaletteCache(const QMap<QString, QString> &attrs) const;
 		/**
 		 * @brief Evaluates one alias pass sequence.
 		 * @param currentLine Current command line.
@@ -375,10 +449,32 @@ class WorldCommandProcessor : public QObject
 		 * @param variableName Variable name for variable targets.
 		 * @param description Description text for UI/logging.
 		 * @param plugin Optional originating plugin.
+		 * @param styleRuns Optional matched trigger style runs for script targets.
+		 * @param hasTriggerContext Execute script target with trigger line context when `true`.
+		 * @param replaceMatchedLineOutput First script output replaces matched line when `true`.
+		 * @param triggerMatchedLineBufferIndex One-based matched line index captured at dispatch.
+		 * @param triggerMatchedLineAbsoluteNumber Stable matched line number captured at dispatch.
 		 */
 		void sendTo(int sendTo, const QString &text, bool omitFromOutput, bool omitFromLog,
 		            const QString &variableName, const QString &description,
-		            const WorldRuntime::Plugin *plugin);
+		            const WorldRuntime::Plugin *plugin, const QVector<LuaStyleRun> *styleRuns = nullptr,
+		            bool hasTriggerContext = false, bool replaceMatchedLineOutput = false,
+		            int triggerMatchedLineBufferIndex = 0, qint64 triggerMatchedLineAbsoluteNumber = 0);
+		/**
+		 * @brief Executes one send-to-script request on the active runtime/script context.
+		 * @param pluginId Origin plugin ID, or empty for world script context.
+		 * @param text Script text/code to execute.
+		 * @param description Script description for diagnostics.
+		 * @param styleRuns Optional style runs to expose as `TriggerStyleRuns`.
+		 * @param hasTriggerContext Execute with trigger line context when `true`.
+		 * @param replaceMatchedLineOutput First output replaces matched line when `true`.
+		 * @param triggerMatchedLineBufferIndex One-based matched line index captured at dispatch.
+		 * @param triggerMatchedLineAbsoluteNumber Stable matched line number captured at dispatch.
+		 */
+		void dispatchScriptSend(const QString &pluginId, const QString &text, const QString &description,
+		                        const QVector<LuaStyleRun> *styleRuns, bool hasTriggerContext,
+		                        bool replaceMatchedLineOutput, int triggerMatchedLineBufferIndex,
+		                        qint64 triggerMatchedLineAbsoluteNumber) const;
 		/**
 		 * @brief Emits one trace line through plugin trace callbacks/world output.
 		 * @param message Trace message without `TRACE:` prefix.
@@ -425,45 +521,59 @@ class WorldCommandProcessor : public QObject
 		 * @param functionType Callback type label.
 		 * @param functionName Callback function name.
 		 * @param lua Lua callback engine.
-		 * @param requireFunction Require function to exist when `true`.
 		 * @return `true` when callback can execute.
 		 */
 		bool canExecuteWorldScript(const QString &functionType, const QString &functionName,
-		                           LuaCallbackEngine *lua, bool requireFunction) const;
+		                           const LuaCallbackEngine *lua) const;
+		/**
+		 * @brief Emits world-script missing-function warning when configured.
+		 * @param functionType Callback type label.
+		 * @param functionName Callback function name.
+		 */
+		void warnMissingWorldScriptFunction(const QString &functionType, const QString &functionName) const;
 
-		WorldRuntime                              *m_runtime{nullptr};
-		WorldView                                 *m_view{nullptr};
-		QStringList                                m_queuedCommands;
-		bool                                       m_queueStatusOwnsMessage{false};
-		int                                        m_speedWalkDelay{0};
-		QString                                    m_speedWalkFiller;
-		bool                                       m_pluginProcessingSend{false};
-		bool                                       m_pluginProcessingSent{false};
-		bool                                       m_noEcho{false};
-		bool                                       m_translateGerman{false};
-		bool                                       m_translateBackslashSequences{false};
-		bool                                       m_processingAutoSay{false};
-		bool                                       m_enableSpamPrevention{false};
-		bool                                       m_doNotTranslateIac{false};
-		bool                                       m_regexpMatchEmpty{true};
-		bool                                       m_utf8{false};
-		int                                        m_spamLineCount{0};
-		QString                                    m_spamMessage;
-		QString                                    m_lastCommandSent;
-		int                                        m_lastCommandCount{0};
-		QTimer                                    *m_timerCheck{nullptr};
-		QElapsedTimer                              m_queueDispatchTimer;
-		bool                                       m_suppressInputLog{false};
-		bool                                       m_processingEnteredCommand{false};
-		bool                                       m_omitFromHistoryForEnteredCommand{false};
-		bool                                       m_enteredCommandSendFailed{false};
-		int                                        m_executionDepth{0};
-		mutable QHash<QString, QRegularExpression> m_regexCache;
-		QHash<QString, QString>                    m_wildcardRegexCache;
-		mutable QSet<QString>                      m_invalidRegexWarnings;
-		QHash<quintptr, TriggerOrderCacheEntry>    m_triggerOrderCache;
-		QHash<quintptr, AliasOrderCacheEntry>      m_aliasOrderCache;
-		PluginOrderCacheEntry                      m_pluginOrderCache;
+		WorldRuntime                                *m_runtime{nullptr};
+		WorldView                                   *m_view{nullptr};
+		QStringList                                  m_queuedCommands;
+		bool                                         m_queueStatusOwnsMessage{false};
+		int                                          m_speedWalkDelay{0};
+		QString                                      m_speedWalkFiller;
+		bool                                         m_pluginProcessingSend{false};
+		bool                                         m_pluginProcessingSent{false};
+		bool                                         m_noEcho{false};
+		bool                                         m_translateGerman{false};
+		bool                                         m_translateBackslashSequences{false};
+		bool                                         m_processingAutoSay{false};
+		bool                                         m_enableSpamPrevention{false};
+		bool                                         m_doNotTranslateIac{false};
+		bool                                         m_regexpMatchEmpty{true};
+		bool                                         m_utf8{false};
+		int                                          m_spamLineCount{0};
+		QString                                      m_spamMessage;
+		QString                                      m_lastCommandSent;
+		int                                          m_lastCommandCount{0};
+		QTimer                                      *m_timerCheck{nullptr};
+		QElapsedTimer                                m_queueDispatchTimer;
+		bool                                         m_suppressInputLog{false};
+		bool                                         m_processingEnteredCommand{false};
+		bool                                         m_omitFromHistoryForEnteredCommand{false};
+		bool                                         m_enteredCommandSendFailed{false};
+		int                                          m_executionDepth{0};
+		mutable QHash<QString, QRegularExpression>   m_regexCache;
+		QHash<QString, QString>                      m_wildcardRegexCache;
+		mutable QSet<QString>                        m_invalidRegexWarnings;
+		QHash<quintptr, TriggerEvaluationCacheEntry> m_triggerEvaluationCache;
+		quint64                                      m_triggerEvaluationCacheGeneration{0};
+		QHash<quintptr, AliasOrderCacheEntry>        m_aliasOrderCache;
+		PluginOrderCacheEntry                        m_pluginOrderCache;
+		mutable bool                                 m_paletteCacheValid{false};
+		mutable quint64                              m_paletteCacheSignature{0};
+		mutable QVector<QColor>                      m_paletteCacheNormal;
+		mutable QVector<QColor>                      m_paletteCacheBold;
+		mutable QVector<QColor>                      m_paletteCacheCustomText;
+		mutable QVector<QColor>                      m_paletteCacheCustomBack;
+		mutable QColor                               m_paletteCacheDefaultFore;
+		mutable QColor                               m_paletteCacheDefaultBack;
 };
 
 #endif // QMUD_WORLDCOMMANDPROCESSOR_H

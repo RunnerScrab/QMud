@@ -111,6 +111,90 @@ class tst_WorldDocument_Includes : public QObject
 			QCOMPARE(pluginVariableByName(plugin, QStringLiteral("score")), QStringLiteral("99"));
 		}
 
+		void expandIncludesMergesMinimalMiniWindowGeometryPluginState()
+		{
+			QMudTest::ScopedTempDir tempDir;
+			QVERIFY(tempDir.isValid());
+
+			const QString pluginsPath = QDir(tempDir.path()).filePath(QStringLiteral("plugins"));
+			const QString statePath   = QDir(tempDir.path()).filePath(QStringLiteral("state"));
+			QVERIFY(QDir().mkpath(pluginsPath));
+			QVERIFY(QDir().mkpath(statePath));
+
+			const QString worldId    = QStringLiteral("aaaaaaaaaaaaaaaaaaaaaaaa");
+			const QString pluginId   = QStringLiteral("bbbbbbbbbbbbbbbbbbbbbbbb");
+			const QString worldPath  = QDir(tempDir.path()).filePath(QStringLiteral("world.xml"));
+			const QString pluginPath = QDir(pluginsPath).filePath(QStringLiteral("mini_geometry.xml"));
+			const QString pluginStatePath =
+			    QDir(statePath).filePath(QStringLiteral("%1-%2-state.xml").arg(worldId, pluginId));
+
+			QVERIFY(writeTextFile(worldPath, QStringLiteral(R"(<?xml version="1.0" encoding="UTF-8"?>
+<qmud>
+  <world id="aaaaaaaaaaaaaaaaaaaaaaaa" name="Main"/>
+  <include name="mini_geometry.xml" plugin="y"/>
+</qmud>)")));
+			QVERIFY(writeTextFile(pluginPath, QStringLiteral(R"(<?xml version="1.0" encoding="UTF-8"?>
+<muclient>
+  <plugin
+    name="MiniGeometryPlugin"
+    author="Tester"
+    id="bbbbbbbbbbbbbbbbbbbbbbbb"
+    language="lua"
+    save_state="y">
+    <description>minimal miniwindow geometry plugin</description>
+    <script><![CDATA[
+local window_name = "geometry"
+
+function OnPluginInstall()
+  local left = tonumber(GetVariable("mini_left")) or 10
+  local top = tonumber(GetVariable("mini_top")) or 20
+  local width = tonumber(GetVariable("mini_width")) or 120
+  local height = tonumber(GetVariable("mini_height")) or 80
+  WindowCreate(window_name, left, top, width, height, 0, 0, 0)
+end
+
+function OnPluginSaveState()
+  SetVariable("mini_left", tostring(WindowInfo(window_name, 1) or 10))
+  SetVariable("mini_top", tostring(WindowInfo(window_name, 2) or 20))
+  SetVariable("mini_width", tostring(WindowInfo(window_name, 3) or 120))
+  SetVariable("mini_height", tostring(WindowInfo(window_name, 4) or 80))
+  SaveState()
+end
+]]></script>
+  </plugin>
+  <variables>
+    <variable name="mini_left">10</variable>
+    <variable name="mini_top">20</variable>
+    <variable name="mini_width">120</variable>
+    <variable name="mini_height">80</variable>
+  </variables>
+</muclient>)")));
+			QVERIFY(writeTextFile(pluginStatePath, QStringLiteral(R"(<?xml version="1.0" encoding="UTF-8"?>
+<qmud>
+  <variables>
+    <variable name="mini_left">44</variable>
+    <variable name="mini_top">55</variable>
+    <variable name="mini_width">64</variable>
+    <variable name="mini_height">40</variable>
+  </variables>
+</qmud>)")));
+
+			WorldDocument doc;
+			QVERIFY(doc.loadFromFile(worldPath));
+			QVERIFY(doc.expandIncludes(worldPath, pluginsPath, tempDir.path(), statePath));
+
+			QCOMPARE(doc.plugins().size(), 1);
+			const WorldDocument::Plugin plugin = doc.plugins().front();
+			QCOMPARE(plugin.attributes.value(QStringLiteral("id")), pluginId);
+			QCOMPARE(plugin.attributes.value(QStringLiteral("save_state")), QStringLiteral("y"));
+			QVERIFY(plugin.script.contains(QStringLiteral("WindowCreate")));
+			QVERIFY(plugin.script.contains(QStringLiteral("OnPluginSaveState")));
+			QCOMPARE(pluginVariableByName(plugin, QStringLiteral("mini_left")), QStringLiteral("44"));
+			QCOMPARE(pluginVariableByName(plugin, QStringLiteral("mini_top")), QStringLiteral("55"));
+			QCOMPARE(pluginVariableByName(plugin, QStringLiteral("mini_width")), QStringLiteral("64"));
+			QCOMPARE(pluginVariableByName(plugin, QStringLiteral("mini_height")), QStringLiteral("40"));
+		}
+
 		void duplicatePluginIdIsRejected()
 		{
 			QMudTest::ScopedTempDir tempDir;
@@ -256,7 +340,6 @@ class tst_WorldDocument_Includes : public QObject
 };
 
 QTEST_APPLESS_MAIN(tst_WorldDocument_Includes)
-
 
 #if __has_include("tst_WorldDocument_Includes.moc")
 #include "tst_WorldDocument_Includes.moc"

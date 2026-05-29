@@ -80,6 +80,21 @@ namespace QMudLuaSupport
 	 */
 	lua_State *makeLuaState();
 	/**
+	 * @brief Executes a protected Lua call.
+	 * @param L Lua state pointer.
+	 * @param arguments Number of call arguments.
+	 * @param returnsCount Expected number of returns.
+	 * @param errorFunctionIndex Lua stack index for error handler function, or `0` for none.
+	 * @return `lua_pcall` status code.
+	 */
+	int        callLuaProtected(lua_State *L, int arguments, int returnsCount, int errorFunctionIndex);
+	/**
+	 * @brief Enables/disables native C-call boundary serialization for a Lua state.
+	 * @param L Lua state pointer.
+	 * @param enabled Enable boundary lock/hook when `true`.
+	 */
+	void       setNativeCallBoundaryLockEnabled(lua_State *L, bool enabled);
+	/**
 	 * @brief Calls a C function with Lua error protection.
 	 * @param L Lua state pointer.
 	 * @param fn Lua C function pointer to invoke.

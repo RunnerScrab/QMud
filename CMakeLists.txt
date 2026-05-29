@@ -185,6 +185,8 @@ set(QMUD_SOURCES
         helpers/HyperlinkActionUtils.cpp
         helpers/WorldCommandProcessorUtils.cpp
         helpers/LuaExecutionUtils.cpp
+        helpers/OutputWrapUtils.cpp
+        helpers/GuiSystemUtils.cpp
         NameGeneration.cpp
         DoubleMetaphone.cpp
         ErrorDescriptions.cpp
@@ -252,6 +254,7 @@ set(QMUD_HEADERS
         helpers/MainFrameActionUtils.h
         helpers/MainFrameMdiUtils.h
         helpers/LuaExecutionUtils.h
+        helpers/OutputWrapUtils.h
         TabActivationHistory.h
         AppController.h
         Environment.h
@@ -301,7 +304,7 @@ set(QMUD_HEADERS
         MxpDebugWindow.h
         BraceMatch.h
         LuaExecutor.h
-        LuaExecutorThreaded.h
+        LuaExecutorWorker.h
         LuaCallbackEngine.h
         LuaApiExport.h
         FileExtensions.h
@@ -327,7 +330,7 @@ set(QMUD_HEADERS
 
 set(QMUD_SOURCE_FILES_ABS)
 if (QMUD_ENABLE_EXPERIMENTAL_THREADED_LUA_EXECUTOR)
-    list(APPEND QMUD_SOURCES LuaExecutorThreaded.cpp)
+    list(APPEND QMUD_SOURCES LuaExecutorWorker.cpp)
 endif ()
 foreach (QMUD_SOURCE_FILE IN LISTS QMUD_SOURCES)
     list(APPEND QMUD_SOURCE_FILES_ABS "${QMUD_SRC_DIR}/${QMUD_SOURCE_FILE}")
@@ -543,12 +546,8 @@ if (QMUD_ENABLE_LUA_SCRIPTING)
     else ()
         set(QMUD_RESOLVED_BC_PROVIDER "BUNDLED")
         message(STATUS "System bc not found, building bundled bc fallback")
-        target_sources(QMud PRIVATE src/scripting/Number.c)
-        target_sources(QMud PRIVATE src/scripting/Lbc.c)
-        set_source_files_properties(
-                src/scripting/Number.c
-                PROPERTIES COMPILE_OPTIONS "-Wno-old-style-definition;-Wno-unknown-pragmas;-Wno-unused-but-set-variable;-Wno-unused-parameter"
-        )
+        target_sources(QMud PRIVATE src/scripting/Number.cpp)
+        target_sources(QMud PRIVATE src/scripting/Lbc.cpp)
         target_compile_definitions(QMud PRIVATE QMUD_BUNDLED_BC=1)
     endif ()
 

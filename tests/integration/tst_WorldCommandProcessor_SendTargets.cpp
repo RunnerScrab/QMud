@@ -93,6 +93,18 @@ class tst_WorldCommandProcessor_SendTargets : public QObject
 			QCOMPARE(QMudCommandText::buildTriggerMultilineTarget(lines, false),
 			         QStringLiteral("line 1\nline 2\n"));
 		}
+
+		void pluginTriggerSoundBypassesWorldToggle()
+		{
+			QVERIFY(QMudTriggerSound::shouldPlayTriggerSound(true, false));
+			QVERIFY(QMudTriggerSound::shouldPlayTriggerSound(true, true));
+		}
+
+		void worldTriggerSoundFollowsWorldToggle()
+		{
+			QVERIFY(!QMudTriggerSound::shouldPlayTriggerSound(false, false));
+			QVERIFY(QMudTriggerSound::shouldPlayTriggerSound(false, true));
+		}
 		// NOLINTEND(readability-convert-member-functions-to-static)
 };
 

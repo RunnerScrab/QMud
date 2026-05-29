@@ -57,14 +57,14 @@ typedef struct bc_struct
 		char  *n_ptr;   /* The pointer to the actual storage.
 		                If NULL, n_value points to the inside of
 		                another number (bc_multiply...) and should
-		                not be "freed." */
+		                not be "freed" */
 		char  *n_value; /* The number. Not zero char terminated.
 		           May not point to the same place as n_ptr as
 		           in the case of leading zeros generated. */
 } bc_struct;
 
 /* The base used in storing the numbers in n_value above.
-   Currently this MUST be 10. */
+   Currently, this MUST be 10. */
 
 #define BASE 10
 
@@ -90,132 +90,138 @@ typedef struct bc_struct
 #define LONG_MAX 0x7ffffff
 #endif
 
+#if defined(_MSC_VER)
+#define QMUD_BC_THREAD_LOCAL __declspec(thread)
+#else
+#define QMUD_BC_THREAD_LOCAL __thread
+#endif
+
 /* Global numbers. */
-extern bc_num _zero_;
-extern bc_num _one_;
-extern bc_num _two_;
+extern QMUD_BC_THREAD_LOCAL bc_num bc_zero;
+extern QMUD_BC_THREAD_LOCAL bc_num bc_one;
+extern QMUD_BC_THREAD_LOCAL bc_num bc_two;
 
 /* Function Prototypes */
 
-/* Define the _PROTOTYPE macro if it is needed. */
+/* Define the prototype macro if it is needed. */
 
-#ifndef _PROTOTYPE
-#define _PROTOTYPE(func, args) func args
+#ifndef QMUD_BC_PROTOTYPE
+#define QMUD_BC_PROTOTYPE(func, args) func args
 #endif
 
 /**
  * @brief Initializes global constant bc numbers.
  */
-_PROTOTYPE(void bc_init_numbers, (void));
+QMUD_BC_PROTOTYPE(void bc_init_numbers, (void));
 
 /**
  * @brief Allocates new bc number with integer length and scale.
  */
-_PROTOTYPE(bc_num bc_new_num, (int length, int scale));
+QMUD_BC_PROTOTYPE(bc_num bc_new_num, (int length, int scale));
 
 /**
  * @brief Frees bc number and clears caller pointer.
  */
-_PROTOTYPE(void bc_free_num, (bc_num * num));
+QMUD_BC_PROTOTYPE(void bc_free_num, (bc_num * num));
 
 /**
  * @brief Returns deep copy of bc number.
  */
-_PROTOTYPE(bc_num bc_copy_num, (bc_num num));
+QMUD_BC_PROTOTYPE(bc_num bc_copy_num, (bc_num num));
 
 /**
  * @brief Initializes bc number pointer to zero.
  */
-_PROTOTYPE(void bc_init_num, (bc_num * num));
+QMUD_BC_PROTOTYPE(void bc_init_num, (bc_num * num));
 
 /**
  * @brief Parses numeric string into bc number.
  */
-_PROTOTYPE(void bc_str2num, (bc_num * num, char *str, int scale));
+QMUD_BC_PROTOTYPE(void bc_str2num, (bc_num * num, char *str, int scale));
 
 /**
  * @brief Converts bc number to newly allocated C string.
  */
-_PROTOTYPE(char *bc_num2str, (bc_num num));
+QMUD_BC_PROTOTYPE(char *bc_num2str, (bc_num num));
 
 /**
  * @brief Assigns integer value to bc number.
  */
-_PROTOTYPE(void bc_int2num, (bc_num * num, int val));
+QMUD_BC_PROTOTYPE(void bc_int2num, (bc_num * num, int val));
 
 /**
  * @brief Converts bc number to long.
  */
-_PROTOTYPE(long bc_num2long, (bc_num num));
+QMUD_BC_PROTOTYPE(long bc_num2long, (bc_num num));
 
 /**
  * @brief Compares two bc numbers.
  */
-_PROTOTYPE(int bc_compare, (bc_num n1, bc_num n2));
+QMUD_BC_PROTOTYPE(int bc_compare, (bc_num n1, bc_num n2));
 
 /**
  * @brief Returns true when number is zero.
  */
-_PROTOTYPE(char bc_is_zero, (bc_num num));
+QMUD_BC_PROTOTYPE(char bc_is_zero, (bc_num num));
 
 /**
  * @brief Returns true when number is near zero at given scale.
  */
-_PROTOTYPE(char bc_is_near_zero, (bc_num num, int scale));
+QMUD_BC_PROTOTYPE(char bc_is_near_zero, (bc_num num, int scale));
 
 /**
  * @brief Returns true when number sign is negative.
  */
-_PROTOTYPE(char bc_is_neg, (bc_num num));
+QMUD_BC_PROTOTYPE(char bc_is_neg, (bc_num num));
 
 /**
  * @brief Adds two bc numbers.
  */
-_PROTOTYPE(void bc_add, (bc_num n1, bc_num n2, bc_num *result, int scale_min));
+QMUD_BC_PROTOTYPE(void bc_add, (bc_num n1, bc_num n2, bc_num *result, int scale_min));
 
 /**
  * @brief Subtracts two bc numbers.
  */
-_PROTOTYPE(void bc_sub, (bc_num n1, bc_num n2, bc_num *result, int scale_min));
+QMUD_BC_PROTOTYPE(void bc_sub, (bc_num n1, bc_num n2, bc_num *result, int scale_min));
 
 /**
  * @brief Multiplies two bc numbers.
  */
-_PROTOTYPE(void bc_multiply, (bc_num n1, bc_num n2, bc_num *prod, int scale));
+QMUD_BC_PROTOTYPE(void bc_multiply, (bc_num n1, bc_num n2, bc_num *prod, int scale));
 
 /**
  * @brief Divides two bc numbers.
  */
-_PROTOTYPE(int bc_divide, (bc_num n1, bc_num n2, bc_num *quot, int scale));
+QMUD_BC_PROTOTYPE(int bc_divide, (bc_num n1, bc_num n2, bc_num *quot, int scale));
 
 /**
  * @brief Computes modulo of two bc numbers.
  */
-_PROTOTYPE(int bc_modulo, (bc_num num1, bc_num num2, bc_num *result, int scale));
+QMUD_BC_PROTOTYPE(int bc_modulo, (bc_num num1, bc_num num2, bc_num *result, int scale));
 
 /**
  * @brief Computes quotient and remainder in one call.
  */
-_PROTOTYPE(int bc_divmod, (bc_num num1, bc_num num2, bc_num *quot, bc_num *rem, int scale));
+QMUD_BC_PROTOTYPE(int bc_divmod, (bc_num num1, bc_num num2, bc_num *quot, bc_num *rem, int scale));
 
 /**
  * @brief Computes modular exponentiation.
  */
-_PROTOTYPE(int bc_raisemod, (bc_num base, bc_num expo, bc_num mod, bc_num *result, int scale));
+QMUD_BC_PROTOTYPE(int bc_raisemod, (bc_num base, bc_num expo, bc_num mod, bc_num *result, int scale));
 
 /**
  * @brief Raises num1 to num2 power.
  */
-_PROTOTYPE(void bc_raise, (bc_num num1, bc_num num2, bc_num *result, int scale));
+QMUD_BC_PROTOTYPE(void bc_raise, (bc_num num1, bc_num num2, bc_num *result, int scale));
 
 /**
  * @brief Computes square root of bc number.
  */
-_PROTOTYPE(int bc_sqrt, (bc_num * num, int scale));
+QMUD_BC_PROTOTYPE(int bc_sqrt, (bc_num * num, int scale));
 
 /**
  * @brief Writes bc number digits through callback in requested base.
  */
-_PROTOTYPE(void bc_out_num, (bc_num num, int o_base, void (*out_char)(int), int leading_zero));
+QMUD_BC_PROTOTYPE(void bc_out_num, (bc_num num, int o_base, void (*out_char)(int), int leading_zero));
 
 #endif // QMUD_NUMBER_H

@@ -11,6 +11,7 @@
 #include "LuaCallbackEngine.h"
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 #include "LuaHeaders.h"
+#include "LuaSupport.h"
 #include <QDir>
 #include <QSaveFile>
 #include <QSet>
@@ -113,7 +114,7 @@ namespace
 		}
 
 		lua_pushstring(&state, "sqlite3");
-		if (lua_pcall(&state, 1, 1, 0) != 0)
+		if (QMudLuaSupport::callLuaProtected(&state, 1, 1, 0) != 0)
 		{
 			lua_pop(&state, 1);
 			return false;
@@ -215,7 +216,7 @@ namespace
 			return {};
 		}
 
-		if (lua_pcall(state, 0, 1, 0) != 0)
+		if (QMudLuaSupport::callLuaProtected(state, 0, 1, 0) != 0)
 		{
 			lua_pop(state, 2);
 			return {};

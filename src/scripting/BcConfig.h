@@ -17,23 +17,18 @@
  * Clients of number.c should include config.h before number.h.
  */
 
-#include <limits.h>
-#include <string.h>
 #define NDEBUG 1
 
-#define _zero_ bc_zero
-#define _one_ bc_one
-#define _two_ bc_two
 #define num2str bc_num2str
 #define mul_base_digits bc_mul_base_digits
 
-#define bc_rt_warn bc_error
+#define bc_rt_warn(mesg) static_cast<void>(mesg)
 #define bc_rt_error bc_error
-#define bc_out_of_memory() bc_error(NULL)
+#define bc_out_of_memory() bc_error(nullptr)
 
 /**
  * @brief Reports bc runtime/configuration errors.
  */
-void bc_error(const char *mesg);
+[[noreturn]] void bc_error(const char *mesg);
 
 #endif // QMUD_BCCONFIG_H

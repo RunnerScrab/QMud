@@ -20,7 +20,6 @@
 #include "FontUtils.h"
 #include "ImportMergeUtils.h"
 #include "LuaCallbackEngine.h"
-#include "LuaExecutor.h"
 #include "LuaFunctionTypes.h"
 #include "MainFrame.h"
 #include "MainWindowHost.h"
@@ -756,7 +755,7 @@ namespace
 			const QString modernExtension = QStringLiteral(".") + QString::fromLatin1(entry.modernExtension);
 			const QString legacyExtension = QStringLiteral(".") + QString::fromLatin1(entry.legacyExtension);
 
-			const bool    ok = writeRegistryStringValue(modernExtension, QString(), programId) &&
+			const bool ok = writeRegistryStringValue(modernExtension, QString(), programId) &&
 			                writeRegistryStringValue(legacyExtension, QString(), programId) &&
 			                writeRegistryStringValue(programId, QString(), description) &&
 			                writeRegistryStringValue(programId + QStringLiteral("\\DefaultIcon"), QString(),
@@ -1899,7 +1898,7 @@ static const struct
     {"EnableSpellCheck",                1                       },
     {"AllowLoadingDlls",                1                       },
     {"F1macro",                         0                       },
-    {"DisableWindowScaler",             0                       },
+    {"DisableWindowScaler",             1                       },
     {"FixedFontForEditing",             1                       },
     {"NotepadWordWrap",                 1                       },
     {"NotifyIfCannotConnect",           1                       },
@@ -2301,9 +2300,9 @@ namespace
 			}
 		}
 		const QString defaultModernAbsolutePath = absolutePathFromBase(baseDir, canonicalPath);
-		QString       resolvedModernPath        = QFileInfo::exists(defaultModernAbsolutePath)
-		                                              ? QDir::cleanPath(defaultModernAbsolutePath)
-		                                              : resolveExistingPathCaseInsensitive(defaultModernAbsolutePath);
+		QString resolvedModernPath = QFileInfo::exists(defaultModernAbsolutePath)
+		                                 ? QDir::cleanPath(defaultModernAbsolutePath)
+		                                 : resolveExistingPathCaseInsensitive(defaultModernAbsolutePath);
 		if (resolvedModernPath.isEmpty())
 		{
 			if (const QString remappedModernPath = resolveExistingPathCaseInsensitive(
@@ -2778,6 +2777,7 @@ qint64 AppController::nextUniqueNumber()
 
 void AppController::seedRandom(const quint32 seed)
 {
+	QMutexLocker locker(&m_rngMutex);
 	m_rng.seed(seed);
 }
 
@@ -2789,11 +2789,13 @@ void AppController::seedRandomFromArray(const QVector<quint32> &values)
 	quint32 seed = 0x6d2b79f5u;
 	for (const quint32 value : values)
 		seed ^= value + 0x9e3779b9u + (seed << 6) + (seed >> 2);
+	QMutexLocker locker(&m_rngMutex);
 	m_rng.seed(seed);
 }
 
 double AppController::nextRandomUnit()
 {
+	QMutexLocker locker(&m_rngMutex);
 	return m_rng.generateDouble();
 }
 
@@ -2887,6 +2889,31 @@ QVector<WorldRuntime *> AppController::activeWorldRuntimes() const
 	return runtimes;
 }
 
+bool AppController::saveOpenWorldStateBeforeShutdown(QString *errorMessage) const
+{
+	if (errorMessage)
+		errorMessage->clear();
+
+	QString dirtyWorldSaveError;
+	if (!saveDirtyAutoSaveWorldsBeforeRestart(&dirtyWorldSaveError))
+	{
+		if (errorMessage)
+			*errorMessage = QStringLiteral("Failed to save dirty worlds.\n%1").arg(dirtyWorldSaveError);
+		return false;
+	}
+
+	QString sessionStateError;
+	if (!saveOpenWorldSessionStatesBeforeRestart(&sessionStateError))
+	{
+		if (errorMessage)
+			*errorMessage =
+			    QStringLiteral("Failed to persist world session state.\n%1").arg(sessionStateError);
+		return false;
+	}
+
+	return true;
+}
+
 bool AppController::saveDirtyAutoSaveWorldsBeforeRestart(QString *errorMessage) const
 {
 	if (errorMessage)
@@ -2927,7 +2954,7 @@ bool AppController::saveDirtyAutoSaveWorldsBeforeRestart(QString *errorMessage) 
 			if (errorMessage)
 			{
 				*errorMessage =
-				    QStringLiteral("Unable to save world \"%1\" before restart: %2")
+				    QStringLiteral("Unable to save world \"%1\": %2")
 				        .arg(worldName, saveError.isEmpty() ? QStringLiteral("Unknown error.") : saveError);
 			}
 			return false;
@@ -3263,7 +3290,7 @@ void AppController::restoreWorldSessionStateAsync(WorldRuntime *runtime, WorldVi
 	const auto loadPlan        = (forceReadSessionState && stateFileExists)
 	                                 ? QMudWorldSessionRestoreFlow::SessionStateLoadPlan::ReadFileAndApply
 	                                 : QMudWorldSessionRestoreFlow::computeSessionStateLoadPlan(
-                                    persistOutputBuffer, persistCommandHistory, stateFileExists);
+	                                       persistOutputBuffer, persistCommandHistory, stateFileExists);
 	const bool trackScrollbackRestoreStatus =
 	    QMudWorldSessionRestoreFlow::shouldTrackScrollbackRestoreStatus(persistOutputBuffer, loadPlan);
 	const QPointer<AppController> controllerGuard(const_cast<AppController *>(this));
@@ -3307,9 +3334,9 @@ void AppController::restoreWorldSessionStateAsync(WorldRuntime *runtime, WorldVi
 
 			        if (!runtimeGuard || !viewGuard)
 			        {
+				        finishTrackedRestore();
 				        if (completionFn && *completionFn)
 					        (*completionFn)(false, QStringLiteral("Runtime or view was destroyed."));
-				        finishTrackedRestore();
 				        return;
 			        }
 
@@ -3325,9 +3352,9 @@ void AppController::restoreWorldSessionStateAsync(WorldRuntime *runtime, WorldVi
 					        runtimeGuard->setCustomMxpElements(state.customMxpElements);
 			        }
 
+			        finishTrackedRestore();
 			        if (completionFn && *completionFn)
 				        (*completionFn)(ok, error);
-			        finishTrackedRestore();
 		        },
 		        Qt::QueuedConnection);
 	    });
@@ -3359,15 +3386,34 @@ bool AppController::restoreWorldSessionStateSync(WorldRuntime *runtime, WorldVie
 	return loadOk;
 }
 
-void AppController::runWorldStartupPostRestore(WorldRuntime *runtime) const
+void AppController::runWorldStartupPostRestore(WorldRuntime *runtime, std::function<void()> completion,
+                                               const bool waitForPluginInstallCommit) const
 {
 	if (!runtime)
+	{
+		if (completion)
+			completion();
 		return;
+	}
 
 	emitStartupBanner(runtime);
-	loadGlobalPlugins(runtime);
-	runtime->setPluginInstallDeferred(false);
-	runtime->installPendingPlugins();
+	loadGlobalPlugins(runtime,
+	                  [runtimeGuard = QPointer<WorldRuntime>(runtime), completion = std::move(completion),
+	                   waitForPluginInstallCommit]() mutable
+	                  {
+		                  if (!runtimeGuard)
+		                  {
+			                  if (completion)
+				                  completion();
+			                  return;
+		                  }
+		                  runtimeGuard->setPluginInstallDeferred(false);
+		                  const auto completionMode =
+		                      waitForPluginInstallCommit
+		                          ? WorldRuntime::PluginInstallCompletionMode::Committed
+		                          : WorldRuntime::PluginInstallCompletionMode::Staged;
+		                  runtimeGuard->installPendingPluginsAsync(std::move(completion), completionMode);
+	                  });
 }
 
 void AppController::detectReloadStartupArguments()
@@ -3595,6 +3641,7 @@ QString AppController::defaultWorldDirectory() const
 
 QVariant AppController::getGlobalOption(const QString &name) const
 {
+	QMutexLocker locker(&m_globalPrefsMutex);
 	if (name.trimmed().isEmpty())
 		return {};
 	const QString lookupName =
@@ -3659,10 +3706,13 @@ void AppController::setGlobalOptionString(const QString &name, const QString &va
 		return target;
 	};
 
-	const auto key          = findKey(lookupName);
-	const auto storedValue  = normalizeStoredGlobalStringValue(key, value);
-	const auto runtimeValue = normalizeRuntimeGlobalStringValue(key, storedValue);
-	m_globalStringPrefs.insert(key, runtimeValue);
+	const auto key         = findKey(lookupName);
+	const auto storedValue = normalizeStoredGlobalStringValue(key, value);
+	{
+		const auto   runtimeValue = normalizeRuntimeGlobalStringValue(key, storedValue);
+		QMutexLocker locker(&m_globalPrefsMutex);
+		m_globalStringPrefs.insert(key, runtimeValue);
+	}
 	(void)dbWriteString(QStringLiteral("prefs"), key, storedValue);
 }
 
@@ -3687,12 +3737,16 @@ void AppController::setGlobalOptionInt(const QString &name, const int value)
 	};
 
 	const auto key = findKey(lookupName);
-	m_globalIntPrefs.insert(key, value);
+	{
+		QMutexLocker locker(&m_globalPrefsMutex);
+		m_globalIntPrefs.insert(key, value);
+	}
 	(void)dbWriteInt(QStringLiteral("prefs"), key, value);
 }
 
 QString AppController::makeAbsolutePath(const QString &fileName) const
 {
+	QMutexLocker locker(&m_globalPrefsMutex);
 	// Convert relative file names against the configured working directory.
 	if (fileName.isEmpty())
 		return fileName;
@@ -4171,9 +4225,9 @@ bool AppController::setupI18N()
 
 		// sandbox it
 		const bool loaded = !(luaL_loadbuffer(state.get(), luaSandbox, sizeof(luaSandbox) - 1, "sandbox") ||
-		                      lua_pcall(state.get(), 0, 0, 0) ||
+		                      QMudLuaSupport::callLuaProtected(state.get(), 0, 0, 0) ||
 		                      luaL_loadfile(state.get(), m_translatorFile.toUtf8().constData()) ||
-		                      lua_pcall(state.get(), 0, 0, 0));
+		                      QMudLuaSupport::callLuaProtected(state.get(), 0, 0, 0));
 		if (!loaded)
 		{
 			QMudLuaSupport::luaError(state.get(), "Localization initialization");
@@ -4188,13 +4242,46 @@ bool AppController::setupI18N()
 	return true;
 } // end of AppController::setupI18N
 
-lua_State *AppController::translatorLuaState() const
+bool AppController::isTranslatorLuaAvailable() const
 {
-	return m_translatorLua;
+	QMutexLocker locker(&m_luaStateMutex);
+	return m_translatorLua != nullptr;
+}
+
+int AppController::translateDebugMessage(const QString &message) const
+{
+	QMutexLocker locker(&m_luaStateMutex);
+#ifdef QMUD_ENABLE_LUA_I18N
+	lua_State *translator = m_translatorLua;
+	if (!translator)
+		return 1;
+
+	lua_settop(translator, 0);
+	lua_getglobal(translator, "Debug");
+	if (!lua_isfunction(translator, -1))
+	{
+		lua_pop(translator, 1);
+		return 2;
+	}
+
+	const QByteArray msgBytes = message.toLocal8Bit();
+	lua_pushlstring(translator, msgBytes.constData(), msgBytes.size());
+	if (QMudLuaSupport::callLuaProtected(translator, 1, 0, 0))
+	{
+		lua_pop(translator, 1);
+		return 3;
+	}
+
+	return 0;
+#else
+	Q_UNUSED(message);
+	return 1;
+#endif
 }
 
 void AppController::loadMapDirections()
 {
+	QMutexLocker locker(&m_sharedLookupMutex);
 	m_mapDirections.clear();
 
 	auto put = [&](const QString &key, const QString &toLog, const QString &toSend, const QString &reverse)
@@ -4224,20 +4311,31 @@ void AppController::loadMapDirections()
 
 QString AppController::mapDirectionToLog(const QString &direction) const
 {
+	QMutexLocker        locker(&m_sharedLookupMutex);
 	const MapDirection *mapping = findMapDirection(direction);
 	return mapping ? mapping->toLog : QString{};
 }
 
 QString AppController::mapDirectionToSend(const QString &direction) const
 {
+	QMutexLocker        locker(&m_sharedLookupMutex);
 	const MapDirection *mapping = findMapDirection(direction);
 	return mapping ? mapping->toSend : QString{};
 }
 
 QString AppController::mapDirectionReverse(const QString &direction) const
 {
+	QMutexLocker        locker(&m_sharedLookupMutex);
 	const MapDirection *mapping = findMapDirection(direction);
 	return mapping ? mapping->reverse : QString{};
+}
+
+QHash<QString, AppController::MapDirection> AppController::mapDirectionSnapshot() const
+{
+	QMutexLocker locker(&m_sharedLookupMutex);
+	if (m_mapDirections.isEmpty())
+		const_cast<AppController *>(this)->loadMapDirections();
+	return m_mapDirections;
 }
 
 const AppController::MapDirection *AppController::findMapDirection(const QString &direction) const
@@ -4252,6 +4350,7 @@ const AppController::MapDirection *AppController::findMapDirection(const QString
 
 QMudColorRef AppController::xtermColorAt(const int index) const
 {
+	QMutexLocker locker(&m_sharedLookupMutex);
 	if (index < 0 || index >= m_xterm256Colours.size())
 		return qmudRgb(0, 0, 0);
 	return m_xterm256Colours[index];
@@ -4259,6 +4358,7 @@ QMudColorRef AppController::xtermColorAt(const int index) const
 
 void AppController::setXtermColourCube(const int which)
 {
+	QMutexLocker locker(&m_sharedLookupMutex);
 	if (which == 1)
 	{
 		for (int red = 0; red < 6; ++red)
@@ -4293,6 +4393,7 @@ void AppController::setXtermColourCube(const int which)
 
 void AppController::generate256Colours()
 {
+	QMutexLocker locker(&m_sharedLookupMutex);
 	m_xterm256Colours[0] = qmudRgb(0, 0, 0);
 	m_xterm256Colours[1] = qmudRgb(128, 0, 0);
 	m_xterm256Colours[2] = qmudRgb(0, 128, 0);
@@ -4572,127 +4673,139 @@ bool AppController::recoverReloadStartupState()
 			qWarning() << "Failed to restore world session state during reload recovery for"
 			           << reloadWorldIdentity(worldState) << ":" << error;
 		}
-		runWorldStartupPostRestore(runtime);
-
-		if (!worldState.connectedAtReload)
+		const auto continueRecovery =
+		    [asyncContext, runtimeGuard = QPointer<WorldRuntime>(runtime), worldState, restoredOneWorld]
 		{
-			restoredOneWorld();
-			return;
-		}
+			if (!runtimeGuard)
+			{
+				restoredOneWorld();
+				return;
+			}
+			if (!worldState.connectedAtReload)
+			{
+				restoredOneWorld();
+				return;
+			}
 
-		// Defer socket reattach/probe work to the next event-loop turn so restored
-		// output can paint before network recovery traffic starts.
-		const QPointer<WorldRuntime> runtimeGuard(runtime);
-		QMetaObject::invokeMethod(
-		    qApp,
-		    [asyncContext, runtimeGuard, worldState, restoredOneWorld]
-		    {
-			    if (!runtimeGuard)
+			// Defer socket reattach/probe work to the next event-loop turn so restored
+			// output can paint before network recovery traffic starts.
+			QMetaObject::invokeMethod(
+			    qApp,
+			    [asyncContext, runtimeGuard, worldState, restoredOneWorld]
 			    {
-				    restoredOneWorld();
-				    return;
-			    }
-
-			    WorldRuntime *runtimePtr = runtimeGuard.data();
-			    if (worldState.socketDescriptor >= 0)
-			    {
-				    WorldRuntimeReloadOps              runtimeOps(*runtimePtr);
-				    const ReloadRecoverySocketDecision decision =
-				        applyReloadSocketRecovery(runtimeOps, worldState);
-#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
-				    QString cloexecError;
-				    if (!setSocketDescriptorInheritable(worldState.socketDescriptor, false, &cloexecError) &&
-				        !cloexecError.isEmpty())
+				    if (!runtimeGuard)
 				    {
-					    printReloadInfoToStdout(
-					        QStringLiteral(
-					            "Unable to restore close-on-exec for descriptor %1 after recovery: %2")
-					            .arg(worldState.socketDescriptor)
-					            .arg(cloexecError));
+					    restoredOneWorld();
+					    return;
 				    }
-#endif
-				    if (decision.outcome == ReloadRecoverySocketOutcome::ReconnectQueued)
+
+				    WorldRuntime *runtimePtr = runtimeGuard.data();
+				    if (worldState.socketDescriptor >= 0)
 				    {
-					    if (!decision.error.isEmpty())
+					    WorldRuntimeReloadOps              runtimeOps(*runtimePtr);
+					    const ReloadRecoverySocketDecision decision =
+					        applyReloadSocketRecovery(runtimeOps, worldState);
+#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
+					    QString cloexecError;
+					    if (!setSocketDescriptorInheritable(worldState.socketDescriptor, false,
+					                                        &cloexecError) &&
+					        !cloexecError.isEmpty())
 					    {
-						    ++asyncContext->adoptFailures;
 						    printReloadInfoToStdout(
 						        QStringLiteral(
-						            "Socket reattach failed for %1; reconnect queued. Descriptor=%2. "
-						            "Reason: %3")
-						            .arg(reloadWorldIdentity(worldState))
+						            "Unable to restore close-on-exec for descriptor %1 after recovery: %2")
 						            .arg(worldState.socketDescriptor)
-						            .arg(decision.error.trimmed().isEmpty() ? QStringLiteral("Unknown error.")
-						                                                    : decision.error.trimmed()));
-#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
-						    QString closeError;
-						    if (!closeSocketDescriptorIfOpen(worldState.socketDescriptor, &closeError) &&
-						        !closeError.isEmpty())
-						    {
-							    printReloadInfoToStdout(
-							        QStringLiteral("Unable to close orphaned descriptor %1 during reconnect "
-							                       "fallback: %2")
-							            .arg(worldState.socketDescriptor)
-							            .arg(closeError));
-						    }
+						            .arg(cloexecError));
+					    }
 #endif
-					    }
-					    else
+					    if (decision.outcome == ReloadRecoverySocketOutcome::ReconnectQueued)
 					    {
-						    const QString reason =
-						        !worldState.notes.trimmed().isEmpty()
-						            ? worldState.notes.trimmed()
-						            : QStringLiteral("Policy selected reconnect after descriptor adoption.");
-						    printReloadInfoToStdout(
-						        QStringLiteral("Reconnect queued for %1. Descriptor=%2. Reason: %3")
-						            .arg(reloadWorldIdentity(worldState))
-						            .arg(worldState.socketDescriptor)
-						            .arg(reason));
+						    if (!decision.error.isEmpty())
+						    {
+							    ++asyncContext->adoptFailures;
+							    printReloadInfoToStdout(
+							        QStringLiteral(
+							            "Socket reattach failed for %1; reconnect queued. Descriptor=%2. "
+							            "Reason: %3")
+							            .arg(reloadWorldIdentity(worldState))
+							            .arg(worldState.socketDescriptor)
+							            .arg(decision.error.trimmed().isEmpty()
+							                     ? QStringLiteral("Unknown error.")
+							                     : decision.error.trimmed()));
+#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
+							    QString closeError;
+							    if (!closeSocketDescriptorIfOpen(worldState.socketDescriptor, &closeError) &&
+							        !closeError.isEmpty())
+							    {
+								    printReloadInfoToStdout(
+								        QStringLiteral(
+								            "Unable to close orphaned descriptor %1 during reconnect "
+								            "fallback: %2")
+								            .arg(worldState.socketDescriptor)
+								            .arg(closeError));
+							    }
+#endif
+						    }
+						    else
+						    {
+							    const QString reason =
+							        !worldState.notes.trimmed().isEmpty()
+							            ? worldState.notes.trimmed()
+							            : QStringLiteral(
+							                  "Policy selected reconnect after descriptor adoption.");
+							    printReloadInfoToStdout(
+							        QStringLiteral("Reconnect queued for %1. Descriptor=%2. Reason: %3")
+							            .arg(reloadWorldIdentity(worldState))
+							            .arg(worldState.socketDescriptor)
+							            .arg(reason));
+						    }
+						    ++asyncContext->reconnectCount;
+						    if (asyncContext->verboseReloadLogs)
+						    {
+							    qInfo() << kReloadLogTag << "Queued reconnect for"
+							            << (worldState.displayName.isEmpty() ? QStringLiteral("<unnamed>")
+							                                                 : worldState.displayName);
+						    }
+						    reconnectRecoveredWorld(runtimePtr, worldState, decision.closeSocketFirst);
 					    }
+					    else if (decision.outcome == ReloadRecoverySocketOutcome::Reattached)
+					    {
+						    applyReloadPostReattachActions(runtimeOps, worldState);
+						    ++asyncContext->reattachedCount;
+						    if (asyncContext->verboseReloadLogs)
+						    {
+							    qInfo() << kReloadLogTag << "Reattached socket for"
+							            << (worldState.displayName.isEmpty() ? QStringLiteral("<unnamed>")
+							                                                 : worldState.displayName);
+						    }
+					    }
+				    }
+				    else
+				    {
 					    ++asyncContext->reconnectCount;
+					    const QString reason =
+					        !worldState.notes.trimmed().isEmpty()
+					            ? worldState.notes.trimmed()
+					            : QStringLiteral("Connected world had no reusable socket descriptor.");
+					    printReloadInfoToStdout(
+					        QStringLiteral("Reconnect queued for %1. Descriptor=%2. Reason: %3")
+					            .arg(reloadWorldIdentity(worldState))
+					            .arg(worldState.socketDescriptor)
+					            .arg(reason));
 					    if (asyncContext->verboseReloadLogs)
 					    {
-						    qInfo() << kReloadLogTag << "Queued reconnect for"
+						    qInfo() << kReloadLogTag << "Queued reconnect (no descriptor) for"
 						            << (worldState.displayName.isEmpty() ? QStringLiteral("<unnamed>")
 						                                                 : worldState.displayName);
 					    }
-					    reconnectRecoveredWorld(runtimePtr, worldState, decision.closeSocketFirst);
+					    reconnectRecoveredWorld(runtimePtr, worldState, false);
 				    }
-				    else if (decision.outcome == ReloadRecoverySocketOutcome::Reattached)
-				    {
-					    applyReloadPostReattachActions(runtimeOps, worldState);
-					    ++asyncContext->reattachedCount;
-					    if (asyncContext->verboseReloadLogs)
-					    {
-						    qInfo() << kReloadLogTag << "Reattached socket for"
-						            << (worldState.displayName.isEmpty() ? QStringLiteral("<unnamed>")
-						                                                 : worldState.displayName);
-					    }
-				    }
-			    }
-			    else
-			    {
-				    ++asyncContext->reconnectCount;
-				    const QString reason =
-				        !worldState.notes.trimmed().isEmpty()
-				            ? worldState.notes.trimmed()
-				            : QStringLiteral("Connected world had no reusable socket descriptor.");
-				    printReloadInfoToStdout(
-				        QStringLiteral("Reconnect queued for %1. Descriptor=%2. Reason: %3")
-				            .arg(reloadWorldIdentity(worldState))
-				            .arg(worldState.socketDescriptor)
-				            .arg(reason));
-				    if (asyncContext->verboseReloadLogs)
-				    {
-					    qInfo() << kReloadLogTag << "Queued reconnect (no descriptor) for"
-					            << (worldState.displayName.isEmpty() ? QStringLiteral("<unnamed>")
-					                                                 : worldState.displayName);
-				    }
-				    reconnectRecoveredWorld(runtimePtr, worldState, false);
-			    }
-			    restoredOneWorld();
-		    },
-		    Qt::QueuedConnection);
+				    restoredOneWorld();
+			    },
+			    Qt::QueuedConnection);
+		};
+		const bool waitForPluginInstallCommit = runtime == asyncContext->requestedActiveRuntime;
+		runWorldStartupPostRestore(runtime, continueRecovery, waitForPluginInstallCommit);
 	};
 
 	if (asyncContext->requestedActiveRuntime && !openedWorlds.isEmpty())
@@ -4723,7 +4836,7 @@ bool AppController::recoverReloadStartupState()
 		const auto loadPlan        = stateFileExists
 		                                 ? QMudWorldSessionRestoreFlow::SessionStateLoadPlan::ReadFileAndApply
 		                                 : QMudWorldSessionRestoreFlow::computeSessionStateLoadPlan(
-                                        persistOutputBuffer, persistCommandHistory, false);
+		                                       persistOutputBuffer, persistCommandHistory, false);
 		return QMudWorldSessionRestoreFlow::shouldTrackScrollbackRestoreStatus(persistOutputBuffer, loadPlan);
 	};
 
@@ -5022,12 +5135,12 @@ bool AppController::openWorldDocument(const QString &path)
 		const auto &attrs            = runtime->worldAttributes();
 		const auto  useDefaultInput  = attrs.value(QStringLiteral("use_default_input_font"));
 		const auto  useDefaultOutput = attrs.value(QStringLiteral("use_default_output_font"));
-		const auto  useInput = useDefaultInput.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
-		                      useDefaultInput == QStringLiteral("1") ||
-		                      useDefaultInput.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
-		const auto useOutput = useDefaultOutput.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
-		                       useDefaultOutput == QStringLiteral("1") ||
-		                       useDefaultOutput.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
+		const auto  useInput  = useDefaultInput.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
+		                        useDefaultInput == QStringLiteral("1") ||
+		                        useDefaultInput.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
+		const auto  useOutput = useDefaultOutput.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
+		                        useDefaultOutput == QStringLiteral("1") ||
+		                        useDefaultOutput.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
 		if (useInput)
 		{
 			const auto inputFont   = getGlobalOption(QStringLiteral("DefaultInputFont")).toString();
@@ -5095,8 +5208,17 @@ bool AppController::openWorldDocument(const QString &path)
 			    QMudWorldSessionRestoreFlow::runPostRestoreFlow(
 			        ok, error,
 			        {
-			            [this, runtimeGuard] { runWorldStartupPostRestore(runtimeGuard); },
-			            [this, runtimeGuard] { maybeAutoConnectWorld(runtimeGuard); },
+			            [this, runtimeGuard]
+			            {
+				            runWorldStartupPostRestore(runtimeGuard,
+				                                       [this, runtimeGuard]
+				                                       {
+					                                       if (!runtimeGuard)
+						                                       return;
+					                                       maybeAutoConnectWorld(runtimeGuard);
+				                                       });
+			            },
+			            {},
 			            [runtimeGuard](const QString &restoreError)
 			            {
 				            qWarning()
@@ -5138,8 +5260,17 @@ bool AppController::openWorldDocument(const QString &path)
 		    QMudWorldSessionRestoreFlow::runPostRestoreFlow(
 		        ok, error,
 		        {
-		            [this, runtimeGuard] { runWorldStartupPostRestore(runtimeGuard); },
-		            [this, runtimeGuard] { maybeAutoConnectWorld(runtimeGuard); },
+		            [this, runtimeGuard]
+		            {
+			            runWorldStartupPostRestore(runtimeGuard,
+			                                       [this, runtimeGuard]
+			                                       {
+				                                       if (!runtimeGuard)
+					                                       return;
+				                                       maybeAutoConnectWorld(runtimeGuard);
+			                                       });
+		            },
+		            {},
 		            [runtimeGuard](const QString &restoreError)
 		            {
 			            qWarning() << "Failed to restore world session state for"
@@ -5265,7 +5396,7 @@ void AppController::applyConfiguredWorldDefaults(WorldRuntime *runtime) const
 
 	auto loadDefaultDoc = [&](const QString &prefKey, const unsigned long mask, WorldDocument &doc) -> bool
 	{
-		const QString configured = m_globalStringPrefs.value(prefKey, QString()).trimmed();
+		const QString configured = getGlobalOption(prefKey).toString().trimmed();
 		if (configured.isEmpty())
 			return false;
 		const QString fileName = makeAbsolutePath(configured);
@@ -5593,11 +5724,14 @@ void AppController::saveViewPreferences()
 	(void)dbWriteInt(QStringLiteral("prefs"), QStringLiteral("ViewInfoBar"), viewInfoBar);
 
 	// Keep runtime cache aligned with persisted DB-only view-state keys.
-	m_globalIntPrefs.insert(QStringLiteral("ViewToolbar"), viewToolbar);
-	m_globalIntPrefs.insert(QStringLiteral("ViewWorldToolbar"), viewWorldToolbar);
-	m_globalIntPrefs.insert(QStringLiteral("ActivityToolbar"), activityToolbar);
-	m_globalIntPrefs.insert(QStringLiteral("ViewStatusbar"), viewStatusbar);
-	m_globalIntPrefs.insert(QStringLiteral("ViewInfoBar"), viewInfoBar);
+	{
+		QMutexLocker locker(&m_globalPrefsMutex);
+		m_globalIntPrefs.insert(QStringLiteral("ViewToolbar"), viewToolbar);
+		m_globalIntPrefs.insert(QStringLiteral("ViewWorldToolbar"), viewWorldToolbar);
+		m_globalIntPrefs.insert(QStringLiteral("ActivityToolbar"), activityToolbar);
+		m_globalIntPrefs.insert(QStringLiteral("ViewStatusbar"), viewStatusbar);
+		m_globalIntPrefs.insert(QStringLiteral("ViewInfoBar"), viewInfoBar);
+	}
 
 	if (m_mainWindow)
 	{
@@ -6155,7 +6289,7 @@ void AppController::handleUpdateQmudNow()
 		    const QVariant statusVar  = replyGuard->attribute(QNetworkRequest::HttpStatusCodeAttribute);
 		    const int      httpStatus = statusVar.isValid() ? statusVar.toInt() : 0;
 		    const QString  networkError =
-                replyGuard->error() == QNetworkReply::NoError ? QString() : replyGuard->errorString();
+		        replyGuard->error() == QNetworkReply::NoError ? QString() : replyGuard->errorString();
 		    replyGuard->deleteLater();
 
 		    if (*timedOut)
@@ -7174,9 +7308,9 @@ static int luaUtilsInfoQt(lua_State *L)
 		const QString worldsDir = ensureTrailingSeparator(app->makeAbsolutePath(
 		    app->getGlobalOption(QStringLiteral("DefaultWorldFileDirectory")).toString()));
 		const QString stateDir  = ensureTrailingSeparator(
-            app->makeAbsolutePath(app->getGlobalOption(QStringLiteral("StateFilesDirectory")).toString()));
+		    app->makeAbsolutePath(app->getGlobalOption(QStringLiteral("StateFilesDirectory")).toString()));
 		const QString logDir     = ensureTrailingSeparator(app->makeAbsolutePath(
-            app->getGlobalOption(QStringLiteral("DefaultLogFileDirectory")).toString()));
+		    app->getGlobalOption(QStringLiteral("DefaultLogFileDirectory")).toString()));
 		const QString pluginsDir = ensureTrailingSeparator(
 		    app->makeAbsolutePath(app->getGlobalOption(QStringLiteral("PluginsDirectory")).toString()));
 
@@ -7201,6 +7335,7 @@ static int luaUtilsInfoQt(lua_State *L)
 
 bool AppController::ensureSpellCheckerLoaded()
 {
+	QMutexLocker locker(&m_luaStateMutex);
 	if (const int enableSpellCheck = getGlobalOption(QStringLiteral("EnableSpellCheck")).toInt();
 	    !enableSpellCheck)
 	{
@@ -7247,7 +7382,8 @@ bool AppController::ensureSpellCheckerLoaded()
 		return false;
 
 	if (const QByteArray pathBytes = spellPath.toUtf8();
-	    luaL_loadfile(state.get(), pathBytes.constData()) || lua_pcall(state.get(), 0, 0, 0))
+	    luaL_loadfile(state.get(), pathBytes.constData()) ||
+	    QMudLuaSupport::callLuaProtected(state.get(), 0, 0, 0))
 	{
 		QMudLuaSupport::luaError(state.get(), "Spellcheck initialization");
 		return false;
@@ -7266,13 +7402,155 @@ bool AppController::ensureSpellCheckerLoaded()
 	return true;
 }
 
-lua_State *AppController::spellCheckerLuaState() const
+int AppController::addSpellCheckWord(const QByteArray &original, const QByteArray &action,
+                                     const QByteArray &replacement)
 {
-	return m_spellCheckerLua;
+	QMutexLocker locker(&m_luaStateMutex);
+	if (!ensureSpellCheckerLoaded())
+		return eSpellCheckNotActive;
+	lua_State *spell = m_spellCheckerLua;
+	if (!spell)
+		return eSpellCheckNotActive;
+
+	lua_settop(spell, 0);
+	lua_getglobal(spell, "spellcheck_add_word");
+	if (!lua_isfunction(spell, -1))
+	{
+		lua_settop(spell, 0);
+		return eSpellCheckNotActive;
+	}
+	lua_pushlstring(spell, original.constData(), original.size());
+	lua_pushlstring(spell, action.constData(), action.size());
+	lua_pushlstring(spell, replacement.constData(), replacement.size());
+	if (const int error = QMudLuaSupport::callLuaWithTraceback(spell, 3, 1); error)
+	{
+		Q_UNUSED(error);
+		QMudLuaSupport::luaError(spell, "Run-time error", "spellcheck_add_word", "world.AddSpellCheckWord");
+		closeSpellChecker();
+		return eSpellCheckNotActive;
+	}
+
+	if (lua_isboolean(spell, -1))
+	{
+		const int ok = lua_toboolean(spell, -1);
+		lua_settop(spell, 0);
+		return ok ? eOK : eBadParameter;
+	}
+	lua_settop(spell, 0);
+	return eOK;
+}
+
+QVariant AppController::spellCheckString(const QString &text, const QString &errorContext)
+{
+	QMutexLocker locker(&m_luaStateMutex);
+	if (!ensureSpellCheckerLoaded())
+		return {};
+	lua_State *spell = m_spellCheckerLua;
+	if (!spell)
+		return {};
+
+	lua_settop(spell, 0);
+	lua_getglobal(spell, "spellcheck_string");
+	if (!lua_isfunction(spell, -1))
+	{
+		lua_settop(spell, 0);
+		return {};
+	}
+	const QByteArray textBytes = text.toUtf8();
+	lua_pushlstring(spell, textBytes.constData(), textBytes.size());
+	if (const int error = QMudLuaSupport::callLuaWithTraceback(spell, 1, 1); error)
+	{
+		Q_UNUSED(error);
+		QMudLuaSupport::luaError(spell, "Run-time error", "spellcheck_string",
+		                         errorContext.toLocal8Bit().constData());
+		lua_settop(spell, 0);
+		return {};
+	}
+
+	if (lua_isnumber(spell, -1))
+	{
+		const double result = lua_tonumber(spell, -1);
+		lua_settop(spell, 0);
+		return result;
+	}
+	if (lua_isstring(spell, -1))
+	{
+		const QString result = QString::fromUtf8(lua_tostring(spell, -1));
+		lua_settop(spell, 0);
+		return result;
+	}
+	if (!lua_istable(spell, -1))
+	{
+		lua_settop(spell, 0);
+		return {};
+	}
+
+	QStringList errors;
+	for (int i = 1;; ++i)
+	{
+		lua_rawgeti(spell, -1, i);
+		if (lua_isnil(spell, -1))
+		{
+			lua_pop(spell, 1);
+			break;
+		}
+		if (lua_isstring(spell, -1))
+			errors.append(QString::fromUtf8(lua_tostring(spell, -1)));
+		lua_pop(spell, 1);
+	}
+	lua_settop(spell, 0);
+	errors.removeDuplicates();
+	errors.sort();
+	return errors;
+}
+
+AppController::SpellCommandResult AppController::spellCheckCommandText(const QString &selectedText,
+                                                                       const bool     all)
+{
+	QMutexLocker       locker(&m_luaStateMutex);
+	SpellCommandResult result;
+	if (!ensureSpellCheckerLoaded())
+		return result;
+	lua_State *spell = m_spellCheckerLua;
+	if (!spell)
+		return result;
+
+	lua_settop(spell, 0);
+	lua_getglobal(spell, "spellcheck");
+	if (!lua_isfunction(spell, -1))
+	{
+		lua_settop(spell, 0);
+		return result;
+	}
+
+	const QByteArray textBytes = selectedText.toUtf8();
+	lua_pushlstring(spell, textBytes.constData(), textBytes.size());
+	lua_pushboolean(spell, all);
+	if (const int error = QMudLuaSupport::callLuaWithTraceback(spell, 2, 1); error)
+	{
+		Q_UNUSED(error);
+		QMudLuaSupport::luaError(spell, "Run-time error", "spellcheck", "Command-line spell-check");
+		closeSpellChecker();
+		lua_settop(spell, 0);
+		return result;
+	}
+
+	if (lua_isstring(spell, -1))
+	{
+		result.status      = 1;
+		result.replacement = QString::fromUtf8(lua_tostring(spell, -1));
+		lua_settop(spell, 0);
+		return result;
+	}
+
+	lua_settop(spell, 0);
+	result.status = 0;
+	return result;
 }
 
 void AppController::closeSpellChecker()
 {
+	QMutexLocker locker(&m_luaStateMutex);
 	if (m_spellCheckerLua)
 	{
 		lua_close(m_spellCheckerLua);
@@ -7292,15 +7570,23 @@ void AppController::applyPluginPreferences()
 	}
 }
 
-void AppController::loadGlobalPlugins(WorldRuntime *runtime) const
+void AppController::loadGlobalPlugins(WorldRuntime *runtime, const std::function<void()> &completion) const
 {
 	if (!runtime)
+	{
+		if (completion)
+			completion();
 		return;
+	}
 
 	const QString pluginList =
 	    canonicalizePluginListForRuntime(getGlobalOption(QStringLiteral("PluginList")).toString());
 	if (pluginList.trimmed().isEmpty())
+	{
+		if (completion)
+			completion();
 		return;
+	}
 
 	for (const QStringList entries = splitSerializedPathList(pluginList); const auto &entry : entries)
 	{
@@ -7315,6 +7601,9 @@ void AppController::loadGlobalPlugins(WorldRuntime *runtime) const
 			}
 		}
 	}
+
+	if (completion)
+		completion();
 }
 
 void AppController::applyFontPreferences() const
@@ -8230,9 +8519,12 @@ void AppController::loadGlobalsFromDatabase()
 		if (!found)
 			dbValue = QString::number(kGlobalOptionsTable[i].defaultValue);
 
-		bool      ok    = false;
-		const int value = dbValue.toInt(&ok);
-		m_globalIntPrefs.insert(key, ok ? value : kGlobalOptionsTable[i].defaultValue);
+		{
+			bool         ok    = false;
+			const int    value = dbValue.toInt(&ok);
+			QMutexLocker locker(&m_globalPrefsMutex);
+			m_globalIntPrefs.insert(key, ok ? value : kGlobalOptionsTable[i].defaultValue);
+		}
 	}
 
 	for (int i = 0; kAlphaGlobalOptionsTable[i].name; i++)
@@ -8290,7 +8582,10 @@ void AppController::loadGlobalsFromDatabase()
 			(void)dbWriteString(QStringLiteral("prefs"), key, storedValue);
 		}
 		const QString runtimeValue = normalizeRuntimeGlobalStringValue(key, storedValue);
-		m_globalStringPrefs.insert(key, runtimeValue);
+		{
+			QMutexLocker locker(&m_globalPrefsMutex);
+			m_globalStringPrefs.insert(key, runtimeValue);
+		}
 		if (key == QStringLiteral("PluginsDirectory"))
 			m_pluginsDirectory = runtimeValue;
 		if (key == QStringLiteral("FixedPitchFont"))
@@ -8300,7 +8595,7 @@ void AppController::loadGlobalsFromDatabase()
 	}
 
 	migrateLegacyWorldTree(m_workingDir,
-	                       m_globalStringPrefs.value(QStringLiteral("DefaultWorldFileDirectory")));
+	                       getGlobalOption(QStringLiteral("DefaultWorldFileDirectory")).toString());
 
 	// Legacy behavior: these prefs are stored in DB but are not part of the canonical
 	// global option tables. Load them explicitly so session restarts preserve them.
@@ -8309,9 +8604,12 @@ void AppController::loadGlobalsFromDatabase()
 		const QString key = QString::fromUtf8(prefKey);
 		if (!readPrefsValue(key, dbValue))
 			dbValue = QString::number(prefDefault);
-		bool      ok    = false;
-		const int value = dbValue.toInt(&ok);
-		m_globalIntPrefs.insert(key, ok ? value : prefDefault);
+		{
+			bool         ok    = false;
+			const int    value = dbValue.toInt(&ok);
+			QMutexLocker locker(&m_globalPrefsMutex);
+			m_globalIntPrefs.insert(key, ok ? value : prefDefault);
+		}
 	}
 
 	if (!migratedLegacyPrefKeys.isEmpty())
@@ -8399,8 +8697,8 @@ int AppController::dbWriteInt(const QString &section, const QString &entry, cons
 
 	const QString escapedEntry = escapeSql(entry);
 	const QString sqlUpdate    = QStringLiteral("UPDATE %1 SET value = '%2' WHERE name = '%3'")
-	                              .arg(section, QString::number(value), escapedEntry);
-	int rc = dbExecute(sqlUpdate, false);
+	                                 .arg(section, QString::number(value), escapedEntry);
+	int           rc           = dbExecute(sqlUpdate, false);
 	if (rc != SQLITE_OK)
 		return rc;
 
@@ -8408,7 +8706,7 @@ int AppController::dbWriteInt(const QString &section, const QString &entry, cons
 	{
 		const QString sqlInsert = QStringLiteral("INSERT INTO %1 (name, value) VALUES ('%2', '%3')")
 		                              .arg(section, escapedEntry, QString::number(value));
-		rc = dbExecute(sqlInsert, false);
+		rc                      = dbExecute(sqlInsert, false);
 	}
 
 	return rc;
@@ -8435,8 +8733,8 @@ int AppController::dbWriteString(const QString &section, const QString &entry, c
 	const QString escapedEntry = escapeSql(entry);
 	const QString escapedValue = escapeSql(normalizedValue);
 	const QString sqlUpdate    = QStringLiteral("UPDATE %1 SET value = '%2' WHERE name = '%3'")
-	                              .arg(section, escapedValue, escapedEntry);
-	int rc = dbExecute(sqlUpdate, false);
+	                                 .arg(section, escapedValue, escapedEntry);
+	int           rc           = dbExecute(sqlUpdate, false);
 	if (rc != SQLITE_OK)
 		return rc;
 
@@ -8444,7 +8742,7 @@ int AppController::dbWriteString(const QString &section, const QString &entry, c
 	{
 		const QString sqlInsert = QStringLiteral("INSERT INTO %1 (name, value) VALUES ('%2', '%3')")
 		                              .arg(section, escapedEntry, escapedValue);
-		rc = dbExecute(sqlInsert, false);
+		rc                      = dbExecute(sqlInsert, false);
 	}
 
 	return rc;
@@ -8570,8 +8868,8 @@ void AppController::onCommandTriggered(const QString &cmdName)
 		const QString message = QStringLiteral("Clipboard converted for use with the Forum, %1 change%2 made")
 		                            .arg(changes)
 		                            .arg(changes == 1 ? QString() : QStringLiteral("s"));
-		const auto response = QMessageBox::question(m_mainWindow, QStringLiteral("QMud"), message,
-		                                            QMessageBox::Ok | QMessageBox::Cancel);
+		const auto    response = QMessageBox::question(m_mainWindow, QStringLiteral("QMud"), message,
+		                                               QMessageBox::Ok | QMessageBox::Cancel);
 		if (response != QMessageBox::Ok)
 			return input;
 		return out;
@@ -8771,8 +9069,8 @@ void AppController::onCommandTriggered(const QString &cmdName)
 		        {
 			        const QString start = makeAbsolutePath(fontEdit->text().trimmed());
 			        const QString path  = QFileDialog::getOpenFileName(
-                        m_mainWindow, QStringLiteral("Select FIGlet Font"), start,
-                        QStringLiteral("FIGlet Font (*.flf);;All Files (*)"));
+			            m_mainWindow, QStringLiteral("Select FIGlet Font"), start,
+			            QStringLiteral("FIGlet Font (*.flf);;All Files (*)"));
 			        if (path.isEmpty())
 				        return;
 			        fontEdit->setText(path);
@@ -8840,8 +9138,8 @@ void AppController::onCommandTriggered(const QString &cmdName)
 		{
 			const int lineCount = qMax(1, editor->document()->blockCount());
 			bool      ok        = false;
-			int       line      = QInputDialog::getInt(m_mainWindow, QStringLiteral("Go To"),
-			                                           QStringLiteral("Line number:"), 1, 1, lineCount, 1, &ok);
+			int       line = QInputDialog::getInt(m_mainWindow, QStringLiteral("Go To"),
+			                                      QStringLiteral("Line number:"), 1, 1, lineCount, 1, &ok);
 			if (!ok)
 				return;
 			QTextCursor cursor(editor->document());
@@ -8928,8 +9226,7 @@ void AppController::onCommandTriggered(const QString &cmdName)
 
 		if (cmdName == QStringLiteral("SendToScript"))
 		{
-			LuaCallbackEngine  *lua      = runtime ? runtime->luaCallbacks() : nullptr;
-			const ILuaExecutor *executor = runtime ? runtime->luaExecutor() : nullptr;
+			LuaCallbackEngine *lua = runtime ? runtime->luaCallbacks() : nullptr;
 			if (!runtime || !lua)
 			{
 				QMessageBox::information(m_mainWindow, QStringLiteral("Send To Script"),
@@ -8938,8 +9235,7 @@ void AppController::onCommandTriggered(const QString &cmdName)
 			}
 			runtime->setLastImmediateExpression(payload);
 			const bool executed =
-			    executor ? executor->executeScript(lua, payload, QStringLiteral("Immediate"), nullptr)
-			             : lua->executeScript(payload, QStringLiteral("Immediate"));
+			    runtime->dispatchLuaExecuteScript(lua, payload, QStringLiteral("Immediate"));
 			if (!executed)
 				QMessageBox::warning(m_mainWindow, QStringLiteral("Send To Script"),
 				                     QStringLiteral("Script execution failed."));
@@ -9015,16 +9311,11 @@ void AppController::onCommandTriggered(const QString &cmdName)
 		runtime->setScriptFileChanged(false);
 		if (LuaCallbackEngine *lua = runtime->luaCallbacks())
 		{
-			const ILuaExecutor *executor = runtime->luaExecutor();
-			if (executor)
-				executor->resetState(lua);
-			else
-				lua->resetState();
 			int allowPackage = 1;
 			if (AppController *app = instance())
 				allowPackage = app->getGlobalOption(QStringLiteral("AllowLoadingDlls")).toInt();
 			runtime->applyPackageRestrictions(allowPackage != 0);
-			const bool loaded = executor ? executor->loadScript(lua) : lua->loadScript();
+			const bool loaded = runtime->dispatchLuaResetAndLoadScript(lua);
 			if (!loaded)
 			{
 				QMessageBox::warning(m_mainWindow, QStringLiteral("Reload Script File"),
@@ -9724,7 +10015,7 @@ void AppController::onCommandTriggered(const QString &cmdName)
 		                            .arg(spanBack.blue(), 2, 16, QLatin1Char('0'))
 		                            .toUpper();
 
-		QString letter;
+		QString       letter;
 		if (zeroBasedCol >= 0 && zeroBasedCol < line.text.size())
 			letter = line.text.mid(zeroBasedCol, 1);
 
@@ -10174,9 +10465,8 @@ void AppController::onCommandTriggered(const QString &cmdName)
 		auto *lua = runtime->luaCallbacks();
 		if (!lua)
 			return;
-		const ILuaExecutor *executor = runtime->luaExecutor();
 
-		QDialog             dlg(m_mainWindow);
+		QDialog dlg(m_mainWindow);
 		dlg.setWindowTitle(QStringLiteral("Immediate"));
 		QVBoxLayout      layout(&dlg);
 		QPlainTextEdit   edit(&dlg);
@@ -10212,7 +10502,7 @@ void AppController::onCommandTriggered(const QString &cmdName)
 			        edit.setPlainText(editor.toPlainText());
 		        });
 		connect(&runButton, &QPushButton::clicked, &dlg,
-		        [this, runtime, lua, executor, &edit]
+		        [this, runtime, lua, &edit]
 		        {
 			        const auto code = edit.toPlainText();
 			        runtime->setLastImmediateExpression(code);
@@ -10221,8 +10511,7 @@ void AppController::onCommandTriggered(const QString &cmdName)
 			        if (m_mainWindow)
 				        m_mainWindow->setStatusMessageNow(QStringLiteral("Executing immediate script"));
 			        const bool executed =
-			            executor ? executor->executeScript(lua, code, QStringLiteral("Immediate"), nullptr)
-			                     : lua->executeScript(code, QStringLiteral("Immediate"));
+			            runtime->dispatchLuaExecuteScript(lua, code, QStringLiteral("Immediate"));
 			        if (!executed)
 				        QMessageBox::warning(m_mainWindow, QStringLiteral("QMud"),
 				                             QStringLiteral("Immediate execution failed."));
@@ -12272,12 +12561,6 @@ void AppController::onCommandTriggered(const QString &cmdName)
 		if (!m_mainWindow)
 			return;
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
-		if (!ensureSpellCheckerLoaded())
-			return;
-		auto *spell = spellCheckerLuaState();
-		if (!spell)
-			return;
-
 		QPlainTextEdit *edit = nullptr;
 		if (auto *focus = QApplication::focusWidget(); auto *plain = qobject_cast<QPlainTextEdit *>(focus))
 			edit = plain;
@@ -12310,33 +12593,14 @@ void AppController::onCommandTriggered(const QString &cmdName)
 		}
 		selected.replace(QChar(0x2029), QLatin1Char('\n'));
 
-		lua_settop(spell, 0);
-		lua_getglobal(spell, "spellcheck");
-		if (!lua_isfunction(spell, -1))
+		const SpellCommandResult decision = spellCheckCommandText(selected, all);
+		if (decision.status == 1)
 		{
-			lua_settop(spell, 0);
-			return;
-		}
-		const auto textBytes = selected.toUtf8();
-		lua_pushlstring(spell, textBytes.constData(), textBytes.size());
-		lua_pushboolean(spell, all);
-		if (const auto error = QMudLuaSupport::callLuaWithTraceback(spell, 2, 1); error)
-		{
-			QMudLuaSupport::luaError(spell, "Run-time error", "spellcheck", "Command-line spell-check");
-			closeSpellChecker();
-			lua_settop(spell, 0);
-			return;
-		}
-
-		if (lua_isstring(spell, -1))
-		{
-			const auto replacement = QString::fromUtf8(lua_tostring(spell, -1));
 			if (all)
 				edit->selectAll();
 			auto replaceCursor = edit->textCursor();
-			replaceCursor.insertText(replacement);
+			replaceCursor.insertText(decision.replacement);
 		}
-		lua_settop(spell, 0);
 
 		auto restore = edit->textCursor();
 		restore.setPosition(origStart);
@@ -12561,7 +12825,7 @@ void AppController::onCommandTriggered(const QString &cmdName)
 			return;
 		const QMap<QString, QString> &attrs     = runtime->worldAttributes();
 		const QString                 worldName = attrs.value(QStringLiteral("name"));
-		const QString                 prompt    = QStringLiteral("Quit from %1?")
+		const QString prompt = QStringLiteral("Quit from %1?")
 		                           .arg(worldName.isEmpty() ? QStringLiteral("this world") : worldName);
 		if (QMessageBox::question(m_mainWindow, QStringLiteral("Quit"), prompt,
 		                          QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
@@ -12605,8 +12869,8 @@ void AppController::onCommandTriggered(const QString &cmdName)
 		    runtime->worldAttributes().value(QStringLiteral("name"), QStringLiteral("world"));
 		const QString dialogTitle = QStringLiteral("File to paste into %1").arg(worldName);
 		const QString fileName    = QFileDialog::getOpenFileName(
-            m_mainWindow, dialogTitle, initialDir,
-            QStringLiteral("MUD files (*.mud;*.mush);;Text files (*.txt);;All files (*.*)"));
+		    m_mainWindow, dialogTitle, initialDir,
+		    QStringLiteral("MUD files (*.mud;*.mush);;Text files (*.txt);;All files (*.*)"));
 		if (fileName.isEmpty())
 			return;
 
@@ -13164,7 +13428,7 @@ void AppController::onCommandTriggered(const QString &cmdName)
 			const int          lineHeight = metrics.lineSpacing();
 			const QRect        pageRect   = printer.pageRect(QPrinter::DevicePixel).toRect();
 			const int          linesPerPage =
-                linesPerPagePref > 0 ? linesPerPagePref : qMax(1, pageRect.height() / qMax(1, lineHeight));
+			    linesPerPagePref > 0 ? linesPerPagePref : qMax(1, pageRect.height() / qMax(1, lineHeight));
 			const int contentLines = qMax(1, linesPerPage - 4);
 			int       pageNumber   = 1;
 			int       lineOnPage   = 0;
@@ -13199,7 +13463,7 @@ void AppController::onCommandTriggered(const QString &cmdName)
 			const int          lineHeight = baseMetrics.lineSpacing();
 			const QRect        pageRect   = printer.pageRect(QPrinter::DevicePixel).toRect();
 			const int          linesPerPage =
-                linesPerPagePref > 0 ? linesPerPagePref : qMax(1, pageRect.height() / qMax(1, lineHeight));
+			    linesPerPagePref > 0 ? linesPerPagePref : qMax(1, pageRect.height() / qMax(1, lineHeight));
 			const int contentLines = qMax(1, linesPerPage - 4);
 			int       pageNumber   = 1;
 			int       lineOnPage   = 0;
@@ -13452,8 +13716,17 @@ void AppController::handleFileNew()
 			    QMudWorldSessionRestoreFlow::runPostRestoreFlow(
 			        ok, error,
 			        {
-			            [this, runtimeGuard] { runWorldStartupPostRestore(runtimeGuard); },
-			            [this, runtimeGuard] { maybeAutoConnectWorld(runtimeGuard); },
+			            [this, runtimeGuard]
+			            {
+				            runWorldStartupPostRestore(runtimeGuard,
+				                                       [this, runtimeGuard]
+				                                       {
+					                                       if (!runtimeGuard)
+						                                       return;
+					                                       maybeAutoConnectWorld(runtimeGuard);
+				                                       });
+			            },
+			            {},
 			            [runtimeGuard](const QString &restoreError)
 			            {
 				            qWarning()
@@ -13466,7 +13739,7 @@ void AppController::handleFileNew()
 	}
 	else
 	{
-		runWorldStartupPostRestore(runtime);
+		runWorldStartupPostRestore(runtime, {});
 	}
 }
 
@@ -13590,8 +13863,9 @@ void AppController::handleQuickConnect()
 	m_lastQuickConnectHost      = host;
 	m_lastQuickConnectPort      = port;
 
-	WorldChildWindow *child   = existingChild;
-	WorldRuntime     *runtime = existingRuntime;
+	WorldChildWindow *child          = existingChild;
+	WorldRuntime     *runtime        = existingRuntime;
+	bool              createdRuntime = false;
 	if (!runtime)
 	{
 		runtime = new WorldRuntime(m_mainWindow);
@@ -13602,9 +13876,7 @@ void AppController::handleQuickConnect()
 		runtime->setPluginInstallDeferred(true);
 		applyConfiguredWorldDefaults(runtime);
 		emitStartupBanner(runtime);
-		loadGlobalPlugins(runtime);
-		runtime->setPluginInstallDeferred(false);
-		runtime->installPendingPlugins();
+		createdRuntime = true;
 	}
 
 	runtime->setWorldAttribute(QStringLiteral("name"), worldName);
@@ -13616,13 +13888,40 @@ void AppController::handleQuickConnect()
 	if (WorldView *view = child->view())
 		view->setWorldName(worldName);
 
-	if (runtime->isConnected() || runtime->isConnecting())
+	const auto connectRuntime = [this, host, port](WorldRuntime *targetRuntime)
 	{
-		QMessageBox::information(m_mainWindow, QStringLiteral("Quick Connect"),
-		                         QStringLiteral("Disconnect the current world before quick connecting."));
+		if (!targetRuntime)
+			return;
+		if (targetRuntime->isConnected() || targetRuntime->isConnecting())
+		{
+			QMessageBox::information(m_mainWindow, QStringLiteral("Quick Connect"),
+			                         QStringLiteral("Disconnect the current world before quick connecting."));
+			return;
+		}
+		targetRuntime->connectToWorld(host, port);
+	};
+
+	if (!createdRuntime)
+	{
+		connectRuntime(runtime);
 		return;
 	}
-	runtime->connectToWorld(host, port);
+
+	loadGlobalPlugins(runtime,
+	                  [runtimeGuard = QPointer<WorldRuntime>(runtime), connectRuntime]()
+	                  {
+		                  if (!runtimeGuard)
+			                  return;
+		                  runtimeGuard->setPluginInstallDeferred(false);
+		                  runtimeGuard->installPendingPluginsAsync(
+		                      [runtimeGuard, connectRuntime]()
+		                      {
+			                      if (!runtimeGuard)
+				                      return;
+			                      connectRuntime(runtimeGuard.data());
+		                      },
+		                      WorldRuntime::PluginInstallCompletionMode::Committed);
+	                  });
 }
 
 void AppController::handleConnectOrReconnect() const

@@ -10,92 +10,35 @@
 #ifndef QMUD_LUAEXECUTIONUTILS_H
 #define QMUD_LUAEXECUTIONUTILS_H
 
-// ReSharper disable once CppUnusedIncludeDirective
-#include <QByteArray>
+#include <QScopeGuard>
 #include <QString>
+#include <functional>
 
 class QObject;
+class QThread;
 struct lua_State;
 
 /**
- * @brief Lua executor backend mode selector.
+ * @brief Last status classification for Lua bridge invocation on the current thread.
  */
-enum class LuaExecutorBackendMode
+enum class LuaBridgeInvokeStatus
 {
-	Direct,
-	Threaded
+	Success,
+	InvalidTargetOrCallback,
+	NoOwningThread,
+	MissingTargetBridgeContext,
+	NoQCoreApplication,
+	TargetThreadNotRunning,
+	TargetThreadNoEventDispatcher,
+	BridgeInvokerUnavailable,
+	BridgeEndpointNotReadyTimeout,
+	MissingCallerBridgeContext,
+	EnqueueFailed,
+	RequestCanceledBeforeDispatch,
+	RequestCanceledTargetThreadStopped,
+	TimedOutInFlight,
+	UnknownFailure
 };
-
-/**
- * @brief Bridge policy used for Lua executor operations during threading migration.
- */
-enum class LuaExecutorBridgePolicy
-{
-	WorkerLocal,
-	UiSync,
-	UiAsync
-};
-
-/**
- * @brief Operation identifiers used to classify executor bridge policy.
- */
-enum class LuaExecutorOperation
-{
-	SetWorldRuntime,
-	SetPluginInfo,
-	SetScriptText,
-	ResetState,
-	TeardownEngine,
-	ApplyPackageRestrictions,
-	SetObservedPluginCallbacks,
-	HasObservedPluginCallback,
-	SetCallbackCatalogObserver,
-	LoadScript,
-	HasFunction,
-	CallFunctionNoArgs,
-	CallFunctionWithString,
-	CallFunctionWithBytes,
-	CallFunctionWithBytesInOut,
-	CallFunctionWithStringInOut,
-	CallFunctionWithNumberAndString,
-	CallFunctionWithTwoNumbersAndString,
-	CallFunctionWithNumberAndBytes,
-	CallFunctionWithNumberAndUtf8Strings,
-	CallProcedureWithString,
-	CallMxpError,
-	CallMxpStartUp,
-	CallMxpShutDown,
-	CallMxpStartTag,
-	CallMxpEndTag,
-	CallMxpSetVariable,
-	CallFunctionWithStringsAndWildcards,
-	ExecuteScript,
-	RefreshLuaCallbackCatalogNow,
-	LuaState
-};
-
-/**
- * @brief Returns whether environment value requests threaded Lua executor mode.
- * @param envValue Raw environment value (for example `QMUD_LUA_EXECUTOR_BACKEND`).
- * @return `true` when value equals `threaded` or `worker` (case-insensitive, trimmed).
- */
-bool                    qmudIsThreadedLuaExecutorRequested(const QByteArray &envValue);
-
-/**
- * @brief Resolves effective Lua executor backend mode.
- * @param envValue Raw environment value.
- * @param threadedBackendAvailable Whether threaded backend is compiled/available.
- * @return Effective backend mode (`Threaded` only when requested and available).
- */
-LuaExecutorBackendMode  qmudResolveLuaExecutorBackendMode(const QByteArray &envValue,
-                                                          bool              threadedBackendAvailable);
-
-/**
- * @brief Returns bridge policy classification for one Lua executor operation.
- * @param operation Operation to classify.
- * @return Effective bridge policy for migration gating.
- */
-LuaExecutorBridgePolicy qmudLuaExecutorBridgePolicy(LuaExecutorOperation operation);
 
 /**
  * @brief Error classification for Lua CallPlugin marshaling/invocation.
@@ -139,5 +82,97 @@ CallPluginLuaMarshallingResult qmudCallPluginLuaWithMarshalling(lua_State     *c
  * @param context Assertion context label.
  */
 void                           qmudAssertObjectThreadAffinity(const QObject *object, const char *context);
+/**
+ * @brief Completes one Lua worker callback dispatch on the runtime thread.
+ *
+ * The worker-in-flight marker is cleared before the result is consumed so deferred
+ * runtime mutations may perform synchronous callback work without blocking behind
+ * the worker dispatch that already finished. Pending queue draining runs after the
+ * result consumer.
+ *
+ * @param workerInFlight Worker-in-flight state to clear before consuming the result.
+ * @param consumeResult Callback that applies the completed worker result.
+ * @param drainQueuedWork Callback that schedules any pending queued callback work.
+ */
+template <typename ConsumeResult, typename DrainQueuedWork>
+void qmudCompleteLuaWorkerCallbackDispatch(bool &workerInFlight, ConsumeResult &&consumeResult,
+                                           DrainQueuedWork &&drainQueuedWork)
+{
+	workerInFlight         = false;
+	const auto drainQueued = qScopeGuard([&drainQueuedWork] { drainQueuedWork(); });
+	consumeResult();
+}
+/**
+ * @brief Ensures a target object's bridge endpoint is in Running state.
+ * @param target Target QObject.
+ * @return `true` when target thread bridge endpoint is ready to accept bridge calls.
+ */
+bool    qmudLuaBridgeEnsureObjectThreadReady(const QObject *target);
+/**
+ * @brief Pumps one pending bridge request on the current thread, if any.
+ * @return `true` when one request was executed; otherwise `false`.
+ */
+bool    qmudLuaBridgePumpCurrentThreadOnce();
+/**
+ * @brief Registers cooperative wait-work pump for current thread's bridge wait loop.
+ * @param pump Callback that may execute one unit of local work and return `true` when work ran.
+ */
+void    qmudLuaBridgeSetCurrentThreadWaitWorkPump(std::function<bool()> pump);
+/**
+ * @brief Clears cooperative wait-work pump for current thread.
+ */
+void    qmudLuaBridgeClearCurrentThreadWaitWorkPump();
+/**
+ * @brief Waits for the current thread's Lua-bridge wake channel.
+ * @param timeoutMs Maximum wait in milliseconds; values <= 0 are treated as 1ms.
+ * @return `true` when the wake channel signaled during the wait.
+ */
+bool    qmudLuaBridgeWaitForCurrentThreadWake(int timeoutMs);
+/**
+ * @brief Signals the Lua-bridge wake channel for a target thread.
+ * @param thread Target thread whose bridge wake channel should be signaled.
+ */
+void    qmudLuaBridgeNotifyThreadWake(QThread *thread);
+/**
+ * @brief Returns `true` while current thread is executing a Lua bridge request callback.
+ * @return `true` when inside bridge request execution on current thread.
+ */
+bool    qmudLuaBridgeIsExecutingRequestOnCurrentThread();
+/**
+ * @brief Synchronously executes a callback on `target` object's thread via dedicated Lua bridge channel.
+ *
+ * Invoke timeout bounds queued pre-dispatch wait only. If dispatch has already
+ * started executing on the target thread, this call keeps cooperative waiting
+ * until completion to preserve ordering/correctness semantics.
+ *
+ * @param target Target QObject whose owning thread should execute the callback.
+ * @param fn Callback to execute on target thread.
+ * @return `true` when callback was executed, `false` when target/context is invalid.
+ */
+bool    qmudLuaBridgeInvokeOnObjectThread(const QObject *target, const std::function<void()> &fn);
+/**
+ * @brief Returns current Lua bridge invoke timeout in milliseconds.
+ * @return Active invoke timeout in milliseconds.
+ */
+int     qmudLuaBridgeInvokeTimeoutMs();
+/**
+ * @brief Overrides Lua bridge invoke timeout for the current process.
+ *
+ * The timeout is used for queued pre-dispatch wait/cancellation. In-flight
+ * requests continue to completion.
+ *
+ * @param timeoutMs New timeout in milliseconds. Values <= 0 reset to default.
+ */
+void    qmudSetLuaBridgeInvokeTimeoutMs(int timeoutMs);
+/**
+ * @brief Returns last bridge failure reason for current thread.
+ * @return Human-readable failure reason, or empty string when no error was recorded.
+ */
+QString qmudLuaBridgeLastError();
+/**
+ * @brief Returns last bridge status classification for current thread.
+ * @return Last bridge status.
+ */
+LuaBridgeInvokeStatus qmudLuaBridgeLastStatus();
 
 #endif // QMUD_LUAEXECUTIONUTILS_H

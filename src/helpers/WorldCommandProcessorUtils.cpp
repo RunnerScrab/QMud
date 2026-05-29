@@ -293,6 +293,16 @@ namespace QMudCommandText
 	}
 } // namespace QMudCommandText
 
+namespace QMudTriggerSound
+{
+	bool shouldPlayTriggerSound(const bool pluginScoped, const bool worldTriggerSoundsEnabled)
+	{
+		if (pluginScoped)
+			return true;
+		return worldTriggerSoundsEnabled;
+	}
+} // namespace QMudTriggerSound
+
 namespace QMudScriptErrorRouting
 {
 	bool shouldForceWorldErrorOutput(const bool hasRuntime, const bool hasPluginScript)
