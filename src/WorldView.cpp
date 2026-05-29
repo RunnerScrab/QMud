@@ -8918,6 +8918,7 @@ void WorldView::appendOutputTextInternal(const QString &text, bool newLine, bool
 	if (recordLine && m_runtime)
 	{
 		Q_UNUSED(injectPendingBreakBeforeRender);
+		removeNativePartialRenderLineOverlay(false);
 		m_hasPartialOutput       = false;
 		m_partialOutputStart     = 0;
 		m_partialOutputLength    = 0;
@@ -9027,6 +9028,7 @@ void WorldView::clearPartialOutput()
 	m_nativeHasPartialOutput = false;
 	m_nativePartialOutputText.clear();
 	m_nativePartialOutputSpans.clear();
+	removeNativePartialRenderLineOverlay(false);
 	m_hasPartialOutput    = false;
 	m_partialOutputStart  = 0;
 	m_partialOutputLength = 0;

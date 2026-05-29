@@ -60,6 +60,7 @@ namespace
 			QStringList                          windowNames;
 			QHash<QString, QHash<int, QVariant>> windowInfo;
 			QHash<QString, QStringList>          hotspotIds;
+			QVector<WorldRuntime::LineEntry>     lineEntries;
 	};
 
 	QHash<const WorldRuntime *, RuntimeStubState> &runtimeStubStates()
@@ -71,6 +72,44 @@ namespace
 	RuntimeStubState &runtimeStubState(const WorldRuntime *runtime)
 	{
 		return runtimeStubStates()[runtime];
+	}
+
+	WorldRuntime::LineEntry makeStubLineEntry(const RuntimeStubState &state, const QString &text,
+	                                          const int flags, const QVector<WorldRuntime::StyleSpan> &spans,
+	                                          const bool hardReturn)
+	{
+		qint64 nextLineNumber = 1;
+		for (const WorldRuntime::LineEntry &entry : state.lineEntries)
+			nextLineNumber = qMax(nextLineNumber, entry.lineNumber + 1);
+
+		WorldRuntime::LineEntry entry;
+		entry.text       = text;
+		entry.flags      = flags;
+		entry.spans      = spans;
+		entry.hardReturn = hardReturn;
+		entry.time       = QDateTime::currentDateTime();
+		entry.lineNumber = nextLineNumber;
+		return entry;
+	}
+
+	QStringList logicalOutputLinesFromEntries(const QVector<WorldRuntime::LineEntry> &entries)
+	{
+		QStringList lines;
+		QString     currentLine;
+		for (const WorldRuntime::LineEntry &entry : entries)
+		{
+			if ((entry.flags & WorldRuntime::LineHidden) != 0)
+				continue;
+			currentLine += entry.text;
+			if (entry.hardReturn)
+			{
+				lines.push_back(currentLine);
+				currentLine.clear();
+			}
+		}
+		if (!currentLine.isEmpty())
+			lines.push_back(currentLine);
+		return lines;
 	}
 
 	int safeQSizeToInt(const qsizetype size)
@@ -197,6 +236,24 @@ long WorldRuntime::noteColourBack() const
 	return runtimeStubState(this).noteColourBack;
 }
 
+long WorldRuntime::normalColour(int index) const
+{
+	Q_UNUSED(index);
+	return 0xFFFFFF;
+}
+
+long WorldRuntime::customColourText(int index) const
+{
+	Q_UNUSED(index);
+	return 0xFFFFFF;
+}
+
+long WorldRuntime::customColourBackground(int index) const
+{
+	Q_UNUSED(index);
+	return 0;
+}
+
 void WorldRuntime::setNoteColourBack(long value)
 {
 	runtimeStubState(this).noteColourBack = value & 0x00FFFFFF;
@@ -205,34 +262,51 @@ void WorldRuntime::setNoteColourBack(long value)
 
 void WorldRuntime::outputText(const QString &text, bool note, bool newLine)
 {
-	Q_UNUSED(note);
 	RuntimeStubState &state = runtimeStubState(this);
 	state.outputLines.push_back(text);
 	state.outputNewLines.push_back(newLine);
+	state.lineEntries.push_back(makeStubLineEntry(state, text, note ? LineNote : LineOutput, {}, newLine));
 }
 
 void WorldRuntime::outputStyledText(const QString &text, const QVector<StyleSpan> &spans, bool note,
                                     bool newLine)
 {
-	Q_UNUSED(spans);
-	Q_UNUSED(note);
 	RuntimeStubState &state = runtimeStubState(this);
 	state.outputLines.push_back(text);
 	state.outputNewLines.push_back(newLine);
+	state.lineEntries.push_back(makeStubLineEntry(state, text, note ? LineNote : LineOutput, spans, newLine));
 }
 
 bool WorldRuntime::writeLuaCallbackOutputAtLineAnchor(qint64 anchorLineNumber, int anchorRelativeOffset,
                                                       bool replaceAnchor, const QString &text, int flags,
                                                       const QVector<StyleSpan> &spans, bool hardReturn)
 {
-	Q_UNUSED(anchorLineNumber);
-	Q_UNUSED(anchorRelativeOffset);
-	Q_UNUSED(replaceAnchor);
-	Q_UNUSED(flags);
-	Q_UNUSED(spans);
 	RuntimeStubState &state = runtimeStubState(this);
 	state.outputLines.push_back(text);
 	state.outputNewLines.push_back(hardReturn);
+
+	int anchorIndex = -1;
+	for (int index = 0; index < state.lineEntries.size(); ++index)
+	{
+		if (state.lineEntries.at(index).lineNumber == anchorLineNumber)
+		{
+			anchorIndex = index;
+			break;
+		}
+	}
+	if (anchorIndex < 0)
+		return false;
+
+	WorldRuntime::LineEntry entry = makeStubLineEntry(state, text, flags & ~LineHidden, spans, hardReturn);
+	if (replaceAnchor)
+	{
+		state.lineEntries[anchorIndex] = entry;
+		return true;
+	}
+
+	const qsizetype insertIndex = qBound<qsizetype>(
+	    0, static_cast<qsizetype>(anchorIndex) + anchorRelativeOffset, state.lineEntries.size());
+	state.lineEntries.insert(insertIndex, entry);
 	return true;
 }
 
@@ -365,6 +439,7 @@ namespace
 			void workerDispatchesPluginLifecycleCallbacksOnRealEngines();
 			void workerCallbackBatchCapturesOutputMiniWindowAndSaveStateMutations();
 			void workerColourOutputMatchesMushclientGroupingAndNewlineSemantics();
+			void triggerAnchoredColourOutputKeepsNativePromptText();
 			void callbackSnapshotSuppliesGetInfoAndMiniWindowReads();
 			void deferredRuntimeMutationSkipsDestroyedRuntime();
 			// NOLINTEND(readability-convert-member-functions-to-static)
@@ -929,6 +1004,55 @@ end
 	         QStringList({QStringLiteral("note-a"), QStringLiteral("note-b"), QStringLiteral("note-c"),
 	                      QStringLiteral("tell-a"), QStringLiteral("tell-b")}));
 	QCOMPARE(state.outputNewLines, QList<bool>({false, false, true, false, false}));
+}
+
+void tst_LuaCallbackEngine::triggerAnchoredColourOutputKeepsNativePromptText()
+{
+	WorldRuntime runtime;
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QStringLiteral(R"lua(
+function prompt_cb(name, line)
+  Tell("[")
+  ColourTell("white", "black", "435")
+  Tell(", ")
+  ColourTell("white", "black", "1226")
+  Note("]")
+end
+)lua"));
+
+	const QString           prompt = QStringLiteral("[Library][SAFE]<2084hp 1806sp 1695st> ");
+	RuntimeStubState       &state  = runtimeStubState(&runtime);
+	WorldRuntime::LineEntry promptEntry;
+	promptEntry.text       = prompt;
+	promptEntry.flags      = WorldRuntime::LineOutput;
+	promptEntry.hardReturn = true;
+	promptEntry.lineNumber = 42;
+	state.lineEntries.push_back(promptEntry);
+
+	LuaExecutorWorker       executor;
+	LuaBatchDispatchRequest request;
+	request.engines        = {engine};
+	request.kind           = LuaBatchDispatchKind::StringsAndWildcards;
+	request.functionName   = QStringLiteral("prompt_cb");
+	request.stringListArg  = {QStringLiteral("prompt"), prompt};
+	request.stringListArg2 = {prompt};
+	const auto styleRuns   = QSharedPointer<QVector<LuaStyleRun>>::create();
+	styleRuns->push_back({prompt, 0xFFFFFF, 0x000000, 0});
+	request.styleRunsArg                     = styleRuns;
+	request.triggerMatchedLineBufferIndex    = 1;
+	request.triggerMatchedLineAbsoluteNumber = promptEntry.lineNumber;
+	request.triggerOutputReplacesMatchedLine = false;
+	request.miniWindowSnapshotArg            = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	QVERIFY(result.hasFunctionValid);
+	QVERIFY(result.hasFunction);
+	QVERIFY(!result.deferredRuntimeMutationBatches.isEmpty());
+	executeDeferredMutations(result);
+
+	const QStringList logicalLines = logicalOutputLinesFromEntries(state.lineEntries);
+	QCOMPARE(logicalLines, QStringList({QStringLiteral("[435, 1226]"), prompt}));
 }
 
 void tst_LuaCallbackEngine::callbackSnapshotSuppliesGetInfoAndMiniWindowReads()

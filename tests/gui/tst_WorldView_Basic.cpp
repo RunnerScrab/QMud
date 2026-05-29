@@ -3204,6 +3204,47 @@ class tst_WorldView_Basic : public QObject
 			resetTestState();
 		}
 
+		void nativeOutputRendererClearsPartialPromptOverlayBeforePluginAnchoredPrompt()
+		{
+			resetTestState();
+
+			WorldView view;
+			view.resize(900, 420);
+			view.show();
+			view.setRuntimeObserver(fakeRuntimePointer());
+			QCoreApplication::processEvents();
+
+			auto *nativeCanvas = view.findChild<QWidget *>(QStringLiteral("worldOutputNativeCanvas"));
+			QVERIFY(nativeCanvas);
+
+			const QString prompt = QStringLiteral("[Library][SAFE]<2084hp 1806sp 1695st> ");
+			view.appendOutputText(QStringLiteral("room description"), true);
+			view.updatePartialOutputText(prompt);
+			QCoreApplication::processEvents();
+			nativeCanvas->repaint();
+			QCoreApplication::processEvents();
+			QVERIFY(view.outputLines().contains(prompt));
+
+			view.clearPartialOutput();
+			view.appendNoteText(QStringLiteral("["), false);
+			view.appendNoteText(QStringLiteral("435"), false);
+			view.appendNoteText(QStringLiteral(", "), false);
+			view.appendNoteText(QStringLiteral("1226"), false);
+			view.appendNoteText(QStringLiteral("]"), true);
+			view.appendOutputText(prompt, true);
+			QCoreApplication::processEvents();
+			nativeCanvas->repaint();
+			QCoreApplication::processEvents();
+
+			const QStringList lines = view.outputLines();
+			QVERIFY(lines.contains(QStringLiteral("[435, 1226]")));
+			QCOMPARE(lines.constLast(), prompt);
+			QVERIFY(!lines.contains(QStringLiteral("[435, 1226]<2084hp 1806sp 1695st> ")));
+			QVERIFY(std::ranges::none_of(lines, [](const QString &line)
+			                             { return line == QStringLiteral("<2084hp 1806sp 1695st> "); }));
+			resetTestState();
+		}
+
 		void nativeOutputRendererKeepsVectorOrderWhenInsertedLineNumberIsNewerThanPrompt()
 		{
 			resetTestState();
