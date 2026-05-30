@@ -84,13 +84,57 @@
 namespace
 {
 	constexpr const char *kWorldOutputAccessibleProperty = "qmud_world_output_widget";
-	constexpr const char *kWorldOutputLiveProperty       = "qmud_world_output_live";
 
 	int                   sizeToInt(const qsizetype value)
 	{
 		constexpr qsizetype kMin = 0;
 		constexpr qsizetype kMax = std::numeric_limits<int>::max();
 		return static_cast<int>(qBound(kMin, value, kMax));
+	}
+
+	QString trimLeadingAnnouncementBreaks(QString text)
+	{
+		while (!text.isEmpty() && (text.front() == QLatin1Char('\n') || text.front() == QLatin1Char('\r')))
+			text.remove(0, 1);
+		return text;
+	}
+
+	QVector<int> prefixTableForText(const QString &text)
+	{
+		QVector<int> table(text.size(), 0);
+		for (int i = 1; i < text.size(); ++i)
+		{
+			int candidate = table.at(i - 1);
+			while (candidate > 0 && text.at(i) != text.at(candidate))
+				candidate = table.at(candidate - 1);
+			if (text.at(i) == text.at(candidate))
+				++candidate;
+			table[i] = candidate;
+		}
+		return table;
+	}
+
+	QString accessibleAnnouncementDelta(const QString &previousText, const QString &currentText)
+	{
+		if (previousText.isEmpty() || currentText.isEmpty() || previousText == currentText)
+			return {};
+		if (currentText.startsWith(previousText))
+			return trimLeadingAnnouncementBreaks(currentText.mid(previousText.size()));
+
+		const QVector<int> prefixTable = prefixTableForText(currentText);
+		int                overlap     = 0;
+		for (const QChar ch : previousText)
+		{
+			while (overlap > 0 && ch != currentText.at(overlap))
+				overlap = prefixTable.at(overlap - 1);
+			if (ch == currentText.at(overlap))
+				++overlap;
+			if (overlap == currentText.size())
+				overlap = prefixTable.at(overlap - 1);
+		}
+		if (overlap <= 0 || overlap >= currentText.size())
+			return {};
+		return trimLeadingAnnouncementBreaks(currentText.mid(overlap));
 	}
 
 	void appendDeduplicatedHistoryEntry(QVector<QString> &history, const QString &entry,
@@ -1099,9 +1143,6 @@ class WrapTextBrowser : public QAbstractScrollArea
 		explicit WrapTextBrowser(WorldView *view, QWidget *parent = nullptr, bool isLive = false)
 		    : QAbstractScrollArea(parent), m_view(view), m_isLive(isLive)
 		{
-			setAccessibleName(isLive ? QStringLiteral("Live world output") : QStringLiteral("World output"));
-			setProperty(kWorldOutputAccessibleProperty, true);
-			setProperty(kWorldOutputLiveProperty, isLive);
 			setFrameShape(QFrame::NoFrame);
 			setViewport(new QWidget(this));
 			if (QWidget *const vp = viewport())
@@ -1131,16 +1172,6 @@ class WrapTextBrowser : public QAbstractScrollArea
 		[[nodiscard]] QMargins viewportMarginsPublic() const
 		{
 			return viewportMargins();
-		}
-
-		[[nodiscard]] WorldView *worldView() const
-		{
-			return m_view;
-		}
-
-		[[nodiscard]] bool isLiveOutput() const
-		{
-			return m_isLive;
 		}
 
 	protected:
@@ -1267,16 +1298,46 @@ class WrapTextBrowser : public QAbstractScrollArea
 		LineWrapMode m_lineWrapMode{NoWrap};
 };
 
+class WorldOutputCanvas : public QWidget
+{
+	public:
+		explicit WorldOutputCanvas(WorldView *view, QWidget *parent = nullptr) : QWidget(parent), m_view(view)
+		{
+			setAccessibleName(QStringLiteral("World output"));
+			setProperty(kWorldOutputAccessibleProperty, true);
+			setAttribute(Qt::WA_TransparentForMouseEvents);
+			setAttribute(Qt::WA_OpaquePaintEvent);
+			setAutoFillBackground(false);
+		}
+
+		[[nodiscard]] WorldView *worldView() const
+		{
+			return m_view;
+		}
+
+	protected:
+		void paintEvent(QPaintEvent *event) override
+		{
+			if (!m_view)
+				return;
+			QPainter      painter(this);
+			const QRegion dirtyRegion = event ? event->region() : QRegion(rect());
+			m_view->paintNativeOutputCanvas(&painter, dirtyRegion);
+			m_view->miniWindowLayerPainted(true, dirtyRegion);
+		}
+
+	private:
+		WorldView *m_view{nullptr};
+};
+
 class WorldOutputAccessible final : public QAccessibleWidget, public QAccessibleTextInterface
 {
 	public:
-		explicit WorldOutputAccessible(WrapTextBrowser *widget)
-		    : QAccessibleWidget(widget, QAccessible::Terminal,
-		                        widget && widget->isLiveOutput() ? QStringLiteral("Live world output")
-		                                                         : QStringLiteral("World output"))
+		explicit WorldOutputAccessible(WorldOutputCanvas *widget)
+		    : QAccessibleWidget(widget, QAccessible::Terminal, QStringLiteral("World output"))
 		{
-			if (widget && widget->worldView())
-				widget->worldView()->primeAccessibleOutputTextState();
+			if (WorldView *view = widget ? widget->worldView() : nullptr)
+				view->primeAccessibleOutputTextState();
 		}
 
 		void *interface_cast(const QAccessible::InterfaceType type) override
@@ -1290,14 +1351,20 @@ class WorldOutputAccessible final : public QAccessibleWidget, public QAccessible
 		{
 			if (type == QAccessible::Name)
 			{
-				const WrapTextBrowser *browser = outputWidget();
-				if (browser && browser->isLiveOutput())
-					return QStringLiteral("Live world output");
 				return QStringLiteral("World output");
 			}
 			if (type == QAccessible::Value)
 				return accessibleText().text(0, accessibleText().characterCount());
 			return QAccessibleWidget::text(type);
+		}
+
+		[[nodiscard]] QAccessible::State state() const override
+		{
+			QAccessible::State state = QAccessibleWidget::state();
+			state.readOnly           = true;
+			state.multiLine          = true;
+			state.selectableText     = true;
+			return state;
 		}
 
 		void selection(int selectionIndex, int *startOffset, int *endOffset) const override
@@ -1353,7 +1420,7 @@ class WorldOutputAccessible final : public QAccessibleWidget, public QAccessible
 			if (selectionIndex != 0)
 				return;
 			WorldView       *view    = worldView();
-			WrapTextBrowser *browser = outputWidget();
+			WrapTextBrowser *browser = targetBrowser();
 			if (!view || !browser)
 				return;
 
@@ -1395,7 +1462,7 @@ class WorldOutputAccessible final : public QAccessibleWidget, public QAccessible
 			const QMudAccessibleTextUtils::TextPosition position =
 			    map.positionForOffset(qBound(0, offset, map.characterCount()));
 			WorldView       *view    = worldView();
-			WrapTextBrowser *browser = outputWidget();
+			WrapTextBrowser *browser = targetBrowser();
 			if (!view || !browser)
 				return {};
 
@@ -1407,7 +1474,7 @@ class WorldOutputAccessible final : public QAccessibleWidget, public QAccessible
 		[[nodiscard]] int offsetAtPoint(const QPoint &point) const override
 		{
 			WorldView       *view    = worldView();
-			WrapTextBrowser *browser = outputWidget();
+			WrapTextBrowser *browser = targetBrowser();
 			if (!view || !browser)
 				return -1;
 
@@ -1426,7 +1493,7 @@ class WorldOutputAccessible final : public QAccessibleWidget, public QAccessible
 		void scrollToSubstring(int startIndex, int endIndex) override
 		{
 			WorldView             *view    = worldView();
-			const WrapTextBrowser *browser = outputWidget();
+			const WrapTextBrowser *browser = targetBrowser();
 			if (!view || !browser)
 				return;
 
@@ -1451,15 +1518,21 @@ class WorldOutputAccessible final : public QAccessibleWidget, public QAccessible
 		}
 
 	private:
-		[[nodiscard]] WrapTextBrowser *outputWidget() const
+		[[nodiscard]] WorldOutputCanvas *outputCanvas() const
 		{
-			return dynamic_cast<WrapTextBrowser *>(widget());
+			return dynamic_cast<WorldOutputCanvas *>(widget());
+		}
+
+		[[nodiscard]] WrapTextBrowser *targetBrowser() const
+		{
+			WorldView *view = worldView();
+			return view ? view->activeOutputView() : nullptr;
 		}
 
 		[[nodiscard]] WorldView *worldView() const
 		{
-			const WrapTextBrowser *browser = outputWidget();
-			return browser ? browser->worldView() : nullptr;
+			WorldOutputCanvas *canvas = outputCanvas();
+			return canvas ? canvas->worldView() : nullptr;
 		}
 
 		[[nodiscard]] QMudAccessibleTextUtils::LineOffsetMap accessibleText() const
@@ -1476,11 +1549,11 @@ class WorldOutputAccessible final : public QAccessibleWidget, public QAccessible
 QAccessibleInterface *worldOutputAccessibleFactory(const QString &className, QObject *object)
 {
 	Q_UNUSED(className);
-	auto *scrollArea = qobject_cast<QAbstractScrollArea *>(object);
-	if (!scrollArea || !scrollArea->property(kWorldOutputAccessibleProperty).toBool())
+	auto *widget = qobject_cast<QWidget *>(object);
+	if (!widget || !widget->property(kWorldOutputAccessibleProperty).toBool())
 		return nullptr;
-	auto *browser = dynamic_cast<WrapTextBrowser *>(scrollArea);
-	return browser ? new WorldOutputAccessible(browser) : nullptr;
+	auto *canvas = dynamic_cast<WorldOutputCanvas *>(widget);
+	return canvas ? new WorldOutputAccessible(canvas) : nullptr;
 }
 
 void qmudInstallWorldOutputAccessibility()
@@ -1550,31 +1623,6 @@ class MiniWindowLayer : public QWidget
 	private:
 		WorldView *m_view{nullptr};
 		bool       m_underneath{false};
-};
-
-class WorldOutputCanvas : public QWidget
-{
-	public:
-		explicit WorldOutputCanvas(WorldView *view, QWidget *parent = nullptr) : QWidget(parent), m_view(view)
-		{
-			setAttribute(Qt::WA_TransparentForMouseEvents);
-			setAttribute(Qt::WA_OpaquePaintEvent);
-			setAutoFillBackground(false);
-		}
-
-	protected:
-		void paintEvent(QPaintEvent *event) override
-		{
-			if (!m_view)
-				return;
-			QPainter      painter(this);
-			const QRegion dirtyRegion = event ? event->region() : QRegion(rect());
-			m_view->paintNativeOutputCanvas(&painter, dirtyRegion);
-			m_view->miniWindowLayerPainted(true, dirtyRegion);
-		}
-
-	private:
-		WorldView *m_view{nullptr};
 };
 
 struct WorldView::OutputFindState
@@ -3051,24 +3099,28 @@ void WorldView::primeAccessibleOutputTextState() const
 	    accessibleNativeOutputTextMap(nativeOutputRenderLines());
 	m_accessibleOutputCharacterCount = map.characterCount();
 	m_accessibleOutputRevision       = m_nativeRenderLineCacheRevision;
+	m_accessibleOutputText           = map.text(0, map.characterCount());
 }
 
 void WorldView::notifyAccessibleOutputPresented(const QVector<NativeOutputRenderLine> &lines) const
 {
 	if (!QAccessible::isActive())
 	{
-		m_accessibleOutputCharacterCount    = -1;
-		m_accessibleOutputRevision          = 0;
+		m_accessibleOutputCharacterCount = -1;
+		m_accessibleOutputRevision       = 0;
+		m_accessibleOutputText.clear();
 		m_accessibleOutputPendingTailAppend = false;
 		return;
 	}
 
 	const QMudAccessibleTextUtils::LineOffsetMap map                   = accessibleNativeOutputTextMap(lines);
 	const int                                    currentCharacterCount = map.characterCount();
+	const QString                                currentText           = map.text(0, currentCharacterCount);
 	if (m_accessibleOutputCharacterCount < 0)
 	{
 		m_accessibleOutputCharacterCount = currentCharacterCount;
 		m_accessibleOutputRevision       = m_nativeRenderLineCacheRevision;
+		m_accessibleOutputText           = currentText;
 		return;
 	}
 
@@ -3076,31 +3128,48 @@ void WorldView::notifyAccessibleOutputPresented(const QVector<NativeOutputRender
 	if (!revisionChanged)
 	{
 		m_accessibleOutputCharacterCount = currentCharacterCount;
+		m_accessibleOutputText           = currentText;
 		return;
 	}
 
 	const bool exactTailAppend = m_accessibleOutputPendingTailAppend &&
 	                             (m_nativeRenderCacheDelta.kind == NativeRenderCacheDeltaKind::TailAppend ||
 	                              !m_nativeRenderLineCacheFromRuntime);
+	auto       announceCanvasText = [this](const QString &message)
+	{
+		const QString announcement = trimLeadingAnnouncementBreaks(message);
+		if (!m_nativeOutputCanvas || !m_nativeOutputCanvas->isVisible() || announcement.isEmpty())
+			return;
+		QAccessibleAnnouncementEvent event(m_nativeOutputCanvas, announcement);
+		event.setPoliteness(QAccessible::AnnouncementPoliteness::Polite);
+		QAccessible::updateAccessibility(&event);
+	};
 	if (currentCharacterCount > m_accessibleOutputCharacterCount && exactTailAppend)
 	{
 		const QString insertedText = map.text(m_accessibleOutputCharacterCount, currentCharacterCount);
 		if (!insertedText.isEmpty())
 		{
-			if (WrapTextBrowser *const target = activeOutputView())
+			if (m_nativeOutputCanvas && m_nativeOutputCanvas->isVisible())
 			{
-				QAccessibleTextInsertEvent event(target, m_accessibleOutputCharacterCount, insertedText);
+				QAccessibleTextInsertEvent event(m_nativeOutputCanvas, m_accessibleOutputCharacterCount,
+				                                 insertedText);
 				QAccessible::updateAccessibility(&event);
 			}
+			announceCanvasText(insertedText);
 		}
 	}
-	else if (WrapTextBrowser *const target = activeOutputView())
+	else if (m_nativeOutputCanvas && m_nativeOutputCanvas->isVisible())
 	{
-		QAccessibleEvent event(target, QAccessible::ValueChanged);
-		QAccessible::updateAccessibility(&event);
+		if (m_accessibleOutputText != currentText)
+		{
+			QAccessibleTextUpdateEvent event(m_nativeOutputCanvas, 0, m_accessibleOutputText, currentText);
+			QAccessible::updateAccessibility(&event);
+			announceCanvasText(accessibleAnnouncementDelta(m_accessibleOutputText, currentText));
+		}
 	}
 	m_accessibleOutputCharacterCount    = currentCharacterCount;
 	m_accessibleOutputRevision          = m_nativeRenderLineCacheRevision;
+	m_accessibleOutputText              = currentText;
 	m_accessibleOutputPendingTailAppend = false;
 }
 

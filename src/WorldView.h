@@ -1723,6 +1723,7 @@ class WorldView : public QWidget
 		mutable NativeRenderCacheDelta               m_nativeRenderCacheDelta;
 		mutable int                                  m_accessibleOutputCharacterCount{-1};
 		mutable quint64                              m_accessibleOutputRevision{0};
+		mutable QString                              m_accessibleOutputText;
 		mutable bool                                 m_accessibleOutputPendingTailAppend{false};
 		mutable bool                                 m_nativePartialRenderLineApplied{false};
 		mutable bool                                 m_nativePartialRenderLineAppended{false};
