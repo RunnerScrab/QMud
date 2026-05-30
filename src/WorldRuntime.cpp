@@ -46,6 +46,7 @@
 #include "WorldView.h"
 #include "helpers/LuaExecutionUtils.h"
 #include "helpers/OutputWrapUtils.h"
+#include "helpers/PluginPathUtils.h"
 #include "scripting/ScriptingErrors.h"
 
 #include <QApplication>
@@ -3543,11 +3544,7 @@ namespace
 
 	QString normalizePathForRuntime(const QString &value)
 	{
-#ifdef Q_OS_WIN
-		return QDir::toNativeSeparators(value);
-#else
 		return normalizePathForStorage(value);
-#endif
 	}
 
 	bool isAbsolutePathLike(const QString &value)
@@ -3880,33 +3877,14 @@ namespace
 		if (normalized.isEmpty() || hasUrlScheme(normalized))
 			return normalized;
 
-		if (const QString portableRelative = extractPortableRootRelativePath(normalized);
-		    !portableRelative.isEmpty())
-		{
-			return toDotRelativePath(portableRelative);
-		}
-
-		if (!isAbsolutePathLike(normalized))
-			return toDotRelativePath(normalized);
-
-		if (normalized.startsWith(QLatin1Char('/')) && normalized.size() > 3 && normalized.at(1).isLetter() &&
-		    normalized.at(2) == QLatin1Char(':'))
-		{
-			normalized.remove(0, 1);
-		}
-
-		QString cleanedAbsolute = QDir::cleanPath(normalized);
-		if (!workingDir.isEmpty())
-		{
-			const QString relative = QDir(workingDir).relativeFilePath(cleanedAbsolute);
-			if (!relative.isEmpty() && relative != QStringLiteral("..") &&
-			    !relative.startsWith(QStringLiteral("../")) && !QDir::isAbsolutePath(relative))
-			{
-				return toDotRelativePath(relative);
-			}
-		}
-
-		return cleanedAbsolute;
+		const bool trailingSlash = normalized.endsWith(QLatin1Char('/'));
+		QString relative = QMudPluginPathUtils::qmudHomeRelativePath(workingDir, normalized, trailingSlash);
+		if (relative.isEmpty())
+			return {};
+		relative = toDotRelativePath(relative);
+		if (trailingSlash && !relative.endsWith(QLatin1Char('/')))
+			relative += QLatin1Char('/');
+		return relative;
 	}
 
 	QString canonicalizePathForRuntime(const QString &path, const QString &workingDir)
@@ -7331,15 +7309,22 @@ int WorldRuntime::addFontFromFile(const QString &path)
 	if (trimmed.isEmpty())
 		return eBadParameter;
 
-	QFileInfo const info(trimmed);
+	QString resolved;
+	QString error;
+	if (!QMudPluginPathUtils::resolveInsideQmudHome(m_startupDirectory, trimmed, &resolved, &error))
+		return eFileNotFound;
+
+	QFileInfo const info(resolved);
 	if (!info.exists())
 		return eFileNotFound;
 
-	const QString key = info.absoluteFilePath();
+	const QString absoluteFontPath = info.absoluteFilePath();
+	const QString key =
+	    QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, absoluteFontPath, false);
 	if (m_specialFontPaths.contains(key))
 		return eOK;
 
-	const int fontId = QFontDatabase::addApplicationFont(key);
+	const int fontId = QFontDatabase::addApplicationFont(absoluteFontPath);
 	if (fontId < 0)
 		return eFileNotFound;
 
@@ -7513,7 +7498,7 @@ void WorldRuntime::setClientStartTime(const QDateTime &when)
 
 void WorldRuntime::setWorldFilePath(const QString &path)
 {
-	m_worldFilePath = path;
+	m_worldFilePath = QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, path, false);
 }
 
 QString WorldRuntime::worldFilePath() const
@@ -7727,11 +7712,22 @@ bool WorldRuntime::saveWorldFile(const QString &fileName, QString *error)
 	// Preserve ordering: run world/plugin save callbacks before persisting.
 	fireWorldSaveHandlers();
 
-	SaveSnapshot const snapshot = buildSaveSnapshot(trimmed);
+	QString resolvedFileName;
+	QString pathError;
+	if (!QMudPluginPathUtils::resolveInsideQmudHome(m_startupDirectory, trimmed, &resolvedFileName,
+	                                                &pathError))
+	{
+		if (error)
+			*error = pathError;
+		return false;
+	}
+
+	SaveSnapshot const snapshot = buildSaveSnapshot(resolvedFileName);
 	if (!writeSaveSnapshot(snapshot, error))
 		return false;
 
-	m_worldFilePath = snapshot.targetFilePath;
+	m_worldFilePath =
+	    QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, snapshot.targetFilePath, false);
 	if (saveStateMatchesSnapshot(snapshot))
 	{
 		setWorldFileModified(false);
@@ -7758,7 +7754,17 @@ void WorldRuntime::saveWorldFileAsync(const QString                             
 	// Preserve ordering: run world/plugin save callbacks before persisting.
 	fireWorldSaveHandlers();
 
-	auto           snapshot = QSharedPointer<SaveSnapshot>::create(buildSaveSnapshot(trimmed));
+	QString resolvedFileName;
+	QString pathError;
+	if (!QMudPluginPathUtils::resolveInsideQmudHome(m_startupDirectory, trimmed, &resolvedFileName,
+	                                                &pathError))
+	{
+		if (completion)
+			completion(false, pathError);
+		return;
+	}
+
+	auto           snapshot = QSharedPointer<SaveSnapshot>::create(buildSaveSnapshot(resolvedFileName));
 	QPointer const guard(this);
 	auto           completionFn =
 	    QSharedPointer<std::function<void(bool, const QString &)>>::create(std::move(completion));
@@ -7776,7 +7782,8 @@ void WorldRuntime::saveWorldFileAsync(const QString                             
 
 			                           if (ok)
 			                           {
-				                           guard->m_worldFilePath = snapshot->targetFilePath;
+				                           guard->m_worldFilePath = QMudPluginPathUtils::qmudHomeRelativePath(
+				                               guard->m_startupDirectory, snapshot->targetFilePath, false);
 				                           if (guard->saveStateMatchesSnapshot(*snapshot))
 				                           {
 					                           guard->setWorldFileModified(false);
@@ -7794,9 +7801,11 @@ bool WorldRuntime::writeSaveSnapshot(const SaveSnapshot &snapshot, QString *erro
 {
 	SaveSnapshot  normalizedSnapshot = snapshot;
 	const QString workingDir         = resolveWorkingDir(normalizedSnapshot.startupDirectory);
-	const QString worldDir   = normalizedSnapshot.worldFilePath.trimmed().isEmpty()
-	                               ? QString()
-	                               : QFileInfo(normalizedSnapshot.worldFilePath.trimmed()).absolutePath();
+	const QString worldFilePath      = normalizedSnapshot.worldFilePath.trimmed();
+	const QString absoluteWorldFilePath =
+	    worldFilePath.isEmpty() ? QString() : makeAbsolutePath(worldFilePath, workingDir);
+	const QString worldDir =
+	    absoluteWorldFilePath.isEmpty() ? QString() : QFileInfo(absoluteWorldFilePath).absolutePath();
 	const QString pluginsDir = normalizedSnapshot.pluginsDirectory.trimmed();
 
 	const auto    normalizePathAttributes = [&](QMap<QString, QString> &attributes)
@@ -8518,7 +8527,7 @@ bool WorldRuntime::writeSaveSnapshot(const SaveSnapshot &snapshot, QString *erro
 
 void WorldRuntime::setPluginsDirectory(const QString &path)
 {
-	m_pluginsDirectory = path;
+	m_pluginsDirectory = QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, path, true);
 }
 
 QString WorldRuntime::pluginsDirectory() const
@@ -8528,7 +8537,7 @@ QString WorldRuntime::pluginsDirectory() const
 
 void WorldRuntime::setStateFilesDirectory(const QString &path)
 {
-	m_stateFilesDirectory = path;
+	m_stateFilesDirectory = QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, path, true);
 }
 
 QString WorldRuntime::stateFilesDirectory() const
@@ -8538,7 +8547,7 @@ QString WorldRuntime::stateFilesDirectory() const
 
 void WorldRuntime::setFileBrowsingDirectory(const QString &path)
 {
-	m_fileBrowsingDirectory = path;
+	m_fileBrowsingDirectory = QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, path, true);
 }
 
 QString WorldRuntime::fileBrowsingDirectory() const
@@ -8548,7 +8557,7 @@ QString WorldRuntime::fileBrowsingDirectory() const
 
 void WorldRuntime::setPreferencesDatabaseName(const QString &path)
 {
-	m_preferencesDatabaseName = path;
+	m_preferencesDatabaseName = QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, path, false);
 }
 
 QString WorldRuntime::preferencesDatabaseName() const
@@ -8558,7 +8567,7 @@ QString WorldRuntime::preferencesDatabaseName() const
 
 void WorldRuntime::setTranslatorFile(const QString &path)
 {
-	m_translatorFile = path;
+	m_translatorFile = QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, path, false);
 }
 
 QString WorldRuntime::translatorFile() const
@@ -9846,12 +9855,8 @@ QSharedPointer<const LuaCallbackMiniWindowSnapshot> WorldRuntime::captureLuaCall
 		QString dir = plugin.directory;
 		if (!dir.isEmpty() && !dir.endsWith('/') && !dir.endsWith('\\'))
 			dir += '/';
-#ifdef Q_OS_WIN
-		snapshot->pluginDirectoriesById.insert(pluginId, QDir::toNativeSeparators(dir));
-#else
 		dir.replace(QLatin1Char('\\'), QLatin1Char('/'));
 		snapshot->pluginDirectoriesById.insert(pluginId, dir);
-#endif
 		snapshot->pluginEnabledById.insert(pluginId, plugin.enabled);
 		snapshot->pluginEnginesById.insert(pluginId, plugin.lua);
 		if (const auto functionsIt = m_pluginLuaFunctionCatalogById.constFind(pluginId);
@@ -10391,15 +10396,6 @@ static double normalizeSoundVolume(double volume)
 	return qBound(0.0, scaled, 1.0);
 }
 
-static bool isAbsolutePathPortable(const QString &path)
-{
-	if (path.isEmpty())
-		return false;
-	const QChar first   = path.at(0);
-	const bool  isDrive = path.size() > 1 && path.at(1) == QLatin1Char(':') && first.isLetter();
-	return isDrive || first == QLatin1Char('/') || first == QLatin1Char('\\');
-}
-
 int WorldRuntime::playSound(int buffer, const QString &fileName, bool loop, double volume, double pan)
 {
 	if (QThread::currentThread() != thread())
@@ -10480,28 +10476,20 @@ int WorldRuntime::playSound(int buffer, const QString &fileName, bool loop, doub
 		entry.tempFile = nullptr;
 	}
 
-	const QString workingDir         = resolveWorkingDir(m_startupDirectory);
-	const QString normalizedFileName = normalizeSeparators(fileName.trimmed());
+	const QString relative = QMudPluginPathUtils::legacyPathRelativeToQmudHome(fileName);
 	QString       resolved;
 	QStringList   candidates;
-	if (isAbsolutePathPortable(normalizedFileName))
-	{
-		candidates.push_back(normalizedFileName);
-	}
-	else
-	{
-		QString relative = normalizedFileName;
-		if (relative.startsWith(QStringLiteral("./")))
-			relative = relative.mid(2);
-		QDir const base(workingDir);
-		if (!relative.startsWith(QStringLiteral("sounds/"), Qt::CaseInsensitive))
-			candidates.push_back(base.filePath(QStringLiteral("sounds/%1").arg(relative)));
-		candidates.push_back(base.filePath(relative));
-	}
+	if (!relative.isEmpty() && !relative.startsWith(QStringLiteral("sounds/"), Qt::CaseInsensitive))
+		candidates.push_back(QStringLiteral("sounds/%1").arg(relative));
+	candidates.push_back(fileName);
 
 	for (const QString &candidate : candidates)
 	{
-		const QString normalizedCandidate = QDir::cleanPath(normalizeSeparators(candidate));
+		QString normalizedCandidate;
+		QString error;
+		if (!QMudPluginPathUtils::resolveInsideQmudHome(m_startupDirectory, candidate, &normalizedCandidate,
+		                                                &error))
+			continue;
 		if (QFileInfo::exists(normalizedCandidate))
 		{
 			resolved = normalizedCandidate;
@@ -11456,11 +11444,21 @@ int WorldRuntime::setBackgroundImage(const QString &fileName, int mode)
 {
 	if (mode < 0 || mode > 13)
 		return eBadParameter;
-	const int result = loadWorldImageFile(fileName, &m_backgroundImage, &m_backgroundImageName);
+	QString resolvedFileName;
+	QString error;
+	if (!fileName.trimmed().isEmpty() &&
+	    !QMudPluginPathUtils::resolveInsideQmudHome(m_startupDirectory, fileName, &resolvedFileName, &error))
+		return eFileNotFound;
+	const QString imageFileName = fileName.trimmed().isEmpty() ? QString() : resolvedFileName;
+	const int     result        = loadWorldImageFile(imageFileName, &m_backgroundImage, nullptr);
 	if (result == eOK)
 	{
 		m_backgroundImageMode = mode;
-		m_worldFileModified   = true;
+		m_backgroundImageName =
+		    imageFileName.isEmpty()
+		        ? QString()
+		        : QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, imageFileName, false);
+		m_worldFileModified = true;
 		if (m_view)
 		{
 			m_view->applyRuntimeSettings();
@@ -11474,11 +11472,21 @@ int WorldRuntime::setForegroundImage(const QString &fileName, int mode)
 {
 	if (mode < 0 || mode > 13)
 		return eBadParameter;
-	const int result = loadWorldImageFile(fileName, &m_foregroundImage, &m_foregroundImageName);
+	QString resolvedFileName;
+	QString error;
+	if (!fileName.trimmed().isEmpty() &&
+	    !QMudPluginPathUtils::resolveInsideQmudHome(m_startupDirectory, fileName, &resolvedFileName, &error))
+		return eFileNotFound;
+	const QString imageFileName = fileName.trimmed().isEmpty() ? QString() : resolvedFileName;
+	const int     result        = loadWorldImageFile(imageFileName, &m_foregroundImage, nullptr);
 	if (result == eOK)
 	{
 		m_foregroundImageMode = mode;
-		m_worldFileModified   = true;
+		m_foregroundImageName =
+		    imageFileName.isEmpty()
+		        ? QString()
+		        : QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, imageFileName, false);
+		m_worldFileModified = true;
 		if (m_view)
 		{
 			m_view->applyRuntimeSettings();
@@ -12926,15 +12934,24 @@ int WorldRuntime::openLog(const QString &logFileName, bool append)
 	if (m_logFileName.isEmpty())
 		return eCouldNotOpenFile;
 
-	// Resolve relative log paths under the configured default log directory.
-	// If no default is configured, fall back to <startup>/logs.
 	const QString workingDir = resolveWorkingDir(m_startupDirectory);
 	QString       logBaseDir = m_defaultLogDirectory.trimmed();
 	if (logBaseDir.isEmpty())
 		logBaseDir = QDir::cleanPath(QDir(workingDir).filePath(QStringLiteral("logs")));
 	else
 		logBaseDir = makeAbsolutePath(logBaseDir, workingDir);
-	m_logFileName = makeAbsolutePath(m_logFileName, logBaseDir);
+	const QString baseRelative =
+	    QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, logBaseDir, true);
+	QString logRelative = QMudPluginPathUtils::legacyPathRelativeToQmudHome(m_logFileName);
+	if (logRelative.isEmpty() && !QMudPluginPathUtils::normalizeSeparators(m_logFileName).isEmpty())
+		return eCouldNotOpenFile;
+	if (!baseRelative.isEmpty() && baseRelative != QLatin1String("./") &&
+	    !logRelative.startsWith(QStringLiteral("logs/"), Qt::CaseInsensitive) &&
+	    !logRelative.startsWith(QStringLiteral("worlds/"), Qt::CaseInsensitive))
+		logRelative = QDir::cleanPath(QDir(baseRelative).filePath(logRelative));
+	QString error;
+	if (!QMudPluginPathUtils::resolveInsideQmudHome(m_startupDirectory, logRelative, &m_logFileName, &error))
+		return eCouldNotOpenFile;
 
 	// Ensure missing parent folders (for patterns like logs/foo/bar.txt) exist.
 	const QFileInfo logInfo(m_logFileName);
@@ -13165,12 +13182,12 @@ QString WorldRuntime::formatTime(const QDateTime &time, const QString &format, b
 
 void WorldRuntime::setDefaultWorldDirectory(const QString &path)
 {
-	m_defaultWorldDirectory = path;
+	m_defaultWorldDirectory = QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, path, true);
 }
 
 void WorldRuntime::setDefaultLogDirectory(const QString &path)
 {
-	m_defaultLogDirectory = path;
+	m_defaultLogDirectory = QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, path, true);
 }
 
 void WorldRuntime::setStartupDirectory(const QString &path)
@@ -16963,25 +16980,32 @@ int WorldRuntime::databaseOpen(const QString &name, const QString &filename, int
 		                          { return databaseOpen(name, filename, flags); });
 
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::databaseOpen");
+	const bool isMemory = (flags & SQLITE_OPEN_MEMORY) != 0 || filename == QStringLiteral(":memory:");
+	QString    diskName = filename;
+	if (!isMemory)
+	{
+		QString error;
+		if (!QMudPluginPathUtils::resolveInsideQmudHome(m_startupDirectory, filename, &diskName, &error))
+			return SQLITE_CANTOPEN;
+	}
 	const auto it = m_databases.find(name);
 	if (it != m_databases.end())
 	{
-		if (it->diskName == filename)
+		if (it->diskName == diskName)
 			return SQLITE_OK;
 		return kDbErrorDatabaseAlreadyExists;
 	}
 
-	const bool isMemory = (flags & SQLITE_OPEN_MEMORY) != 0 || filename == QStringLiteral(":memory:");
-	if (!isMemory && (flags & SQLITE_OPEN_CREATE) == 0 && !QFileInfo::exists(filename))
+	if (!isMemory && (flags & SQLITE_OPEN_CREATE) == 0 && !QFileInfo::exists(diskName))
 		return SQLITE_CANTOPEN;
 
 	static std::atomic<quint64> connectionCounter{0};
 	DatabaseEntry               entry;
-	entry.diskName = filename;
+	entry.diskName = diskName;
 	entry.connectionName =
 	    QStringLiteral("world_db_%1").arg(connectionCounter.fetch_add(1, std::memory_order_relaxed) + 1);
 	entry.db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), entry.connectionName);
-	entry.db.setDatabaseName(isMemory ? QStringLiteral(":memory:") : filename);
+	entry.db.setDatabaseName(isMemory ? QStringLiteral(":memory:") : diskName);
 	if (flags & SQLITE_OPEN_READONLY)
 		entry.db.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
 	if (!entry.db.open())
@@ -17676,41 +17700,28 @@ bool WorldRuntime::loadPluginFile(const QString &fileName, QString *error, bool 
 		return false;
 	}
 
-	QString const workingDir = resolveWorkingDir(m_startupDirectory);
-	QString       pluginsDir = m_pluginsDirectory;
-	if (!pluginsDir.isEmpty())
-		pluginsDir = makeAbsolutePath(pluginsDir, workingDir);
-	QString resolved = normalizeSeparators(raw);
-	if (resolved.startsWith(QStringLiteral("./")) || resolved.startsWith(QStringLiteral(".\\")))
-		resolved = resolved.mid(2);
+	const QString pluginsRelative =
+	    QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, m_pluginsDirectory, true);
+	const QString rawRelative = QMudPluginPathUtils::legacyPathRelativeToQmudHome(raw);
+	QStringList   candidates;
+	if (!rawRelative.isEmpty() && !pluginsRelative.isEmpty() && pluginsRelative != QLatin1String("./") &&
+	    !rawRelative.startsWith(QStringLiteral("worlds/"), Qt::CaseInsensitive) &&
+	    !rawRelative.startsWith(QStringLiteral("plugins/"), Qt::CaseInsensitive))
+		candidates.push_back(QDir::cleanPath(QDir(pluginsRelative).filePath(rawRelative)));
+	candidates.push_back(raw);
 
-	if (resolved.startsWith(QLatin1Char('/')))
+	QString resolved;
+	for (const QString &candidate : candidates)
 	{
-		QString candidate = resolved;
-		while (candidate.startsWith(QLatin1Char('/')))
-			candidate.remove(0, 1);
-		const QString lower = candidate.toLower();
-		const bool    looksPortable =
-		    lower == QStringLiteral("worlds") || lower.startsWith(QStringLiteral("worlds/")) ||
-		    lower == QStringLiteral("logs") || lower.startsWith(QStringLiteral("logs/"));
-		if (looksPortable)
-			resolved = candidate;
+		QString errorMessage;
+		if (!QMudPluginPathUtils::resolveInsideQmudHome(m_startupDirectory, candidate, &resolved,
+		                                                &errorMessage))
+			continue;
+		if (QFileInfo::exists(resolved))
+			break;
+		resolved.clear();
 	}
 	QFileInfo info(resolved);
-	if (!info.isAbsolute())
-	{
-		const QString normalizedResolved  = normalizeSeparators(resolved);
-		const QString normalizedPlugins   = normalizeSeparators(pluginsDir);
-		const QString normalizedWorking   = normalizeSeparators(workingDir);
-		const bool    looksLikeWorldsPath = normalizedResolved.startsWith(QStringLiteral("worlds/"));
-		const bool    pluginsIsWorlds     = normalizedPlugins.endsWith(QStringLiteral("worlds/plugins/")) ||
-		                                    normalizedPlugins.endsWith(QStringLiteral("worlds/plugins"));
-		if (!normalizedPlugins.isEmpty() && !looksLikeWorldsPath && !pluginsIsWorlds)
-			resolved = QDir::cleanPath(QDir(normalizedPlugins).filePath(normalizedResolved));
-		else
-			resolved = QDir::cleanPath(QDir(normalizedWorking).filePath(normalizedResolved));
-		info = QFileInfo(resolved);
-	}
 
 	if (!info.exists())
 	{
@@ -17731,6 +17742,11 @@ bool WorldRuntime::loadPluginFile(const QString &fileName, QString *error, bool 
 		return false;
 	}
 
+	QString pluginsDir;
+	QString pluginsDirError;
+	static_cast<void>(QMudPluginPathUtils::resolveInsideQmudHome(
+	    m_startupDirectory, pluginsRelative.isEmpty() ? QStringLiteral("worlds/plugins") : pluginsRelative,
+	    &pluginsDir, &pluginsDirError));
 	if (!doc.expandIncludes(resolved, pluginsDir, resolveWorkingDir(m_startupDirectory),
 	                        m_stateFilesDirectory))
 	{
@@ -17757,8 +17773,10 @@ bool WorldRuntime::loadPluginFile(const QString &fileName, QString *error, bool 
 			existing.global = true;
 			if (existing.source.isEmpty())
 			{
-				existing.source    = resolved;
-				existing.directory = info.absolutePath();
+				existing.source =
+				    QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, resolved, false);
+				existing.directory =
+				    QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, info.absolutePath(), true);
 			}
 			return true;
 		}
@@ -17774,14 +17792,14 @@ bool WorldRuntime::loadPluginFile(const QString &fileName, QString *error, bool 
 	}
 
 	Plugin rp;
-	rp.attributes                  = p.attributes;
-	rp.description                 = p.description;
-	rp.script                      = p.script;
-	rp.source                      = resolved;
-	rp.directory                   = info.absolutePath();
-	rp.global                      = markGlobal;
-	rp.sequence                    = pluginSequenceFromAttributes(rp.attributes);
-	rp.version                     = rp.attributes.value(QStringLiteral("version")).toDouble();
+	rp.attributes  = p.attributes;
+	rp.description = p.description;
+	rp.script      = p.script;
+	rp.source      = QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, resolved, false);
+	rp.directory   = QMudPluginPathUtils::qmudHomeRelativePath(m_startupDirectory, info.absolutePath(), true);
+	rp.global      = markGlobal;
+	rp.sequence    = pluginSequenceFromAttributes(rp.attributes);
+	rp.version     = rp.attributes.value(QStringLiteral("version")).toDouble();
 	rp.requiredVersion             = rp.attributes.value(QStringLiteral("requires")).toDouble();
 	rp.dateWritten                 = parsePluginDate(rp.attributes.value(QStringLiteral("date_written")));
 	rp.dateModified                = parsePluginDate(rp.attributes.value(QStringLiteral("date_modified")));
@@ -19479,6 +19497,12 @@ int WorldRuntime::chatSendFile(long id, const QString &path)
 		if (fileName.isEmpty())
 			return eFileNotFound;
 	}
+	else
+	{
+		QString error;
+		if (!QMudPluginPathUtils::resolveInsideQmudHome(m_startupDirectory, fileName, &fileName, &error))
+			return eFileNotFound;
+	}
 
 	connection->m_ourFileName = fileName;
 	QFileInfo const info(fileName);
@@ -19921,12 +19945,8 @@ QVariant WorldRuntime::pluginInfo(const QString &pluginId, int infoType) const
 		QString dir = plugin.directory;
 		if (!dir.isEmpty() && !dir.endsWith('/') && !dir.endsWith('\\'))
 			dir += '/';
-#ifdef Q_OS_WIN
-		return QDir::toNativeSeparators(dir);
-#else
 		dir.replace(QLatin1Char('\\'), QLatin1Char('/'));
 		return dir;
-#endif
 	}
 	case 21:
 		return index + 1;
@@ -22753,10 +22773,15 @@ int WorldRuntime::windowLoadImage(const QString &name, const QString &imageId, c
 	if (!lower.endsWith(QStringLiteral(".bmp")) && !lower.endsWith(QStringLiteral(".png")))
 		return eBadParameter;
 
-	if (!QFileInfo::exists(trimmed))
+	QString resolved;
+	QString error;
+	if (!QMudPluginPathUtils::resolveInsideQmudHome(m_startupDirectory, trimmed, &resolved, &error))
 		return eFileNotFound;
 
-	if (!MiniWindowUtils::loadImage(*window, imageId, trimmed))
+	if (!QFileInfo::exists(resolved))
+		return eFileNotFound;
+
+	if (!MiniWindowUtils::loadImage(*window, imageId, resolved))
 		return eUnableToLoadImage;
 	return eOK;
 }
@@ -22967,7 +22992,12 @@ int WorldRuntime::windowWrite(const QString &name, const QString &filename)
 	if (!lower.endsWith(QStringLiteral(".bmp")) && !lower.endsWith(QStringLiteral(".png")))
 		return eBadParameter;
 
-	if (!MiniWindowUtils::saveWindowImage24Bit(*window, trimmedFilename))
+	QString resolved;
+	QString error;
+	if (!QMudPluginPathUtils::resolveInsideQmudHome(m_startupDirectory, trimmedFilename, &resolved, &error))
+		return eCouldNotOpenFile;
+
+	if (!MiniWindowUtils::saveWindowImage24Bit(*window, resolved))
 		return eCouldNotOpenFile;
 	return eOK;
 }

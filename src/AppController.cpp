@@ -52,6 +52,7 @@
 #include "dialogs/WelcomeDialog.h"
 #include "dialogs/WelcomeUpgradeDialog.h"
 #include "dialogs/WorldPreferencesDialog.h"
+#include "helpers/PluginPathUtils.h"
 #include "helpers/WorldEditUtils.h"
 #include "scripting/ScriptingErrors.h"
 
@@ -1253,6 +1254,7 @@ namespace
 	}
 
 	QString absolutePathFromBase(const QString &baseDir, const QString &path);
+	QString dotRelativeStoragePath(const QString &qmudHome, const QString &value, bool trailingSlash);
 
 	QString canonicalAbsolutePath(const QString &path, const QString &workingDir)
 	{
@@ -1277,16 +1279,7 @@ namespace
 		if (path.trimmed().isEmpty())
 			return {};
 		const QString absolute = canonicalAbsolutePath(path, workingDir);
-		const QString baseDir  = QDir::cleanPath(workingDir);
-		if (QString relative = normalizePathString(QDir(baseDir).relativeFilePath(absolute));
-		    !relative.isEmpty() && relative != QStringLiteral("..") &&
-		    !relative.startsWith(QStringLiteral("../")) && !QDir::isAbsolutePath(relative))
-		{
-			if (relative.startsWith(QStringLiteral("./")) || relative.startsWith(QStringLiteral("../")))
-				return relative;
-			return QStringLiteral("./") + relative;
-		}
-		return normalizePathString(absolute);
+		return dotRelativeStoragePath(workingDir, absolute, false);
 	}
 
 	QString keyLeafName(const QString &key)
@@ -1325,11 +1318,7 @@ namespace
 
 	QString pathForRuntime(const QString &input)
 	{
-#ifdef Q_OS_WIN
-		return QDir::toNativeSeparators(input);
-#else
 		return normalizePathString(input);
-#endif
 	}
 
 	QString pathListForRuntime(const QString &input)
@@ -1450,19 +1439,53 @@ namespace
 #endif
 	}
 
-	QString normalizeStoredGlobalStringValue(const QString &key, const QString &value)
+	bool isDirectoryStorageKey(const QString &key)
+	{
+		const QString leaf = keyLeafName(key);
+		return leaf.contains(QStringLiteral("Directory"), Qt::CaseInsensitive);
+	}
+
+	QString dotRelativeStoragePath(const QString &qmudHome, const QString &value, const bool trailingSlash)
+	{
+		const QString normalized = QMudFileExtensions::canonicalizePathExtension(normalizePathString(value));
+		if (normalized.trimmed().isEmpty())
+			return {};
+		QString relative = QMudPluginPathUtils::qmudHomeRelativePath(qmudHome, normalized, trailingSlash);
+		if (relative.isEmpty())
+			return {};
+		if (relative == QLatin1String("."))
+			relative = QStringLiteral("./");
+		if (!relative.startsWith(QStringLiteral("./")) && !relative.startsWith(QStringLiteral("../")))
+			relative.prepend(QStringLiteral("./"));
+		return relative;
+	}
+
+	QString normalizeStoredGlobalStringValue(const QString &key, const QString &value,
+	                                         const QString &qmudHome)
 	{
 		QString adjusted = normalizeLegacyPortableDirectory(key, value);
 		if (isPathListKey(key))
-			return normalizePathList(adjusted);
+		{
+			const QStringList items = splitSerializedPathList(adjusted);
+			QStringList       normalizedItems;
+			normalizedItems.reserve(items.size());
+			for (const QString &item : items)
+			{
+				if (const QString normalized = dotRelativeStoragePath(qmudHome, item, false);
+				    !normalized.isEmpty())
+					normalizedItems.push_back(normalized);
+			}
+			return normalizedItems.join(QLatin1Char('*'));
+		}
 		if (shouldNormalizePathKey(key))
-			return QMudFileExtensions::canonicalizePathExtension(normalizePathString(adjusted));
+			return dotRelativeStoragePath(qmudHome, adjusted, isDirectoryStorageKey(key));
 		return adjusted;
 	}
 
-	QString normalizeRuntimeGlobalStringValue(const QString &key, const QString &value)
+	QString normalizeRuntimeGlobalStringValue(const QString &key, const QString &value,
+	                                          const QString &qmudHome)
 	{
-		QString stored = normalizeStoredGlobalStringValue(key, value);
+		QString stored = normalizeStoredGlobalStringValue(key, value, qmudHome);
 		if (isPathListKey(key))
 			return pathListForRuntime(stored);
 		if (shouldNormalizePathKey(key))
@@ -1950,32 +1973,32 @@ static const struct
 
     // option name                              default
 
-    {"AsciiArtFont",                  "fonts\\standard.flf"       },
-    {"DefaultAliasesFile",            ""                          },
-    {"DefaultColoursFile",            ""                          },
-    {"DefaultInputFont",              "DejaVu Sans Mono"          },
-    {"DefaultLogFileDirectory",       ".\\logs\\"                 },
-    {"DefaultMacrosFile",             ""                          },
-    {"DefaultNameGenerationFile",     "names/names.txt"           },
-    {"DefaultOutputFont",             "DejaVu Sans Mono"          },
-    {"DefaultTimersFile",             ""                          },
-    {"DefaultTriggersFile",           ""                          },
-    {"DefaultWorldFileDirectory",     ".\\worlds\\"               },
-    {"NotepadQuoteString",            "> "                        },
-    {"PluginList",                    ""                          },
-    {"PluginsDirectory",              R"(.\worlds\plugins\)"      },
-    {"StateFilesDirectory",           R"(.\worlds\plugins\state\)"}, // however see below
-    {"PrinterFont",                   "Courier"                   },
-    {"TrayIconFileName",              ""                          },
-    {"WordDelimiters",                ".,()[]\"\'"                },
-    {"WordDelimitersDblClick",        ".,()[]\"\'"                },
-    {"WorldList",                     ""                          },
-    {"LuaScript",                     ""                          },
-    {"Locale",                        "EN"                        },
-    {"FixedPitchFont",                "DejaVu Sans Mono"          },
-    {"SkipUpdateNotificationVersion", ""                          },
+    {"AsciiArtFont",                  "fonts/standard.flf"     },
+    {"DefaultAliasesFile",            ""                       },
+    {"DefaultColoursFile",            ""                       },
+    {"DefaultInputFont",              "DejaVu Sans Mono"       },
+    {"DefaultLogFileDirectory",       "./logs/"                },
+    {"DefaultMacrosFile",             ""                       },
+    {"DefaultNameGenerationFile",     "names/names.txt"        },
+    {"DefaultOutputFont",             "DejaVu Sans Mono"       },
+    {"DefaultTimersFile",             ""                       },
+    {"DefaultTriggersFile",           ""                       },
+    {"DefaultWorldFileDirectory",     "./worlds/"              },
+    {"NotepadQuoteString",            "> "                     },
+    {"PluginList",                    ""                       },
+    {"PluginsDirectory",              "./worlds/plugins/"      },
+    {"StateFilesDirectory",           "./worlds/plugins/state/"}, // however see below
+    {"PrinterFont",                   "Courier"                },
+    {"TrayIconFileName",              ""                       },
+    {"WordDelimiters",                ".,()[]\"\'"             },
+    {"WordDelimitersDblClick",        ".,()[]\"\'"             },
+    {"WorldList",                     ""                       },
+    {"LuaScript",                     ""                       },
+    {"Locale",                        "EN"                     },
+    {"FixedPitchFont",                "DejaVu Sans Mono"       },
+    {"SkipUpdateNotificationVersion", ""                       },
 
-    {nullptr,                         nullptr                     }  // end of table marker
+    {nullptr,                         nullptr                  }  // end of table marker
 }; // end of table
 
 namespace
@@ -2070,9 +2093,8 @@ namespace
 	QString storagePathFromAbsolute(const QString &baseDir, const QString &sourcePath,
 	                                const QString &absolutePath)
 	{
-		if (QFileInfo(sourcePath).isAbsolute())
-			return normalizePathString(absolutePath);
-		return archiveRelativePathFor(baseDir, absolutePath);
+		Q_UNUSED(sourcePath);
+		return dotRelativeStoragePath(baseDir, absolutePath, false);
 	}
 
 	QString remapLegacyWindowsWorldPathToBase(const QString &baseDir, const QString &path)
@@ -3707,9 +3729,9 @@ void AppController::setGlobalOptionString(const QString &name, const QString &va
 	};
 
 	const auto key         = findKey(lookupName);
-	const auto storedValue = normalizeStoredGlobalStringValue(key, value);
+	const auto storedValue = normalizeStoredGlobalStringValue(key, value, m_workingDir);
 	{
-		const auto   runtimeValue = normalizeRuntimeGlobalStringValue(key, storedValue);
+		const auto   runtimeValue = normalizeRuntimeGlobalStringValue(key, storedValue, m_workingDir);
 		QMutexLocker locker(&m_globalPrefsMutex);
 		m_globalStringPrefs.insert(key, runtimeValue);
 	}
@@ -3921,7 +3943,7 @@ bool AppController::initialize()
 #endif
 
 	m_fixedPitchFont   = QStringLiteral("DejaVu Sans Mono");
-	m_pluginsDirectory = QStringLiteral(".\\\\worlds\\\\plugins\\\\");
+	m_pluginsDirectory = QStringLiteral("./worlds/plugins/");
 
 	// open SQLite database for preferences
 	if (!openPreferencesDatabase())
@@ -4442,8 +4464,9 @@ bool AppController::openWorldForReloadRecovery(const ReloadWorldState &worldStat
 	bool                          opened                     = false;
 	const int                     previousActivationOverride = m_nextNewWorldActivationOverride;
 	m_nextNewWorldActivationOverride                         = activateWindow ? 1 : 0;
-	if (!worldState.worldFilePath.trimmed().isEmpty() && QFileInfo::exists(worldState.worldFilePath))
-		opened = openDocumentFile(worldState.worldFilePath);
+	const QString worldFilePath = dotRelativeStoragePath(m_workingDir, worldState.worldFilePath, false);
+	if (!worldFilePath.trimmed().isEmpty() && QFileInfo::exists(makeAbsolutePath(worldFilePath)))
+		opened = openDocumentFile(worldFilePath);
 	if (!opened)
 		opened = openDocumentFile(QString());
 	m_nextNewWorldActivationOverride = previousActivationOverride;
@@ -4485,8 +4508,8 @@ bool AppController::openWorldForReloadRecovery(const ReloadWorldState &worldStat
 		worldRuntime->setWorldAttribute(QStringLiteral("site"), worldState.host.trimmed());
 	if (worldState.port > 0)
 		worldRuntime->setWorldAttribute(QStringLiteral("port"), QString::number(worldState.port));
-	if (!worldState.worldFilePath.trimmed().isEmpty() && worldRuntime->worldFilePath().trimmed().isEmpty())
-		worldRuntime->setWorldFilePath(worldState.worldFilePath);
+	if (!worldFilePath.trimmed().isEmpty() && worldRuntime->worldFilePath().trimmed().isEmpty())
+		worldRuntime->setWorldFilePath(worldFilePath);
 	worldRuntime->setWorldAttribute(QStringLiteral("utf_8"),
 	                                worldState.utf8Enabled ? QStringLiteral("1") : QStringLiteral("0"));
 
@@ -8432,7 +8455,7 @@ int AppController::populateDatabase() const
 		    key == QStringLiteral("FixedPitchFont"))
 			strDefault = m_fixedPitchFont;
 
-		QString strValue = normalizeStoredGlobalStringValue(key, strDefault);
+		QString strValue = normalizeStoredGlobalStringValue(key, strDefault, m_workingDir);
 
 		strValue.replace('\'', QStringLiteral("''")); // fix up quotes
 
@@ -8559,7 +8582,7 @@ void AppController::loadGlobalsFromDatabase()
 		if (key == QStringLiteral("LuaScript"))
 			dbValue = migrateLegacyLuaScriptTipText(dbValue);
 
-		QString storedValue = normalizeStoredGlobalStringValue(key, dbValue);
+		QString storedValue = normalizeStoredGlobalStringValue(key, dbValue, m_workingDir);
 		if (key.compare(QStringLiteral("WorldList"), Qt::CaseInsensitive) == 0)
 		{
 			bool          worldListChanged = false;
@@ -8581,7 +8604,7 @@ void AppController::loadGlobalsFromDatabase()
 			ensurePrefsSnapshot();
 			(void)dbWriteString(QStringLiteral("prefs"), key, storedValue);
 		}
-		const QString runtimeValue = normalizeRuntimeGlobalStringValue(key, storedValue);
+		const QString runtimeValue = normalizeRuntimeGlobalStringValue(key, storedValue, m_workingDir);
 		{
 			QMutexLocker locker(&m_globalPrefsMutex);
 			m_globalStringPrefs.insert(key, runtimeValue);
@@ -8728,7 +8751,7 @@ int AppController::dbWriteString(const QString &section, const QString &entry, c
 
 	QString normalizedValue = value;
 	if (section.compare(QStringLiteral("prefs"), Qt::CaseInsensitive) == 0)
-		normalizedValue = normalizeStoredGlobalStringValue(entry, normalizedValue);
+		normalizedValue = normalizeStoredGlobalStringValue(entry, normalizedValue, m_workingDir);
 
 	const QString escapedEntry = escapeSql(entry);
 	const QString escapedValue = escapeSql(normalizedValue);
@@ -14526,7 +14549,7 @@ void AppController::handleReloadQmud()
 		world.worldId                       = attrs.value(QStringLiteral("id")).trimmed();
 		if (world.displayName.isEmpty())
 			world.displayName = attrs.value(QStringLiteral("name")).trimmed();
-		world.worldFilePath   = runtime->worldFilePath();
+		world.worldFilePath   = dotRelativeStoragePath(m_workingDir, runtime->worldFilePath(), false);
 		world.host            = attrs.value(QStringLiteral("site")).trimmed();
 		world.port            = attrs.value(QStringLiteral("port")).toUShort();
 		world.utf8Enabled     = isEnabledFlag(attrs.value(QStringLiteral("utf_8")));

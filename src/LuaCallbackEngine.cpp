@@ -39,6 +39,7 @@
 #include "dialogs/SpellCheckDialog.h"
 #include "helpers/LuaExecutionUtils.h"
 #include "helpers/MiniWindowUtils.h"
+#include "helpers/PluginPathUtils.h"
 #include "helpers/WorldCommandProcessorUtils.h"
 #include "scripting/ScriptingErrors.h"
 
@@ -143,13 +144,17 @@ constexpr int kStyleInverse = INVERSE;
 constexpr int kStyleInverse = 0x0008;
 #endif
 // Keep legacy ShowWindow-compatible values returned by GetInfo(238).
-constexpr int kWindowShowNormal    = 1;
-constexpr int kWindowShowMaximized = 3;
-constexpr int kWindowMinimize      = 6;
-constexpr int kWindowRestore       = 9;
-constexpr int kAnsiBold            = 1;
-constexpr int kAnsiTextRed         = 31;
-constexpr int kAnsiTextCyan        = 36;
+constexpr int  kWindowShowNormal    = 1;
+constexpr int  kWindowShowMaximized = 3;
+constexpr int  kWindowMinimize      = 6;
+constexpr int  kWindowRestore       = 9;
+constexpr int  kAnsiBold            = 1;
+constexpr int  kAnsiTextRed         = 31;
+constexpr int  kAnsiTextCyan        = 36;
+
+static QString qmudHomeForLuaFileApi(const LuaCallbackEngine *engine);
+static bool    resolveLuaFileApiPath(const LuaCallbackEngine *engine, const QString &rawPath,
+                                     QString *resolvedPath, QString *error);
 
 #ifdef TRIGGER_MATCH_TEXT
 constexpr int kTriggerMatchText = TRIGGER_MATCH_TEXT;
@@ -9820,12 +9825,8 @@ void LuaCallbackEngine::setPluginInfo(const QString &id, const QString &name, co
 	{
 		normalizedDirectory += '/';
 	}
-#ifdef Q_OS_WIN
-	m_pluginDirectory = QDir::toNativeSeparators(normalizedDirectory);
-#else
 	normalizedDirectory.replace(QLatin1Char('\\'), QLatin1Char('/'));
 	m_pluginDirectory = normalizedDirectory;
-#endif
 }
 
 QString LuaCallbackEngine::pluginId() const
@@ -10601,12 +10602,18 @@ static int luaAddFont(lua_State *L)
 			lua_pushnumber(L, eBadParameter);
 			return 1;
 		}
-		if (!QFileInfo::exists(trimmedPath))
+		QString absolutePath;
+		QString pathError;
+		if (!resolveLuaFileApiPath(engine, trimmedPath, &absolutePath, &pathError))
 		{
 			lua_pushnumber(L, eFileNotFound);
 			return 1;
 		}
-		const QString absolutePath = QFileInfo(trimmedPath).absoluteFilePath();
+		if (!QFileInfo::exists(absolutePath))
+		{
+			lua_pushnumber(L, eFileNotFound);
+			return 1;
+		}
 		if (callbackScopeSyncBridgeForbidden())
 		{
 			const int results = enqueueRuntimeThreadAsyncStatusResult(
@@ -11821,12 +11828,19 @@ static int luaChatSendFile(lua_State *L)
 			lua_pushnumber(L, eFileNotFound);
 			return 1;
 		}
-		const QFileInfo fileInfo(path);
-		QFile           file(path);
+		QString resolvedPath;
+		QString pathError;
+		if (!resolveLuaFileApiPath(engine, path, &resolvedPath, &pathError))
+		{
+			lua_pushnumber(L, eFileNotFound);
+			return 1;
+		}
+		const QFileInfo fileInfo(resolvedPath);
+		QFile           file(resolvedPath);
 		if (!file.open(QIODevice::ReadOnly))
 		{
 			appendCallbackChatNoteOutputLine(engine, runtime, 14,
-			                                 QStringLiteral("File %1 cannot be opened.").arg(path));
+			                                 QStringLiteral("File %1 cannot be opened.").arg(resolvedPath));
 			lua_pushnumber(L, eFileNotFound);
 			return 1;
 		}
@@ -11838,14 +11852,15 @@ static int luaChatSendFile(lua_State *L)
 		    blockSize > 0 ? (fileSize + blockSize - 1) / blockSize : static_cast<qlonglong>(0);
 		const int results = enqueueRuntimeThreadAsyncOkStatusResult(
 		    L, engine, runtime, QStringLiteral("ChatSendFile"), eChatIDNotFound,
-		    [id, path](WorldRuntime &targetRuntime) -> int { return targetRuntime.chatSendFile(id, path); });
+		    [id, resolvedPath](WorldRuntime &targetRuntime) -> int
+		    { return targetRuntime.chatSendFile(id, resolvedPath); });
 		if (lua_tointeger(L, -results) != eOK)
 			return results;
-		setCallbackChatFileTransferSnapshot(engine, id, true, true, fileInfo.fileName(), path, fileSize,
-		                                    fileBlocks, 0, QDateTime::currentDateTime());
+		setCallbackChatFileTransferSnapshot(engine, id, true, true, fileInfo.fileName(), resolvedPath,
+		                                    fileSize, fileBlocks, 0, QDateTime::currentDateTime());
 		appendCallbackChatNoteOutputLine(engine, runtime, 14,
 		                                 QStringLiteral("Initiated transfer of file %1, %2 bytes (%3 Kb).")
-		                                     .arg(path)
+		                                     .arg(resolvedPath)
 		                                     .arg(fileSize)
 		                                     .arg(static_cast<double>(fileSize) / 1024.0, 0, 'f', 1));
 		return results;
@@ -19845,7 +19860,14 @@ static int luaReadNamesFile(lua_State *L)
 		return 1;
 	}
 	const QString fileName = QString::fromUtf8(luaL_checkstring(L, 1));
-	lua_pushnumber(L, WorldRuntime::readNamesFile(fileName));
+	QString       resolvedFileName;
+	QString       pathError;
+	if (!resolveLuaFileApiPath(engine, fileName, &resolvedFileName, &pathError))
+	{
+		lua_pushnumber(L, 0);
+		return 1;
+	}
+	lua_pushnumber(L, WorldRuntime::readNamesFile(resolvedFileName));
 	return 1;
 }
 
@@ -20312,7 +20334,14 @@ static int luaSaveNotepad(lua_State *L)
 		lua_pushnumber(L, 0);
 		return 1;
 	}
-	if (!replace && QFileInfo::exists(fileName))
+	QString resolvedFileName;
+	QString pathError;
+	if (!resolveLuaFileApiPath(engine, fileName, &resolvedFileName, &pathError))
+	{
+		lua_pushnumber(L, 0);
+		return 1;
+	}
+	if (!replace && QFileInfo::exists(resolvedFileName))
 	{
 		lua_pushnumber(L, 0);
 		return 1;
@@ -20326,7 +20355,7 @@ static int luaSaveNotepad(lua_State *L)
 		const bool                 queued =
 		    app && QMetaObject::invokeMethod(
 		               app.data(),
-		               [runtimeGuard, title, worldId, fileName, callbackPluginId, requestId]
+		               [runtimeGuard, title, worldId, resolvedFileName, callbackPluginId, requestId]
 		               {
 			               WorldRuntime *targetRuntime = runtimeGuard.data();
 			               if (!targetRuntime)
@@ -20336,7 +20365,7 @@ static int luaSaveNotepad(lua_State *L)
 			               if (TextChildWindow *text = findNotepadWindow(title, targetRuntime, worldId);
 			                   text && text->editor())
 			               {
-				               ok = text->saveToFile(fileName, &error);
+				               ok = text->saveToFile(resolvedFileName, &error);
 			               }
 			               emitPluginAsyncResult(*targetRuntime, callbackPluginId, requestId,
 			                                     QStringLiteral("SaveNotepad"), ok, ok ? 0 : -1, error);
@@ -20351,13 +20380,13 @@ static int luaSaveNotepad(lua_State *L)
 		return 1;
 	}
 	const bool ok = runOnMainWindowThread(
-	    [title, runtime, worldId, fileName](MainWindow *) -> bool
+	    [title, runtime, worldId, resolvedFileName](MainWindow *) -> bool
 	    {
 		    TextChildWindow *text = findNotepadWindow(title, runtime, worldId);
 		    if (!text || !text->editor())
 			    return false;
 		    QString error;
-		    return text->saveToFile(fileName, &error);
+		    return text->saveToFile(resolvedFileName, &error);
 	    },
 	    false, true);
 	lua_pushnumber(L, ok ? 1 : 0);
@@ -20500,13 +20529,25 @@ static int luaSetBackgroundImage(lua_State *L)
 			lua_pushnumber(L, eBadParameter);
 			return 1;
 		}
-		QString storedName;
-		if (const int validationResult = WorldRuntime::loadWorldImageFile(fileName, nullptr, &storedName);
+		QString resolvedFileName;
+		QString pathError;
+		if (!fileName.trimmed().isEmpty() &&
+		    !resolveLuaFileApiPath(engine, fileName, &resolvedFileName, &pathError))
+		{
+			lua_pushnumber(L, eFileNotFound);
+			return 1;
+		}
+		const QString imageFileName = fileName.trimmed().isEmpty() ? QString() : resolvedFileName;
+		if (const int validationResult = WorldRuntime::loadWorldImageFile(imageFileName, nullptr, nullptr);
 		    validationResult != eOK)
 		{
 			lua_pushnumber(L, validationResult);
 			return 1;
 		}
+		const QString storedName =
+		    imageFileName.isEmpty() ? QString()
+		                            : QMudPluginPathUtils::qmudHomeRelativePath(qmudHomeForLuaFileApi(engine),
+		                                                                        imageFileName, false);
 		if (callbackScopeSyncBridgeForbidden())
 		{
 			return enqueueRuntimeThreadAsyncStatusResult(
@@ -20689,13 +20730,25 @@ static int luaSetForegroundImage(lua_State *L)
 			lua_pushnumber(L, eBadParameter);
 			return 1;
 		}
-		QString storedName;
-		if (const int validationResult = WorldRuntime::loadWorldImageFile(fileName, nullptr, &storedName);
+		QString resolvedFileName;
+		QString pathError;
+		if (!fileName.trimmed().isEmpty() &&
+		    !resolveLuaFileApiPath(engine, fileName, &resolvedFileName, &pathError))
+		{
+			lua_pushnumber(L, eFileNotFound);
+			return 1;
+		}
+		const QString imageFileName = fileName.trimmed().isEmpty() ? QString() : resolvedFileName;
+		if (const int validationResult = WorldRuntime::loadWorldImageFile(imageFileName, nullptr, nullptr);
 		    validationResult != eOK)
 		{
 			lua_pushnumber(L, validationResult);
 			return 1;
 		}
+		const QString storedName =
+		    imageFileName.isEmpty() ? QString()
+		                            : QMudPluginPathUtils::qmudHomeRelativePath(qmudHomeForLuaFileApi(engine),
+		                                                                        imageFileName, false);
 		if (callbackScopeSyncBridgeForbidden())
 		{
 			return enqueueRuntimeThreadAsyncStatusResult(
@@ -22265,6 +22318,49 @@ static int luaGetStatusTime(lua_State *L)
 	return 1;
 }
 
+static QString qmudHomeForLuaFileApi(const LuaCallbackEngine *engine)
+{
+	const WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	return QMudPluginPathUtils::normalizeSeparators(runtime ? runtime->startupDirectory() : QString());
+}
+
+static bool resolveLuaFileApiPath(const LuaCallbackEngine *engine, const QString &rawPath,
+                                  QString *resolvedPath, QString *error)
+{
+	if ((engine ? engine->worldRuntimeForBridgedCall() : nullptr) == nullptr)
+	{
+		if (error)
+			*error = QStringLiteral("Lua file path API has no attached world runtime");
+		return false;
+	}
+	return QMudPluginPathUtils::resolveInsideQmudHome(qmudHomeForLuaFileApi(engine), rawPath, resolvedPath,
+	                                                  error);
+}
+
+static int luaResolveFilePathForApi(lua_State *L)
+{
+	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	const QString rawPath = QString::fromUtf8(luaL_checkstring(L, 1));
+	QString       resolved;
+	QString       error;
+	if (!resolveLuaFileApiPath(engine, rawPath, &resolved, &error))
+		return luaL_error(L, "QMud file path rejected: %s", qPrintable(error));
+	lua_pushstring(L, resolved.toUtf8().constData());
+	return 1;
+}
+
+static QString qmudHomeRelativePathForGetInfo(const LuaCallbackEngine *engine, const QString &path,
+                                              const bool trailingSlash)
+{
+	return QMudPluginPathUtils::qmudHomeRelativePath(qmudHomeForLuaFileApi(engine), path, trailingSlash);
+}
+
+static void pushLuaString(lua_State *L, const QString &value)
+{
+	const QByteArray bytes = value.toLocal8Bit();
+	lua_pushlstring(L, bytes.constData(), bytes.size());
+}
+
 static int luaGetInfo(lua_State *L)
 {
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
@@ -22315,10 +22411,12 @@ static int luaGetInfo(lua_State *L)
 		lua_pushstring(L, getAttr(QStringLiteral("notes")).toLocal8Bit().constData());
 		return 1;
 	case 9:
-		lua_pushstring(L, getAttr(QStringLiteral("new_activity_sound")).toLocal8Bit().constData());
+		pushLuaString(
+		    L, qmudHomeRelativePathForGetInfo(engine, getAttr(QStringLiteral("new_activity_sound")), false));
 		return 1;
 	case 10:
-		lua_pushstring(L, getAttr(QStringLiteral("script_editor")).toLocal8Bit().constData());
+		pushLuaString(
+		    L, qmudHomeRelativePathForGetInfo(engine, getAttr(QStringLiteral("script_editor")), false));
 		return 1;
 	case 11:
 		lua_pushstring(L, getMulti(QStringLiteral("log_file_preamble")).toLocal8Bit().constData());
@@ -22393,7 +22491,8 @@ static int luaGetInfo(lua_State *L)
 		lua_pushstring(L, getAttr(QStringLiteral("on_world_lose_focus")).toLocal8Bit().constData());
 		return 1;
 	case 35:
-		lua_pushstring(L, getAttr(QStringLiteral("script_filename")).toLocal8Bit().constData());
+		pushLuaString(
+		    L, qmudHomeRelativePathForGetInfo(engine, getAttr(QStringLiteral("script_filename")), false));
 		return 1;
 	case 36:
 		lua_pushstring(L, getAttr(QStringLiteral("script_prefix")).toLocal8Bit().constData());
@@ -22408,7 +22507,8 @@ static int luaGetInfo(lua_State *L)
 		lua_pushstring(L, getAttr(QStringLiteral("tab_completion_defaults")).toLocal8Bit().constData());
 		return 1;
 	case 40:
-		lua_pushstring(L, getAttr(QStringLiteral("auto_log_file_name")).toLocal8Bit().constData());
+		pushLuaString(
+		    L, qmudHomeRelativePathForGetInfo(engine, getAttr(QStringLiteral("auto_log_file_name")), false));
 		return 1;
 	case 41:
 		lua_pushstring(L, getAttr(QStringLiteral("recall_line_preamble")).toLocal8Bit().constData());
@@ -22438,7 +22538,8 @@ static int luaGetInfo(lua_State *L)
 		lua_pushstring(L, getAttr(QStringLiteral("on_mxp_set_variable")).toLocal8Bit().constData());
 		return 1;
 	case 50:
-		lua_pushstring(L, getAttr(QStringLiteral("beep_sound")).toLocal8Bit().constData());
+		pushLuaString(L,
+		              qmudHomeRelativePathForGetInfo(engine, getAttr(QStringLiteral("beep_sound")), false));
 		return 1;
 	case 51:
 	{
@@ -22448,7 +22549,7 @@ static int luaGetInfo(lua_State *L)
 			lua_pushstring(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.logFileName.toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.logFileName, false));
 		return 1;
 	}
 	case 52:
@@ -22481,7 +22582,7 @@ static int luaGetInfo(lua_State *L)
 			lua_pushstring(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.worldFilePath.toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.worldFilePath, false));
 		return 1;
 	}
 	case 55:
@@ -22496,7 +22597,7 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	}
 	case 56:
-		lua_pushstring(L, QCoreApplication::applicationFilePath().toLocal8Bit().constData());
+		pushLuaString(L, QMudPluginPathUtils::normalizeSeparators(QCoreApplication::applicationFilePath()));
 		return 1;
 	case 57:
 	{
@@ -22506,7 +22607,7 @@ static int luaGetInfo(lua_State *L)
 			lua_pushstring(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.defaultWorldDirectory.toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.defaultWorldDirectory, true));
 		return 1;
 	}
 	case 58:
@@ -22517,11 +22618,11 @@ static int luaGetInfo(lua_State *L)
 			lua_pushstring(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.defaultLogDirectory.toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.defaultLogDirectory, true));
 		return 1;
 	}
 	case 59:
-		lua_pushstring(L, QCoreApplication::applicationDirPath().toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, qmudHomeForLuaFileApi(engine), true));
 		return 1;
 	case 60:
 	{
@@ -22531,7 +22632,7 @@ static int luaGetInfo(lua_State *L)
 			lua_pushstring(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.pluginsDirectory.toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.pluginsDirectory, true));
 		return 1;
 	}
 	case 61:
@@ -22561,10 +22662,7 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	case 64:
 	{
-		QString cwd = QDir::currentPath();
-		if (const QChar sep = QDir::separator(); !cwd.endsWith(sep))
-			cwd += sep;
-		lua_pushstring(L, cwd.toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, qmudHomeForLuaFileApi(engine), true));
 		return 1;
 	}
 	case 65:
@@ -22578,11 +22676,7 @@ static int luaGetInfo(lua_State *L)
 		QString                               base;
 		if (resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 			base = snapshot.startupDirectory;
-		if (base.isEmpty())
-			base = QCoreApplication::applicationDirPath();
-		if (!base.endsWith(QDir::separator()))
-			base.append(QDir::separator());
-		lua_pushstring(L, base.toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, base, true));
 		return 1;
 	}
 	case 67:
@@ -22596,11 +22690,8 @@ static int luaGetInfo(lua_State *L)
 			lua_pushstring(L, "");
 			return 1;
 		}
-		QFileInfo info(worldFilePath);
-		QString   worldDir = info.absolutePath();
-		if (const QChar sep = QDir::separator(); !worldDir.isEmpty() && !worldDir.endsWith(sep))
-			worldDir += sep;
-		lua_pushstring(L, worldDir.toLocal8Bit().constData());
+		const QString worldDir = QFileInfo(QMudPluginPathUtils::normalizeSeparators(worldFilePath)).path();
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, worldDir, true));
 		return 1;
 	}
 	case 68:
@@ -22611,7 +22702,7 @@ static int luaGetInfo(lua_State *L)
 			lua_pushstring(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.startupDirectory.toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.startupDirectory, true));
 		return 1;
 	}
 	case 69:
@@ -22622,7 +22713,7 @@ static int luaGetInfo(lua_State *L)
 			lua_pushstring(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.translatorFile.toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.translatorFile, false));
 		return 1;
 	}
 	case 70:
@@ -22661,10 +22752,8 @@ static int luaGetInfo(lua_State *L)
 			root = snapshot.startupDirectory;
 		if (root.isEmpty())
 			root = QCoreApplication::applicationDirPath();
-		QString sounds = QDir(root).filePath(QStringLiteral("sounds"));
-		if (const QChar sep = QDir::separator(); !sounds.endsWith(sep))
-			sounds += sep;
-		lua_pushstring(L, sounds.toLocal8Bit().constData());
+		const QString sounds = QDir(root).filePath(QStringLiteral("sounds"));
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, sounds, true));
 		return 1;
 	}
 	case 75:
@@ -22686,17 +22775,19 @@ static int luaGetInfo(lua_State *L)
 			lua_pushstring(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.firstSpecialFontPath.toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.firstSpecialFontPath, false));
 		return 1;
 	}
 	case 77:
 		lua_pushstring(L, "");
 		return 1;
 	case 78:
-		lua_pushstring(L, getAttr(QStringLiteral("foreground_image")).toLocal8Bit().constData());
+		pushLuaString(
+		    L, qmudHomeRelativePathForGetInfo(engine, getAttr(QStringLiteral("foreground_image")), false));
 		return 1;
 	case 79:
-		lua_pushstring(L, getAttr(QStringLiteral("background_image")).toLocal8Bit().constData());
+		pushLuaString(
+		    L, qmudHomeRelativePathForGetInfo(engine, getAttr(QStringLiteral("background_image")), false));
 		return 1;
 	case 81:
 	case 80:
@@ -22710,7 +22801,7 @@ static int luaGetInfo(lua_State *L)
 			lua_pushstring(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.preferencesDatabaseName.toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.preferencesDatabaseName, false));
 		return 1;
 	}
 	case 83:
@@ -22724,7 +22815,7 @@ static int luaGetInfo(lua_State *L)
 			lua_pushstring(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.fileBrowsingDirectory.toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.fileBrowsingDirectory, true));
 		return 1;
 	}
 	case 85:
@@ -22735,7 +22826,7 @@ static int luaGetInfo(lua_State *L)
 			lua_pushstring(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.stateFilesDirectory.toLocal8Bit().constData());
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.stateFilesDirectory, true));
 		return 1;
 	}
 	case 86:
@@ -24955,7 +25046,12 @@ static int luaUtilsHash(lua_State *L)
 
 static int luaUtilsReadDir(lua_State *L)
 {
-	const QString   pattern = QString::fromUtf8(luaL_checkstring(L, 1));
+	QString       error;
+	QString       pattern;
+	const QString rawPattern = QString::fromUtf8(luaL_checkstring(L, 1));
+	const auto   *engine     = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	if (!resolveLuaFileApiPath(engine, rawPattern, &pattern, &error))
+		return luaL_error(L, "QMud file path rejected: %s", qPrintable(error));
 	const QFileInfo patternInfo(pattern);
 	QDir            dir = patternInfo.dir();
 	if (!dir.exists())
@@ -25047,11 +25143,11 @@ static int luaUtilsInfo(lua_State *L)
 	if (const QString currentDir = slashPathWithTrailingSlash(QDir::currentPath()); !currentDir.isEmpty())
 	{
 		lua_pushstring(L, "current_directory");
-		lua_pushstring(L, currentDir.toUtf8().constData());
+		lua_pushstring(L, qmudHomeRelativePathForGetInfo(engine, currentDir, true).toUtf8().constData());
 		lua_rawset(L, -3);
 	}
 
-	const QString appDir = slashPathWithTrailingSlash(QCoreApplication::applicationDirPath());
+	const QString appDir = qmudHomeRelativePathForGetInfo(engine, qmudHomeForLuaFileApi(engine), true);
 	lua_pushstring(L, "app_directory");
 	lua_pushstring(L, appDir.toUtf8().constData());
 	lua_rawset(L, -3);
@@ -25068,16 +25164,16 @@ static int luaUtilsInfo(lua_State *L)
 		auto globalString = [app](const char *key) -> QString
 		{ return app->getGlobalOption(QString::fromLatin1(key)).toString(); };
 
-		setString("world_files_directory", slashPathWithTrailingSlash(app->makeAbsolutePath(
-		                                       globalString("DefaultWorldFileDirectory"))));
+		setString("world_files_directory",
+		          qmudHomeRelativePathForGetInfo(engine, globalString("DefaultWorldFileDirectory"), true));
 		setString("state_files_directory",
-		          slashPathWithTrailingSlash(app->makeAbsolutePath(globalString("StateFilesDirectory"))));
+		          qmudHomeRelativePathForGetInfo(engine, globalString("StateFilesDirectory"), true));
 		setString("log_files_directory",
-		          slashPathWithTrailingSlash(app->makeAbsolutePath(globalString("DefaultLogFileDirectory"))));
+		          qmudHomeRelativePathForGetInfo(engine, globalString("DefaultLogFileDirectory"), true));
 		setString("plugins_directory",
-		          slashPathWithTrailingSlash(app->makeAbsolutePath(globalString("PluginsDirectory"))));
+		          qmudHomeRelativePathForGetInfo(engine, globalString("PluginsDirectory"), true));
 		setString("startup_directory",
-		          slashPathWithTrailingSlash(QFileInfo(app->iniFilePath()).absolutePath()));
+		          qmudHomeRelativePathForGetInfo(engine, QFileInfo(app->iniFilePath()).absolutePath(), true));
 		setString("locale", globalString("Locale"));
 		setString("fixed_pitch_font", globalString("FixedPitchFont"));
 		lua_pushstring(L, "fixed_pitch_font_size");
@@ -25091,7 +25187,7 @@ static int luaUtilsInfo(lua_State *L)
 			if (resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 				translatorFile = snapshot.translatorFile;
 		}
-		setString("translator_file", QDir::fromNativeSeparators(translatorFile));
+		setString("translator_file", qmudHomeRelativePathForGetInfo(engine, translatorFile, false));
 	}
 
 	return 1;
@@ -25933,7 +26029,8 @@ static int luaUtilsFilePicker(lua_State *L)
 	auto         *engine           = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	WorldRuntime *runtime          = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 
-	QString       initialDir = QDir::currentPath();
+	const QString qmudHome   = qmudHomeForLuaFileApi(engine);
+	QString       initialDir = qmudHome.isEmpty() ? QDir::currentPath() : qmudHome;
 	if (runtime)
 	{
 		const bool callbackForbidden =
@@ -25942,14 +26039,16 @@ static int luaUtilsFilePicker(lua_State *L)
 		if (resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
 			if (!snapshot.fileBrowsingDirectory.isEmpty())
-				initialDir = snapshot.fileBrowsingDirectory;
+				static_cast<void>(QMudPluginPathUtils::resolveInsideQmudHome(
+				    qmudHome, snapshot.fileBrowsingDirectory, &initialDir));
 		}
 		else if (!callbackForbidden)
 		{
 			const QString runtimeDir = runOnRuntimeThread(
 			    runtime, [&]() -> QString { return runtime->fileBrowsingDirectory(); }, QString());
 			if (!runtimeDir.isEmpty())
-				initialDir = runtimeDir;
+				static_cast<void>(
+				    QMudPluginPathUtils::resolveInsideQmudHome(qmudHome, runtimeDir, &initialDir));
 		}
 	}
 
@@ -25959,13 +26058,13 @@ static int luaUtilsFilePicker(lua_State *L)
 		const quint64 requestId        = callbackPluginId.isEmpty() ? 0 : nextPluginAsyncResultRequestId();
 		const bool    accepted         = enqueueRuntimeThreadDeferredMutationNoResult(
 		    engine, runtime,
-		    [title, defaultName, defaultExtension, filterString, saveDialog, initialDir, callbackPluginId,
-		     requestId](WorldRuntime &targetRuntime)
+		    [title, defaultName, defaultExtension, filterString, saveDialog, initialDir, qmudHome,
+		     callbackPluginId, requestId](WorldRuntime &targetRuntime)
 		    {
 			    const QPointer<WorldRuntime> runtimeGuard(&targetRuntime);
 			    const bool                   queued = enqueueOnMainThread(
 			        [runtimeGuard, title, defaultName, defaultExtension, filterString, saveDialog, initialDir,
-			         callbackPluginId, requestId]()
+			         qmudHome, callbackPluginId, requestId]()
 			        {
 				        WorldRuntime *targetRuntimeOnMain = runtimeGuard.data();
 				        if (!targetRuntimeOnMain)
@@ -25999,9 +26098,23 @@ static int luaUtilsFilePicker(lua_State *L)
 					        return;
 				        }
 
-				        const QString resolvedPath  = QDir::toNativeSeparators(selectedPath);
-				        const QString browseDir     = QFileInfo(selectedPath).absolutePath();
-				        const bool    runtimeQueued = QMetaObject::invokeMethod(
+				        const QString cleanedSelected =
+				            QDir::cleanPath(QMudPluginPathUtils::normalizeSeparators(selectedPath));
+				        const QString selectedContainer =
+				            saveDialog ? QFileInfo(cleanedSelected).absolutePath() : cleanedSelected;
+				        if (!QMudPluginPathUtils::pathIsWithinOrEqualTo(selectedContainer, qmudHome))
+				        {
+					        emitPluginAsyncResult(*targetRuntimeOnMain, callbackPluginId, requestId,
+					                              QStringLiteral("FilePicker"), false, eCouldNotOpenFile,
+					                              QString());
+					        return;
+				        }
+
+				        const QString resolvedPath =
+				            QMudPluginPathUtils::qmudHomeRelativePath(qmudHome, cleanedSelected, false);
+				        const QString browseDir = QMudPluginPathUtils::qmudHomeRelativePath(
+				            qmudHome, QFileInfo(cleanedSelected).absolutePath(), true);
+				        const bool runtimeQueued = QMetaObject::invokeMethod(
 				            targetRuntimeOnMain,
 				            [runtimeGuard, callbackPluginId, requestId, resolvedPath, browseDir]
 				            {
@@ -26058,15 +26171,26 @@ static int luaUtilsFilePicker(lua_State *L)
 		return 1;
 	}
 
+	const QString cleanedSelected = QDir::cleanPath(QMudPluginPathUtils::normalizeSeparators(selectedPath));
+	const QString selectedContainer =
+	    saveDialog ? QFileInfo(cleanedSelected).absolutePath() : cleanedSelected;
+	if (!QMudPluginPathUtils::pathIsWithinOrEqualTo(selectedContainer, qmudHome))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+
 	if (runtime)
 	{
 		const QString absolutePath = QFileInfo(selectedPath).absolutePath();
 		enqueueRuntimeThreadDeferredMutationNoResult(
 		    engine, runtime, [absolutePath](WorldRuntime &targetRuntime)
 		    { targetRuntime.setFileBrowsingDirectory(absolutePath); });
-		setCallbackFileBrowsingDirectorySnapshot(engine, runtime, absolutePath);
+		setCallbackFileBrowsingDirectorySnapshot(
+		    engine, runtime, QMudPluginPathUtils::qmudHomeRelativePath(qmudHome, absolutePath, true));
 	}
-	const QByteArray bytes = QDir::toNativeSeparators(selectedPath).toUtf8();
+	const QString    resultPath = QMudPluginPathUtils::qmudHomeRelativePath(qmudHome, cleanedSelected, false);
+	const QByteArray bytes      = resultPath.toUtf8();
 	lua_pushlstring(L, bytes.constData(), bytes.size());
 	return 1;
 }
@@ -41364,7 +41488,16 @@ static int luaWindowLoadImage(lua_State *L)
 			lua_pushnumber(L, eBadParameter);
 			return 1;
 		}
-		if (!QFileInfo::exists(trimmed))
+		QString resolvedFileName;
+		QString pathError;
+		if (!resolveLuaFileApiPath(engine, trimmed, &resolvedFileName, &pathError))
+		{
+			enqueueRuntimeLoad();
+			removeShadowImage();
+			lua_pushnumber(L, eFileNotFound);
+			return 1;
+		}
+		if (!QFileInfo::exists(resolvedFileName))
 		{
 			enqueueRuntimeLoad();
 			removeShadowImage();
@@ -41372,7 +41505,7 @@ static int luaWindowLoadImage(lua_State *L)
 			return 1;
 		}
 		QImage image;
-		if (!image.load(trimmed))
+		if (!image.load(resolvedFileName))
 		{
 			enqueueRuntimeLoad();
 			removeShadowImage();
@@ -41380,7 +41513,7 @@ static int luaWindowLoadImage(lua_State *L)
 			return 1;
 		}
 		enqueueRuntimeLoad();
-		loadCallbackMiniWindowShadowImage(engine, name, imageId, filename);
+		loadCallbackMiniWindowShadowImage(engine, name, imageId, resolvedFileName);
 		cacheCallbackMiniWindowImageExists(engine, name, imageId, true);
 		clearCallbackMiniWindowImageHasAlphaCache(engine, name, imageId);
 		invalidateCallbackMiniWindowListCachesForWindow(engine, name);
@@ -42109,10 +42242,18 @@ static int luaWindowWrite(lua_State *L)
 			lua_pushnumber(L, eBadParameter);
 			return 1;
 		}
+		QString resolvedFileName;
+		QString pathError;
+		if (!resolveLuaFileApiPath(engine, trimmedFileName, &resolvedFileName, &pathError))
+		{
+			lua_pushnumber(L, eCouldNotOpenFile);
+			return 1;
+		}
 		if (const MiniWindow *shadow = callbackMiniWindowShadowConst(engine, name))
 		{
-			lua_pushnumber(
-			    L, MiniWindowUtils::saveWindowImage24Bit(*shadow, trimmedFileName) ? eOK : eCouldNotOpenFile);
+			lua_pushnumber(L, MiniWindowUtils::saveWindowImage24Bit(*shadow, resolvedFileName)
+			                      ? eOK
+			                      : eCouldNotOpenFile);
 			return 1;
 		}
 		if (callbackScopeSyncBridgeForbidden())
@@ -42148,7 +42289,7 @@ static int luaWindowWrite(lua_State *L)
 		snapshotWindow.height =
 		    qMax(1, static_cast<int>(std::ceil(snapshot.deviceIndependentSize().height())));
 		snapshotWindow.setBackingSurface(snapshot);
-		lua_pushnumber(L, MiniWindowUtils::saveWindowImage24Bit(snapshotWindow, trimmedFileName)
+		lua_pushnumber(L, MiniWindowUtils::saveWindowImage24Bit(snapshotWindow, resolvedFileName)
 		                      ? eOK
 		                      : eCouldNotOpenFile);
 		return 1;
@@ -42776,6 +42917,123 @@ static int luaWindowMenu(lua_State *L)
 }
 #endif
 
+static void installLuaFilePathCompat(lua_State *L, LuaCallbackEngine *engine)
+{
+	if (!L)
+		return;
+
+	lua_pushlightuserdata(L, engine);
+	lua_pushcclosure(L, luaResolveFilePathForApi, 1);
+	lua_setglobal(L, "__qmud_resolve_file_path");
+
+	static const auto *kFilePathCompatScript = R"lua(
+if not rawget(_G, "__qmud_file_path_compat_installed") then
+__qmud_file_path_compat_installed = true
+local qmud_resolve_file_path = __qmud_resolve_file_path
+
+local function qmud_resolve_string_path(path)
+  if type(path) ~= "string" then return path end
+  return qmud_resolve_file_path(path)
+end
+
+if type(io) == "table" then
+  local io_open = io.open
+  if type(io_open) == "function" then
+    io.open = function(filename, mode)
+      return io_open(qmud_resolve_string_path(filename), mode)
+    end
+  end
+
+  local io_lines = io.lines
+  if type(io_lines) == "function" then
+    io.lines = function(filename, ...)
+      if filename == nil then
+        return io_lines()
+      end
+      return io_lines(qmud_resolve_string_path(filename), ...)
+    end
+  end
+
+  local io_input = io.input
+  if type(io_input) == "function" then
+    io.input = function(file)
+      if file == nil then
+        return io_input()
+      end
+      return io_input(qmud_resolve_string_path(file))
+    end
+  end
+
+  local io_output = io.output
+  if type(io_output) == "function" then
+    io.output = function(file)
+      if file == nil then
+        return io_output()
+      end
+      return io_output(qmud_resolve_string_path(file))
+    end
+  end
+end
+
+if type(os) == "table" then
+  local os_remove = os.remove
+  if type(os_remove) == "function" then
+    os.remove = function(filename)
+      return os_remove(qmud_resolve_string_path(filename))
+    end
+  end
+
+  local os_rename = os.rename
+  if type(os_rename) == "function" then
+    os.rename = function(oldname, newname)
+      return os_rename(qmud_resolve_string_path(oldname), qmud_resolve_string_path(newname))
+    end
+  end
+end
+
+local qmud_loadfile = loadfile
+if type(qmud_loadfile) == "function" then
+  loadfile = function(filename)
+    if filename == nil then
+      return qmud_loadfile()
+    end
+    return qmud_loadfile(qmud_resolve_string_path(filename))
+  end
+end
+
+local qmud_dofile = dofile
+if type(qmud_dofile) == "function" then
+  dofile = function(filename)
+    if filename == nil then
+      return qmud_dofile()
+    end
+    return qmud_dofile(qmud_resolve_string_path(filename))
+  end
+end
+
+if type(sqlite3) == "table" and type(sqlite3.open) == "function" then
+  local sqlite_open = sqlite3.open
+  sqlite3.open = function(filename, ...)
+    if filename == ":memory:" then
+      return sqlite_open(filename, ...)
+    end
+    return sqlite_open(qmud_resolve_string_path(filename), ...)
+  end
+end
+end
+)lua";
+
+	const bool         failed = luaL_dostring(L, kFilePathCompatScript) != 0;
+	lua_pushnil(L);
+	lua_setglobal(L, "__qmud_resolve_file_path");
+	if (failed)
+	{
+		const char *err = lua_tostring(L, -1);
+		qWarning() << "Failed to install Lua file path normalization mapping:" << (err ? err : "<unknown>");
+		lua_pop(L, 1);
+	}
+}
+
 bool LuaCallbackEngine::ensureState()
 {
 	bindOrAssertExecutionThread("LuaCallbackEngine::ensureState");
@@ -42801,7 +43059,10 @@ bool LuaCallbackEngine::ensureState()
 	}
 
 	if (!m_worldBindingsReady)
+	{
 		registerWorldBindings();
+		installLuaFilePathCompat(m_state, this);
+	}
 
 	if (!m_packageRestrictionsApplied || m_packageRestrictionsAppliedValue != m_allowPackage)
 	{
@@ -42960,7 +43221,18 @@ static int luaTestGetInfo(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	const int infoType = static_cast<int>(luaL_checkinteger(L, 1));
+	WorldRuntime *runtime  = engine->worldRuntimeForBridgedCall();
+	const int     infoType = static_cast<int>(luaL_checkinteger(L, 1));
+	if (infoType == 56)
+	{
+		pushLuaString(L, QMudPluginPathUtils::normalizeSeparators(QCoreApplication::applicationFilePath()));
+		return 1;
+	}
+	if (!runtime)
+	{
+		lua_pushnil(L);
+		return 1;
+	}
 	if (infoType == 86)
 	{
 		if (const auto *snapshot = engine->currentDispatchMiniWindowSnapshot();
@@ -42972,9 +43244,76 @@ static int luaTestGetInfo(lua_State *L)
 			lua_pushlstring(L, bytes.constData(), bytes.size());
 			return 1;
 		}
+		lua_pushstring(L, "");
+		return 1;
 	}
-	lua_pushnil(L);
-	return 1;
+
+	const auto pushRelative = [L, engine](const QString &path, const bool trailingSlash)
+	{
+		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, path, trailingSlash));
+		return 1;
+	};
+	const auto pushAttribute = [&](const QString &key, const bool trailingSlash)
+	{ return pushRelative(runtime->worldAttributeValue(key), trailingSlash); };
+
+	switch (infoType)
+	{
+	case 9:
+		return pushAttribute(QStringLiteral("new_activity_sound"), false);
+	case 10:
+		return pushAttribute(QStringLiteral("script_editor"), false);
+	case 35:
+		return pushAttribute(QStringLiteral("script_filename"), false);
+	case 40:
+		return pushAttribute(QStringLiteral("auto_log_file_name"), false);
+	case 50:
+		return pushAttribute(QStringLiteral("beep_sound"), false);
+	case 59:
+	case 64:
+		return pushRelative(qmudHomeForLuaFileApi(engine), true);
+	case 78:
+		return pushAttribute(QStringLiteral("foreground_image"), false);
+	case 79:
+		return pushAttribute(QStringLiteral("background_image"), false);
+	default:
+		break;
+	}
+
+	const WorldRuntime::RuntimeCountersSnapshot snapshot = runtime->runtimeCountersSnapshot(true);
+	switch (infoType)
+	{
+	case 51:
+		return pushRelative(snapshot.logFileName, false);
+	case 54:
+		return pushRelative(snapshot.worldFilePath, false);
+	case 57:
+		return pushRelative(snapshot.defaultWorldDirectory, true);
+	case 58:
+		return pushRelative(snapshot.defaultLogDirectory, true);
+	case 60:
+		return pushRelative(snapshot.pluginsDirectory, true);
+	case 66:
+	case 68:
+		return pushRelative(snapshot.startupDirectory, true);
+	case 67:
+		return pushRelative(
+		    QFileInfo(QMudPluginPathUtils::normalizeSeparators(snapshot.worldFilePath)).path(), true);
+	case 69:
+		return pushRelative(snapshot.translatorFile, false);
+	case 74:
+		return pushRelative(QDir(snapshot.startupDirectory).filePath(QStringLiteral("sounds")), true);
+	case 76:
+		return pushRelative(snapshot.firstSpecialFontPath, false);
+	case 82:
+		return pushRelative(snapshot.preferencesDatabaseName, false);
+	case 84:
+		return pushRelative(snapshot.fileBrowsingDirectory, true);
+	case 85:
+		return pushRelative(snapshot.stateFilesDirectory, true);
+	default:
+		lua_pushnil(L);
+		return 1;
+	}
 }
 
 static int luaTestNote(lua_State *L)
@@ -43190,6 +43529,14 @@ void LuaCallbackEngine::registerWorldBindings()
 	};
 	for (const LuaBindingEntry *entry = kMinimalWorldBindings; entry->name != nullptr; ++entry)
 		registerWorldFn(entry->name, entry->function);
+	lua_newtable(m_state);
+	lua_pushlightuserdata(m_state, this);
+	lua_pushcclosure(m_state, luaUtilsInfo, 1);
+	lua_setfield(m_state, -2, "info");
+	lua_pushlightuserdata(m_state, this);
+	lua_pushcclosure(m_state, luaUtilsReadDir, 1);
+	lua_setfield(m_state, -2, "readdir");
+	lua_setglobal(m_state, "utils");
 	lua_pushnumber(m_state, eOK);
 	lua_setglobal(m_state, "eOK");
 	m_worldBindingsReady = true;

@@ -16,6 +16,12 @@
 #include "WorldView.h"
 #include "helpers/LuaExecutionUtils.h"
 
+// ReSharper disable once CppUnusedIncludeDirective
+#include <QDir>
+#include <QFile>
+#include <QMetaObject>
+#include <QScopeGuard>
+#include <QThread>
 #include <QtTest/QTest>
 
 #include <atomic>
@@ -41,6 +47,21 @@ QVariant AppController::getGlobalOption(const QString &name) const
 	return {};
 }
 
+QString AppController::iniFilePath() const
+{
+	return QDir::current().filePath(QStringLiteral("qmud.ini"));
+}
+
+bool AppController::isTranslatorLuaAvailable() const
+{
+	return false;
+}
+
+QVariantMap qmudCollectGuiSystemValues()
+{
+	return {};
+}
+
 TelnetProcessor::TelnetProcessor() = default;
 
 namespace
@@ -61,6 +82,18 @@ namespace
 			QHash<QString, QHash<int, QVariant>> windowInfo;
 			QHash<QString, QStringList>          hotspotIds;
 			QVector<WorldRuntime::LineEntry>     lineEntries;
+			QString                              startupDirectory;
+			QMap<QString, QString>               worldAttributes;
+			QString                              logFileName;
+			QString                              worldFilePath;
+			QString                              defaultWorldDirectory;
+			QString                              defaultLogDirectory;
+			QString                              pluginsDirectory;
+			QString                              translatorFile;
+			QString                              firstSpecialFontPath;
+			QString                              preferencesDatabaseName;
+			QString                              fileBrowsingDirectory;
+			QString                              stateFilesDirectory;
 	};
 
 	QHash<const WorldRuntime *, RuntimeStubState> &runtimeStubStates()
@@ -147,6 +180,20 @@ WorldRuntime::RuntimeCountersSnapshot WorldRuntime::runtimeCountersSnapshot(bool
 	snapshot.noteColourFore       = state.noteColourFore;
 	snapshot.noteColourBack       = state.noteColourBack;
 	snapshot.outputLineCount      = safeQSizeToInt(state.outputLines.size());
+	if (includeStrings)
+	{
+		snapshot.logFileName             = state.logFileName;
+		snapshot.worldFilePath           = state.worldFilePath;
+		snapshot.defaultWorldDirectory   = state.defaultWorldDirectory;
+		snapshot.defaultLogDirectory     = state.defaultLogDirectory;
+		snapshot.pluginsDirectory        = state.pluginsDirectory;
+		snapshot.startupDirectory        = state.startupDirectory;
+		snapshot.translatorFile          = state.translatorFile;
+		snapshot.firstSpecialFontPath    = state.firstSpecialFontPath;
+		snapshot.preferencesDatabaseName = state.preferencesDatabaseName;
+		snapshot.fileBrowsingDirectory   = state.fileBrowsingDirectory;
+		snapshot.stateFilesDirectory     = state.stateFilesDirectory;
+	}
 	return snapshot;
 }
 
@@ -184,7 +231,7 @@ void WorldRuntime::endMiniWindowMutationBatch()
 
 QString WorldRuntime::startupDirectory() const
 {
-	return {};
+	return runtimeStubState(this).startupDirectory;
 }
 
 QString WorldRuntime::defaultLogDirectory() const
@@ -194,7 +241,25 @@ QString WorldRuntime::defaultLogDirectory() const
 
 QString WorldRuntime::worldAttributeValue(const QString &key) const
 {
-	Q_UNUSED(key);
+	return runtimeStubState(this).worldAttributes.value(key);
+}
+
+QString WorldRuntime::worldMultilineAttributeValue(const QString &key) const
+{
+	return worldAttributeValue(key);
+}
+
+long WorldRuntime::backgroundColour() const
+{
+	return 0;
+}
+
+WorldRuntime::CommandUiSnapshot WorldRuntime::commandUiSnapshot(bool includeHistory, bool includeFrameData,
+                                                                bool allowSelectedWordHitTest) const
+{
+	Q_UNUSED(includeHistory);
+	Q_UNUSED(includeFrameData);
+	Q_UNUSED(allowSelectedWordHitTest);
 	return {};
 }
 
@@ -433,6 +498,10 @@ namespace
 			void mxpCallbacksMarshalArguments();
 			void callbackCatalogObserverTracksFunctionPresence();
 			void packageRestrictionsAreAppliedToExistingState();
+			void worldLuaFileApisAcceptMixedSeparators();
+			void worldLuaFileApisUseRuntimeHomeAcrossThreadAffinity();
+			void worldLuaFileApisIgnoreProcessQmudHome();
+			void luaVisiblePathApisReturnRelativePosix();
 			void deferredRuntimeMutationBatchesPreserveOrderAndOwnership();
 			void directExecutorDispatchesRealEngines();
 			void callPluginMarshallingUsesTargetEngineState();
@@ -756,6 +825,288 @@ restricted_seen = package.loadlib == nil and
 )lua"),
 	                             QStringLiteral("package restrictions")));
 	QVERIFY(luaGlobalBoolean(engine.luaState(), "restricted_seen"));
+}
+
+void tst_LuaCallbackEngine::worldLuaFileApisAcceptMixedSeparators()
+{
+	const QString rootPath = QDir::current().absoluteFilePath(QStringLiteral("qmud_lua_file_path_compat"));
+	QDir          root(rootPath);
+	if (root.exists())
+		QVERIFY(root.removeRecursively());
+	QVERIFY(QDir().mkpath(root.filePath(QStringLiteral("sounds"))));
+
+	QFile input(root.filePath(QStringLiteral("sounds/alert.txt")));
+	QVERIFY(input.open(QIODevice::WriteOnly | QIODevice::Text));
+	QCOMPARE(input.write(QByteArrayLiteral("ok")), qint64{2});
+	input.close();
+
+	WorldRuntime runtime;
+	runtimeStubState(&runtime).startupDirectory = root.absolutePath();
+	LuaCallbackEngine engine;
+	engine.setWorldRuntime(&runtime);
+	setEngineScript(engine, QString());
+
+	const QString script = QStringLiteral(R"lua(
+local input = assert(io.open([[C:\MUSHclient\sounds\\\alert.txt]], "r"))
+local text = input:read("*a")
+input:close()
+
+local output = assert(io.open([[\\legacy\share\sounds\written.txt]], "w"))
+output:write("done")
+output:close()
+
+local outside_ok = pcall(function()
+  return io.open([[..\outside.txt]], "w")
+end)
+
+local entries = utils.readdir([[C:\MUSHclient\sounds\\\*.txt]])
+mixed_path_io_ok = text == "ok"
+mixed_path_readdir_ok = entries["alert.txt"] ~= nil and entries["written.txt"] ~= nil
+mixed_path_escape_rejected = not outside_ok
+)lua");
+	QVERIFY(engine.executeScript(script, QStringLiteral("mixed path compatibility")));
+	QVERIFY(luaGlobalBoolean(engine.luaState(), "mixed_path_io_ok"));
+	QVERIFY(luaGlobalBoolean(engine.luaState(), "mixed_path_readdir_ok"));
+	QVERIFY(luaGlobalBoolean(engine.luaState(), "mixed_path_escape_rejected"));
+	QVERIFY(QFile::exists(root.filePath(QStringLiteral("sounds/written.txt"))));
+	QVERIFY(root.removeRecursively());
+}
+
+void tst_LuaCallbackEngine::worldLuaFileApisUseRuntimeHomeAcrossThreadAffinity()
+{
+	const QString rootPath = QDir::current().absoluteFilePath(QStringLiteral("qmud_lua_file_path_affinity"));
+	QDir          root(rootPath);
+	if (root.exists())
+		QVERIFY(root.removeRecursively());
+	QVERIFY(QDir().mkpath(root.filePath(QStringLiteral("worlds/Tanthul"))));
+
+	QFile input(root.filePath(QStringLiteral("worlds/Tanthul/map.lua")));
+	QVERIFY(input.open(QIODevice::WriteOnly | QIODevice::Text));
+	QCOMPARE(input.write(QByteArrayLiteral("return 'loaded'")), qint64{15});
+	input.close();
+
+	QThread      worker;
+	WorldRuntime runtime;
+	QThread     *mainThread = QThread::currentThread();
+	const auto   cleanup    = qScopeGuard(
+	    [&]()
+	    {
+		    if (runtime.thread() == &worker)
+		    {
+			    const bool moved = QMetaObject::invokeMethod(
+			        &runtime, [&runtime, mainThread]() { runtime.moveToThread(mainThread); },
+			        Qt::BlockingQueuedConnection);
+			    QVERIFY(moved);
+		    }
+		    worker.quit();
+		    worker.wait();
+	    });
+	worker.start();
+	QVERIFY(worker.isRunning());
+	runtimeStubState(&runtime).startupDirectory = root.absolutePath();
+	runtime.moveToThread(&worker);
+
+	LuaCallbackEngine engine;
+	engine.setWorldRuntime(&runtime);
+	setEngineScript(engine, QString());
+
+	const QString script = QStringLiteral(R"lua(
+local chunk = assert(loadfile([[worlds\Tanthul\map.lua]]))
+affinity_path_loaded = chunk() == "loaded"
+)lua");
+	QVERIFY(engine.executeScript(script, QStringLiteral("runtime home across thread affinity")));
+	QVERIFY(luaGlobalBoolean(engine.luaState(), "affinity_path_loaded"));
+	QVERIFY(root.removeRecursively());
+}
+
+void tst_LuaCallbackEngine::worldLuaFileApisIgnoreProcessQmudHome()
+{
+	const QString runtimeRootPath = QDir::current().absoluteFilePath(QStringLiteral("qmud_lua_runtime_home"));
+	const QString envRootPath     = QDir::current().absoluteFilePath(QStringLiteral("qmud_lua_env_home"));
+	QDir          runtimeRoot(runtimeRootPath);
+	QDir          envRoot(envRootPath);
+	if (runtimeRoot.exists())
+		QVERIFY(runtimeRoot.removeRecursively());
+	if (envRoot.exists())
+		QVERIFY(envRoot.removeRecursively());
+	QVERIFY(QDir().mkpath(runtimeRoot.filePath(QStringLiteral("worlds/Tanthul"))));
+	QVERIFY(QDir().mkpath(envRoot.filePath(QStringLiteral("worlds/Tanthul"))));
+
+	const auto writeScript = [](const QString &fileName, const QByteArray &content)
+	{
+		QFile file(fileName);
+		if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+			return false;
+		return file.write(content) == content.size();
+	};
+	QVERIFY(writeScript(runtimeRoot.filePath(QStringLiteral("worlds/Tanthul/map.lua")),
+	                    QByteArrayLiteral("return 'runtime'")));
+	QVERIFY(writeScript(envRoot.filePath(QStringLiteral("worlds/Tanthul/map.lua")),
+	                    QByteArrayLiteral("return 'env'")));
+
+	const bool       hadOriginalQmudHome = qEnvironmentVariableIsSet("QMUD_HOME");
+	const QByteArray originalQmudHome    = qgetenv("QMUD_HOME");
+	qputenv("QMUD_HOME", envRoot.absolutePath().toUtf8());
+	const auto restoreQmudHome = qScopeGuard(
+	    [hadOriginalQmudHome, originalQmudHome]()
+	    {
+		    if (hadOriginalQmudHome)
+			    qputenv("QMUD_HOME", originalQmudHome);
+		    else
+			    qunsetenv("QMUD_HOME");
+	    });
+
+	WorldRuntime      runtime;
+	RuntimeStubState &state = runtimeStubState(&runtime);
+	state.startupDirectory  = runtimeRoot.absolutePath();
+
+	LuaCallbackEngine engine;
+	engine.setWorldRuntime(&runtime);
+	setEngineScript(engine, QString());
+
+	const QString script = QStringLiteral(R"lua(
+local chunk = assert(loadfile([[worlds\Tanthul\map.lua]]))
+process_qmud_home_ignored = chunk() == "runtime"
+)lua");
+	QVERIFY(engine.executeScript(script, QStringLiteral("ignore process QMUD_HOME")));
+	QVERIFY(luaGlobalBoolean(engine.luaState(), "process_qmud_home_ignored"));
+
+	state.startupDirectory.clear();
+	LuaCallbackEngine missingHomeEngine;
+	missingHomeEngine.setWorldRuntime(&runtime);
+	setEngineScript(missingHomeEngine, QString());
+
+	const QString missingHomeScript = QStringLiteral(R"lua(
+local ok = pcall(function()
+  assert(loadfile([[worlds\Tanthul\map.lua]]))
+end)
+missing_runtime_home_does_not_use_env = not ok
+)lua");
+	QVERIFY(missingHomeEngine.executeScript(missingHomeScript,
+	                                        QStringLiteral("missing runtime home ignores env")));
+	QVERIFY(luaGlobalBoolean(missingHomeEngine.luaState(), "missing_runtime_home_does_not_use_env"));
+	QVERIFY(runtimeRoot.removeRecursively());
+	QVERIFY(envRoot.removeRecursively());
+}
+
+void tst_LuaCallbackEngine::luaVisiblePathApisReturnRelativePosix()
+{
+	const QString rootPath = QDir::current().absoluteFilePath(QStringLiteral("qmud_lua_visible_path_api"));
+	QDir          root(rootPath);
+	if (root.exists())
+		QVERIFY(root.removeRecursively());
+	QVERIFY(QDir().mkpath(root.filePath(QStringLiteral("worlds/foo"))));
+	QVERIFY(QDir().mkpath(root.filePath(QStringLiteral("logs"))));
+	QVERIFY(QDir().mkpath(root.filePath(QStringLiteral("worlds/plugins/state"))));
+	QVERIFY(QDir().mkpath(root.filePath(QStringLiteral("locale"))));
+	QVERIFY(QDir().mkpath(root.filePath(QStringLiteral("fonts"))));
+	QVERIFY(QDir().mkpath(root.filePath(QStringLiteral("prefs"))));
+	QVERIFY(QDir().mkpath(root.filePath(QStringLiteral("worlds/browse"))));
+
+	const QString previousCurrentPath = QDir::currentPath();
+	QVERIFY(QDir::setCurrent(root.absolutePath()));
+	[[maybe_unused]] const auto restoreCurrentPath =
+	    qScopeGuard([previousCurrentPath] { QDir::setCurrent(previousCurrentPath); });
+
+	WorldRuntime      runtime;
+	RuntimeStubState &state = runtimeStubState(&runtime);
+	state.startupDirectory  = root.absolutePath();
+	state.worldAttributes.insert(QStringLiteral("new_activity_sound"),
+	                             QStringLiteral(R"(C:\MUSHclient\sounds\activity.wav)"));
+	state.worldAttributes.insert(QStringLiteral("script_editor"),
+	                             QStringLiteral(R"(C:\MUSHclient\worlds\foo\editor.lua)"));
+	state.worldAttributes.insert(QStringLiteral("script_filename"),
+	                             QStringLiteral(R"(C:\MUSHclient\worlds\foo\script.lua)"));
+	state.worldAttributes.insert(QStringLiteral("auto_log_file_name"),
+	                             QStringLiteral(R"(C:\MUSHclient\logs\auto.log)"));
+	state.worldAttributes.insert(QStringLiteral("beep_sound"),
+	                             QStringLiteral(R"(C:\MUSHclient\sounds\beep.wav)"));
+	state.worldAttributes.insert(QStringLiteral("foreground_image"),
+	                             QStringLiteral(R"(C:\MUSHclient\worlds\foo\foreground.png)"));
+	state.worldAttributes.insert(QStringLiteral("background_image"),
+	                             QStringLiteral(R"(C:\MUSHclient\worlds\foo\background.png)"));
+	state.logFileName             = root.filePath(QStringLiteral("logs/current.log"));
+	state.worldFilePath           = root.filePath(QStringLiteral("worlds/foo/test.mcl"));
+	state.defaultWorldDirectory   = QStringLiteral(R"(C:\MUSHclient\worlds\)");
+	state.defaultLogDirectory     = root.filePath(QStringLiteral("logs"));
+	state.pluginsDirectory        = QStringLiteral(R"(C:\MUSHclient\worlds\plugins\)");
+	state.translatorFile          = root.filePath(QStringLiteral("locale/EN.lua"));
+	state.firstSpecialFontPath    = root.filePath(QStringLiteral("fonts/special.ttf"));
+	state.preferencesDatabaseName = root.filePath(QStringLiteral("prefs/qmud.db"));
+	state.fileBrowsingDirectory   = root.filePath(QStringLiteral("worlds/browse"));
+	state.stateFilesDirectory     = QStringLiteral(R"(C:\MUSHclient\worlds\plugins\state\)");
+
+	LuaCallbackEngine engine;
+	engine.setWorldRuntime(&runtime);
+	setEngineScript(engine, QStringLiteral(R"lua(
+local values = {
+  GetInfo(9),
+  GetInfo(10),
+  GetInfo(35),
+  GetInfo(40),
+  GetInfo(50),
+  GetInfo(51),
+  GetInfo(54),
+  GetInfo(57),
+  GetInfo(58),
+  GetInfo(59),
+  GetInfo(60),
+  GetInfo(64),
+  GetInfo(66),
+  GetInfo(67),
+  GetInfo(68),
+  GetInfo(69),
+  GetInfo(74),
+  GetInfo(76),
+  GetInfo(78),
+  GetInfo(79),
+  GetInfo(82),
+  GetInfo(84),
+  GetInfo(85),
+}
+path_summary = table.concat(values, "|")
+path_no_backslashes = not path_summary:find("\\", 1, true)
+getinfo_56 = tostring(GetInfo(56))
+getinfo_56_ok = #getinfo_56 > 0 and not getinfo_56:find("\\", 1, true)
+local info = utils.info()
+utils_info_summary = tostring(info.app_directory) .. "|" .. tostring(info.current_directory)
+utils_info_ok = utils_info_summary == "./|./"
+)lua"));
+
+	const QString expected =
+	    QStringList{
+	        QStringLiteral("sounds/activity.wav"),
+	        QStringLiteral("worlds/foo/editor.lua"),
+	        QStringLiteral("worlds/foo/script.lua"),
+	        QStringLiteral("logs/auto.log"),
+	        QStringLiteral("sounds/beep.wav"),
+	        QStringLiteral("logs/current.log"),
+	        QStringLiteral("worlds/foo/test.mcl"),
+	        QStringLiteral("worlds/"),
+	        QStringLiteral("logs/"),
+	        QStringLiteral("./"),
+	        QStringLiteral("worlds/plugins/"),
+	        QStringLiteral("./"),
+	        QStringLiteral("./"),
+	        QStringLiteral("worlds/foo/"),
+	        QStringLiteral("./"),
+	        QStringLiteral("locale/EN.lua"),
+	        QStringLiteral("sounds/"),
+	        QStringLiteral("fonts/special.ttf"),
+	        QStringLiteral("worlds/foo/foreground.png"),
+	        QStringLiteral("worlds/foo/background.png"),
+	        QStringLiteral("prefs/qmud.db"),
+	        QStringLiteral("worlds/browse/"),
+	        QStringLiteral("worlds/plugins/state/"),
+	    }
+	        .join(QLatin1Char('|'));
+	QCOMPARE(luaGlobalString(engine.luaState(), "path_summary"), expected);
+	QVERIFY(luaGlobalBoolean(engine.luaState(), "path_no_backslashes"));
+	QVERIFY(luaGlobalBoolean(engine.luaState(), "getinfo_56_ok"));
+	QCOMPARE(luaGlobalString(engine.luaState(), "utils_info_summary"), QStringLiteral("./|./"));
+	QVERIFY(luaGlobalBoolean(engine.luaState(), "utils_info_ok"));
+	QVERIFY(QDir::setCurrent(previousCurrentPath));
+	QVERIFY(root.removeRecursively());
 }
 
 void tst_LuaCallbackEngine::deferredRuntimeMutationBatchesPreserveOrderAndOwnership()
