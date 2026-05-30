@@ -10,6 +10,7 @@
 #ifndef QMUD_WORLDVIEW_H
 #define QMUD_WORLDVIEW_H
 
+#include "AccessibleTextUtils.h"
 #include "WorldRuntime.h"
 
 #include <QFont>
@@ -40,6 +41,12 @@ class QWheelEvent;
 class QMouseEvent;
 class QPainter;
 class WorldOutputCanvas;
+class WorldOutputAccessible;
+
+/**
+ * @brief Installs the custom accessibility factory for native world output widgets.
+ */
+void qmudInstallWorldOutputAccessibility();
 
 /**
  * @brief Stateful options and cursor data for command-history find operations.
@@ -500,6 +507,7 @@ class WorldView : public QWidget
 		friend class InputTextEdit;
 		friend class WrapTextBrowser;
 		friend class MiniWindowLayer;
+		friend class WorldOutputAccessible;
 		/**
 		 * @brief Extended editing/selection/output APIs used by runtime and widgets.
 		 */
@@ -960,6 +968,22 @@ class WorldView : public QWidget
 		 */
 		void requestNativeOutputPresentationRepaint(bool repaintVisiblePanes,
 		                                            const QVector<NativeOutputRenderLine> &lines) const;
+		/**
+		 * @brief Builds an accessible text offset map from native output lines.
+		 * @param lines Native render lines to expose.
+		 * @return Accessible text map over the current logical output.
+		 */
+		[[nodiscard]] static QMudAccessibleTextUtils::LineOffsetMap
+		     accessibleNativeOutputTextMap(const QVector<NativeOutputRenderLine> &lines);
+		/**
+		 * @brief Primes the accessible text length without emitting backlog events.
+		 */
+		void primeAccessibleOutputTextState() const;
+		/**
+		 * @brief Emits active-only accessibility notifications for newly presented native output.
+		 * @param lines Native render lines after presentation synchronization.
+		 */
+		void notifyAccessibleOutputPresented(const QVector<NativeOutputRenderLine> &lines) const;
 		[[nodiscard]] QRect nativeOutputPaneRect(const WrapTextBrowser *view) const;
 		/**
 		 * @brief Returns mutable paint state for a native output pane.
@@ -1281,6 +1305,23 @@ class WorldView : public QWidget
 		                                          QString *hint = nullptr, bool allowCacheBuild = true,
 		                                          bool requireTextHit = false, bool *textHit = nullptr) const;
 		/**
+		 * @brief Resolves the global screen rectangle for a native-output character position.
+		 * @param view Source output view.
+		 * @param position Output line/column position.
+		 * @param globalRect Output global character rectangle when resolution succeeds.
+		 * @return `true` when @p position maps to a visible native output character/caret rectangle.
+		 */
+		[[nodiscard]] bool    nativeOutputCharacterRect(const WrapTextBrowser      *view,
+		                                                const NativeOutputPosition &position,
+		                                                QRect                      &globalRect) const;
+		/**
+		 * @brief Scrolls an output pane until the requested native output line range is visible.
+		 * @param view Output pane to scroll.
+		 * @param firstLine First zero-based native render line to reveal.
+		 * @param lastLine Last zero-based native render line to reveal.
+		 */
+		void scrollNativeOutputRangeIntoView(const WrapTextBrowser *view, int firstLine, int lastLine) const;
+		/**
 		 * @brief Resolves native-output hit-test information for a mouse event source widget.
 		 * @param watched Event source widget from the installed event filter.
 		 * @param event Mouse event carrying viewport/widget-relative coordinates.
@@ -1306,11 +1347,16 @@ class WorldView : public QWidget
 		 * @param position Output line/column position.
 		 * @param href Optional hyperlink href at hit point.
 		 * @param hint Optional hyperlink hint at hit point.
+		 * @param allowCacheBuild `true` to rebuild layout caches on demand.
+		 * @param requireTextHit `true` to require the point to fall inside rendered text glyph bounds.
+		 * @param textHit Optional output set to `true` when the point is over rendered text glyph bounds.
 		 * @return `true` when point maps to native output.
 		 */
 		[[nodiscard]] bool nativeOutputHitTestGlobal(const QPoint &globalPos, WrapTextBrowser *&view,
 		                                             NativeOutputPosition &position, QString *href = nullptr,
-		                                             QString *hint = nullptr) const;
+		                                             QString *hint = nullptr, bool allowCacheBuild = true,
+		                                             bool  requireTextHit = false,
+		                                             bool *textHit        = nullptr) const;
 		/**
 		 * @brief Clears native output selection state.
 		 * @param notify Emit selection changed flow when state changes.
@@ -1675,6 +1721,10 @@ class WorldView : public QWidget
 		mutable int                                  m_nativeRuntimeRangeRestitchStartIndex{-1};
 		mutable quint64                              m_nativeRenderLineCacheRevision{0};
 		mutable NativeRenderCacheDelta               m_nativeRenderCacheDelta;
+		mutable int                                  m_accessibleOutputCharacterCount{-1};
+		mutable quint64                              m_accessibleOutputRevision{0};
+		mutable QString                              m_accessibleOutputText;
+		mutable bool                                 m_accessibleOutputPendingTailAppend{false};
 		mutable bool                                 m_nativePartialRenderLineApplied{false};
 		mutable bool                                 m_nativePartialRenderLineAppended{false};
 		mutable bool                                 m_nativePartialRenderBaseLastHardReturn{true};

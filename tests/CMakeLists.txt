@@ -102,6 +102,20 @@ qmud_add_qtest(tst_OutputWrapUtils
         LABELS
         unit)
 
+qmud_add_qtest(tst_AccessibleTextUtils
+        SOURCES
+        unit/tst_AccessibleTextUtils.cpp
+        "${CMAKE_SOURCE_DIR}/src/helpers/AccessibleTextUtils.cpp"
+        LABELS
+        unit)
+
+qmud_add_qtest(tst_PluginPathUtils
+        SOURCES
+        unit/tst_PluginPathUtils.cpp
+        "${CMAKE_SOURCE_DIR}/src/helpers/PluginPathUtils.cpp"
+        LABELS
+        unit)
+
 qmud_add_qtest(tst_HyperlinkActionUtils
         SOURCES
         unit/tst_HyperlinkActionUtils.cpp
@@ -198,6 +212,7 @@ if (QMUD_ENABLE_LUA_SCRIPTING)
             "${CMAKE_SOURCE_DIR}/src/Sqlite3Lua.cpp"
             "${CMAKE_SOURCE_DIR}/src/Environment.cpp"
             "${CMAKE_SOURCE_DIR}/src/helpers/LuaExecutionUtils.cpp"
+            "${CMAKE_SOURCE_DIR}/src/helpers/PluginPathUtils.cpp"
             LIBRARIES
             ${LUA_LIBRARIES}
             Qt6::Gui
@@ -640,6 +655,7 @@ if (QMUD_ENABLE_GUI_TESTS)
             "${CMAKE_SOURCE_DIR}/src/WorldView.cpp"
             "${CMAKE_SOURCE_DIR}/src/TelnetProcessor.cpp"
             "${CMAKE_SOURCE_DIR}/src/helpers/AnsiSgrParseUtils.cpp"
+            "${CMAKE_SOURCE_DIR}/src/helpers/AccessibleTextUtils.cpp"
             "${CMAKE_SOURCE_DIR}/src/helpers/MiniWindowUtils.cpp"
             "${CMAKE_SOURCE_DIR}/src/helpers/OutputWrapUtils.cpp"
             "${CMAKE_SOURCE_DIR}/src/Environment.cpp"
