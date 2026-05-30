@@ -102,6 +102,13 @@ qmud_add_qtest(tst_OutputWrapUtils
         LABELS
         unit)
 
+qmud_add_qtest(tst_AccessibleTextUtils
+        SOURCES
+        unit/tst_AccessibleTextUtils.cpp
+        "${CMAKE_SOURCE_DIR}/src/helpers/AccessibleTextUtils.cpp"
+        LABELS
+        unit)
+
 qmud_add_qtest(tst_HyperlinkActionUtils
         SOURCES
         unit/tst_HyperlinkActionUtils.cpp
@@ -640,6 +647,7 @@ if (QMUD_ENABLE_GUI_TESTS)
             "${CMAKE_SOURCE_DIR}/src/WorldView.cpp"
             "${CMAKE_SOURCE_DIR}/src/TelnetProcessor.cpp"
             "${CMAKE_SOURCE_DIR}/src/helpers/AnsiSgrParseUtils.cpp"
+            "${CMAKE_SOURCE_DIR}/src/helpers/AccessibleTextUtils.cpp"
             "${CMAKE_SOURCE_DIR}/src/helpers/MiniWindowUtils.cpp"
             "${CMAKE_SOURCE_DIR}/src/helpers/OutputWrapUtils.cpp"
             "${CMAKE_SOURCE_DIR}/src/Environment.cpp"

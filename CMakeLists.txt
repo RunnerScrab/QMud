@@ -185,6 +185,7 @@ set(QMUD_SOURCES
         helpers/HyperlinkActionUtils.cpp
         helpers/WorldCommandProcessorUtils.cpp
         helpers/LuaExecutionUtils.cpp
+        helpers/AccessibleTextUtils.cpp
         helpers/OutputWrapUtils.cpp
         helpers/GuiSystemUtils.cpp
         NameGeneration.cpp
@@ -254,6 +255,7 @@ set(QMUD_HEADERS
         helpers/MainFrameActionUtils.h
         helpers/MainFrameMdiUtils.h
         helpers/LuaExecutionUtils.h
+        helpers/AccessibleTextUtils.h
         helpers/OutputWrapUtils.h
         TabActivationHistory.h
         AppController.h

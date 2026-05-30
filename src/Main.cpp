@@ -12,6 +12,7 @@
 #include "LuaApiExport.h"
 #include "MainFrame.h"
 #include "ReloadUtils.h"
+#include "WorldView.h"
 #include <QApplication>
 #include <QCoreApplication>
 #include <QDebug>
@@ -117,6 +118,7 @@ int main(int argc, char *argv[])
 	QCoreApplication::setApplicationName(QStringLiteral("QMud"));
 	QCoreApplication::setOrganizationName(QStringLiteral("QMudOrg"));
 	QApplication::setWindowIcon(QIcon(QStringLiteral(":/qmud/res/QMud.png")));
+	qmudInstallWorldOutputAccessibility();
 
 	const QStringList args      = QCoreApplication::arguments();
 	bool allowMultipleInstances = isEnabledValue(qEnvironmentVariable("QMUD_ALLOW_MULTI_INSTANCE").trimmed());
