@@ -508,6 +508,7 @@ namespace
 			void workerDispatchesPluginLifecycleCallbacksOnRealEngines();
 			void workerCallbackBatchCapturesOutputMiniWindowAndSaveStateMutations();
 			void workerColourOutputMatchesMushclientGroupingAndNewlineSemantics();
+			void colourTellIgnoresTrailingLuaGsubReturnAndKeepsFollowingNote();
 			void triggerAnchoredColourOutputKeepsNativePromptText();
 			void callbackSnapshotSuppliesGetInfoAndMiniWindowReads();
 			void deferredRuntimeMutationSkipsDestroyedRuntime();
@@ -1355,6 +1356,37 @@ end
 	         QStringList({QStringLiteral("note-a"), QStringLiteral("note-b"), QStringLiteral("note-c"),
 	                      QStringLiteral("tell-a"), QStringLiteral("tell-b")}));
 	QCOMPARE(state.outputNewLines, QList<bool>({false, false, true, false, false}));
+}
+
+void tst_LuaCallbackEngine::colourTellIgnoresTrailingLuaGsubReturnAndKeepsFollowingNote()
+{
+	WorldRuntime runtime;
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QStringLiteral(R"lua(
+function OnPluginEnable()
+  local profit = 10000
+  Tell("You made ")
+  ColourTell("yellow", "black", tostring(profit):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
+  Note(" gold!")
+end
+)lua"));
+
+	LuaExecutorWorker       executor;
+	LuaBatchDispatchRequest request;
+	request.engines      = {engine};
+	request.kind         = LuaBatchDispatchKind::NoArgs;
+	request.functionName = QStringLiteral("OnPluginEnable");
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	executeDeferredMutations(result);
+
+	const RuntimeStubState &state = runtimeStubState(&runtime);
+	QCOMPARE(state.outputLines,
+	         QStringList({QStringLiteral("You made "), QStringLiteral("10,000"), QStringLiteral(" gold!")}));
+	QCOMPARE(state.outputNewLines, QList<bool>({false, false, true}));
+	QCOMPARE(logicalOutputLinesFromEntries(state.lineEntries),
+	         QStringList({QStringLiteral("You made 10,000 gold!")}));
 }
 
 void tst_LuaCallbackEngine::triggerAnchoredColourOutputKeepsNativePromptText()

@@ -12102,14 +12102,16 @@ static int luaColourOutput(lua_State *L, const bool noteLastSegment)
 		return 0;
 
 	QVector<ColourOutputSegment> segments;
-	const int                    top = lua_gettop(L);
-	for (int index = 1; index <= top; index += 3)
+	const int                    top                  = lua_gettop(L);
+	const int                    completeSegmentCount = top / 3;
+	for (int segmentIndex = 0; segmentIndex < completeSegmentCount; ++segmentIndex)
 	{
+		const int     index      = segmentIndex * 3 + 1;
 		const QString textColour = QString::fromUtf8(luaL_optstring(L, index, ""));
 		const QString backColour = QString::fromUtf8(luaL_optstring(L, index + 1, ""));
 		const QString text       = QString::fromUtf8(luaL_checkstring(L, index + 2));
 		segments.push_back({text, WorldView::parseColor(textColour), WorldView::parseColor(backColour),
-		                    noteLastSegment && index + 2 >= top});
+		                    noteLastSegment && segmentIndex + 1 == completeSegmentCount});
 	}
 
 	for (const ColourOutputSegment &segment : segments)
