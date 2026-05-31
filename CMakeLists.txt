@@ -1648,8 +1648,10 @@ if (UNIX AND NOT APPLE)
         endif ()
         set(QMUD_APPIMAGE_APPDIR "${QMUD_APPIMAGE_WORK_DIR}/AppDir")
         set(QMUD_APPIMAGE_DESKTOP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/resources/appimage/qmud.desktop")
-        set(QMUD_APPIMAGE_DESKTOP_DST "${QMUD_APPIMAGE_APPDIR}/usr/share/applications/qmud.desktop")
-        set(QMUD_APPIMAGE_DESKTOP_ROOT_DST "${QMUD_APPIMAGE_APPDIR}/QMud.desktop")
+        set(QMUD_APPIMAGE_DESKTOP_DST "${QMUD_APPIMAGE_APPDIR}/usr/share/applications/io.github.nodens.QMud.desktop")
+        set(QMUD_APPIMAGE_DESKTOP_ROOT_DST "${QMUD_APPIMAGE_APPDIR}/io.github.nodens.QMud.desktop")
+        set(QMUD_APPIMAGE_METAINFO_SRC "${CMAKE_CURRENT_SOURCE_DIR}/resources/appimage/io.github.nodens.QMud.appdata.xml")
+        set(QMUD_APPIMAGE_METAINFO_DST "${QMUD_APPIMAGE_APPDIR}/usr/share/metainfo/io.github.nodens.QMud.appdata.xml")
         set(QMUD_APPIMAGE_ICON_SRC "${CMAKE_CURRENT_SOURCE_DIR}/resources/qmud/res/QMud.png")
         set(QMUD_APPIMAGE_ICON_DST "${QMUD_APPIMAGE_APPDIR}/usr/share/icons/hicolor/256x256/apps/QMud.png")
         set(QMUD_APPIMAGE_ICON_ROOT_DST "${QMUD_APPIMAGE_APPDIR}/QMud.png")
@@ -1669,6 +1671,9 @@ if (UNIX AND NOT APPLE)
 
         if (NOT EXISTS "${QMUD_APPIMAGE_DESKTOP_SRC}")
             message(FATAL_ERROR "Missing desktop file template for AppImage: ${QMUD_APPIMAGE_DESKTOP_SRC}")
+        endif ()
+        if (NOT EXISTS "${QMUD_APPIMAGE_METAINFO_SRC}")
+            message(FATAL_ERROR "Missing AppStream metadata for AppImage: ${QMUD_APPIMAGE_METAINFO_SRC}")
         endif ()
         if (NOT EXISTS "${QMUD_APPIMAGE_ICON_SRC}")
             message(FATAL_ERROR "Missing AppImage icon source: ${QMUD_APPIMAGE_ICON_SRC}")
@@ -1708,62 +1713,12 @@ if (UNIX AND NOT APPLE)
         if (NOT QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR)
             message(FATAL_ERROR "Could not resolve Qt runtime library directory from Qt6::Core.")
         endif ()
-        file(GLOB QMUD_APPIMAGE_QT_RUNTIME_LIB_FILES
-                "${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}/libQt6*.so*")
-        list(LENGTH QMUD_APPIMAGE_QT_RUNTIME_LIB_FILES QMUD_APPIMAGE_QT_RUNTIME_LIB_COUNT)
-        if (QMUD_APPIMAGE_QT_RUNTIME_LIB_COUNT EQUAL 0)
-            message(FATAL_ERROR "No Qt runtime shared libraries found in ${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}")
+        file(GLOB QMUD_APPIMAGE_QT_CORE_RUNTIME_LIB_FILES
+                "${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}/libQt6Core.so*")
+        if (NOT QMUD_APPIMAGE_QT_CORE_RUNTIME_LIB_FILES)
+            message(FATAL_ERROR "No Qt Core runtime shared libraries found in ${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}")
         endif ()
-
-        if (COMMAND qt_generate_deploy_app_script)
-            set(QMUD_QT_DEPLOY_SCRIPT_KEYWORD OUTPUT_SCRIPT)
-            set(QMUD_QT_DEPLOY_SUPPORTS_NO_UNSUPPORTED_FLAG ON)
-            set(QMUD_QT_DEPLOY_SUPPORTS_PLUGIN_FILTERS ON)
-            if (DEFINED Qt6Core_DIR AND EXISTS "${Qt6Core_DIR}/Qt6CoreMacros.cmake")
-                file(READ "${Qt6Core_DIR}/Qt6CoreMacros.cmake" QMUD_QTCORE_MACROS_CONTENT)
-                if (QMUD_QTCORE_MACROS_CONTENT MATCHES "FILENAME_VARIABLE")
-                    set(QMUD_QT_DEPLOY_SCRIPT_KEYWORD FILENAME_VARIABLE)
-                endif ()
-                if (NOT QMUD_QTCORE_MACROS_CONTENT MATCHES "NO_UNSUPPORTED_PLATFORM_ERROR")
-                    set(QMUD_QT_DEPLOY_SUPPORTS_NO_UNSUPPORTED_FLAG OFF)
-                endif ()
-                if (NOT QMUD_QTCORE_MACROS_CONTENT MATCHES "INCLUDE_PLUGIN_TYPES")
-                    set(QMUD_QT_DEPLOY_SUPPORTS_PLUGIN_FILTERS OFF)
-                endif ()
-            endif ()
-
-            set(QMUD_APPIMAGE_QT_DEPLOY_ARGS
-                    TARGET QMud
-                    ${QMUD_QT_DEPLOY_SCRIPT_KEYWORD} QMUD_APPIMAGE_QT_DEPLOY_SCRIPT)
-            if (QMUD_QT_DEPLOY_SUPPORTS_NO_UNSUPPORTED_FLAG)
-                list(APPEND QMUD_APPIMAGE_QT_DEPLOY_ARGS NO_UNSUPPORTED_PLATFORM_ERROR)
-            endif ()
-            if (QMUD_QT_DEPLOY_SUPPORTS_PLUGIN_FILTERS)
-                list(APPEND QMUD_APPIMAGE_QT_DEPLOY_ARGS
-                        INCLUDE_PLUGIN_TYPES
-                        platforms
-                        tls
-                        sqldrivers
-                        platformthemes
-                        platforminputcontexts
-                        xcbglintegrations
-                        egldeviceintegrations
-                        texttospeech
-                        wayland-decoration-client
-                        wayland-graphics-integration-client
-                        wayland-shell-integration
-                        INCLUDE_PLUGINS
-                        qsqlite
-                        qopensslbackend
-                        qxcb
-                        qwayland
-                        qwayland-egl
-                        qwayland-generic)
-            endif ()
-            qt_generate_deploy_app_script(${QMUD_APPIMAGE_QT_DEPLOY_ARGS})
-        else ()
-            message(FATAL_ERROR "Qt deploy API is unavailable; cannot stage AppImage runtime dependencies.")
-        endif ()
+        get_filename_component(QMUD_APPIMAGE_QT_RUNTIME_ROOT "${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}" DIRECTORY)
 
         set(QMUD_APPIMAGE_LPEG_SO "${QMUD_SYSTEM_LPEG_SO}")
         if (NOT QMUD_APPIMAGE_LPEG_SO)
@@ -1864,10 +1819,12 @@ if (UNIX AND NOT APPLE)
                     COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_APPIMAGE_APPDIR}/usr/lib"
                     COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_APPIMAGE_APPDIR}/usr/glibc"
                     COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_APPIMAGE_APPDIR}/usr/share/applications"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_APPIMAGE_APPDIR}/usr/share/metainfo"
                     COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_APPIMAGE_APPDIR}/usr/share/icons/hicolor/256x256/apps"
                     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:QMud>" "${QMUD_APPIMAGE_EXE_DST}"
                     COMMAND ${CMAKE_COMMAND} -E copy "${QMUD_APPIMAGE_DESKTOP_SRC}" "${QMUD_APPIMAGE_DESKTOP_DST}"
                     COMMAND ${CMAKE_COMMAND} -E copy "${QMUD_APPIMAGE_DESKTOP_SRC}" "${QMUD_APPIMAGE_DESKTOP_ROOT_DST}"
+                    COMMAND ${CMAKE_COMMAND} -E copy "${QMUD_APPIMAGE_METAINFO_SRC}" "${QMUD_APPIMAGE_METAINFO_DST}"
                     COMMAND ${CMAKE_COMMAND} -E copy "${QMUD_APPIMAGE_ICON_SRC}" "${QMUD_APPIMAGE_ICON_DST}"
                     COMMAND ${CMAKE_COMMAND} -E copy "${QMUD_APPIMAGE_ICON_SRC}" "${QMUD_APPIMAGE_ICON_ROOT_DST}"
                     COMMAND ${CMAKE_COMMAND} -E copy "${QMUD_APPIMAGE_CUSTOM_APPRUN}" "${QMUD_APPIMAGE_APPDIR}/AppRun"
@@ -1903,27 +1860,6 @@ if (UNIX AND NOT APPLE)
                         COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_LUA_SSL_DIR}>"
                 )
             endif ()
-            get_filename_component(QMUD_APPIMAGE_QT_RUNTIME_ROOT "${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}" DIRECTORY)
-            add_custom_command(TARGET AppImage POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E echo "Staging Qt runtime libraries/plugins into AppDir"
-                    COMMAND ${CMAKE_COMMAND} -E env
-                    "QT_PLUGIN_PATH=$<SHELL_PATH:${QMUD_APPIMAGE_QT_RUNTIME_ROOT}/plugins>"
-                    "QT_QPA_PLATFORM_PLUGIN_PATH=$<SHELL_PATH:${QMUD_APPIMAGE_QT_RUNTIME_ROOT}/plugins/platforms>"
-                    ${CMAKE_COMMAND}
-                    -DCMAKE_INSTALL_PREFIX="$<SHELL_PATH:${QMUD_APPIMAGE_APPDIR}>"
-                    -DQT_DEPLOY_PREFIX="$<SHELL_PATH:${QMUD_APPIMAGE_APPDIR}>"
-                    -DQT_DEPLOY_BIN_DIR=usr/bin
-                    -DQT_DEPLOY_LIB_DIR=usr/lib
-                    -DQT_DEPLOY_PLUGINS_DIR=usr/plugins
-                    -DQT_DEPLOY_QML_DIR=usr/qml
-                    -DQT_DEPLOY_TRANSLATIONS_DIR=usr/translations
-                    -P "$<SHELL_PATH:${QMUD_APPIMAGE_QT_DEPLOY_SCRIPT}>"
-            )
-            add_custom_command(TARGET AppImage POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E echo "Removing GTK3 platformtheme plugin from AppDir"
-                    COMMAND ${CMAKE_COMMAND} -E rm -f
-                    "$<SHELL_PATH:${QMUD_APPIMAGE_APPDIR}/usr/plugins/platformthemes/libqgtk3.so>"
-            )
             set(QMUD_APPIMAGE_QT_TLS_PLUGIN_DIR "")
             set(QMUD_APPIMAGE_QT_TLS_PLUGIN_FILES)
             set(QMUD_APPIMAGE_QT_TLS_PLUGIN_CANDIDATE_DIRS
@@ -1962,12 +1898,6 @@ if (UNIX AND NOT APPLE)
                         ${QMUD_APPIMAGE_QT_TLS_PLUGIN_CANDIDATE_DIRS})
                 message(WARNING "Qt TLS plugin libqopensslbackend.so was not found in candidate directories: ${QMUD_APPIMAGE_QT_TLS_PLUGIN_SEARCH_PATHS}. AppImage update checks may fail without a functional TLS backend.")
             endif ()
-            add_custom_command(TARGET AppImage POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E echo "Copying Qt shared libraries into AppDir/usr/lib"
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    ${QMUD_APPIMAGE_QT_RUNTIME_LIB_FILES}
-                    "$<SHELL_PATH:${QMUD_APPIMAGE_APPDIR}/usr/lib>"
-            )
             if (QMUD_LUA_LIBRARY_FILES)
                 add_custom_command(TARGET AppImage POST_BUILD
                         COMMAND ${CMAKE_COMMAND} -E echo "Copying Lua shared library into AppDir/usr/lib"
@@ -2060,6 +1990,8 @@ if (UNIX AND NOT APPLE)
                     COMMAND ${CMAKE_COMMAND} -E echo "Collecting transitive runtime libraries into AppDir/usr/lib and AppDir/usr/glibc"
                     COMMAND ${CMAKE_COMMAND} -E env
                     QMUD_APPIMAGE_BUNDLE_GLIBC=1
+                    "QMUD_QT_LIB_DIR=$<SHELL_PATH:${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}>"
+                    "QMUD_QT_PLUGIN_DIR=$<SHELL_PATH:${QMUD_APPIMAGE_QT_RUNTIME_ROOT}/plugins>"
                     /bin/sh
                     "$<SHELL_PATH:${QMUD_APPIMAGE_COLLECT_RUNTIME_SCRIPT}>"
                     "$<SHELL_PATH:${QMUD_APPIMAGE_APPDIR}>"

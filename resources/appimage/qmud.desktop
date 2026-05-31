@@ -4,5 +4,5 @@ Name=QMud
 Comment=QMud MUD client
 Exec=QMud
 Icon=QMud
-Categories=Network;Game;
+Categories=Game;RolePlaying;
 Terminal=false
