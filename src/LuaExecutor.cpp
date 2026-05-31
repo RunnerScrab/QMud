@@ -310,14 +310,16 @@ LuaBatchDispatchResult ILuaExecutor::dispatchBatch(const LuaBatchDispatchRequest
 		              { engine->setObservedPluginCallbacks(request.observedCallbackNamesArg); });
 		return result;
 	case LuaBatchDispatchKind::TeardownEnginesMany:
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    engine->setCallbackCatalogObserver({});
-			    engine->setWorldRuntime(nullptr);
-			    engine->resetState();
-			    engine->clearExecutionThreadAffinity();
-		    });
+		for (const auto &engine : request.engines)
+		{
+			if (!engine)
+				continue;
+			engine->setCallbackCatalogObserver({});
+			engine->setWorldRuntime(nullptr);
+			engine->resetState();
+			result.deferredRuntimeMutationBatches += engine->takeDeferredRuntimeMutationBatches();
+			engine->clearExecutionThreadAffinity();
+		}
 		return result;
 	case LuaBatchDispatchKind::ApplyPackageRestrictionsMany:
 		forEachEngine([&](LuaCallbackEngine *engine)

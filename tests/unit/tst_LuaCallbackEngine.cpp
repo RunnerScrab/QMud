@@ -582,6 +582,38 @@ namespace
 		dispatchWorkerAndWait(executor, request, unusedResult);
 	}
 
+	void initializeWorkerEngine(const LuaExecutorWorker                 &executor,
+	                            const QSharedPointer<LuaCallbackEngine> &engine, const QString &script,
+	                            WorldRuntime *runtime = nullptr)
+	{
+		QVERIFY(engine);
+		LuaEngineObservedInitializationRequest initRequest;
+		initRequest.engine          = engine.data();
+		initRequest.runtime         = runtime;
+		initRequest.scriptText      = script;
+		initRequest.pluginId        = QStringLiteral("Plugin.Id");
+		initRequest.pluginName      = QStringLiteral("Plugin Name");
+		initRequest.pluginDirectory = QStringLiteral("/tmp/plugin");
+
+		auto initRequests = QSharedPointer<QVector<LuaEngineObservedInitializationRequest>>::create();
+		initRequests->push_back(std::move(initRequest));
+
+		LuaBatchDispatchRequest request;
+		request.kind            = LuaBatchDispatchKind::InitializeEnginesWithObservedCallbacksMany;
+		request.initRequestsArg = initRequests;
+		dispatchWorkerAndWait(executor, request);
+	}
+
+	void teardownWorkerEngine(const LuaExecutorWorker                 &executor,
+	                          const QSharedPointer<LuaCallbackEngine> &engine)
+	{
+		QVERIFY(engine);
+		LuaBatchDispatchRequest request;
+		request.kind    = LuaBatchDispatchKind::TeardownEnginesMany;
+		request.engines = {engine};
+		dispatchWorkerAndWait(executor, request);
+	}
+
 	void executeDeferredMutations(LuaBatchDispatchResult &result)
 	{
 		for (LuaDeferredRuntimeMutationBatch &batch : result.deferredRuntimeMutationBatches)
@@ -1223,8 +1255,9 @@ end
 
 void tst_LuaCallbackEngine::workerDispatchesPluginLifecycleCallbacksOnRealEngines()
 {
-	auto engine = QSharedPointer<LuaCallbackEngine>::create();
-	setEngineScript(*engine, QStringLiteral(R"lua(
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
 lifecycle = {}
 function OnPluginInstall()
   table.insert(lifecycle, "install")
@@ -1243,7 +1276,6 @@ function lifecycle_join(value)
 end
 )lua"));
 
-	LuaExecutorWorker       executor;
 	LuaBatchDispatchRequest request;
 	request.engines = {engine};
 	request.kind    = LuaBatchDispatchKind::NoArgs;
@@ -1269,10 +1301,10 @@ end
 
 void tst_LuaCallbackEngine::workerCallbackBatchCapturesOutputMiniWindowAndSaveStateMutations()
 {
-	WorldRuntime runtime;
-	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
-	engine->setWorldRuntime(&runtime);
-	setEngineScript(*engine, QStringLiteral(R"lua(
+	WorldRuntime      runtime;
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
 batch_seen = ""
 function OnPluginEnable()
   Note("batch-note")
@@ -1293,9 +1325,9 @@ end
 function batch_status(value)
   return batch_seen
 end
-)lua"));
+)lua"),
+	                       &runtime);
 
-	LuaExecutorWorker       executor;
 	LuaBatchDispatchRequest request;
 	request.engines      = {engine};
 	request.kind         = LuaBatchDispatchKind::NoArgs;
@@ -1325,14 +1357,15 @@ end
 	QCOMPARE(state.windowInfo.value(QStringLiteral("batch")).value(4).toInt(), 32);
 	QVERIFY(state.hotspotIds.value(QStringLiteral("batch")).contains(QStringLiteral("drag")));
 	QCOMPARE(state.savePluginStateCalls, 1);
+	teardownWorkerEngine(executor, engine);
 }
 
 void tst_LuaCallbackEngine::workerColourOutputMatchesMushclientGroupingAndNewlineSemantics()
 {
-	WorldRuntime runtime;
-	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
-	engine->setWorldRuntime(&runtime);
-	setEngineScript(*engine, QStringLiteral(R"lua(
+	WorldRuntime      runtime;
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
 function OnPluginEnable()
   ColourNote("red", "black", "note-a",
              "green", "black", "note-b",
@@ -1340,9 +1373,9 @@ function OnPluginEnable()
   ColourTell("cyan", "black", "tell-a",
              "yellow", "black", "tell-b")
 end
-)lua"));
+)lua"),
+	                       &runtime);
 
-	LuaExecutorWorker       executor;
 	LuaBatchDispatchRequest request;
 	request.engines      = {engine};
 	request.kind         = LuaBatchDispatchKind::NoArgs;
@@ -1356,23 +1389,24 @@ end
 	         QStringList({QStringLiteral("note-a"), QStringLiteral("note-b"), QStringLiteral("note-c"),
 	                      QStringLiteral("tell-a"), QStringLiteral("tell-b")}));
 	QCOMPARE(state.outputNewLines, QList<bool>({false, false, true, false, false}));
+	teardownWorkerEngine(executor, engine);
 }
 
 void tst_LuaCallbackEngine::colourTellIgnoresTrailingLuaGsubReturnAndKeepsFollowingNote()
 {
-	WorldRuntime runtime;
-	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
-	engine->setWorldRuntime(&runtime);
-	setEngineScript(*engine, QStringLiteral(R"lua(
+	WorldRuntime      runtime;
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
 function OnPluginEnable()
   local profit = 10000
   Tell("You made ")
   ColourTell("yellow", "black", tostring(profit):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
   Note(" gold!")
 end
-)lua"));
+)lua"),
+	                       &runtime);
 
-	LuaExecutorWorker       executor;
 	LuaBatchDispatchRequest request;
 	request.engines      = {engine};
 	request.kind         = LuaBatchDispatchKind::NoArgs;
@@ -1387,14 +1421,15 @@ end
 	QCOMPARE(state.outputNewLines, QList<bool>({false, false, true}));
 	QCOMPARE(logicalOutputLinesFromEntries(state.lineEntries),
 	         QStringList({QStringLiteral("You made 10,000 gold!")}));
+	teardownWorkerEngine(executor, engine);
 }
 
 void tst_LuaCallbackEngine::triggerAnchoredColourOutputKeepsNativePromptText()
 {
-	WorldRuntime runtime;
-	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
-	engine->setWorldRuntime(&runtime);
-	setEngineScript(*engine, QStringLiteral(R"lua(
+	WorldRuntime      runtime;
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
 function prompt_cb(name, line)
   Tell("[")
   ColourTell("white", "black", "435")
@@ -1402,7 +1437,8 @@ function prompt_cb(name, line)
   ColourTell("white", "black", "1226")
   Note("]")
 end
-)lua"));
+)lua"),
+	                       &runtime);
 
 	const QString           prompt = QStringLiteral("[Library][SAFE]<2084hp 1806sp 1695st> ");
 	RuntimeStubState       &state  = runtimeStubState(&runtime);
@@ -1413,7 +1449,6 @@ end
 	promptEntry.lineNumber = 42;
 	state.lineEntries.push_back(promptEntry);
 
-	LuaExecutorWorker       executor;
 	LuaBatchDispatchRequest request;
 	request.engines        = {engine};
 	request.kind           = LuaBatchDispatchKind::StringsAndWildcards;
@@ -1436,6 +1471,7 @@ end
 
 	const QStringList logicalLines = logicalOutputLinesFromEntries(state.lineEntries);
 	QCOMPARE(logicalLines, QStringList({QStringLiteral("[435, 1226]"), prompt}));
+	teardownWorkerEngine(executor, engine);
 }
 
 void tst_LuaCallbackEngine::callbackSnapshotSuppliesGetInfoAndMiniWindowReads()
@@ -1492,16 +1528,16 @@ end
 
 void tst_LuaCallbackEngine::deferredRuntimeMutationSkipsDestroyedRuntime()
 {
-	auto runtime = std::make_unique<WorldRuntime>();
-	auto engine  = QSharedPointer<LuaCallbackEngine>::create();
-	engine->setWorldRuntime(runtime.get());
-	setEngineScript(*engine, QStringLiteral(R"lua(
+	auto              runtime = std::make_unique<WorldRuntime>();
+	auto              engine  = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
 function OnPluginEnable()
   SaveState()
 end
-)lua"));
+)lua"),
+	                       runtime.get());
 
-	LuaExecutorWorker       executor;
 	LuaBatchDispatchRequest request;
 	request.engines      = {engine};
 	request.kind         = LuaBatchDispatchKind::NoArgs;
@@ -1516,6 +1552,7 @@ end
 		for (const std::function<void()> &mutation : batch.mutations)
 			mutation();
 	}
+	teardownWorkerEngine(executor, engine);
 }
 // NOLINTEND(readability-convert-member-functions-to-static)
 
