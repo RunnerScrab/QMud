@@ -574,6 +574,7 @@ namespace
 		return kEntries;
 	}
 
+#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
 	QString makeReloadArgument(const QString &name, const QString &value)
 	{
 		return value.isEmpty() ? QString() : (name + QLatin1Char('=') + value);
@@ -585,6 +586,7 @@ namespace
 		const quint64 low  = QRandomGenerator::global()->generate64();
 		return QStringLiteral("%1%2").arg(high, 16, 16, QLatin1Char('0')).arg(low, 16, 16, QLatin1Char('0'));
 	}
+#endif
 
 	QString reloadWorldIdentity(const ReloadWorldState &worldState)
 	{
