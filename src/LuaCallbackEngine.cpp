@@ -267,6 +267,9 @@ extern "C" int luaopen_lsqlite3(lua_State *L);
 #ifdef QMUD_BUNDLED_BC
 extern "C" int luaopen_bc(lua_State *L);
 #endif
+static QString          luaPackageBasePath(QString base);
+static void             extendLuaPackageCPath(lua_State *L, const QString &extraCPath);
+static void             extendLuaNativePackageCPath(lua_State *L, const QString &appDir);
 static void             extendLuaPackagePath(lua_State *L, const QString &appDir);
 static void             refreshLuaFunctionSetForState(lua_State *L, QSet<QString> &out);
 static bool             optBool(lua_State *L, int index, bool defaultValue);
@@ -43049,11 +43052,20 @@ bool LuaCallbackEngine::ensureState()
 		luaL_openlibs(m_state);
 		QMudLuaSupport::applyLua51Compat(m_state);
 		qmudLogLua51CompatState(m_state, "LuaCallbackEngine world state");
+#ifdef Q_OS_MACOS
+		const QString appDirBase = luaPackageBasePath(QCoreApplication::applicationDirPath());
+		extendLuaPackageCPath(m_state, appDirBase + QStringLiteral("?.so;") + appDirBase +
+		                                   QStringLiteral("lua/?.so;") + appDirBase +
+		                                   QStringLiteral("lua/?/core.so"));
+#endif
 		if (m_worldRuntime)
 		{
 			if (const QString startupDir = m_worldRuntime->startupDirectory();
 			    !startupDir.trimmed().isEmpty())
+			{
+				extendLuaNativePackageCPath(m_state, startupDir);
 				extendLuaPackagePath(m_state, startupDir);
+			}
 		}
 		extendLuaPackagePath(m_state, QCoreApplication::applicationDirPath());
 		m_worldBindingsReady         = false;
@@ -43154,11 +43166,8 @@ static void refreshLuaFunctionSetForState(lua_State *L, QSet<QString> &out)
 	lua_pop(L, 1);
 }
 
-static void extendLuaPackagePath(lua_State *L, const QString &appDir)
+static QString luaPackageBasePath(QString base)
 {
-	if (!L)
-		return;
-	QString base = appDir;
 	if (!base.endsWith('/') && !base.endsWith('\\'))
 		base += '/';
 #ifdef Q_OS_WIN
@@ -43166,50 +43175,108 @@ static void extendLuaPackagePath(lua_State *L, const QString &appDir)
 #else
 	base.replace(QLatin1Char('\\'), QLatin1Char('/'));
 #endif
-	const QString extraPath = base + QStringLiteral("lua/?.lua;") + base + QStringLiteral("lua/?/init.lua");
-	const QString extraCPath =
+	return base;
+}
+
+static void appendLuaPackageField(lua_State *L, const char *fieldName, const QString &extraPath)
+{
+	if (extraPath.isEmpty())
+		return;
+
+	lua_getfield(L, -1, fieldName);
+	const char *existing = lua_tostring(L, -1);
+	QString     current  = existing ? QString::fromUtf8(existing) : QString();
+	lua_pop(L, 1);
+
+	if (current.contains(extraPath))
+		return;
+
+	if (!current.isEmpty() && !current.endsWith(QLatin1Char(';')))
+		current += QLatin1Char(';');
+	current += extraPath;
+	const QByteArray bytes = current.toUtf8();
+	lua_pushlstring(L, bytes.constData(), bytes.size());
+	lua_setfield(L, -2, fieldName);
+}
+
+static QString luaNativeModuleSuffix()
+{
 #ifdef Q_OS_WIN
-	    base + QStringLiteral("?.dll;") + base + QStringLiteral("lua/?.dll;") + base +
-	    QStringLiteral("lua/?/core.dll");
+	return QStringLiteral(".dll");
 #else
-	    base + QStringLiteral("?.so;") + base + QStringLiteral("lua/?.so;") + base +
-	    QStringLiteral("lua/?/core.so");
+	return QStringLiteral(".so");
 #endif
+}
+
+static QStringList luaNativePlatformDirectories()
+{
+#ifdef Q_OS_WIN
+	return {QStringLiteral("windows-x86_64")};
+#elif defined(Q_OS_MACOS)
+	QStringList dirs;
+#if defined(Q_PROCESSOR_ARM_64)
+	dirs.push_back(QStringLiteral("macos-arm64"));
+#elif defined(Q_PROCESSOR_X86_64)
+	dirs.push_back(QStringLiteral("macos-x86_64"));
+#endif
+	dirs.push_back(QStringLiteral("macos-universal"));
+	return dirs;
+#else
+	return {QStringLiteral("linux-x86_64")};
+#endif
+}
+
+static void extendLuaPackageCPath(lua_State *L, const QString &extraCPath)
+{
+	if (!L)
+		return;
+
 	lua_getglobal(L, LUA_LOADLIBNAME); // package table
 	if (!lua_istable(L, -1))
 	{
 		lua_pop(L, 1);
 		return;
 	}
-	lua_getfield(L, -1, "path");
-	const char *existing = lua_tostring(L, -1);
-	QString     current  = existing ? QString::fromUtf8(existing) : QString();
-	lua_pop(L, 1);
+	appendLuaPackageField(L, "cpath", extraCPath);
+	lua_pop(L, 1); // package
+}
 
-	if (!current.contains(extraPath))
+static void extendLuaNativePackageCPath(lua_State *L, const QString &appDir)
+{
+	const QString base   = luaPackageBasePath(appDir);
+	const QString suffix = luaNativeModuleSuffix();
+	QString       extraCPath;
+	for (const QString &nativeDir : luaNativePlatformDirectories())
 	{
-		if (!current.isEmpty() && !current.endsWith(QLatin1Char(';')))
-			current += QLatin1Char(';');
-		current += extraPath;
-		const QByteArray bytes = current.toUtf8();
-		lua_pushlstring(L, bytes.constData(), bytes.size());
-		lua_setfield(L, -2, "path");
+		const QString nativeBase = base + QStringLiteral("lua/native/") + nativeDir + QLatin1Char('/');
+		if (!extraCPath.isEmpty())
+			extraCPath += QLatin1Char(';');
+		extraCPath += nativeBase + QLatin1Char('?') + suffix + QLatin1Char(';') + nativeBase +
+		              QStringLiteral("?/core") + suffix;
 	}
+	extendLuaPackageCPath(L, extraCPath);
+}
 
-	lua_getfield(L, -1, "cpath");
-	const char *existingCPath = lua_tostring(L, -1);
-	QString     currentCPath  = existingCPath ? QString::fromUtf8(existingCPath) : QString();
-	lua_pop(L, 1);
+static void extendLuaPackagePath(lua_State *L, const QString &appDir)
+{
+	if (!L)
+		return;
 
-	if (!currentCPath.contains(extraCPath))
+	const QString base       = luaPackageBasePath(appDir);
+	const QString extraPath  = base + QStringLiteral("lua/?.lua;") + base + QStringLiteral("lua/?/init.lua");
+	const QString suffix     = luaNativeModuleSuffix();
+	const QString extraCPath = base + QLatin1Char('?') + suffix + QLatin1Char(';') + base +
+	                           QStringLiteral("lua/?") + suffix + QLatin1Char(';') + base +
+	                           QStringLiteral("lua/?/core") + suffix;
+
+	lua_getglobal(L, LUA_LOADLIBNAME); // package table
+	if (!lua_istable(L, -1))
 	{
-		if (!currentCPath.isEmpty() && !currentCPath.endsWith(QLatin1Char(';')))
-			currentCPath += QLatin1Char(';');
-		currentCPath += extraCPath;
-		const QByteArray bytes = currentCPath.toUtf8();
-		lua_pushlstring(L, bytes.constData(), bytes.size());
-		lua_setfield(L, -2, "cpath");
+		lua_pop(L, 1);
+		return;
 	}
+	appendLuaPackageField(L, "path", extraPath);
+	appendLuaPackageField(L, "cpath", extraCPath);
 	lua_pop(L, 1); // package
 }
 #endif

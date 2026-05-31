@@ -210,6 +210,12 @@ cp "$QMUD_MAC_DOCKER_LUA_PREFIX/lib/liblua.5.4.dylib" "$APP_FRAMEWORKS_DIR/"
 ln -sf liblua.5.4.dylib "$APP_FRAMEWORKS_DIR/liblua.dylib"
 
 mkdir -p "$APP_MACOS_DIR/socket" "$APP_MACOS_DIR/mime" "$APP_MACOS_DIR/ssl" "$APP_MACOS_DIR/lua/json" "$APP_MACOS_DIR/lua/ssl"
+mkdir -p \
+  "$APP_MACOS_DIR/lua/native/linux-x86_64" \
+  "$APP_MACOS_DIR/lua/native/macos-universal" \
+  "$APP_MACOS_DIR/lua/native/macos-arm64" \
+  "$APP_MACOS_DIR/lua/native/macos-x86_64" \
+  "$APP_MACOS_DIR/lua/native/windows-x86_64"
 cp "$QMUD_MAC_DOCKER_LUA_MODULES_PREFIX/socket/core.so" "$APP_MACOS_DIR/socket/core.so"
 cp "$QMUD_MAC_DOCKER_LUA_MODULES_PREFIX/mime/core.so" "$APP_MACOS_DIR/mime/core.so"
 if [ ! -f "$QMUD_MAC_DOCKER_LUA_MODULES_PREFIX/ssl/core.so" ]; then

@@ -331,6 +331,12 @@ else
 fi
 
 mkdir -p "$STAGE_DIR/lua" "$STAGE_DIR/socket" "$STAGE_DIR/mime"
+mkdir -p \
+  "$STAGE_DIR/lua/native/linux-x86_64" \
+  "$STAGE_DIR/lua/native/macos-universal" \
+  "$STAGE_DIR/lua/native/macos-arm64" \
+  "$STAGE_DIR/lua/native/macos-x86_64" \
+  "$STAGE_DIR/lua/native/windows-x86_64"
 
 if [ ! -f "$BUILD_DIR/socket/core.dll" ]; then
   echo "Error: expected generated LuaSocket core module at $BUILD_DIR/socket/core.dll, but it was not found." >&2

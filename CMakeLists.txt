@@ -1243,6 +1243,16 @@ if (APPLE)
                     COMMAND ${CMAKE_COMMAND} -E copy_directory
                     "$<SHELL_PATH:${CMAKE_CURRENT_BINARY_DIR}/mime>"
                     "$<SHELL_PATH:${QMUD_MACAPP_STAGE_DIR}/Contents/MacOS/mime>"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<SHELL_PATH:${QMUD_MACAPP_STAGE_DIR}/Contents/MacOS/lua/native/linux-x86_64>"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<SHELL_PATH:${QMUD_MACAPP_STAGE_DIR}/Contents/MacOS/lua/native/macos-universal>"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<SHELL_PATH:${QMUD_MACAPP_STAGE_DIR}/Contents/MacOS/lua/native/macos-arm64>"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<SHELL_PATH:${QMUD_MACAPP_STAGE_DIR}/Contents/MacOS/lua/native/macos-x86_64>"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<SHELL_PATH:${QMUD_MACAPP_STAGE_DIR}/Contents/MacOS/lua/native/windows-x86_64>"
                     COMMENT "Copying skeleton into QMud.app resources"
             )
         endif ()
@@ -1858,6 +1868,11 @@ if (UNIX AND NOT APPLE)
                         COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_MIME_DIR}>"
                         COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_SSL_DIR}>"
                         COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_LUA_SSL_DIR}>"
+                        COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_LUA_DIR}/native/linux-x86_64>"
+                        COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_LUA_DIR}/native/macos-universal>"
+                        COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_LUA_DIR}/native/macos-arm64>"
+                        COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_LUA_DIR}/native/macos-x86_64>"
+                        COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_LUA_DIR}/native/windows-x86_64>"
                 )
             endif ()
             set(QMUD_APPIMAGE_QT_TLS_PLUGIN_DIR "")
