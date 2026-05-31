@@ -127,7 +127,7 @@ process environment does not override them.
 If nothing is configured, defaults are:
 
 - AppImage: `$HOME/QMud`
-- macOS: `~/Library/Application Support/QMud`
+- macOS: `~/Documents/QMud`
 - Windows and non-AppImage Linux: executable directory
 
 ## Environment flags and CLI switches

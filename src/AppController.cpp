@@ -3835,7 +3835,7 @@ bool AppController::initialize()
 	//   Windows: %LOCALAPPDATA%/QMud/config
 	// - In multi-instance mode, config fallback is disabled and QMUD_HOME must be set explicitly in process env.
 	// - AppImage defaults to $HOME/QMud when QMUD_HOME is not set.
-	// - macOS defaults to ~/Library/Application Support/QMud when QMUD_HOME is not set.
+	// - macOS defaults to ~/Documents/QMud when QMUD_HOME is not set.
 	// - Windows/default keep executable directory when QMUD_HOME is not set.
 	const auto isAppImage                  = !qEnvironmentVariable("APPIMAGE").trimmed().isEmpty();
 	const bool hasQmudHomeFromEnv          = !qEnvironmentVariable("QMUD_HOME").trimmed().isEmpty();
@@ -3861,7 +3861,7 @@ bool AppController::initialize()
 			homeDir = QDir::homePath();
 		if (homeDir.isEmpty())
 			homeDir = QCoreApplication::applicationDirPath();
-		return QDir(homeDir).filePath(QStringLiteral("Library/Application Support/QMud"));
+		return QDir(homeDir).filePath(QStringLiteral("Documents/QMud"));
 #else
 		return QCoreApplication::applicationDirPath();
 #endif
