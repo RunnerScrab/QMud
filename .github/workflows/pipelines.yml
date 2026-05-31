@@ -1249,7 +1249,7 @@ jobs:
           PY
           echo "body_path=ci-release-notes.md" >> "$GITHUB_OUTPUT"
 
-      - name: Remove old CI release assets
+      - name: Delete old CI release
         uses: actions/github-script@v9
         with:
           script: |
@@ -1267,15 +1267,12 @@ jobs:
               throw error;
             }
 
-            const assets = release.data.assets || [];
-            for (const asset of assets) {
-              core.info(`Deleting old CI asset: ${asset.name}`);
-              await github.rest.repos.deleteReleaseAsset({
-                owner,
-                repo,
-                asset_id: asset.id,
-              });
-            }
+            core.info(`Deleting old CI release for tag ${tag}.`);
+            await github.rest.repos.deleteRelease({
+              owner,
+              repo,
+              release_id: release.data.id,
+            });
 
       - name: Publish CI prerelease assets
         uses: softprops/action-gh-release@v2
