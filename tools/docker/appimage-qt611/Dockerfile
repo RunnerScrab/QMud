@@ -1,4 +1,4 @@
-FROM quay.io/fedora/fedora:43
+FROM quay.io/fedora/fedora:44
 
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
@@ -21,6 +21,7 @@ RUN dnf -y upgrade && \
       glibc-langpack-en \
       libglvnd-devel \
       libxkbcommon \
+      libxkbcommon-devel \
       lua \
       lua-devel \
       lua-json \
@@ -41,6 +42,7 @@ RUN dnf -y upgrade && \
       speech-dispatcher-devel \
       tar \
       unzip \
+      vulkan-headers \
       which \
       xz \
       zlib-devel \
@@ -50,12 +52,31 @@ RUN dnf -y upgrade && \
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
     python3 -m pip install --no-cache-dir --upgrade aqtinstall
 
-ARG QT_SERIES=6.10
+RUN mkdir -p /etc/aqt && \
+    printf '%s\n' \
+      '[aqt]' \
+      'baseurl: https://download.qt.io' \
+      '' \
+      '[requests]' \
+      'hash_algorithm: sha256' \
+      'INSECURE_NOT_FOR_PRODUCTION_ignore_hash: False' \
+      '' \
+      '[mirrors]' \
+      'trusted_mirrors:' \
+      '    https://download.qt.io' \
+      'blacklist:' \
+      'fallbacks:' \
+      '    https://download.qt.io' \
+      > /etc/aqt/settings.ini
+
+ENV AQT_CONFIG=/etc/aqt/settings.ini
+
+ARG QT_SERIES=6.11
 ARG QT_ARCH=linux_gcc_64
 
 RUN set -eux; \
     QT_VERSION="$(aqt list-qt linux desktop --spec "${QT_SERIES}" --latest-version)"; \
-    aqt install-qt -O /opt/Qt linux desktop "${QT_VERSION}" "${QT_ARCH}" -m qtmultimedia; \
+    aqt install-qt -O /opt/Qt linux desktop "${QT_VERSION}" "${QT_ARCH}" -m qtmultimedia qttasktree; \
     ln -sfn "/opt/Qt/${QT_VERSION}" /opt/Qt/latest
 
 RUN set -eux; \

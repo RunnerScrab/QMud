@@ -4,7 +4,7 @@ set -eu
 PROJECT_DIR=${PROJECT_DIR:-/home/user/project}
 BUILD_DIR=${BUILD_DIR:-/home/user/build}
 BUILD_ARCH=${BUILD_ARCH:-x86_64}
-QMUD_MAC_DOCKER_IMAGE=${QMUD_MAC_DOCKER_IMAGE:-qmud-macos-builder:qt6.10}
+QMUD_MAC_DOCKER_IMAGE=${QMUD_MAC_DOCKER_IMAGE:-qmud-macos-builder:qt6.11}
 QMUD_MAC_DOCKER_BUILD_TYPE=${QMUD_MAC_DOCKER_BUILD_TYPE:-Release}
 QMUD_MAC_DOCKER_OSX_DEPLOYMENT_TARGET=${QMUD_MAC_DOCKER_OSX_DEPLOYMENT_TARGET:-13.0.0}
 QMUD_MAC_DOCKER_QT_PREFIX=${QMUD_MAC_DOCKER_QT_PREFIX:-/opt/Qt/latest/macos}
@@ -140,6 +140,25 @@ APP_FRAMEWORKS_DIR="$APP_STAGE_DIR/Contents/Frameworks"
 APP_PLUGINS_DIR="$APP_STAGE_DIR/Contents/PlugIns"
 APP_TLS_DIR="$APP_PLUGINS_DIR/tls"
 
+copy_qt_framework() {
+  framework_name=$1
+  framework_source="$QMUD_MAC_DOCKER_QT_PREFIX/lib/${framework_name}.framework"
+  framework_target="$APP_FRAMEWORKS_DIR/${framework_name}.framework"
+
+  if [ ! -d "$framework_source" ]; then
+    echo "Error: required Qt framework is missing at $framework_source." >&2
+    exit 1
+  fi
+
+  rm -rf "$framework_target"
+  cp -a "$framework_source" "$APP_FRAMEWORKS_DIR/"
+  rm -rf "$framework_target/Headers" "$framework_target/Sources"
+  if [ -d "$framework_target/Versions" ]; then
+    find "$framework_target/Versions" -mindepth 2 -maxdepth 2 \( -name Headers -o -name Sources \) -type d -prune -exec rm -rf {} +
+  fi
+  find "$framework_target" -type f -name '*.prl' -delete
+}
+
 mkdir -p "$APP_MACOS_DIR" "$APP_FRAMEWORKS_DIR" "$APP_PLUGINS_DIR/platforms" "$APP_PLUGINS_DIR/sqldrivers"
 if [ -d "$QMUD_MAC_DOCKER_QT_PREFIX/plugins/multimedia" ]; then
   mkdir -p "$APP_PLUGINS_DIR/multimedia"
@@ -148,7 +167,18 @@ if [ -d "$QMUD_MAC_DOCKER_QT_PREFIX/plugins/texttospeech" ]; then
   mkdir -p "$APP_PLUGINS_DIR/texttospeech"
 fi
 
-cp -R "$QMUD_MAC_DOCKER_QT_PREFIX"/lib/Qt*.framework "$APP_FRAMEWORKS_DIR/"
+for QT_FRAMEWORK in \
+  QtCore \
+  QtGui \
+  QtWidgets \
+  QtNetwork \
+  QtSql \
+  QtPrintSupport \
+  QtMultimedia \
+  QtTextToSpeech
+do
+  copy_qt_framework "$QT_FRAMEWORK"
+done
 cp "$QMUD_MAC_DOCKER_QT_PREFIX/plugins/platforms/libqcocoa.dylib" "$APP_PLUGINS_DIR/platforms/"
 cp "$QMUD_MAC_DOCKER_QT_PREFIX/plugins/sqldrivers/libqsqlite.dylib" "$APP_PLUGINS_DIR/sqldrivers/"
 if [ -d "$QMUD_MAC_DOCKER_QT_PREFIX/plugins/multimedia" ]; then
@@ -177,7 +207,7 @@ if ! find "$APP_TLS_DIR" -maxdepth 1 -type f \( -name 'libqsecuretransportbacken
 fi
 
 cp "$QMUD_MAC_DOCKER_LUA_PREFIX/lib/liblua.5.4.dylib" "$APP_FRAMEWORKS_DIR/"
-cp "$QMUD_MAC_DOCKER_LUA_PREFIX/lib/liblua.dylib" "$APP_FRAMEWORKS_DIR/"
+ln -sf liblua.5.4.dylib "$APP_FRAMEWORKS_DIR/liblua.dylib"
 
 mkdir -p "$APP_MACOS_DIR/socket" "$APP_MACOS_DIR/mime" "$APP_MACOS_DIR/ssl" "$APP_MACOS_DIR/lua/json" "$APP_MACOS_DIR/lua/ssl"
 cp "$QMUD_MAC_DOCKER_LUA_MODULES_PREFIX/socket/core.so" "$APP_MACOS_DIR/socket/core.so"
@@ -220,3 +250,5 @@ if [ -d "$QMUD_MAC_DOCKER_LUA_MODULES_PREFIX/ssl" ]; then
   cp -R "$QMUD_MAC_DOCKER_LUA_MODULES_PREFIX/ssl/." "$APP_MACOS_DIR/ssl/"
   cp -R "$QMUD_MAC_DOCKER_LUA_MODULES_PREFIX/ssl/." "$APP_MACOS_DIR/lua/ssl/"
 fi
+
+bash "$PROJECT_DIR/tools/scripts/package_mac_dmg.sh" "$APP_STAGE_DIR" "$BUILD_DIR/macapp-out/QMud.dmg"

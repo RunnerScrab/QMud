@@ -1128,8 +1128,30 @@ if (APPLE)
         endif ()
 
         set(QMUD_MACAPP_ICON_SOURCE "${QMUD_MACAPP_ICON_ICNS}")
+        set(QMUD_MACAPP_ICON_IS_GENERATED FALSE)
+        if (QMUD_MACAPP_ICON_SOURCE AND NOT EXISTS "${QMUD_MACAPP_ICON_SOURCE}")
+            message(FATAL_ERROR "Configured macOS app icon does not exist: ${QMUD_MACAPP_ICON_SOURCE}")
+        endif ()
         if (NOT QMUD_MACAPP_ICON_SOURCE)
             set(QMUD_MACAPP_ICON_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/resources/qmud/res/QMud.icns")
+            if (NOT EXISTS "${QMUD_MACAPP_ICON_SOURCE}")
+                set(QMUD_MACAPP_ICON_PNG_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/resources/qmud/res/QMud.png")
+                set(QMUD_MACAPP_ICON_GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts/png_to_icns.py")
+                if (NOT EXISTS "${QMUD_MACAPP_ICON_PNG_SOURCE}")
+                    message(FATAL_ERROR "Missing macOS app icon source: ${QMUD_MACAPP_ICON_PNG_SOURCE}")
+                endif ()
+                if (NOT Python3_Interpreter_FOUND)
+                    message(FATAL_ERROR "Python3 is required to generate the macOS app icon")
+                endif ()
+                set(QMUD_MACAPP_ICON_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/QMud.icns")
+                set(QMUD_MACAPP_ICON_IS_GENERATED TRUE)
+                add_custom_command(
+                        OUTPUT "${QMUD_MACAPP_ICON_SOURCE}"
+                        COMMAND "${Python3_EXECUTABLE}" "${QMUD_MACAPP_ICON_GENERATOR}"
+                                "${QMUD_MACAPP_ICON_PNG_SOURCE}" "${QMUD_MACAPP_ICON_SOURCE}"
+                        DEPENDS "${QMUD_MACAPP_ICON_GENERATOR}" "${QMUD_MACAPP_ICON_PNG_SOURCE}"
+                        VERBATIM)
+            endif ()
         endif ()
 
         set_target_properties(QMud PROPERTIES
@@ -1145,9 +1167,12 @@ if (APPLE)
                 INSTALL_RPATH_USE_LINK_PATH FALSE
         )
 
-        if (EXISTS "${QMUD_MACAPP_ICON_SOURCE}")
+        if (EXISTS "${QMUD_MACAPP_ICON_SOURCE}" OR QMUD_MACAPP_ICON_IS_GENERATED)
             get_filename_component(QMUD_MACAPP_ICON_NAME "${QMUD_MACAPP_ICON_SOURCE}" NAME)
             set_source_files_properties("${QMUD_MACAPP_ICON_SOURCE}" PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+            if (QMUD_MACAPP_ICON_IS_GENERATED)
+                set_source_files_properties("${QMUD_MACAPP_ICON_SOURCE}" PROPERTIES GENERATED TRUE)
+            endif ()
             target_sources(QMud PRIVATE "${QMUD_MACAPP_ICON_SOURCE}")
             set_target_properties(QMud PROPERTIES MACOSX_BUNDLE_ICON_FILE "${QMUD_MACAPP_ICON_NAME}")
         endif ()
@@ -1238,7 +1263,7 @@ if (UNIX AND NOT APPLE)
         if (DEFINED QMUD_MACAPP_DOCKER_NEW_IMAGE)
             if (NOT DEFINED QMUD_MAC_DOCKER_IMAGE)
                 set(QMUD_MAC_DOCKER_IMAGE "${QMUD_MACAPP_DOCKER_NEW_IMAGE}" CACHE STRING
-                        "Docker image for MacDocker (build from tools/docker/macos-qt610/Dockerfile)" FORCE)
+                        "Docker image for MacDocker (build from tools/docker/macos-qt611/Dockerfile)" FORCE)
             endif ()
             unset(QMUD_MACAPP_DOCKER_NEW_IMAGE CACHE)
         endif ()
@@ -1271,8 +1296,8 @@ if (UNIX AND NOT APPLE)
             unset(QMUD_MACAPP_DOCKER_NEW_BUILD_TYPE CACHE)
         endif ()
 
-        set(QMUD_MAC_DOCKER_IMAGE "qmud-macos-builder:qt6.10" CACHE STRING
-                "Docker image for MacDocker (build from tools/docker/macos-qt610/Dockerfile)")
+        set(QMUD_MAC_DOCKER_IMAGE "qmud-macos-builder:qt6.11" CACHE STRING
+                "Docker image for MacDocker (build from tools/docker/macos-qt611/Dockerfile)")
         set(QMUD_MAC_DOCKER_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/mac-docker-build" CACHE PATH
                 "Host build directory mounted into container for MacDocker")
         set(QMUD_MAC_DOCKER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/mac-docker-out" CACHE PATH
@@ -1391,13 +1416,41 @@ if (UNIX AND NOT APPLE)
                     sh /home/user/project/tools/scripts/mac_docker_build.sh
                     COMMAND ${CMAKE_COMMAND} -E rm -rf "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
                     COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
-                    COMMAND ${CMAKE_COMMAND} -E copy_directory
-                    "${QMUD_MAC_DOCKER_BUILD_DIR}/macapp-out"
+                    COMMAND /bin/cp -a
+                    "${QMUD_MAC_DOCKER_BUILD_DIR}/macapp-out/."
                     "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
                     COMMAND ${CMAKE_COMMAND} -E rm -f "${QMUD_MAC_DOCKER_OUTPUT_DIR}/QMud.app.zip"
                     COMMAND ${CMAKE_COMMAND} -E chdir "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
                     ${CMAKE_COMMAND} -E tar cf "QMud.app.zip" --format=zip "QMud.app"
-                    COMMENT "Cross-building macOS QMud.app via ${QMUD_MAC_DOCKER_IMAGE} (MacDocker)"
+                    COMMENT "Cross-building macOS QMud.app and QMud.dmg via ${QMUD_MAC_DOCKER_IMAGE} (MacDocker)"
+                    USES_TERMINAL
+            )
+            add_custom_target(MacDockerU
+                    COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_MAC_DOCKER_BUILD_DIR}"
+                    COMMAND /bin/chmod 0777 "${QMUD_MAC_DOCKER_BUILD_DIR}"
+                    COMMAND ${QMUD_DOCKER_EXECUTABLE_FOUND_NEW} run --rm
+                    ${QMUD_MAC_DOCKER_SECURITY_OPT}
+                    ${QMUD_MAC_DOCKER_USERNS_ARGS}
+                    ${QMUD_MAC_DOCKER_USER_ARGS}
+                    -e CCACHE_DISABLE=1
+                    -e QMUD_MAC_DOCKER_IMAGE=${QMUD_MAC_DOCKER_IMAGE}
+                    -e QMUD_MAC_DOCKER_BUILD_TYPE=${QMUD_MAC_DOCKER_BUILD_TYPE}
+                    -e QMUD_MAC_DOCKER_OSX_DEPLOYMENT_TARGET=${QMUD_MAC_DOCKER_OSX_DEPLOYMENT_TARGET}
+                    -e QMUD_MAC_DOCKER_QT_PREFIX=${QMUD_MAC_DOCKER_QT_PREFIX}
+                    -e QMUD_MAC_DOCKER_QT_HOST_PREFIX=${QMUD_MAC_DOCKER_QT_HOST_PREFIX}
+                    -v "${CMAKE_SOURCE_DIR}:/home/user/project:ro"
+                    -v "${QMUD_MAC_DOCKER_BUILD_DIR}:/home/user/build:rw"
+                    "${QMUD_MAC_DOCKER_IMAGE}"
+                    bash /home/user/project/tools/scripts/mac_docker_build_universal.sh
+                    COMMAND ${CMAKE_COMMAND} -E rm -rf "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
+                    COMMAND /bin/cp -a
+                    "${QMUD_MAC_DOCKER_BUILD_DIR}/macapp-out/."
+                    "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
+                    COMMAND ${CMAKE_COMMAND} -E rm -f "${QMUD_MAC_DOCKER_OUTPUT_DIR}/QMud.app.zip"
+                    COMMAND ${CMAKE_COMMAND} -E chdir "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
+                    ${CMAKE_COMMAND} -E tar cf "QMud.app.zip" --format=zip "QMud.app"
+                    COMMENT "Cross-building universal macOS QMud.app and QMud.dmg via ${QMUD_MAC_DOCKER_IMAGE} (MacDockerU)"
                     USES_TERMINAL
             )
         else ()
@@ -1406,13 +1459,18 @@ if (UNIX AND NOT APPLE)
                     COMMAND ${CMAKE_COMMAND} -E echo "Set QMUD_DOCKER_EXECUTABLE to docker/podman and ensure it is available."
                     COMMAND ${CMAKE_COMMAND} -E false
             )
+            add_custom_target(MacDockerU
+                    COMMAND ${CMAKE_COMMAND} -E echo "MacDockerU requires a docker-compatible executable."
+                    COMMAND ${CMAKE_COMMAND} -E echo "Set QMUD_DOCKER_EXECUTABLE to docker/podman and ensure it is available."
+                    COMMAND ${CMAKE_COMMAND} -E false
+            )
         endif ()
     endif ()
 
     option(QMUD_ENABLE_WINDOCKER "Enable WinDocker target using a prebuilt custom Windows builder image" ON)
     if (QMUD_ENABLE_WINDOCKER)
-        set(QMUD_WINDOCKER_IMAGE "qmud-windows-builder:qt6.10" CACHE STRING
-                "Docker image for WinDocker (build from tools/docker/windows-qt610/Dockerfile)")
+        set(QMUD_WINDOCKER_IMAGE "qmud-windows-builder:qt6.11" CACHE STRING
+                "Docker image for WinDocker (build from tools/docker/windows-qt611/Dockerfile)")
         set(QMUD_WINDOCKER_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/windows-docker-build" CACHE PATH
                 "Host build directory mounted into container for WinDocker")
         set(QMUD_WINDOCKER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/windows-docker-out" CACHE PATH
@@ -2042,8 +2100,8 @@ if (UNIX AND NOT APPLE)
 
     option(QMUD_ENABLE_APPIMAGE_DOCKER "Enable AppImageDocker target using a prebuilt custom Linux builder image" ON)
     if (QMUD_ENABLE_APPIMAGE_DOCKER)
-        set(QMUD_APPIMAGE_DOCKER_IMAGE "qmud-appimage-builder:qt6.10" CACHE STRING
-                "Docker image for AppImageDocker (build from tools/docker/appimage-qt610/Dockerfile)")
+        set(QMUD_APPIMAGE_DOCKER_IMAGE "qmud-appimage-builder:qt6.11" CACHE STRING
+                "Docker image for AppImageDocker (build from tools/docker/appimage-qt611/Dockerfile)")
         set(QMUD_APPIMAGE_DOCKER_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/appimage-docker-build" CACHE PATH
                 "Host build directory mounted into container for AppImageDocker")
         set(QMUD_APPIMAGE_DOCKER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/appimage-docker-out" CACHE PATH

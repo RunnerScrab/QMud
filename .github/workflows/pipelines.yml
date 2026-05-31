@@ -581,35 +581,35 @@ jobs:
 
       - name: Build AppImage image
         run: |
-          if podman image exists qmud-appimage-builder:qt6.10; then
-            echo "Image qmud-appimage-builder:qt6.10 already exists, skipping build."
+          if podman image exists qmud-appimage-builder:qt6.11; then
+            echo "Image qmud-appimage-builder:qt6.11 already exists, skipping build."
           else
             podman build \
-              --file tools/docker/appimage-qt610/Dockerfile \
-              --tag qmud-appimage-builder:qt6.10 \
-              tools/docker/appimage-qt610
+              --file tools/docker/appimage-qt611/Dockerfile \
+              --tag qmud-appimage-builder:qt6.11 \
+              tools/docker/appimage-qt611
           fi
 
       - name: Build macOS cross image
         run: |
-          if podman image exists qmud-macos-builder:qt6.10; then
-            echo "Image qmud-macos-builder:qt6.10 already exists, skipping build."
+          if podman image exists qmud-macos-builder:qt6.11; then
+            echo "Image qmud-macos-builder:qt6.11 already exists, skipping build."
           else
             podman build \
-              --file tools/docker/macos-qt610/Dockerfile \
-              --tag qmud-macos-builder:qt6.10 \
-              tools/docker/macos-qt610
+              --file tools/docker/macos-qt611/Dockerfile \
+              --tag qmud-macos-builder:qt6.11 \
+              tools/docker/macos-qt611
           fi
 
       - name: Build Windows cross image
         run: |
-          if podman image exists qmud-windows-builder:qt6.10; then
-            echo "Image qmud-windows-builder:qt6.10 already exists, skipping build."
+          if podman image exists qmud-windows-builder:qt6.11; then
+            echo "Image qmud-windows-builder:qt6.11 already exists, skipping build."
           else
             podman build \
-              --file tools/docker/windows-qt610/Dockerfile \
-              --tag qmud-windows-builder:qt6.10 \
-              tools/docker/windows-qt610
+              --file tools/docker/windows-qt611/Dockerfile \
+              --tag qmud-windows-builder:qt6.11 \
+              tools/docker/windows-qt611
           fi
 
       - name: Build AppImage
@@ -618,7 +618,7 @@ jobs:
 
       - name: Build macOS package
         run: |
-          CCACHE_DISABLE=1 cmake --build cmake-build-release --target MacDocker -j 6
+          CCACHE_DISABLE=1 cmake --build cmake-build-release --target MacDockerU -j 6
 
       - name: Build Windows package
         run: |
@@ -628,15 +628,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          MAC_SRC="cmake-build-release/mac-docker-out/QMud.app.zip"
-          MAC_DST="cmake-build-release/mac-docker-out/QMud-${QMUD_PACKAGE_VERSION}-macos.zip"
+          MAC_ZIP_SRC="cmake-build-release/mac-docker-out/QMud.app.zip"
+          MAC_ZIP_DST="cmake-build-release/mac-docker-out/QMud-${QMUD_PACKAGE_VERSION}-macos.app.zip"
+          MAC_DMG_SRC="cmake-build-release/mac-docker-out/QMud.dmg"
+          MAC_DMG_DST="cmake-build-release/mac-docker-out/QMud-${QMUD_PACKAGE_VERSION}-macos.dmg"
           WIN_SRC="cmake-build-release/windows-docker-out/QMud.zip"
           WIN_DST="cmake-build-release/windows-docker-out/QMud-${QMUD_PACKAGE_VERSION}-windows.zip"
           WIN_SETUP_SRC="cmake-build-release/windows-docker-out/QMud-setup.exe"
           WIN_SETUP_DST="cmake-build-release/windows-docker-out/QMud-${QMUD_PACKAGE_VERSION}-win-setup.exe"
 
-          if [ ! -f "$MAC_SRC" ]; then
-            echo "Missing macOS package: $MAC_SRC" >&2
+          if [ ! -f "$MAC_ZIP_SRC" ]; then
+            echo "Missing macOS auto-update package: $MAC_ZIP_SRC" >&2
+            exit 1
+          fi
+          if [ ! -f "$MAC_DMG_SRC" ]; then
+            echo "Missing macOS DMG package: $MAC_DMG_SRC" >&2
             exit 1
           fi
           if [ ! -f "$WIN_SRC" ]; then
@@ -648,7 +654,8 @@ jobs:
             exit 1
           fi
 
-          mv -f "$MAC_SRC" "$MAC_DST"
+          mv -f "$MAC_ZIP_SRC" "$MAC_ZIP_DST"
+          mv -f "$MAC_DMG_SRC" "$MAC_DMG_DST"
           mv -f "$WIN_SRC" "$WIN_DST"
           mv -f "$WIN_SETUP_SRC" "$WIN_SETUP_DST"
 
@@ -673,7 +680,8 @@ jobs:
           name: qmud-macos
           if-no-files-found: error
           path: |
-            cmake-build-release/mac-docker-out/QMud-*.zip
+            cmake-build-release/mac-docker-out/QMud-*.app.zip
+            cmake-build-release/mac-docker-out/QMud-*.dmg
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
@@ -764,35 +772,35 @@ jobs:
 
       - name: Build AppImage image
         run: |
-          if podman image exists qmud-appimage-builder:qt6.10; then
-            echo "Image qmud-appimage-builder:qt6.10 already exists, skipping build."
+          if podman image exists qmud-appimage-builder:qt6.11; then
+            echo "Image qmud-appimage-builder:qt6.11 already exists, skipping build."
           else
             podman build \
-              --file tools/docker/appimage-qt610/Dockerfile \
-              --tag qmud-appimage-builder:qt6.10 \
-              tools/docker/appimage-qt610
+              --file tools/docker/appimage-qt611/Dockerfile \
+              --tag qmud-appimage-builder:qt6.11 \
+              tools/docker/appimage-qt611
           fi
 
       - name: Build macOS cross image
         run: |
-          if podman image exists qmud-macos-builder:qt6.10; then
-            echo "Image qmud-macos-builder:qt6.10 already exists, skipping build."
+          if podman image exists qmud-macos-builder:qt6.11; then
+            echo "Image qmud-macos-builder:qt6.11 already exists, skipping build."
           else
             podman build \
-              --file tools/docker/macos-qt610/Dockerfile \
-              --tag qmud-macos-builder:qt6.10 \
-              tools/docker/macos-qt610
+              --file tools/docker/macos-qt611/Dockerfile \
+              --tag qmud-macos-builder:qt6.11 \
+              tools/docker/macos-qt611
           fi
 
       - name: Build Windows cross image
         run: |
-          if podman image exists qmud-windows-builder:qt6.10; then
-            echo "Image qmud-windows-builder:qt6.10 already exists, skipping build."
+          if podman image exists qmud-windows-builder:qt6.11; then
+            echo "Image qmud-windows-builder:qt6.11 already exists, skipping build."
           else
             podman build \
-              --file tools/docker/windows-qt610/Dockerfile \
-              --tag qmud-windows-builder:qt6.10 \
-              tools/docker/windows-qt610
+              --file tools/docker/windows-qt611/Dockerfile \
+              --tag qmud-windows-builder:qt6.11 \
+              tools/docker/windows-qt611
           fi
 
       - name: Configure CMake
@@ -815,7 +823,7 @@ jobs:
 
       - name: Build macOS package
         run: |
-          CCACHE_DISABLE=1 cmake --build cmake-build-release --target MacDocker -j 6
+          CCACHE_DISABLE=1 cmake --build cmake-build-release --target MacDockerU -j 6
 
       - name: Build Windows package
         run: |
@@ -825,15 +833,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          MAC_SRC="cmake-build-release/mac-docker-out/QMud.app.zip"
-          MAC_DST="cmake-build-release/mac-docker-out/QMud-${QMUD_PACKAGE_VERSION}-macos.zip"
+          MAC_ZIP_SRC="cmake-build-release/mac-docker-out/QMud.app.zip"
+          MAC_ZIP_DST="cmake-build-release/mac-docker-out/QMud-${QMUD_PACKAGE_VERSION}-macos.app.zip"
+          MAC_DMG_SRC="cmake-build-release/mac-docker-out/QMud.dmg"
+          MAC_DMG_DST="cmake-build-release/mac-docker-out/QMud-${QMUD_PACKAGE_VERSION}-macos.dmg"
           WIN_SRC="cmake-build-release/windows-docker-out/QMud.zip"
           WIN_DST="cmake-build-release/windows-docker-out/QMud-${QMUD_PACKAGE_VERSION}-windows.zip"
           WIN_SETUP_SRC="cmake-build-release/windows-docker-out/QMud-setup.exe"
           WIN_SETUP_DST="cmake-build-release/windows-docker-out/QMud-${QMUD_PACKAGE_VERSION}-win-setup.exe"
 
-          if [ ! -f "$MAC_SRC" ]; then
-            echo "Missing macOS package: $MAC_SRC" >&2
+          if [ ! -f "$MAC_ZIP_SRC" ]; then
+            echo "Missing macOS auto-update package: $MAC_ZIP_SRC" >&2
+            exit 1
+          fi
+          if [ ! -f "$MAC_DMG_SRC" ]; then
+            echo "Missing macOS DMG package: $MAC_DMG_SRC" >&2
             exit 1
           fi
           if [ ! -f "$WIN_SRC" ]; then
@@ -845,7 +859,8 @@ jobs:
             exit 1
           fi
 
-          mv -f "$MAC_SRC" "$MAC_DST"
+          mv -f "$MAC_ZIP_SRC" "$MAC_ZIP_DST"
+          mv -f "$MAC_DMG_SRC" "$MAC_DMG_DST"
           mv -f "$WIN_SRC" "$WIN_DST"
           mv -f "$WIN_SETUP_SRC" "$WIN_SETUP_DST"
 
@@ -870,7 +885,8 @@ jobs:
           name: qmud-macos
           if-no-files-found: error
           path: |
-            cmake-build-release/mac-docker-out/QMud-*.zip
+            cmake-build-release/mac-docker-out/QMud-*.app.zip
+            cmake-build-release/mac-docker-out/QMud-*.dmg
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
@@ -1020,7 +1036,8 @@ jobs:
           files: |
             release-assets/qmud-appimage/*.AppImage
             release-assets/qmud-appimage/*.AppImage.zsync
-            release-assets/qmud-macos/*.zip
+            release-assets/qmud-macos/*.app.zip
+            release-assets/qmud-macos/*.dmg
             release-assets/qmud-windows/*.zip
             release-assets/qmud-windows/*.exe
 
@@ -1273,7 +1290,8 @@ jobs:
           files: |
             release-assets/qmud-appimage/*.AppImage
             release-assets/qmud-appimage/*.AppImage.zsync
-            release-assets/qmud-macos/*.zip
+            release-assets/qmud-macos/*.app.zip
+            release-assets/qmud-macos/*.dmg
             release-assets/qmud-windows/*.zip
             release-assets/qmud-windows/*.exe
 
