@@ -17,7 +17,7 @@ It is compatible with existing MUSHclient files and plugins, but it will migrate
 its own format in order to maintain separation. As more features are implemented,
 things were bound to diverge, especially in data persistence, so, as a conscious
 choice, QMud diverges from the get-go.
-The active implementation in this repository is C++20 + Qt 6.10.
+The active implementation in this repository is C++20 + Qt 6.11.
 
 The official site and documentation of QMud is here: [qmud.dev](https://qmud.dev)
 
@@ -127,7 +127,7 @@ process environment does not override them.
 If nothing is configured, defaults are:
 
 - AppImage: `$HOME/QMud`
-- macOS: `~/Library/Application Support/QMud`
+- macOS: `~/Documents/QMud`
 - Windows and non-AppImage Linux: executable directory
 
 ## Environment flags and CLI switches
@@ -219,9 +219,9 @@ cmake --build cmake-build-release --target QMud -j"$(sysctl -n hw.ncpu)"
 Build the cross-build images first:
 
 ```bash
-docker build -t qmud-appimage-builder:qt6.10 -f tools/docker/appimage-qt610/Dockerfile tools/docker/appimage-qt610
-docker build -t qmud-macos-builder:qt6.10 -f tools/docker/macos-qt610/Dockerfile tools/docker/macos-qt610
-docker build -t qmud-windows-builder:qt6.10 -f tools/docker/windows-qt610/Dockerfile tools/docker/windows-qt610
+docker build -t qmud-appimage-builder:qt6.11 -f tools/docker/appimage-qt611/Dockerfile tools/docker/appimage-qt611
+docker build -t qmud-macos-builder:qt6.11 -f tools/docker/macos-qt611/Dockerfile tools/docker/macos-qt611
+docker build -t qmud-windows-builder:qt6.11 -f tools/docker/windows-qt611/Dockerfile tools/docker/windows-qt611
 ```
 
 Configure once (Docker targets are Linux-host only):
@@ -240,9 +240,21 @@ Build cross targets:
 
 ```bash
 cmake --build cmake-build-release --target AppImageDocker
-cmake --build cmake-build-release --target MacDocker
+cmake --build cmake-build-release --target MacDockerU
 cmake --build cmake-build-release --target WinDocker
 ```
+
+`MacDockerU` is the default macOS packaging target and produces universal `x86_64`/`arm64` binaries. To build a
+single-architecture macOS package manually, use `MacDocker` with `QMUD_MAC_DOCKER_ARCH` set at configure time:
+
+```bash
+cmake -S . -B cmake-build-release -DQMUD_MAC_DOCKER_ARCH=aarch64
+cmake --build cmake-build-release --target MacDocker
+```
+
+`QMUD_MAC_DOCKER_ARCH` accepts `x86_64` or `aarch64`.
+
+Notice that Qt is always universal as it is not customly built for QMud.
 
 Artifacts are written to:
 

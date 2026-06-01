@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.nodens.QMud</id>
+  <name>QMud</name>
+  <summary>Qt MUD client</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <developer id="io.github.nodens">
+    <name>Nodens</name>
+  </developer>
+  <launchable type="desktop-id">io.github.nodens.QMud.desktop</launchable>
+  <url type="homepage">https://qmud.dev</url>
+  <description>
+    <p>QMud is a Qt client for connecting to and playing text-based MUD worlds, with scripting, triggers, aliases, mapper support, and packaged runtime support for desktop Linux systems.</p>
+  </description>
+  <content_rating type="oars-1.1" />
+  <provides>
+    <binary>QMud</binary>
+  </provides>
+</component>

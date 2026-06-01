@@ -1128,8 +1128,30 @@ if (APPLE)
         endif ()
 
         set(QMUD_MACAPP_ICON_SOURCE "${QMUD_MACAPP_ICON_ICNS}")
+        set(QMUD_MACAPP_ICON_IS_GENERATED FALSE)
+        if (QMUD_MACAPP_ICON_SOURCE AND NOT EXISTS "${QMUD_MACAPP_ICON_SOURCE}")
+            message(FATAL_ERROR "Configured macOS app icon does not exist: ${QMUD_MACAPP_ICON_SOURCE}")
+        endif ()
         if (NOT QMUD_MACAPP_ICON_SOURCE)
             set(QMUD_MACAPP_ICON_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/resources/qmud/res/QMud.icns")
+            if (NOT EXISTS "${QMUD_MACAPP_ICON_SOURCE}")
+                set(QMUD_MACAPP_ICON_PNG_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/resources/qmud/res/QMud.png")
+                set(QMUD_MACAPP_ICON_GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts/png_to_icns.py")
+                if (NOT EXISTS "${QMUD_MACAPP_ICON_PNG_SOURCE}")
+                    message(FATAL_ERROR "Missing macOS app icon source: ${QMUD_MACAPP_ICON_PNG_SOURCE}")
+                endif ()
+                if (NOT Python3_Interpreter_FOUND)
+                    message(FATAL_ERROR "Python3 is required to generate the macOS app icon")
+                endif ()
+                set(QMUD_MACAPP_ICON_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/QMud.icns")
+                set(QMUD_MACAPP_ICON_IS_GENERATED TRUE)
+                add_custom_command(
+                        OUTPUT "${QMUD_MACAPP_ICON_SOURCE}"
+                        COMMAND "${Python3_EXECUTABLE}" "${QMUD_MACAPP_ICON_GENERATOR}"
+                                "${QMUD_MACAPP_ICON_PNG_SOURCE}" "${QMUD_MACAPP_ICON_SOURCE}"
+                        DEPENDS "${QMUD_MACAPP_ICON_GENERATOR}" "${QMUD_MACAPP_ICON_PNG_SOURCE}"
+                        VERBATIM)
+            endif ()
         endif ()
 
         set_target_properties(QMud PROPERTIES
@@ -1145,9 +1167,12 @@ if (APPLE)
                 INSTALL_RPATH_USE_LINK_PATH FALSE
         )
 
-        if (EXISTS "${QMUD_MACAPP_ICON_SOURCE}")
+        if (EXISTS "${QMUD_MACAPP_ICON_SOURCE}" OR QMUD_MACAPP_ICON_IS_GENERATED)
             get_filename_component(QMUD_MACAPP_ICON_NAME "${QMUD_MACAPP_ICON_SOURCE}" NAME)
             set_source_files_properties("${QMUD_MACAPP_ICON_SOURCE}" PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+            if (QMUD_MACAPP_ICON_IS_GENERATED)
+                set_source_files_properties("${QMUD_MACAPP_ICON_SOURCE}" PROPERTIES GENERATED TRUE)
+            endif ()
             target_sources(QMud PRIVATE "${QMUD_MACAPP_ICON_SOURCE}")
             set_target_properties(QMud PROPERTIES MACOSX_BUNDLE_ICON_FILE "${QMUD_MACAPP_ICON_NAME}")
         endif ()
@@ -1218,6 +1243,16 @@ if (APPLE)
                     COMMAND ${CMAKE_COMMAND} -E copy_directory
                     "$<SHELL_PATH:${CMAKE_CURRENT_BINARY_DIR}/mime>"
                     "$<SHELL_PATH:${QMUD_MACAPP_STAGE_DIR}/Contents/MacOS/mime>"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<SHELL_PATH:${QMUD_MACAPP_STAGE_DIR}/Contents/MacOS/lua/native/linux-x86_64>"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<SHELL_PATH:${QMUD_MACAPP_STAGE_DIR}/Contents/MacOS/lua/native/macos-universal>"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<SHELL_PATH:${QMUD_MACAPP_STAGE_DIR}/Contents/MacOS/lua/native/macos-arm64>"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<SHELL_PATH:${QMUD_MACAPP_STAGE_DIR}/Contents/MacOS/lua/native/macos-x86_64>"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<SHELL_PATH:${QMUD_MACAPP_STAGE_DIR}/Contents/MacOS/lua/native/windows-x86_64>"
                     COMMENT "Copying skeleton into QMud.app resources"
             )
         endif ()
@@ -1238,7 +1273,7 @@ if (UNIX AND NOT APPLE)
         if (DEFINED QMUD_MACAPP_DOCKER_NEW_IMAGE)
             if (NOT DEFINED QMUD_MAC_DOCKER_IMAGE)
                 set(QMUD_MAC_DOCKER_IMAGE "${QMUD_MACAPP_DOCKER_NEW_IMAGE}" CACHE STRING
-                        "Docker image for MacDocker (build from tools/docker/macos-qt610/Dockerfile)" FORCE)
+                        "Docker image for MacDocker (build from tools/docker/macos-qt611/Dockerfile)" FORCE)
             endif ()
             unset(QMUD_MACAPP_DOCKER_NEW_IMAGE CACHE)
         endif ()
@@ -1271,8 +1306,8 @@ if (UNIX AND NOT APPLE)
             unset(QMUD_MACAPP_DOCKER_NEW_BUILD_TYPE CACHE)
         endif ()
 
-        set(QMUD_MAC_DOCKER_IMAGE "qmud-macos-builder:qt6.10" CACHE STRING
-                "Docker image for MacDocker (build from tools/docker/macos-qt610/Dockerfile)")
+        set(QMUD_MAC_DOCKER_IMAGE "qmud-macos-builder:qt6.11" CACHE STRING
+                "Docker image for MacDocker (build from tools/docker/macos-qt611/Dockerfile)")
         set(QMUD_MAC_DOCKER_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/mac-docker-build" CACHE PATH
                 "Host build directory mounted into container for MacDocker")
         set(QMUD_MAC_DOCKER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/mac-docker-out" CACHE PATH
@@ -1391,13 +1426,41 @@ if (UNIX AND NOT APPLE)
                     sh /home/user/project/tools/scripts/mac_docker_build.sh
                     COMMAND ${CMAKE_COMMAND} -E rm -rf "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
                     COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
-                    COMMAND ${CMAKE_COMMAND} -E copy_directory
-                    "${QMUD_MAC_DOCKER_BUILD_DIR}/macapp-out"
+                    COMMAND /bin/cp -a
+                    "${QMUD_MAC_DOCKER_BUILD_DIR}/macapp-out/."
                     "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
                     COMMAND ${CMAKE_COMMAND} -E rm -f "${QMUD_MAC_DOCKER_OUTPUT_DIR}/QMud.app.zip"
                     COMMAND ${CMAKE_COMMAND} -E chdir "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
                     ${CMAKE_COMMAND} -E tar cf "QMud.app.zip" --format=zip "QMud.app"
-                    COMMENT "Cross-building macOS QMud.app via ${QMUD_MAC_DOCKER_IMAGE} (MacDocker)"
+                    COMMENT "Cross-building macOS QMud.app and QMud.dmg via ${QMUD_MAC_DOCKER_IMAGE} (MacDocker)"
+                    USES_TERMINAL
+            )
+            add_custom_target(MacDockerU
+                    COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_MAC_DOCKER_BUILD_DIR}"
+                    COMMAND /bin/chmod 0777 "${QMUD_MAC_DOCKER_BUILD_DIR}"
+                    COMMAND ${QMUD_DOCKER_EXECUTABLE_FOUND_NEW} run --rm
+                    ${QMUD_MAC_DOCKER_SECURITY_OPT}
+                    ${QMUD_MAC_DOCKER_USERNS_ARGS}
+                    ${QMUD_MAC_DOCKER_USER_ARGS}
+                    -e CCACHE_DISABLE=1
+                    -e QMUD_MAC_DOCKER_IMAGE=${QMUD_MAC_DOCKER_IMAGE}
+                    -e QMUD_MAC_DOCKER_BUILD_TYPE=${QMUD_MAC_DOCKER_BUILD_TYPE}
+                    -e QMUD_MAC_DOCKER_OSX_DEPLOYMENT_TARGET=${QMUD_MAC_DOCKER_OSX_DEPLOYMENT_TARGET}
+                    -e QMUD_MAC_DOCKER_QT_PREFIX=${QMUD_MAC_DOCKER_QT_PREFIX}
+                    -e QMUD_MAC_DOCKER_QT_HOST_PREFIX=${QMUD_MAC_DOCKER_QT_HOST_PREFIX}
+                    -v "${CMAKE_SOURCE_DIR}:/home/user/project:ro"
+                    -v "${QMUD_MAC_DOCKER_BUILD_DIR}:/home/user/build:rw"
+                    "${QMUD_MAC_DOCKER_IMAGE}"
+                    bash /home/user/project/tools/scripts/mac_docker_build_universal.sh
+                    COMMAND ${CMAKE_COMMAND} -E rm -rf "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
+                    COMMAND /bin/cp -a
+                    "${QMUD_MAC_DOCKER_BUILD_DIR}/macapp-out/."
+                    "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
+                    COMMAND ${CMAKE_COMMAND} -E rm -f "${QMUD_MAC_DOCKER_OUTPUT_DIR}/QMud.app.zip"
+                    COMMAND ${CMAKE_COMMAND} -E chdir "${QMUD_MAC_DOCKER_OUTPUT_DIR}"
+                    ${CMAKE_COMMAND} -E tar cf "QMud.app.zip" --format=zip "QMud.app"
+                    COMMENT "Cross-building universal macOS QMud.app and QMud.dmg via ${QMUD_MAC_DOCKER_IMAGE} (MacDockerU)"
                     USES_TERMINAL
             )
         else ()
@@ -1406,13 +1469,18 @@ if (UNIX AND NOT APPLE)
                     COMMAND ${CMAKE_COMMAND} -E echo "Set QMUD_DOCKER_EXECUTABLE to docker/podman and ensure it is available."
                     COMMAND ${CMAKE_COMMAND} -E false
             )
+            add_custom_target(MacDockerU
+                    COMMAND ${CMAKE_COMMAND} -E echo "MacDockerU requires a docker-compatible executable."
+                    COMMAND ${CMAKE_COMMAND} -E echo "Set QMUD_DOCKER_EXECUTABLE to docker/podman and ensure it is available."
+                    COMMAND ${CMAKE_COMMAND} -E false
+            )
         endif ()
     endif ()
 
     option(QMUD_ENABLE_WINDOCKER "Enable WinDocker target using a prebuilt custom Windows builder image" ON)
     if (QMUD_ENABLE_WINDOCKER)
-        set(QMUD_WINDOCKER_IMAGE "qmud-windows-builder:qt6.10" CACHE STRING
-                "Docker image for WinDocker (build from tools/docker/windows-qt610/Dockerfile)")
+        set(QMUD_WINDOCKER_IMAGE "qmud-windows-builder:qt6.11" CACHE STRING
+                "Docker image for WinDocker (build from tools/docker/windows-qt611/Dockerfile)")
         set(QMUD_WINDOCKER_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/windows-docker-build" CACHE PATH
                 "Host build directory mounted into container for WinDocker")
         set(QMUD_WINDOCKER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/windows-docker-out" CACHE PATH
@@ -1590,8 +1658,10 @@ if (UNIX AND NOT APPLE)
         endif ()
         set(QMUD_APPIMAGE_APPDIR "${QMUD_APPIMAGE_WORK_DIR}/AppDir")
         set(QMUD_APPIMAGE_DESKTOP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/resources/appimage/qmud.desktop")
-        set(QMUD_APPIMAGE_DESKTOP_DST "${QMUD_APPIMAGE_APPDIR}/usr/share/applications/qmud.desktop")
-        set(QMUD_APPIMAGE_DESKTOP_ROOT_DST "${QMUD_APPIMAGE_APPDIR}/QMud.desktop")
+        set(QMUD_APPIMAGE_DESKTOP_DST "${QMUD_APPIMAGE_APPDIR}/usr/share/applications/io.github.nodens.QMud.desktop")
+        set(QMUD_APPIMAGE_DESKTOP_ROOT_DST "${QMUD_APPIMAGE_APPDIR}/io.github.nodens.QMud.desktop")
+        set(QMUD_APPIMAGE_METAINFO_SRC "${CMAKE_CURRENT_SOURCE_DIR}/resources/appimage/io.github.nodens.QMud.appdata.xml")
+        set(QMUD_APPIMAGE_METAINFO_DST "${QMUD_APPIMAGE_APPDIR}/usr/share/metainfo/io.github.nodens.QMud.appdata.xml")
         set(QMUD_APPIMAGE_ICON_SRC "${CMAKE_CURRENT_SOURCE_DIR}/resources/qmud/res/QMud.png")
         set(QMUD_APPIMAGE_ICON_DST "${QMUD_APPIMAGE_APPDIR}/usr/share/icons/hicolor/256x256/apps/QMud.png")
         set(QMUD_APPIMAGE_ICON_ROOT_DST "${QMUD_APPIMAGE_APPDIR}/QMud.png")
@@ -1611,6 +1681,9 @@ if (UNIX AND NOT APPLE)
 
         if (NOT EXISTS "${QMUD_APPIMAGE_DESKTOP_SRC}")
             message(FATAL_ERROR "Missing desktop file template for AppImage: ${QMUD_APPIMAGE_DESKTOP_SRC}")
+        endif ()
+        if (NOT EXISTS "${QMUD_APPIMAGE_METAINFO_SRC}")
+            message(FATAL_ERROR "Missing AppStream metadata for AppImage: ${QMUD_APPIMAGE_METAINFO_SRC}")
         endif ()
         if (NOT EXISTS "${QMUD_APPIMAGE_ICON_SRC}")
             message(FATAL_ERROR "Missing AppImage icon source: ${QMUD_APPIMAGE_ICON_SRC}")
@@ -1650,62 +1723,12 @@ if (UNIX AND NOT APPLE)
         if (NOT QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR)
             message(FATAL_ERROR "Could not resolve Qt runtime library directory from Qt6::Core.")
         endif ()
-        file(GLOB QMUD_APPIMAGE_QT_RUNTIME_LIB_FILES
-                "${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}/libQt6*.so*")
-        list(LENGTH QMUD_APPIMAGE_QT_RUNTIME_LIB_FILES QMUD_APPIMAGE_QT_RUNTIME_LIB_COUNT)
-        if (QMUD_APPIMAGE_QT_RUNTIME_LIB_COUNT EQUAL 0)
-            message(FATAL_ERROR "No Qt runtime shared libraries found in ${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}")
+        file(GLOB QMUD_APPIMAGE_QT_CORE_RUNTIME_LIB_FILES
+                "${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}/libQt6Core.so*")
+        if (NOT QMUD_APPIMAGE_QT_CORE_RUNTIME_LIB_FILES)
+            message(FATAL_ERROR "No Qt Core runtime shared libraries found in ${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}")
         endif ()
-
-        if (COMMAND qt_generate_deploy_app_script)
-            set(QMUD_QT_DEPLOY_SCRIPT_KEYWORD OUTPUT_SCRIPT)
-            set(QMUD_QT_DEPLOY_SUPPORTS_NO_UNSUPPORTED_FLAG ON)
-            set(QMUD_QT_DEPLOY_SUPPORTS_PLUGIN_FILTERS ON)
-            if (DEFINED Qt6Core_DIR AND EXISTS "${Qt6Core_DIR}/Qt6CoreMacros.cmake")
-                file(READ "${Qt6Core_DIR}/Qt6CoreMacros.cmake" QMUD_QTCORE_MACROS_CONTENT)
-                if (QMUD_QTCORE_MACROS_CONTENT MATCHES "FILENAME_VARIABLE")
-                    set(QMUD_QT_DEPLOY_SCRIPT_KEYWORD FILENAME_VARIABLE)
-                endif ()
-                if (NOT QMUD_QTCORE_MACROS_CONTENT MATCHES "NO_UNSUPPORTED_PLATFORM_ERROR")
-                    set(QMUD_QT_DEPLOY_SUPPORTS_NO_UNSUPPORTED_FLAG OFF)
-                endif ()
-                if (NOT QMUD_QTCORE_MACROS_CONTENT MATCHES "INCLUDE_PLUGIN_TYPES")
-                    set(QMUD_QT_DEPLOY_SUPPORTS_PLUGIN_FILTERS OFF)
-                endif ()
-            endif ()
-
-            set(QMUD_APPIMAGE_QT_DEPLOY_ARGS
-                    TARGET QMud
-                    ${QMUD_QT_DEPLOY_SCRIPT_KEYWORD} QMUD_APPIMAGE_QT_DEPLOY_SCRIPT)
-            if (QMUD_QT_DEPLOY_SUPPORTS_NO_UNSUPPORTED_FLAG)
-                list(APPEND QMUD_APPIMAGE_QT_DEPLOY_ARGS NO_UNSUPPORTED_PLATFORM_ERROR)
-            endif ()
-            if (QMUD_QT_DEPLOY_SUPPORTS_PLUGIN_FILTERS)
-                list(APPEND QMUD_APPIMAGE_QT_DEPLOY_ARGS
-                        INCLUDE_PLUGIN_TYPES
-                        platforms
-                        tls
-                        sqldrivers
-                        platformthemes
-                        platforminputcontexts
-                        xcbglintegrations
-                        egldeviceintegrations
-                        texttospeech
-                        wayland-decoration-client
-                        wayland-graphics-integration-client
-                        wayland-shell-integration
-                        INCLUDE_PLUGINS
-                        qsqlite
-                        qopensslbackend
-                        qxcb
-                        qwayland
-                        qwayland-egl
-                        qwayland-generic)
-            endif ()
-            qt_generate_deploy_app_script(${QMUD_APPIMAGE_QT_DEPLOY_ARGS})
-        else ()
-            message(FATAL_ERROR "Qt deploy API is unavailable; cannot stage AppImage runtime dependencies.")
-        endif ()
+        get_filename_component(QMUD_APPIMAGE_QT_RUNTIME_ROOT "${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}" DIRECTORY)
 
         set(QMUD_APPIMAGE_LPEG_SO "${QMUD_SYSTEM_LPEG_SO}")
         if (NOT QMUD_APPIMAGE_LPEG_SO)
@@ -1806,10 +1829,12 @@ if (UNIX AND NOT APPLE)
                     COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_APPIMAGE_APPDIR}/usr/lib"
                     COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_APPIMAGE_APPDIR}/usr/glibc"
                     COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_APPIMAGE_APPDIR}/usr/share/applications"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_APPIMAGE_APPDIR}/usr/share/metainfo"
                     COMMAND ${CMAKE_COMMAND} -E make_directory "${QMUD_APPIMAGE_APPDIR}/usr/share/icons/hicolor/256x256/apps"
                     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:QMud>" "${QMUD_APPIMAGE_EXE_DST}"
                     COMMAND ${CMAKE_COMMAND} -E copy "${QMUD_APPIMAGE_DESKTOP_SRC}" "${QMUD_APPIMAGE_DESKTOP_DST}"
                     COMMAND ${CMAKE_COMMAND} -E copy "${QMUD_APPIMAGE_DESKTOP_SRC}" "${QMUD_APPIMAGE_DESKTOP_ROOT_DST}"
+                    COMMAND ${CMAKE_COMMAND} -E copy "${QMUD_APPIMAGE_METAINFO_SRC}" "${QMUD_APPIMAGE_METAINFO_DST}"
                     COMMAND ${CMAKE_COMMAND} -E copy "${QMUD_APPIMAGE_ICON_SRC}" "${QMUD_APPIMAGE_ICON_DST}"
                     COMMAND ${CMAKE_COMMAND} -E copy "${QMUD_APPIMAGE_ICON_SRC}" "${QMUD_APPIMAGE_ICON_ROOT_DST}"
                     COMMAND ${CMAKE_COMMAND} -E copy "${QMUD_APPIMAGE_CUSTOM_APPRUN}" "${QMUD_APPIMAGE_APPDIR}/AppRun"
@@ -1843,29 +1868,13 @@ if (UNIX AND NOT APPLE)
                         COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_MIME_DIR}>"
                         COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_SSL_DIR}>"
                         COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_LUA_SSL_DIR}>"
+                        COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_LUA_DIR}/native/linux-x86_64>"
+                        COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_LUA_DIR}/native/macos-universal>"
+                        COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_LUA_DIR}/native/macos-arm64>"
+                        COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_LUA_DIR}/native/macos-x86_64>"
+                        COMMAND ${CMAKE_COMMAND} -E make_directory "$<SHELL_PATH:${QMUD_APPIMAGE_SKELETON_LUA_DIR}/native/windows-x86_64>"
                 )
             endif ()
-            get_filename_component(QMUD_APPIMAGE_QT_RUNTIME_ROOT "${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}" DIRECTORY)
-            add_custom_command(TARGET AppImage POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E echo "Staging Qt runtime libraries/plugins into AppDir"
-                    COMMAND ${CMAKE_COMMAND} -E env
-                    "QT_PLUGIN_PATH=$<SHELL_PATH:${QMUD_APPIMAGE_QT_RUNTIME_ROOT}/plugins>"
-                    "QT_QPA_PLATFORM_PLUGIN_PATH=$<SHELL_PATH:${QMUD_APPIMAGE_QT_RUNTIME_ROOT}/plugins/platforms>"
-                    ${CMAKE_COMMAND}
-                    -DCMAKE_INSTALL_PREFIX="$<SHELL_PATH:${QMUD_APPIMAGE_APPDIR}>"
-                    -DQT_DEPLOY_PREFIX="$<SHELL_PATH:${QMUD_APPIMAGE_APPDIR}>"
-                    -DQT_DEPLOY_BIN_DIR=usr/bin
-                    -DQT_DEPLOY_LIB_DIR=usr/lib
-                    -DQT_DEPLOY_PLUGINS_DIR=usr/plugins
-                    -DQT_DEPLOY_QML_DIR=usr/qml
-                    -DQT_DEPLOY_TRANSLATIONS_DIR=usr/translations
-                    -P "$<SHELL_PATH:${QMUD_APPIMAGE_QT_DEPLOY_SCRIPT}>"
-            )
-            add_custom_command(TARGET AppImage POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E echo "Removing GTK3 platformtheme plugin from AppDir"
-                    COMMAND ${CMAKE_COMMAND} -E rm -f
-                    "$<SHELL_PATH:${QMUD_APPIMAGE_APPDIR}/usr/plugins/platformthemes/libqgtk3.so>"
-            )
             set(QMUD_APPIMAGE_QT_TLS_PLUGIN_DIR "")
             set(QMUD_APPIMAGE_QT_TLS_PLUGIN_FILES)
             set(QMUD_APPIMAGE_QT_TLS_PLUGIN_CANDIDATE_DIRS
@@ -1904,12 +1913,6 @@ if (UNIX AND NOT APPLE)
                         ${QMUD_APPIMAGE_QT_TLS_PLUGIN_CANDIDATE_DIRS})
                 message(WARNING "Qt TLS plugin libqopensslbackend.so was not found in candidate directories: ${QMUD_APPIMAGE_QT_TLS_PLUGIN_SEARCH_PATHS}. AppImage update checks may fail without a functional TLS backend.")
             endif ()
-            add_custom_command(TARGET AppImage POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E echo "Copying Qt shared libraries into AppDir/usr/lib"
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    ${QMUD_APPIMAGE_QT_RUNTIME_LIB_FILES}
-                    "$<SHELL_PATH:${QMUD_APPIMAGE_APPDIR}/usr/lib>"
-            )
             if (QMUD_LUA_LIBRARY_FILES)
                 add_custom_command(TARGET AppImage POST_BUILD
                         COMMAND ${CMAKE_COMMAND} -E echo "Copying Lua shared library into AppDir/usr/lib"
@@ -2002,6 +2005,8 @@ if (UNIX AND NOT APPLE)
                     COMMAND ${CMAKE_COMMAND} -E echo "Collecting transitive runtime libraries into AppDir/usr/lib and AppDir/usr/glibc"
                     COMMAND ${CMAKE_COMMAND} -E env
                     QMUD_APPIMAGE_BUNDLE_GLIBC=1
+                    "QMUD_QT_LIB_DIR=$<SHELL_PATH:${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}>"
+                    "QMUD_QT_PLUGIN_DIR=$<SHELL_PATH:${QMUD_APPIMAGE_QT_RUNTIME_ROOT}/plugins>"
                     /bin/sh
                     "$<SHELL_PATH:${QMUD_APPIMAGE_COLLECT_RUNTIME_SCRIPT}>"
                     "$<SHELL_PATH:${QMUD_APPIMAGE_APPDIR}>"
@@ -2042,8 +2047,8 @@ if (UNIX AND NOT APPLE)
 
     option(QMUD_ENABLE_APPIMAGE_DOCKER "Enable AppImageDocker target using a prebuilt custom Linux builder image" ON)
     if (QMUD_ENABLE_APPIMAGE_DOCKER)
-        set(QMUD_APPIMAGE_DOCKER_IMAGE "qmud-appimage-builder:qt6.10" CACHE STRING
-                "Docker image for AppImageDocker (build from tools/docker/appimage-qt610/Dockerfile)")
+        set(QMUD_APPIMAGE_DOCKER_IMAGE "qmud-appimage-builder:qt6.11" CACHE STRING
+                "Docker image for AppImageDocker (build from tools/docker/appimage-qt611/Dockerfile)")
         set(QMUD_APPIMAGE_DOCKER_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/appimage-docker-build" CACHE PATH
                 "Host build directory mounted into container for AppImageDocker")
         set(QMUD_APPIMAGE_DOCKER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/appimage-docker-out" CACHE PATH

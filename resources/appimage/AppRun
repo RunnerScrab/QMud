@@ -12,6 +12,10 @@ GLIBC_DIR="$APPDIR/usr/glibc"
 
 export QT_PLUGIN_PATH="$APPDIR/usr/plugins"
 export QT_QPA_PLATFORM_PLUGIN_PATH="$APPDIR/usr/plugins/platforms"
+
+if [ "${QT_QPA_PLATFORMTHEME:-}" = "gtk3" ]; then
+  unset QT_QPA_PLATFORMTHEME
+fi
 export QT_QPA_PLATFORMTHEME="${QT_QPA_PLATFORMTHEME:-xdgdesktopportal}"
 
 # Host-first run:

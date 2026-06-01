@@ -9,6 +9,7 @@
 #include "MainFrameMdiUtils.h"
 
 #include <QMdiSubWindow>
+#include <QVariant>
 #include <QtTest/QTest>
 
 /**
@@ -62,6 +63,59 @@ class tst_MainFrameMdiUtils : public QObject
 			QCOMPARE(
 			    QMudMainFrameMdiUtils::resolveBackgroundAddRestoreTarget(&added, &added, windows, &added),
 			    nullptr);
+		}
+
+		void windowMatchesRuntimeIdentityPrefersRuntimeToken()
+		{
+			QMdiSubWindow notepad;
+			notepad.setProperty("worldRuntimeToken", QVariant::fromValue<qulonglong>(42));
+			notepad.setProperty("worldId", QStringLiteral("other-world"));
+
+			QVERIFY(QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(&notepad, 42,
+			                                                            QStringLiteral("world-a"), false));
+		}
+
+		void windowMatchesRuntimeIdentityRejectsMismatchedRuntimeToken()
+		{
+			QMdiSubWindow notepad;
+			notepad.setProperty("worldRuntimeToken", QVariant::fromValue<qulonglong>(7));
+
+			QVERIFY(!QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(&notepad, 42,
+			                                                             QStringLiteral("world-a"), true));
+		}
+
+		void windowMatchesRuntimeIdentityUsesWorldIdWhenTokenIsAbsent()
+		{
+			QMdiSubWindow notepad;
+			notepad.setProperty("worldId", QStringLiteral("WORLD-A"));
+
+			QVERIFY(QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(&notepad, 42,
+			                                                            QStringLiteral("world-a"), false));
+		}
+
+		void windowMatchesRuntimeIdentityKeepsUnownedOutOfStrictMatches()
+		{
+			QMdiSubWindow notepad;
+
+			QVERIFY(!QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(&notepad, 42,
+			                                                             QStringLiteral("world-a"), false));
+			QVERIFY(QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(&notepad, 42,
+			                                                            QStringLiteral("world-a"), true));
+		}
+
+		void firstWindowMatchingRuntimeIdentityUsesCreationOrder()
+		{
+			QMdiSubWindow unrelated;
+			unrelated.setProperty("worldRuntimeToken", QVariant::fromValue<qulonglong>(7));
+			QMdiSubWindow first;
+			first.setProperty("worldRuntimeToken", QVariant::fromValue<qulonglong>(42));
+			QMdiSubWindow second;
+			second.setProperty("worldRuntimeToken", QVariant::fromValue<qulonglong>(42));
+
+			const QList<QMdiSubWindow *> windows{&unrelated, &first, &second};
+			QCOMPARE(QMudMainFrameMdiUtils::firstWindowMatchingRuntimeIdentity(
+			             windows, 42, QStringLiteral("world-a"), false),
+			         &first);
 		}
 
 		void prepareOpenWorldStateBeforeChildCloseAllowsCloseWithoutController()

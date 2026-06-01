@@ -143,6 +143,7 @@ extern "C"
 #include <QTimer>
 #include <QTranslator>
 #include <QUrl>
+#include <QVariant>
 #include <QtSql/QSqlDatabase>
 #include <QtSql/QSqlError>
 #include <QtSql/QSqlQuery>
@@ -574,6 +575,7 @@ namespace
 		return kEntries;
 	}
 
+#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
 	QString makeReloadArgument(const QString &name, const QString &value)
 	{
 		return value.isEmpty() ? QString() : (name + QLatin1Char('=') + value);
@@ -585,6 +587,7 @@ namespace
 		const quint64 low  = QRandomGenerator::global()->generate64();
 		return QStringLiteral("%1%2").arg(high, 16, 16, QLatin1Char('0')).arg(low, 16, 16, QLatin1Char('0'));
 	}
+#endif
 
 	QString reloadWorldIdentity(const ReloadWorldState &worldState)
 	{
@@ -3835,7 +3838,7 @@ bool AppController::initialize()
 	//   Windows: %LOCALAPPDATA%/QMud/config
 	// - In multi-instance mode, config fallback is disabled and QMUD_HOME must be set explicitly in process env.
 	// - AppImage defaults to $HOME/QMud when QMUD_HOME is not set.
-	// - macOS defaults to ~/Library/Application Support/QMud when QMUD_HOME is not set.
+	// - macOS defaults to ~/Documents/QMud when QMUD_HOME is not set.
 	// - Windows/default keep executable directory when QMUD_HOME is not set.
 	const auto isAppImage                  = !qEnvironmentVariable("APPIMAGE").trimmed().isEmpty();
 	const bool hasQmudHomeFromEnv          = !qEnvironmentVariable("QMUD_HOME").trimmed().isEmpty();
@@ -3861,7 +3864,7 @@ bool AppController::initialize()
 			homeDir = QDir::homePath();
 		if (homeDir.isEmpty())
 			homeDir = QCoreApplication::applicationDirPath();
-		return QDir(homeDir).filePath(QStringLiteral("Library/Application Support/QMud"));
+		return QDir(homeDir).filePath(QStringLiteral("Documents/QMud"));
 #else
 		return QCoreApplication::applicationDirPath();
 #endif
@@ -11494,6 +11497,17 @@ void AppController::onCommandTriggered(const QString &cmdName)
 			}
 		}
 		auto *text = new TextChildWindow(title, QString());
+		if (auto *world = m_mainWindow->activeWorldChildWindow())
+		{
+			if (auto *runtime = world->runtime())
+			{
+				text->setProperty("worldRuntimeToken", QVariant::fromValue(static_cast<qulonglong>(
+				                                           reinterpret_cast<quintptr>(runtime))));
+				if (const auto worldId = runtime->worldAttributes().value(QStringLiteral("id")).trimmed();
+				    !worldId.isEmpty())
+					text->setProperty("worldId", worldId);
+			}
+		}
 		m_mainWindow->addMdiSubWindow(text);
 	}
 	else if (cmdName == QStringLiteral("FlipToNotepad"))

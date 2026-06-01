@@ -24,9 +24,14 @@ LUA_MODULES_PREFIX="$QMUD_WINDOCKER_LUA_MODULES_PREFIX"
 MINGW_TRIPLET="$QMUD_WINDOCKER_MINGW_TRIPLET"
 MINGW_INCLUDE_DIR="$MINGW_PREFIX/include"
 MINGW_LIB_DIR="$MINGW_PREFIX/lib"
+PE_OBJDUMP="${MINGW_TRIPLET}-objdump"
 
 if [ "$MINGW_TRIPLET" != "x86_64-w64-mingw32" ]; then
   echo "Error: unsupported MinGW triplet '$MINGW_TRIPLET'. Only x86_64-w64-mingw32 is supported." >&2
+  exit 1
+fi
+if ! command -v "$PE_OBJDUMP" >/dev/null 2>&1; then
+  echo "Error: ${PE_OBJDUMP} was not found; Windows dependency staging requires mingw64-binutils." >&2
   exit 1
 fi
 
@@ -132,12 +137,165 @@ mkdir -p "$STAGE_DIR"
 cp "$QMUD_EXE" "$STAGE_DIR/QMud.exe"
 mkdir -p "$STAGE_DIR/lib"
 
-if [ -d "$QT_PREFIX/bin" ]; then
-  cp "$QT_PREFIX/bin/"*.dll "$STAGE_DIR/lib/" || true
+lower_name() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+is_packaged_dependency_dll() {
+  dll_lower="$(lower_name "$1")"
+  case "$dll_lower" in
+    qt6*.dll | lua54.dll | lua.dll | libgcc_s_seh-1.dll | libstdc++-6.dll | libwinpthread-1.dll | \
+      zlib1.dll | libatomic-1.dll | libssp-0.dll | libssl-*.dll | libcrypto-*.dll | avcodec-*.dll | \
+      avformat-*.dll | avutil-*.dll | swresample-*.dll | swscale-*.dll | d3dcompiler_47.dll | opengl32sw.dll)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+find_dependency_dll() {
+  dll="$1"
+  dll_lower="$(lower_name "$dll")"
+
+  case "$dll_lower" in
+    qt6*.dll | avcodec-*.dll | avformat-*.dll | avutil-*.dll | swresample-*.dll | swscale-*.dll | \
+      d3dcompiler_47.dll | opengl32sw.dll)
+      search_dirs="$STAGE_DIR
+$STAGE_DIR/lib
+$QT_PREFIX/bin
+$MINGW_PREFIX/bin
+$LUA_PREFIX/bin
+$LUA_PREFIX/lib"
+      ;;
+    lua54.dll | lua.dll)
+      search_dirs="$STAGE_DIR
+$STAGE_DIR/lib
+$LUA_PREFIX/bin
+$LUA_PREFIX/lib
+$MINGW_PREFIX/bin
+$QT_PREFIX/bin"
+      ;;
+    libgcc_s_seh-1.dll | libstdc++-6.dll | libwinpthread-1.dll | zlib1.dll | libatomic-1.dll | \
+      libssp-0.dll | libssl-*.dll | libcrypto-*.dll)
+      search_dirs="$STAGE_DIR
+$STAGE_DIR/lib
+$MINGW_PREFIX/bin
+$QT_PREFIX/bin
+$LUA_PREFIX/bin
+$LUA_PREFIX/lib"
+      ;;
+    *)
+      search_dirs="$STAGE_DIR
+$STAGE_DIR/lib
+$QT_PREFIX/bin
+$MINGW_PREFIX/bin
+$LUA_PREFIX/bin
+$LUA_PREFIX/lib"
+      ;;
+  esac
+
+  printf '%s\n' "$search_dirs" | while IFS= read -r search_dir; do
+    [ -d "$search_dir" ] || continue
+    found="$(find "$search_dir" -maxdepth 1 -type f -iname "$dll" | sort | head -n 1 || true)"
+    if [ -n "$found" ]; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+  done
+}
+
+dependency_is_staged() {
+  dll="$1"
+  find "$STAGE_DIR" "$STAGE_DIR/lib" -maxdepth 1 -type f -iname "$dll" | grep -q .
+}
+
+collect_dll_closure() {
+  destination="$1"
+  shift
+  mkdir -p "$destination"
+
+  queue_file="$BUILD_DIR/windocker-deps-queue.$$"
+  seen_file="$BUILD_DIR/windocker-deps-seen.$$"
+  : >"$queue_file"
+  : >"$seen_file"
+  for binary in "$@"; do
+    [ -f "$binary" ] || continue
+    printf '%s\n' "$binary" >>"$queue_file"
+  done
+
+  while [ -s "$queue_file" ]; do
+    binary="$(sed -n '1p' "$queue_file")"
+    sed '1d' "$queue_file" >"$queue_file.next"
+    mv "$queue_file.next" "$queue_file"
+    [ -f "$binary" ] || continue
+
+    "$PE_OBJDUMP" -p "$binary" 2>/dev/null | sed -n 's/^[[:space:]]*DLL Name: //p' | while IFS= read -r dependency; do
+      [ -n "$dependency" ] || continue
+      dependency_lower="$(lower_name "$dependency")"
+      if grep -Fxq "$dependency_lower" "$seen_file"; then
+        continue
+      fi
+      printf '%s\n' "$dependency_lower" >>"$seen_file"
+
+      if ! is_packaged_dependency_dll "$dependency"; then
+        continue
+      fi
+      if dependency_is_staged "$dependency"; then
+        continue
+      fi
+
+      source_path="$(find_dependency_dll "$dependency" || true)"
+      if [ -z "$source_path" ]; then
+        echo "Error: unresolved packaged Windows dependency '$dependency' required by $binary." >&2
+        exit 1
+      fi
+
+      target_path="$destination/$(basename "$source_path")"
+      cp -f "$source_path" "$target_path"
+      printf '%s\n' "$target_path" >>"$queue_file"
+    done
+  done
+
+  rm -f "$queue_file" "$seen_file"
+}
+
+copy_qt_plugin() {
+  relative_path="$1"
+  required="$2"
+  source_path="$QT_PREFIX/plugins/$relative_path"
+  target_path="$STAGE_DIR/qtplugins/$relative_path"
+  if [ ! -f "$source_path" ]; then
+    if [ "$required" = "required" ]; then
+      echo "Error: required Qt plugin is missing: $source_path" >&2
+      exit 1
+    fi
+    return 0
+  fi
+  mkdir -p "$(dirname "$target_path")"
+  cp -f "$source_path" "$target_path"
+}
+
+copy_qt_plugin platforms/qwindows.dll required
+copy_qt_plugin sqldrivers/qsqlite.dll required
+copy_qt_plugin tls/qcertonlybackend.dll optional
+copy_qt_plugin tls/qopensslbackend.dll optional
+copy_qt_plugin tls/qschannelbackend.dll optional
+copy_qt_plugin texttospeech/qtexttospeech_sapi.dll required
+copy_qt_plugin iconengines/qsvgicon.dll required
+copy_qt_plugin imageformats/qgif.dll required
+copy_qt_plugin imageformats/qico.dll required
+copy_qt_plugin imageformats/qjpeg.dll required
+copy_qt_plugin imageformats/qsvg.dll required
+copy_qt_plugin styles/qmodernwindowsstyle.dll optional
+copy_qt_plugin networkinformation/qnetworklistmanager.dll optional
+
+if [ ! -d "$QT_PREFIX/plugins/multimedia" ]; then
+  echo "Error: Qt Multimedia plugins directory is missing: $QT_PREFIX/plugins/multimedia" >&2
+  exit 1
 fi
-if [ -d "$QT_PREFIX/plugins" ]; then
-  cp -R "$QT_PREFIX/plugins" "$STAGE_DIR/qtplugins"
-fi
+mkdir -p "$STAGE_DIR/qtplugins/multimedia"
+find "$QT_PREFIX/plugins/multimedia" -maxdepth 1 -type f -iname '*.dll' -exec cp -f {} "$STAGE_DIR/qtplugins/multimedia/" \;
+
 TLS_PLUGIN_DIR="$STAGE_DIR/qtplugins/tls"
 if [ ! -d "$TLS_PLUGIN_DIR" ]; then
   echo "Error: Qt TLS plugins directory is missing from staged package: $TLS_PLUGIN_DIR" >&2
@@ -158,20 +316,8 @@ if ! find "$TTS_PLUGIN_DIR" -maxdepth 1 -type f -iname '*.dll' | grep -q .; then
   echo "Expected at least one plugin DLL in $TTS_PLUGIN_DIR." >&2
   exit 1
 fi
-if [ -d "$MINGW_PREFIX/bin" ]; then
-  cp "$MINGW_PREFIX/bin/"*.dll "$STAGE_DIR/lib/" || true
-fi
-if [ -d "$LUA_PREFIX/bin" ]; then
-  cp "$LUA_PREFIX/bin/"*.dll "$STAGE_DIR/lib/" || true
-fi
 
-STARTUP_DLLS='Qt6Core.dll Qt6Gui.dll Qt6Multimedia.dll Qt6Network.dll Qt6PrintSupport.dll Qt6Sql.dll Qt6TextToSpeech.dll Qt6Widgets.dll lua54.dll libgcc_s_seh-1.dll libstdc++-6.dll zlib1.dll libwinpthread-1.dll'
-for dll in $STARTUP_DLLS; do
-  src="$(find "$STAGE_DIR/lib" -maxdepth 1 -type f -iname "$dll" | head -n 1)"
-  if [ -n "$src" ]; then
-    mv -f "$src" "$STAGE_DIR/$dll"
-  fi
-done
+collect_dll_closure "$STAGE_DIR" "$STAGE_DIR/QMud.exe"
 
 printf '%s\n' '[Paths]' 'Plugins = qtplugins' > "$STAGE_DIR/qt.conf"
 
@@ -185,6 +331,12 @@ else
 fi
 
 mkdir -p "$STAGE_DIR/lua" "$STAGE_DIR/socket" "$STAGE_DIR/mime"
+mkdir -p \
+  "$STAGE_DIR/lua/native/linux-x86_64" \
+  "$STAGE_DIR/lua/native/macos-universal" \
+  "$STAGE_DIR/lua/native/macos-arm64" \
+  "$STAGE_DIR/lua/native/macos-x86_64" \
+  "$STAGE_DIR/lua/native/windows-x86_64"
 
 if [ ! -f "$BUILD_DIR/socket/core.dll" ]; then
   echo "Error: expected generated LuaSocket core module at $BUILD_DIR/socket/core.dll, but it was not found." >&2
@@ -247,6 +399,11 @@ if [ ! -f "$STAGE_DIR/lua/ssl.lua" ]; then
   echo "Error: expected LuaSec top-level module ssl.lua at $LUA_MODULES_PREFIX/ssl.lua, but it was not found." >&2
   exit 1
 fi
+
+PLUGIN_DLLS="$(find "$STAGE_DIR/qtplugins" -type f -iname '*.dll' | sort)"
+MODULE_DLLS="$(find "$STAGE_DIR/lua" "$STAGE_DIR/socket" "$STAGE_DIR/mime" "$STAGE_DIR/ssl" -type f -iname '*.dll' | sort)"
+# shellcheck disable=SC2086
+collect_dll_closure "$STAGE_DIR/lib" $PLUGIN_DLLS $MODULE_DLLS
 
 cmake -E rm -f "$STAGE_ROOT/$PACKAGE_NAME.zip"
 cmake -E chdir "$STAGE_ROOT" cmake -E tar cf "$PACKAGE_NAME.zip" --format=zip "$PACKAGE_NAME"

@@ -3700,16 +3700,14 @@ namespace
 		return dir;
 	}
 
+#ifndef Q_OS_WIN
 	QString normalizeSeparators(const QString &input)
 	{
-#ifdef Q_OS_WIN
-		return QDir::fromNativeSeparators(input);
-#else
 		QString output = input;
 		output.replace(QLatin1Char('\\'), QLatin1Char('/'));
 		return output;
-#endif
 	}
+#endif
 
 	QString appendNumberBeforeExtension(const QString &filePath, int number)
 	{

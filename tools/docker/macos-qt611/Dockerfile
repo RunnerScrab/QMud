@@ -1,4 +1,4 @@
-FROM quay.io/fedora/fedora:43
+FROM quay.io/fedora/fedora:44
 
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
@@ -21,6 +21,7 @@ RUN dnf -y upgrade && \
       flex \
       git \
       glibc-langpack-en \
+      hfsplus-tools \
       libarchive \
       libarchive-devel \
       libxml2-devel \
@@ -50,6 +51,18 @@ RUN dnf -y upgrade && \
       zip && \
     dnf clean all
 
+RUN git clone --depth 1 https://github.com/mozilla/libdmg-hfsplus.git /tmp/libdmg-hfsplus && \
+    cmake -S /tmp/libdmg-hfsplus -B /tmp/libdmg-hfsplus-build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_FLAGS="-UHAVE_CRYPT" && \
+    cmake --build /tmp/libdmg-hfsplus-build -j"$(nproc)" && \
+    test -x /tmp/libdmg-hfsplus-build/dmg/dmg && \
+    test -x /tmp/libdmg-hfsplus-build/hfs/hfsplus && \
+    install -m 0755 /tmp/libdmg-hfsplus-build/dmg/dmg /usr/local/bin/dmg && \
+    install -m 0755 /tmp/libdmg-hfsplus-build/hfs/hfsplus /usr/local/bin/hfsplus && \
+    if [ -x /tmp/libdmg-hfsplus-build/hdutil/hdutil ]; then install -m 0755 /tmp/libdmg-hfsplus-build/hdutil/hdutil /usr/local/bin/hdutil; fi && \
+    rm -rf /tmp/libdmg-hfsplus /tmp/libdmg-hfsplus-build
+
 RUN if ! command -v xml2-config >/dev/null 2>&1 && pkg-config --exists libxml-2.0; then \
       printf '%s\n' \
         '#!/usr/bin/env bash' \
@@ -66,6 +79,25 @@ RUN if ! command -v xml2-config >/dev/null 2>&1 && pkg-config --exists libxml-2.
 
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
     python3 -m pip install --no-cache-dir --upgrade aqtinstall
+
+RUN mkdir -p /etc/aqt && \
+    printf '%s\n' \
+      '[aqt]' \
+      'baseurl: https://download.qt.io' \
+      '' \
+      '[requests]' \
+      'hash_algorithm: sha256' \
+      'INSECURE_NOT_FOR_PRODUCTION_ignore_hash: False' \
+      '' \
+      '[mirrors]' \
+      'trusted_mirrors:' \
+      '    https://download.qt.io' \
+      'blacklist:' \
+      'fallbacks:' \
+      '    https://download.qt.io' \
+      > /etc/aqt/settings.ini
+
+ENV AQT_CONFIG=/etc/aqt/settings.ini
 
 # osxcross requires a macOS SDK archive.
 # Default points to the requested 14.5 SDK release URL and can be overridden
@@ -86,7 +118,7 @@ ENV OSXCROSS_ROOT=/opt/osxcross
 ENV OSXCROSS_BIN_DIR=/opt/osxcross/target/bin
 ENV PATH=/opt/osxcross/target/bin:/opt/osxcross/bin:${PATH}
 
-ARG QT_SERIES=6.10
+ARG QT_SERIES=6.11
 ARG QT_ARCH=clang_64
 
 RUN dnf -y install qt6-qtbase-devel && \

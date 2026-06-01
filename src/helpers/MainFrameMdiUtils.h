@@ -13,6 +13,7 @@ class QMdiSubWindow;
 class QString;
 template <typename T> class QList;
 
+#include <QtGlobal>
 #include <functional>
 
 namespace QMudMainFrameMdiUtils
@@ -24,8 +25,8 @@ namespace QMudMainFrameMdiUtils
 	 * @param creationOrder Current QMdiArea creation-order window list.
 	 * @return Active/fallback subwindow when valid, otherwise `nullptr`.
 	 */
-	QMdiSubWindow *resolveCurrentOrLastActiveSubWindow(QMdiSubWindow *active, QMdiSubWindow *lastActive,
-	                                                   const QList<QMdiSubWindow *> &creationOrder);
+	QMdiSubWindow     *resolveCurrentOrLastActiveSubWindow(QMdiSubWindow *active, QMdiSubWindow *lastActive,
+	                                                       const QList<QMdiSubWindow *> &creationOrder);
 
 	/**
 	 * @brief Resolves which subwindow should be restored after adding a window with activation disabled.
@@ -35,9 +36,33 @@ namespace QMudMainFrameMdiUtils
 	 * @param addedSubWindow Newly added subwindow.
 	 * @return Restore target, or `nullptr` when no restore is needed.
 	 */
-	QMdiSubWindow *resolveBackgroundAddRestoreTarget(QMdiSubWindow *active, QMdiSubWindow *lastActive,
-	                                                 const QList<QMdiSubWindow *> &creationOrder,
-	                                                 const QMdiSubWindow          *addedSubWindow);
+	QMdiSubWindow     *resolveBackgroundAddRestoreTarget(QMdiSubWindow *active, QMdiSubWindow *lastActive,
+	                                                     const QList<QMdiSubWindow *> &creationOrder,
+	                                                     const QMdiSubWindow          *addedSubWindow);
+
+	/**
+	 * @brief Checks whether an MDI subwindow is related to a world runtime identity.
+	 * @param window Subwindow to inspect.
+	 * @param ownerToken Runtime identity token; `0` means no token constraint.
+	 * @param ownerWorldId Runtime world id; empty means no world-id constraint.
+	 * @param acceptUnowned Accept windows with no runtime identity properties when `true`.
+	 * @return `true` when the subwindow identity is compatible with the runtime identity.
+	 */
+	[[nodiscard]] bool windowMatchesRuntimeIdentity(const QMdiSubWindow *window, qulonglong ownerToken,
+	                                                const QString &ownerWorldId, bool acceptUnowned);
+
+	/**
+	 * @brief Resolves first subwindow matching a world runtime identity.
+	 * @param windows Candidate subwindows in desired priority order.
+	 * @param ownerToken Runtime identity token; `0` means no token constraint.
+	 * @param ownerWorldId Runtime world id; empty means no world-id constraint.
+	 * @param acceptUnowned Accept windows with no runtime identity properties when `true`.
+	 * @return First matching subwindow, or `nullptr`.
+	 */
+	[[nodiscard]] QMdiSubWindow *firstWindowMatchingRuntimeIdentity(const QList<QMdiSubWindow *> &windows,
+	                                                                qulonglong                    ownerToken,
+	                                                                const QString &ownerWorldId,
+	                                                                bool           acceptUnowned);
 
 	/**
 	 * @brief Runs open-world persistence before child windows are closed.

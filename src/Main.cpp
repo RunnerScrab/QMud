@@ -20,6 +20,7 @@
 #include <QLibraryInfo>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <cstring>
 #ifdef Q_OS_WIN
 #include <wchar.h>
 #include <windows.h>
@@ -33,6 +34,15 @@ namespace
 #else
 	constexpr DWORD kLoadLibrarySearchDefaultDirs = 0x00001000;
 #endif
+
+	template <typename Function> Function resolveKernel32Function(HMODULE kernel32, const char *name)
+	{
+		const FARPROC procedure = GetProcAddress(kernel32, name);
+		Function      function  = nullptr;
+		static_assert(sizeof(function) == sizeof(procedure));
+		std::memcpy(&function, &procedure, sizeof(function));
+		return function;
+	}
 #endif
 
 	QString singleInstanceServerName()
@@ -78,10 +88,9 @@ namespace
 		using AddDllDirectoryFn          = DLL_DIRECTORY_COOKIE(WINAPI *)(PCWSTR);
 		using SetDllDirectoryWFn         = BOOL(WINAPI *)(LPCWSTR);
 
-		auto setDefaultDllDirectoriesFn = reinterpret_cast<SetDefaultDllDirectoriesFn>(
-		    GetProcAddress(kernel32, "SetDefaultDllDirectories"));
-		auto addDllDirectoryFn =
-		    reinterpret_cast<AddDllDirectoryFn>(GetProcAddress(kernel32, "AddDllDirectory"));
+		auto setDefaultDllDirectoriesFn =
+		    resolveKernel32Function<SetDefaultDllDirectoriesFn>(kernel32, "SetDefaultDllDirectories");
+		auto addDllDirectoryFn = resolveKernel32Function<AddDllDirectoryFn>(kernel32, "AddDllDirectory");
 		if (setDefaultDllDirectoriesFn && addDllDirectoryFn)
 		{
 			setDefaultDllDirectoriesFn(kLoadLibrarySearchDefaultDirs);
@@ -89,8 +98,7 @@ namespace
 			return;
 		}
 
-		auto setDllDirectoryWFn =
-		    reinterpret_cast<SetDllDirectoryWFn>(GetProcAddress(kernel32, "SetDllDirectoryW"));
+		auto setDllDirectoryWFn = resolveKernel32Function<SetDllDirectoryWFn>(kernel32, "SetDllDirectoryW");
 		if (setDllDirectoryWFn)
 			setDllDirectoryWFn(libDirPath);
 	}

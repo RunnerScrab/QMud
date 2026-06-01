@@ -104,7 +104,14 @@ ensure_runpath() {
 collect_deps_for() {
   item="$1"
   [ -e "$item" ] || return 0
-  ldd "$item" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' | while IFS= read -r dep; do
+  dep_library_path="$APP_LIB_DIR"
+  if [ -n "${QMUD_QT_LIB_DIR:-}" ]; then
+    dep_library_path="$dep_library_path:$QMUD_QT_LIB_DIR"
+  fi
+  if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+    dep_library_path="$dep_library_path:$LD_LIBRARY_PATH"
+  fi
+  LD_LIBRARY_PATH="$dep_library_path" ldd "$item" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' | while IFS= read -r dep; do
     [ -n "$dep" ] || continue
     copy_lib "$dep"
   done
@@ -140,18 +147,26 @@ if [ -n "${QMUD_QT_PLUGIN_DIR:-}" ] && [ -d "${QMUD_QT_PLUGIN_DIR}" ]; then
     cp -L "$src" "$APP_PLUGIN_DIR/$sub/"
   }
 
-  # Keep plugin set minimal and Qt-native. Avoid platformtheme extras that can
-  # drag in large host/KDE stacks and unstable portal behavior.
+  # Keep plugin set minimal and Qt-native. Keep the desktop portal platform
+  # theme, but avoid platformtheme extras that can drag in large host/KDE stacks.
   copy_plugin "${QMUD_QT_PLUGIN_DIR}/platforms/libqxcb.so" platforms
   copy_plugin "${QMUD_QT_PLUGIN_DIR}/platforms/libqwayland.so" platforms
   copy_plugin "${QMUD_QT_PLUGIN_DIR}/platforms/libqwayland-egl.so" platforms
   copy_plugin "${QMUD_QT_PLUGIN_DIR}/platforms/libqwayland-generic.so" platforms
+  copy_plugin "${QMUD_QT_PLUGIN_DIR}/platformthemes/libqxdgdesktopportal.so" platformthemes
   copy_plugin "${QMUD_QT_PLUGIN_DIR}/sqldrivers/libqsqlite.so" sqldrivers
   copy_plugin "${QMUD_QT_PLUGIN_DIR}/tls/libqopensslbackend.so" tls
   copy_plugin "${QMUD_QT_PLUGIN_DIR}/iconengines/libqsvgicon.so" iconengines
   copy_plugin "${QMUD_QT_PLUGIN_DIR}/styles/libqfusionstyle.so" styles
   copy_plugin "${QMUD_QT_PLUGIN_DIR}/xcbglintegrations/libqxcb-glx-integration.so" xcbglintegrations
   copy_plugin "${QMUD_QT_PLUGIN_DIR}/xcbglintegrations/libqxcb-egl-integration.so" xcbglintegrations
+  copy_plugin "${QMUD_QT_PLUGIN_DIR}/texttospeech/libqtexttospeech_flite.so" texttospeech
+  copy_plugin "${QMUD_QT_PLUGIN_DIR}/texttospeech/libqtexttospeech_speechd.so" texttospeech
+
+  if [ -d "${QMUD_QT_PLUGIN_DIR}/multimedia" ]; then
+    mkdir -p "$APP_PLUGIN_DIR/multimedia"
+    find "${QMUD_QT_PLUGIN_DIR}/multimedia" -maxdepth 1 -type f -name '*.so*' -exec cp -L {} "$APP_PLUGIN_DIR/multimedia/" \;
+  fi
 
   for sub in wayland-decoration-client wayland-graphics-integration-client wayland-shell-integration; do
     if [ -d "${QMUD_QT_PLUGIN_DIR}/${sub}" ]; then

@@ -12,6 +12,7 @@
 #include <QList>
 #include <QMdiSubWindow>
 #include <QString>
+#include <QVariant>
 
 namespace QMudMainFrameMdiUtils
 {
@@ -33,6 +34,45 @@ namespace QMudMainFrameMdiUtils
 		if (!target || target == addedSubWindow)
 			return nullptr;
 		return target;
+	}
+
+	bool windowMatchesRuntimeIdentity(const QMdiSubWindow *window, const qulonglong ownerToken,
+	                                  const QString &ownerWorldId, const bool acceptUnowned)
+	{
+		if (!window)
+			return false;
+
+		const qulonglong relatedToken = window->property("worldRuntimeToken").toULongLong();
+		if (ownerToken != 0)
+		{
+			if (relatedToken == ownerToken)
+				return true;
+			if (relatedToken != 0)
+				return false;
+		}
+
+		const QString relatedWorldId = window->property("worldId").toString().trimmed();
+		if (!ownerWorldId.isEmpty())
+		{
+			if (!relatedWorldId.isEmpty())
+				return relatedWorldId.compare(ownerWorldId, Qt::CaseInsensitive) == 0;
+			return acceptUnowned;
+		}
+
+		return acceptUnowned || (ownerToken == 0 && relatedToken == 0 && relatedWorldId.isEmpty());
+	}
+
+	QMdiSubWindow *firstWindowMatchingRuntimeIdentity(const QList<QMdiSubWindow *> &windows,
+	                                                  const qulonglong              ownerToken,
+	                                                  const QString &ownerWorldId, const bool acceptUnowned)
+	{
+		for (QMdiSubWindow *window : windows)
+		{
+			if (windowMatchesRuntimeIdentity(window, ownerToken, ownerWorldId, acceptUnowned))
+				return window;
+		}
+
+		return nullptr;
 	}
 
 	bool prepareOpenWorldStateBeforeChildClose(const std::function<bool(QString *)> &saveOpenWorldState,
