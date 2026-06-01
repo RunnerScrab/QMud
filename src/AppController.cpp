@@ -1955,6 +1955,8 @@ static const struct
     {"ActivityWindowRefreshType",       2                       },
     {"ParenMatchFlags",                 0x0001 | 0x0020 | 0x0040},
     {"PrinterFontSize",                 10                      },
+    {"PrinterFontItalic",               0                       },
+    {"PrinterFontWeight",               400                     },
     {"PrinterLeftMargin",               15                      },
     {"PrinterLinesPerPage",             60                      },
     {"PrinterTopMargin",                15                      },
@@ -13392,13 +13394,26 @@ void AppController::onCommandTriggered(const QString &cmdName)
 		                        : textWindow ? textWindow->windowTitle()
 		                                     : QStringLiteral("QMud");
 
-		const int     printerFontSize  = getGlobalOption(QStringLiteral("PrinterFontSize")).toInt();
-		const int     leftMarginMm     = getGlobalOption(QStringLiteral("PrinterLeftMargin")).toInt();
-		const int     topMarginMm      = getGlobalOption(QStringLiteral("PrinterTopMargin")).toInt();
-		const int     linesPerPagePref = getGlobalOption(QStringLiteral("PrinterLinesPerPage")).toInt();
-		QString       printerFontName  = getGlobalOption(QStringLiteral("PrinterFont")).toString();
+		const int     printerFontSize   = getGlobalOption(QStringLiteral("PrinterFontSize")).toInt();
+		const int     printerFontWeight = getGlobalOption(QStringLiteral("PrinterFontWeight")).toInt();
+		const int     printerFontItalic = getGlobalOption(QStringLiteral("PrinterFontItalic")).toInt();
+		const int     leftMarginMm      = getGlobalOption(QStringLiteral("PrinterLeftMargin")).toInt();
+		const int     topMarginMm       = getGlobalOption(QStringLiteral("PrinterTopMargin")).toInt();
+		const int     linesPerPagePref  = getGlobalOption(QStringLiteral("PrinterLinesPerPage")).toInt();
+		QString       printerFontName   = getGlobalOption(QStringLiteral("PrinterFont")).toString();
 		if (printerFontName.trimmed().isEmpty())
 			printerFontName = QStringLiteral("Courier");
+		const auto printerWeight = static_cast<QFont::Weight>(
+		    qBound(static_cast<int>(QFont::Thin), printerFontWeight, static_cast<int>(QFont::Black)));
+		const auto makePrinterFont = [&](const bool bold = false, const bool underline = false)
+		{
+			QFont font(printerFontName, printerFontSize);
+			font.setWeight(printerWeight);
+			font.setItalic(printerFontItalic != 0);
+			font.setBold(font.bold() || bold);
+			font.setUnderline(underline);
+			return font;
+		};
 
 		QPrinter printer(QPrinter::HighResolution);
 		if (m_hasPrintSetup)
@@ -13435,9 +13450,7 @@ void AppController::onCommandTriggered(const QString &cmdName)
 
 		auto       drawHeader = [&](QPainter &painter, const QRect &pageRect, const int pageNumber)
 		{
-			QFont headerFont(printerFontName, printerFontSize);
-			headerFont.setBold(true);
-			headerFont.setUnderline(true);
+			QFont headerFont = makePrinterFont(true, true);
 			painter.setFont(headerFont);
 			const QString timeText =
 			    QDateTime::currentDateTime().toString(QStringLiteral("dddd, MMMM dd, yyyy, h:mm AP"));
@@ -13445,9 +13458,7 @@ void AppController::onCommandTriggered(const QString &cmdName)
 			const int     x      = pageRect.left();
 			const int     y      = pageRect.top() + painter.fontMetrics().ascent();
 			painter.drawText(x, y, header);
-			QFont footerFont(printerFontName, printerFontSize);
-			footerFont.setBold(true);
-			footerFont.setUnderline(false);
+			QFont footerFont = makePrinterFont(true);
 			painter.setFont(footerFont);
 			const QString footer  = QStringLiteral("Page %1").arg(pageNumber);
 			const int     footerY = pageRect.bottom() - painter.fontMetrics().descent();
@@ -13459,7 +13470,7 @@ void AppController::onCommandTriggered(const QString &cmdName)
 			if (lines.isEmpty())
 				return;
 			QPainter    painter(&printer);
-			const QFont font(printerFontName, printerFontSize);
+			const QFont font = makePrinterFont();
 			painter.setFont(font);
 			const QFontMetrics metrics(font);
 			const int          lineHeight = metrics.lineSpacing();
@@ -13494,7 +13505,7 @@ void AppController::onCommandTriggered(const QString &cmdName)
 			if (lines.isEmpty())
 				return;
 			QPainter    painter(&printer);
-			const QFont baseFont(printerFontName, printerFontSize);
+			const QFont baseFont = makePrinterFont();
 			painter.setFont(baseFont);
 			const QFontMetrics baseMetrics(baseFont);
 			const int          lineHeight = baseMetrics.lineSpacing();
@@ -13535,8 +13546,8 @@ void AppController::onCommandTriggered(const QString &cmdName)
 							continue;
 						const QString chunk = entry.text.mid(offset, span.length);
 						QFont         font  = baseFont;
-						font.setBold(span.bold);
-						font.setItalic(span.italic);
+						font.setBold(baseFont.bold() || span.bold);
+						font.setItalic(baseFont.italic() || span.italic);
 						font.setUnderline(span.underline);
 						painter.setFont(font);
 						const QColor fore = span.fore.isValid() ? span.fore : QColor(Qt::black);

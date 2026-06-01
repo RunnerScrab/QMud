@@ -282,7 +282,7 @@ namespace
 
 	QString preferredQmudHomeRelativePath(const QString &value)
 	{
-		const QString normalized = storagePath(value);
+		QString normalized = storagePath(value);
 		if (normalized.isEmpty())
 			return normalized;
 
@@ -290,7 +290,7 @@ namespace
 		if (!app)
 			return normalized;
 
-		const QString absolute = QDir::cleanPath(app->makeAbsolutePath(normalized));
+		QString       absolute = QDir::cleanPath(app->makeAbsolutePath(normalized));
 		const QString qmudHome = qmudHomeDirectory(app);
 		if (qmudHome.isEmpty())
 			return absolute;
@@ -760,6 +760,8 @@ QWidget *GlobalPreferencesDialog::buildPrintingPage()
 	m_printerFontLabel = new QLabel(QStringLiteral("Font name"));
 	registerLabel(QStringLiteral("PrinterFont"), m_printerFontLabel);
 	layout->addWidget(m_printerFontLabel);
+	m_printerFontStyleLabel = new QLabel(QStringLiteral("10 pt. Regular"));
+	layout->addWidget(m_printerFontStyleLabel);
 
 	auto *grid = new QGridLayout;
 	grid->addWidget(new QLabel(QStringLiteral("Top margin:")), 0, 0, Qt::AlignRight);
@@ -792,12 +794,18 @@ QWidget *GlobalPreferencesDialog::buildPrintingPage()
 		                 QFont current(m_printerFontLabel->text());
 		                 if (m_printerFontSize > 0)
 			                 current.setPointSize(m_printerFontSize);
+		                 if (m_printerFontWeight > 0)
+			                 current.setWeight(static_cast<QFont::Weight>(m_printerFontWeight));
+		                 current.setItalic(m_printerFontItalic != 0);
 		                 QFont chosen =
 		                     QFontDialog::getFont(&ok, current, this, QStringLiteral("Select Printer Font"));
 		                 if (!ok)
 			                 return;
 		                 m_printerFontLabel->setText(chosen.family());
-		                 m_printerFontSize = chosen.pointSize();
+		                 m_printerFontSize   = chosen.pointSize();
+		                 m_printerFontWeight = chosen.weight();
+		                 m_printerFontItalic = chosen.italic() ? 1 : 0;
+		                 updatePrinterFontStyleLabel();
 	                 });
 	return page;
 }
@@ -1721,7 +1729,10 @@ void GlobalPreferencesDialog::loadPreferences()
 
 	if (m_printerFontLabel)
 		m_printerFontLabel->setText(app->getGlobalOption(QStringLiteral("PrinterFont")).toString());
-	m_printerFontSize = app->getGlobalOption(QStringLiteral("PrinterFontSize")).toInt();
+	m_printerFontSize   = app->getGlobalOption(QStringLiteral("PrinterFontSize")).toInt();
+	m_printerFontWeight = app->getGlobalOption(QStringLiteral("PrinterFontWeight")).toInt();
+	m_printerFontItalic = app->getGlobalOption(QStringLiteral("PrinterFontItalic")).toInt();
+	updatePrinterFontStyleLabel();
 
 	m_outputFontHeight = app->getGlobalOption(QStringLiteral("DefaultOutputFontHeight")).toInt();
 	m_inputFontHeight  = app->getGlobalOption(QStringLiteral("DefaultInputFontHeight")).toInt();
@@ -1814,6 +1825,13 @@ void GlobalPreferencesDialog::refreshUpdateCheckControlsEnabledState() const
 		m_checkNowButton->setEnabled(m_updateMechanismAvailable);
 }
 
+void GlobalPreferencesDialog::updatePrinterFontStyleLabel() const
+{
+	if (m_printerFontStyleLabel)
+		m_printerFontStyleLabel->setText(
+		    fontStyleSummary(m_printerFontSize, m_printerFontWeight, m_printerFontItalic != 0));
+}
+
 bool GlobalPreferencesDialog::applyPreferences()
 {
 	AppController *app = AppController::instance();
@@ -1900,6 +1918,8 @@ bool GlobalPreferencesDialog::applyPreferences()
 	app->setGlobalOptionInt(QStringLiteral("ActivityWindowRefreshInterval"), m_activityPeriod->value());
 
 	app->setGlobalOptionInt(QStringLiteral("PrinterFontSize"), m_printerFontSize);
+	app->setGlobalOptionInt(QStringLiteral("PrinterFontWeight"), m_printerFontWeight);
+	app->setGlobalOptionInt(QStringLiteral("PrinterFontItalic"), m_printerFontItalic);
 	app->setGlobalOptionInt(QStringLiteral("DefaultOutputFontHeight"), m_outputFontHeight);
 	app->setGlobalOptionInt(QStringLiteral("DefaultInputFontHeight"), m_inputFontHeight);
 	app->setGlobalOptionInt(QStringLiteral("DefaultInputFontWeight"), m_inputFontWeight);

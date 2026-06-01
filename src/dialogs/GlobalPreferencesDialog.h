@@ -10,6 +10,7 @@
 #define QMUD_GLOBALPREFERENCESDIALOG_H
 
 #include <QDialog>
+#include <QFont>
 #include <QHash>
 #include <QVector>
 
@@ -69,7 +70,10 @@ class GlobalPreferencesDialog : public QDialog
 
 		QPushButton                *m_printerFontButton{nullptr};
 		QLabel                     *m_printerFontLabel{nullptr};
+		QLabel                     *m_printerFontStyleLabel{nullptr};
 		int                         m_printerFontSize{0};
+		int                         m_printerFontWeight{QFont::Normal};
+		int                         m_printerFontItalic{0};
 		QSpinBox                   *m_printerTopMargin{nullptr};
 		QSpinBox                   *m_printerLeftMargin{nullptr};
 		QSpinBox                   *m_printerLinesPerPage{nullptr};
@@ -213,6 +217,10 @@ class GlobalPreferencesDialog : public QDialog
 		 * @brief Applies enabled/disabled state for update-check controls.
 		 */
 		void                        refreshUpdateCheckControlsEnabledState() const;
+		/**
+		 * @brief Updates printer font style summary from stored dialog state.
+		 */
+		void                        updatePrinterFontStyleLabel() const;
 
 		/**
 		 * @brief Creates a small color swatch button control.
@@ -275,7 +283,7 @@ class GlobalPreferencesDialog : public QDialog
 		/**
 		 * @brief Converts legacy color-ref integer to QColor.
 		 * @param colorRef Legacy COLORREF value.
-		 * @return Converted colour value.
+		 * @return Converted color value.
 		 */
 		static QColor               colorFromColorRef(int colorRef);
 		/**
