@@ -200,6 +200,32 @@ QAction *MainWindow::actionForCommand(const QString &cmdName) const
 	return m_actions.value(cmdName, nullptr);
 }
 
+static void applyExplicitMacMenuRole(QAction *action)
+{
+#ifdef Q_OS_MACOS
+	if (action)
+		action->setMenuRole(QAction::NoRole);
+#else
+	Q_UNUSED(action);
+#endif
+}
+
+static QMenu *addMainFrameMenu(QMenuBar *menuBar, const QString &title)
+{
+	QMenu *menu = menuBar ? menuBar->addMenu(title) : nullptr;
+	if (menu)
+		applyExplicitMacMenuRole(menu->menuAction());
+	return menu;
+}
+
+static QMenu *addMainFrameSubMenu(QMenu *parent, const QString &title)
+{
+	QMenu *menu = parent ? parent->addMenu(title) : nullptr;
+	if (menu)
+		applyExplicitMacMenuRole(menu->menuAction());
+	return menu;
+}
+
 QAction *MainWindow::addActionToMenu(QMenu *menu, const QString &cmdName, const QString &text,
                                      const QKeySequence &shortcut)
 {
@@ -227,7 +253,7 @@ QAction *MainWindow::addActionToMenu(QMenu *menu, const QString &cmdName, const 
 void MainWindow::buildMenus()
 {
 	// File menu
-	m_fileMenu = menuBar()->addMenu(QStringLiteral("&File"));
+	m_fileMenu = addMainFrameMenu(menuBar(), QStringLiteral("&File"));
 	addActionToMenu(m_fileMenu, QStringLiteral("New"), QStringLiteral("&New World...\tCtrl+N"),
 	                QKeySequence::New);
 	addActionToMenu(m_fileMenu, QStringLiteral("Open"), QStringLiteral("&Open World...\tCtrl+O"),
@@ -289,7 +315,7 @@ void MainWindow::buildMenus()
 	addActionToMenu(m_fileMenu, QStringLiteral("ExitClient"), QStringLiteral("E&xit"));
 
 	// Edit menu
-	QMenu *editMenu = menuBar()->addMenu(QStringLiteral("&Edit"));
+	QMenu *editMenu = addMainFrameMenu(menuBar(), QStringLiteral("&Edit"));
 	addActionToMenu(editMenu, QStringLiteral("Undo"), QStringLiteral("&Undo\tCtrl+Z"), QKeySequence::Undo);
 	editMenu->addSeparator();
 	addActionToMenu(editMenu, QStringLiteral("Cut"), QStringLiteral("Cu&t\tCtrl+X"), QKeySequence::Cut);
@@ -350,7 +376,7 @@ void MainWindow::buildMenus()
 	                QStringLiteral("&Refresh Recalled Data"));
 
 	// View menu
-	QMenu *viewMenu    = menuBar()->addMenu(QStringLiteral("&View"));
+	QMenu *viewMenu    = addMainFrameMenu(menuBar(), QStringLiteral("&View"));
 	auto  *viewToolbar = addActionToMenu(viewMenu, QStringLiteral("ViewToolbar"), QStringLiteral("&Toolbar"));
 	viewToolbar->setCheckable(true);
 	viewToolbar->setChecked(true);
@@ -402,7 +428,7 @@ void MainWindow::buildMenus()
 	fullScreen->setCheckable(true);
 
 	// Connection menu
-	QMenu *connectionMenu = menuBar()->addMenu(QStringLiteral("&Connection"));
+	QMenu *connectionMenu = addMainFrameMenu(menuBar(), QStringLiteral("&Connection"));
 	addActionToMenu(connectionMenu, QStringLiteral("QuickConnect"),
 	                QStringLiteral("&Quick Connect...\tCtrl+Alt+Shift+K"),
 	                QKeySequence(QStringLiteral("Ctrl+Alt+Shift+K")));
@@ -426,7 +452,7 @@ void MainWindow::buildMenus()
 	                QStringLiteral("Connect To Worlds &In Startup List"));
 
 	// Input menu
-	QMenu *inputMenu = menuBar()->addMenu(QStringLiteral("&Input"));
+	QMenu *inputMenu = addMainFrameMenu(menuBar(), QStringLiteral("&Input"));
 	addActionToMenu(inputMenu, QStringLiteral("ActivateInputArea"),
 	                QStringLiteral("Activate &Input Area\tTab"), QKeySequence(QStringLiteral("Tab")));
 	inputMenu->addSeparator();
@@ -459,7 +485,7 @@ void MainWindow::buildMenus()
 	addActionToMenu(inputMenu, QStringLiteral("KeyName"), QStringLiteral("&Key Name..."));
 
 	// Display menu
-	QMenu *displayMenu = menuBar()->addMenu(QStringLiteral("&Display"));
+	QMenu *displayMenu = addMainFrameMenu(menuBar(), QStringLiteral("&Display"));
 	addActionToMenu(displayMenu, QStringLiteral("DisplayStart"), QStringLiteral("&Start\tCtrl+Home"),
 	                QKeySequence(QStringLiteral("Ctrl+Home")));
 	addActionToMenu(displayMenu, QStringLiteral("DisplayPageUp"), QStringLiteral("Page &Up\tPageUp"),
@@ -518,8 +544,8 @@ void MainWindow::buildMenus()
 	                QKeySequence(QStringLiteral("Ctrl+Alt+E")));
 
 	// Game / World menu
-	QMenu   *gameMenu               = menuBar()->addMenu(QStringLiteral("&Game"));
-	QMenu   *configureMenu          = gameMenu->addMenu(QStringLiteral("&Configure"));
+	QMenu   *gameMenu               = addMainFrameMenu(menuBar(), QStringLiteral("&Game"));
+	QMenu   *configureMenu          = addMainFrameSubMenu(gameMenu, QStringLiteral("&Configure"));
 	QAction *allConfigurationAction = addActionToMenu(configureMenu, QStringLiteral("Preferences"),
 	                                                  QStringLiteral("All &Configuration...\tAlt+Enter"),
 	                                                  QKeySequence(QStringLiteral("Alt+Return")));
@@ -624,7 +650,7 @@ void MainWindow::buildMenus()
 	                QKeySequence(QStringLiteral("Ctrl+Alt+Shift+D")));
 
 	// Window menu
-	m_windowMenu = menuBar()->addMenu(QStringLiteral("&Window"));
+	m_windowMenu = addMainFrameMenu(menuBar(), QStringLiteral("&Window"));
 	addActionToMenu(m_windowMenu, QStringLiteral("NewWindow"), QStringLiteral("&New Window"));
 	addActionToMenu(m_windowMenu, QStringLiteral("CascadeWindows"), QStringLiteral("&Cascade"));
 	addActionToMenu(m_windowMenu, QStringLiteral("TileWindows"), QStringLiteral("&Tile Horizontally"));
@@ -639,7 +665,7 @@ void MainWindow::buildMenus()
 	connect(m_windowMenu, &QMenu::aboutToShow, this, &MainWindow::updateWindowMenu);
 
 	// Help menu
-	QMenu *helpMenu = menuBar()->addMenu(QStringLiteral("&Help"));
+	QMenu *helpMenu = addMainFrameMenu(menuBar(), QStringLiteral("&Help"));
 	addActionToMenu(helpMenu, QStringLiteral("TipOfTheDay"), QStringLiteral("&Tip Of The Day..."));
 	helpMenu->addSeparator();
 	addActionToMenu(helpMenu, QStringLiteral("GettingStarted"), QStringLiteral("&Getting Started..."));

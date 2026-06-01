@@ -30,9 +30,14 @@ namespace QMudMainFrameActionUtils
 	{
 		if (commandName == QStringLiteral("ExitClient"))
 			return QAction::QuitRole;
+#ifdef Q_OS_MACOS
+		Q_UNUSED(commandName);
+		return QAction::NoRole;
+#else
 		if (commandName == QStringLiteral("QuitFromWorld"))
 			return QAction::NoRole;
 		return QAction::TextHeuristicRole;
+#endif
 	}
 
 	QKeySequence shortcutForCommand(const QString &commandName, const QKeySequence &configuredShortcut)

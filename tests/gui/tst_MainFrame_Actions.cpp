@@ -61,8 +61,14 @@ class tst_MainFrame_Actions : public QObject
 			QTest::addColumn<QAction::MenuRole>("expected");
 
 			QTest::newRow("application-quit") << QStringLiteral("ExitClient") << QAction::QuitRole;
+#ifdef Q_OS_MACOS
+			QTest::newRow("world-quit") << QStringLiteral("QuitFromWorld") << QAction::NoRole;
+			QTest::newRow("ordinary-action") << QStringLiteral("Open") << QAction::NoRole;
+			QTest::newRow("preferences-action") << QStringLiteral("Preferences") << QAction::NoRole;
+#else
 			QTest::newRow("world-quit") << QStringLiteral("QuitFromWorld") << QAction::NoRole;
 			QTest::newRow("ordinary-action") << QStringLiteral("Open") << QAction::TextHeuristicRole;
+#endif
 		}
 
 		void menuRoleForCommand()
