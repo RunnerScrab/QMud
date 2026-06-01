@@ -5351,6 +5351,15 @@ namespace
 		context->miniWindowInfoByKey.insert(callbackMiniWindowInfoKey(windowName, infoType), value);
 	}
 
+	void cacheCallbackMiniWindowApiRect(const LuaCallbackEngine *engine, const MiniWindow &window)
+	{
+		const QRect apiRect = window.apiRect();
+		cacheCallbackMiniWindowInfo(engine, window.name, 10, apiRect.left());
+		cacheCallbackMiniWindowInfo(engine, window.name, 11, apiRect.top());
+		cacheCallbackMiniWindowInfo(engine, window.name, 12, apiRect.right());
+		cacheCallbackMiniWindowInfo(engine, window.name, 13, apiRect.bottom());
+	}
+
 	bool tryResolveCallbackMiniWindowInfoSnapshotValue(
 	    const LuaCallbackMiniWindowSnapshot::WindowInfoSnapshot &info, const int infoType, QVariant &value)
 	{
@@ -5590,10 +5599,11 @@ namespace
 		    window.background.isValid()
 		        ? QVariant::fromValue<qlonglong>(callbackMiniWindowColorValue(window.background)).toLongLong()
 		        : 0;
-		info.rectLeft         = window.rect.left();
-		info.rectTop          = window.rect.top();
-		info.rectRight        = window.rect.right();
-		info.rectBottom       = window.rect.bottom();
+		const QRect apiRect   = window.apiRect();
+		info.rectLeft         = apiRect.left();
+		info.rectTop          = apiRect.top();
+		info.rectRight        = apiRect.right();
+		info.rectBottom       = apiRect.bottom();
 		info.lastMouseX       = window.lastMousePosition.x();
 		info.lastMouseY       = window.lastMousePosition.y();
 		info.lastMouseUpdate  = window.lastMouseUpdate;
@@ -5796,10 +5806,7 @@ namespace
 		    window.background.isValid()
 		        ? QVariant::fromValue<qlonglong>(callbackMiniWindowColorValue(window.background))
 		        : QVariant(0));
-		cacheCallbackMiniWindowInfo(engine, window.name, 10, window.rect.left());
-		cacheCallbackMiniWindowInfo(engine, window.name, 11, window.rect.top());
-		cacheCallbackMiniWindowInfo(engine, window.name, 12, window.rect.right());
-		cacheCallbackMiniWindowInfo(engine, window.name, 13, window.rect.bottom());
+		cacheCallbackMiniWindowApiRect(engine, window);
 		cacheCallbackMiniWindowInfo(engine, window.name, 14, window.lastMousePosition.x());
 		cacheCallbackMiniWindowInfo(engine, window.name, 15, window.lastMousePosition.y());
 		cacheCallbackMiniWindowInfo(engine, window.name, 16, window.lastMouseUpdate);
@@ -5819,6 +5826,11 @@ namespace
 	{
 		auto         *context   = activeCallbackContext(engine);
 		const QString windowKey = callbackMiniWindowWindowKey(windowName);
+		if (!windowKey.isEmpty())
+		{
+			context->missingMiniWindowIds.remove(windowKey);
+			context->existingMiniWindowIds.insert(windowKey);
+		}
 		if (const auto it = context->miniWindowShadowByWindow.constFind(windowKey);
 		    it == context->miniWindowShadowByWindow.constEnd())
 		{
@@ -5871,6 +5883,7 @@ namespace
 		MiniWindowUtils::resize(*window, width, height, colour);
 		cacheCallbackMiniWindowInfo(engine, window->name, 3, width);
 		cacheCallbackMiniWindowInfo(engine, window->name, 4, height);
+		cacheCallbackMiniWindowApiRect(engine, *window);
 	}
 
 	void setCallbackMiniWindowShadowFont(const LuaCallbackEngine *engine, const QString &windowName,
@@ -5925,16 +5938,16 @@ namespace
 			            : QVariant(0);
 			return true;
 		case 10:
-			value = window->rect.left();
+			value = window->apiRect().left();
 			return true;
 		case 11:
-			value = window->rect.top();
+			value = window->apiRect().top();
 			return true;
 		case 12:
-			value = window->rect.right();
+			value = window->apiRect().right();
 			return true;
 		case 13:
-			value = window->rect.bottom();
+			value = window->apiRect().bottom();
 			return true;
 		case 14:
 			value = window->lastMousePosition.x();
@@ -6043,6 +6056,7 @@ namespace
 		cacheCallbackMiniWindowInfo(engine, window->name, 2, top);
 		cacheCallbackMiniWindowInfo(engine, window->name, 7, position);
 		cacheCallbackMiniWindowInfo(engine, window->name, 8, flags);
+		cacheCallbackMiniWindowApiRect(engine, *window);
 	}
 
 	void setCallbackMiniWindowShadowZOrder(const LuaCallbackEngine *engine, const QString &windowName,
@@ -40196,10 +40210,6 @@ static int luaWindowCreate(lua_State *L)
 		cacheCallbackMiniWindowInfo(engine, name, 7, position);
 		cacheCallbackMiniWindowInfo(engine, name, 8, flags);
 		cacheCallbackMiniWindowInfo(engine, name, 9, static_cast<qlonglong>(backgroundValue));
-		cacheCallbackMiniWindowInfo(engine, name, 10, 0);
-		cacheCallbackMiniWindowInfo(engine, name, 11, 0);
-		cacheCallbackMiniWindowInfo(engine, name, 12, 0);
-		cacheCallbackMiniWindowInfo(engine, name, 13, 0);
 		lua_pushnumber(L, eOK);
 		return 1;
 	}

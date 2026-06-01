@@ -180,6 +180,19 @@ struct MiniWindow
 		}
 
 		/**
+		 * @brief Returns the script-visible miniwindow rectangle for WindowInfo APIs.
+		 *
+		 * Absolute miniwindows keep their plugin coordinate space even when QMud scales their
+		 * painted rectangle to fit the current view.
+		 */
+		[[nodiscard]] QRect apiRect() const
+		{
+			if ((flags & kMiniWindowAbsoluteLocation) != 0)
+				return {location, logicalSize()};
+			return rect;
+		}
+
+		/**
 		 * @brief Returns the high-DPI backing image for painting/compositing.
 		 */
 		[[nodiscard]] const QImage &backingSurface() const

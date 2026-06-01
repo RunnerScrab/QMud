@@ -442,10 +442,11 @@ namespace
 			infoSnapshot.flags           = window.flags;
 			infoSnapshot.backgroundRef =
 			    window.background.isValid() ? toRef(window.background) : static_cast<qlonglong>(0);
-			infoSnapshot.rectLeft         = window.rect.left();
-			infoSnapshot.rectTop          = window.rect.top();
-			infoSnapshot.rectRight        = window.rect.right();
-			infoSnapshot.rectBottom       = window.rect.bottom();
+			const QRect apiRect           = window.apiRect();
+			infoSnapshot.rectLeft         = apiRect.left();
+			infoSnapshot.rectTop          = apiRect.top();
+			infoSnapshot.rectRight        = apiRect.right();
+			infoSnapshot.rectBottom       = apiRect.bottom();
 			infoSnapshot.lastMouseX       = window.lastMousePosition.x();
 			infoSnapshot.lastMouseY       = window.lastMousePosition.y();
 			infoSnapshot.lastMouseUpdate  = window.lastMouseUpdate;
@@ -21289,13 +21290,13 @@ QVariant WorldRuntime::windowInfo(const QString &name, int infoType) const
 			return QVariant::fromValue<qlonglong>(colorToRef(window->background));
 		return 0;
 	case 10:
-		return window->rect.left();
+		return window->apiRect().left();
 	case 11:
-		return window->rect.top();
+		return window->apiRect().top();
 	case 12:
-		return window->rect.right();
+		return window->apiRect().right();
 	case 13:
-		return window->rect.bottom();
+		return window->apiRect().bottom();
 	case 14:
 		return window->lastMousePosition.x();
 	case 15:
