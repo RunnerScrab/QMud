@@ -3220,24 +3220,21 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 	if (!keyEvent)
 		return QMainWindow::eventFilter(watched, event);
 	const Qt::KeyboardModifiers mods = keyEvent->modifiers();
-	const bool hasOnlyAlt   = mods.testFlag(Qt::AltModifier) && !mods.testFlag(Qt::ControlModifier) &&
-	                          !mods.testFlag(Qt::ShiftModifier) && !mods.testFlag(Qt::MetaModifier);
-	const bool hasOnlyCtrl  = mods.testFlag(Qt::ControlModifier) && !mods.testFlag(Qt::AltModifier) &&
-	                          !mods.testFlag(Qt::ShiftModifier) && !mods.testFlag(Qt::MetaModifier);
-	const bool hasOnlyShift = mods.testFlag(Qt::ShiftModifier) && !mods.testFlag(Qt::ControlModifier) &&
-	                          !mods.testFlag(Qt::AltModifier) && !mods.testFlag(Qt::MetaModifier);
+	const bool hasOnlyAlt  = mods.testFlag(Qt::AltModifier) && !mods.testFlag(Qt::ControlModifier) &&
+	                         !mods.testFlag(Qt::ShiftModifier) && !mods.testFlag(Qt::MetaModifier);
+	const bool hasOnlyCtrl = mods.testFlag(Qt::ControlModifier) && !mods.testFlag(Qt::AltModifier) &&
+	                         !mods.testFlag(Qt::ShiftModifier) && !mods.testFlag(Qt::MetaModifier);
 	const bool altEnter =
 	    hasOnlyAlt && (keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter);
-	const bool ctrlG      = hasOnlyCtrl && keyEvent->key() == Qt::Key_G;
-	const bool shiftLeft  = hasOnlyShift && keyEvent->key() == Qt::Key_Left;
-	const bool shiftRight = hasOnlyShift && keyEvent->key() == Qt::Key_Right;
+	const bool ctrlG       = hasOnlyCtrl && keyEvent->key() == Qt::Key_G;
+	const int  tabShortcut = QMudMainFrameActionUtils::adjacentTabShortcutStep(keyEvent->key(), mods);
 
-	if (!altEnter && !ctrlG && !shiftLeft && !shiftRight)
+	if (!altEnter && !ctrlG && tabShortcut == 0)
 		return QMainWindow::eventFilter(watched, event);
 
 	if (event->type() == QEvent::ShortcutOverride)
 	{
-		if (shiftLeft || shiftRight)
+		if (tabShortcut != 0)
 		{
 			if (QApplication::activeModalWidget())
 				return QMainWindow::eventFilter(watched, event);
@@ -3253,7 +3250,7 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 
 	if (QApplication::activeModalWidget())
 	{
-		if (shiftLeft || shiftRight)
+		if (tabShortcut != 0)
 			return QMainWindow::eventFilter(watched, event);
 		keyEvent->accept();
 		return true;
@@ -3271,7 +3268,7 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 		return true;
 	}
 
-	if ((shiftLeft || shiftRight) && triggerAdjacentMdiTabFromShortcut(shiftRight ? 1 : -1))
+	if (tabShortcut != 0 && triggerAdjacentMdiTabFromShortcut(tabShortcut))
 	{
 		keyEvent->accept();
 		return true;
