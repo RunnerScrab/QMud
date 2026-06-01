@@ -630,6 +630,7 @@ qmud_add_qtest(tst_WorldCommandProcessor_TimerAccounting
 
 if (QMUD_ENABLE_GUI_TESTS)
     qmud_add_qtest(tst_MainFrame_Actions
+            GUI
             SOURCES
             gui/tst_MainFrame_Actions.cpp
             "${CMAKE_SOURCE_DIR}/src/helpers/MainFrameActionUtils.cpp"

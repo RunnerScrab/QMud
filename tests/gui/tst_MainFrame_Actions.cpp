@@ -55,6 +55,56 @@ class tst_MainFrame_Actions : public QObject
 			QCOMPARE(QMudMainFrameActionUtils::worldButtonTooltipForSlot(slot), expected);
 		}
 
+		void menuRoleForCommand_data()
+		{
+			QTest::addColumn<QString>("commandName");
+			QTest::addColumn<QAction::MenuRole>("expected");
+
+			QTest::newRow("application-quit") << QStringLiteral("ExitClient") << QAction::QuitRole;
+			QTest::newRow("world-quit") << QStringLiteral("QuitFromWorld") << QAction::NoRole;
+			QTest::newRow("ordinary-action") << QStringLiteral("Open") << QAction::TextHeuristicRole;
+		}
+
+		void menuRoleForCommand()
+		{
+			QFETCH(QString, commandName);
+			QFETCH(QAction::MenuRole, expected);
+			QCOMPARE(QMudMainFrameActionUtils::menuRoleForCommand(commandName), expected);
+		}
+
+		void shortcutForCommand_data()
+		{
+			QTest::addColumn<QString>("commandName");
+			QTest::addColumn<QString>("configuredShortcutText");
+			QTest::addColumn<bool>("expectedStandardQuit");
+			QTest::addColumn<QString>("expectedShortcutText");
+
+			QTest::newRow("application-quit-default")
+			    << QStringLiteral("ExitClient") << QString() << true << QString();
+			QTest::newRow("application-quit-explicit")
+			    << QStringLiteral("ExitClient") << QStringLiteral("Ctrl+Alt+Q") << false
+			    << QStringLiteral("Ctrl+Alt+Q");
+			QTest::newRow("world-quit") << QStringLiteral("QuitFromWorld") << QStringLiteral("Ctrl+Shift+Q")
+			                            << false << QStringLiteral("Ctrl+Shift+Q");
+		}
+
+		void shortcutForCommand()
+		{
+			QFETCH(QString, commandName);
+			QFETCH(QString, configuredShortcutText);
+			QFETCH(bool, expectedStandardQuit);
+			QFETCH(QString, expectedShortcutText);
+
+			const QKeySequence configuredShortcut =
+			    QKeySequence::fromString(configuredShortcutText, QKeySequence::PortableText);
+			const QKeySequence actual =
+			    QMudMainFrameActionUtils::shortcutForCommand(commandName, configuredShortcut);
+			if (expectedStandardQuit)
+				QCOMPARE(actual, QKeySequence(QKeySequence::Quit));
+			else
+				QCOMPARE(actual.toString(QKeySequence::PortableText), expectedShortcutText);
+		}
+
 		void shouldAttemptIncomingLineTaskbarFlash_data()
 		{
 			QTest::addColumn<bool>("worldFlashEnabled");
@@ -166,7 +216,7 @@ class tst_MainFrame_Actions : public QObject
 		// NOLINTEND(readability-convert-member-functions-to-static)
 };
 
-QTEST_APPLESS_MAIN(tst_MainFrame_Actions)
+QTEST_MAIN(tst_MainFrame_Actions)
 
 #if __has_include("tst_MainFrame_Actions.moc")
 #include "tst_MainFrame_Actions.moc"

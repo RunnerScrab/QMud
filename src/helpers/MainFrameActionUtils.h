@@ -3,11 +3,14 @@
  * Copyright (c) 2026 Panagiotis Kalogiratos (Nodens)
  *
  * File: MainFrameActionUtils.h
- * Role: Pure helpers for action ids/tooltips used by main-frame world-slot toolbar wiring.
+ * Role: Pure helpers for main-frame action ids, tooltips, and platform menu policy.
  */
 
 #ifndef QMUD_MAINFRAMEACTIONUTILS_H
 #define QMUD_MAINFRAMEACTIONUTILS_H
+
+#include <QAction>
+#include <QKeySequence>
 
 class QString;
 
@@ -18,28 +21,42 @@ namespace QMudMainFrameActionUtils
 	 * @param slot 1-based slot index.
 	 * @return Command name used by action dispatch.
 	 */
-	QString            worldCommandNameForSlot(int slot);
+	QString                         worldCommandNameForSlot(int slot);
 
 	/**
 	 * @brief Builds user-facing toolbar tooltip text for one world slot.
 	 * @param slot 1-based slot index.
 	 * @return Tooltip string including shortcut hint when available.
 	 */
-	QString            worldButtonTooltipForSlot(int slot);
+	QString                         worldButtonTooltipForSlot(int slot);
+	/**
+	 * @brief Resolves native menu role for a main-frame command action.
+	 * @param commandName Command identifier.
+	 * @return Qt menu role used for platform menu integration.
+	 */
+	[[nodiscard]] QAction::MenuRole menuRoleForCommand(const QString &commandName);
+	/**
+	 * @brief Resolves keyboard shortcut for a main-frame command action.
+	 * @param commandName Command identifier.
+	 * @param configuredShortcut Shortcut explicitly assigned by caller.
+	 * @return Shortcut that should be installed on the action.
+	 */
+	[[nodiscard]] QKeySequence shortcutForCommand(const QString      &commandName,
+	                                              const QKeySequence &configuredShortcut = QKeySequence());
 	/**
 	 * @brief Returns whether incoming server line should attempt taskbar flash.
 	 * @param worldFlashEnabled `true` when world flash option is enabled.
 	 * @param appFocused `true` when QMud currently has application focus.
 	 * @return `true` when runtime should attempt flash request.
 	 */
-	[[nodiscard]] bool shouldAttemptIncomingLineTaskbarFlash(bool worldFlashEnabled, bool appFocused);
+	[[nodiscard]] bool         shouldAttemptIncomingLineTaskbarFlash(bool worldFlashEnabled, bool appFocused);
 	/**
 	 * @brief Resolves app-focused state for taskbar flash gating from Qt/main-window focus signals.
 	 * @param qtAppFocused `true` when Qt reports ApplicationActive.
 	 * @param windowFocused `true` when main-window focus tracker reports focused.
 	 * @return `true` when flash logic should treat app as focused.
 	 */
-	[[nodiscard]] bool resolveIncomingLineFocusForFlash(bool qtAppFocused, bool windowFocused);
+	[[nodiscard]] bool         resolveIncomingLineFocusForFlash(bool qtAppFocused, bool windowFocused);
 	/**
 	 * @brief Resolves app-focused state for activity-sound gating from Qt/main-window focus signals.
 	 * @param qtAppFocused `true` when Qt reports ApplicationActive.

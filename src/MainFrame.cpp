@@ -203,10 +203,12 @@ QAction *MainWindow::actionForCommand(const QString &cmdName) const
 QAction *MainWindow::addActionToMenu(QMenu *menu, const QString &cmdName, const QString &text,
                                      const QKeySequence &shortcut)
 {
-	auto *a = new QAction(text, this);
-	if (!shortcut.isEmpty())
-		a->setShortcut(shortcut);
+	auto              *a                = new QAction(text, this);
+	const QKeySequence resolvedShortcut = QMudMainFrameActionUtils::shortcutForCommand(cmdName, shortcut);
+	if (!resolvedShortcut.isEmpty())
+		a->setShortcut(resolvedShortcut);
 	a->setShortcutContext(Qt::ApplicationShortcut);
+	a->setMenuRole(QMudMainFrameActionUtils::menuRoleForCommand(cmdName));
 	a->setObjectName(cmdName); // preserve original command-name for lookup
 	a->setIconVisibleInMenu(false);
 	QString tipText = text;
