@@ -1009,6 +1009,21 @@ namespace
 		return {x, y};
 	}
 
+	QPoint miniWindowDisplayToContentUnbounded(const MiniWindow *window, const QPoint &displayPoint)
+	{
+		if (!hasScaledAbsoluteRect(window))
+			return displayPoint;
+
+		const int displayWidth  = qMax(1, window->rect.width());
+		const int displayHeight = qMax(1, window->rect.height());
+		const int contentWidth  = qMax(1, window->width);
+		const int contentHeight = qMax(1, window->height);
+
+		const int x = (displayPoint.x() * contentWidth) / displayWidth;
+		const int y = (displayPoint.y() * contentHeight) / displayHeight;
+		return {x, y};
+	}
+
 	QPoint miniWindowContentToDisplay(const MiniWindow *window, const QPoint &contentPoint)
 	{
 		if (!hasScaledAbsoluteRect(window))
@@ -10424,6 +10439,20 @@ void WorldView::clearHotspotCursor()
 	applyOutputCursor(nullptr);
 }
 
+void WorldView::setMiniWindowCallbackMousePosition(MiniWindow &window, const QPoint &callbackLocal,
+                                                   const bool updateWindowRelativePosition)
+{
+	m_lastMousePos             = callbackLocal;
+	m_hasLastMousePos          = true;
+	window.clientMousePosition = callbackLocal;
+	if (updateWindowRelativePosition)
+	{
+		window.lastMousePosition =
+		    miniWindowDisplayToContentUnbounded(&window, callbackLocal - window.rect.topLeft());
+		window.lastMouseUpdate++;
+	}
+}
+
 void WorldView::scheduleCapturedMiniWindowDragMove(const QPoint &callbackLocal)
 {
 	m_pendingCapturedMiniWindowDragMoveLocal = callbackLocal;
@@ -10443,6 +10472,15 @@ void WorldView::scheduleCapturedMiniWindowDragMove(const QPoint &callbackLocal)
 		dispatchPendingCapturedMiniWindowDragMove();
 }
 
+void WorldView::flushPendingCapturedMiniWindowDragMove(const QPoint &callbackLocal)
+{
+	if (!m_hasPendingCapturedMiniWindowDragMove)
+		return;
+	m_pendingCapturedMiniWindowDragMoveLocal = callbackLocal;
+	m_capturedMiniWindowDragMoveDrainQueued  = false;
+	dispatchPendingCapturedMiniWindowDragMove();
+}
+
 void WorldView::dispatchPendingCapturedMiniWindowDragMove()
 {
 	if (!m_hasPendingCapturedMiniWindowDragMove)
@@ -10455,9 +10493,9 @@ void WorldView::dispatchPendingCapturedMiniWindowDragMove()
 	if (!captured || captured->mouseDownHotspot.isEmpty())
 		return;
 
-	captured->clientMousePosition = m_pendingCapturedMiniWindowDragMoveLocal;
-	const QString down            = captured->mouseDownHotspot;
-	auto          it              = captured->hotspots.find(down);
+	setMiniWindowCallbackMousePosition(*captured, m_pendingCapturedMiniWindowDragMoveLocal, true);
+	const QString down = captured->mouseDownHotspot;
+	auto          it   = captured->hotspots.find(down);
 	if (it == captured->hotspots.end())
 		return;
 
@@ -10576,12 +10614,7 @@ bool WorldView::handleMiniWindowMouseMove(const QMouseEvent *event, const QWidge
 	const QRect  outputRect = m_outputStack->rect();
 	if (!outputRect.contains(hitLocal))
 	{
-		if (!m_capturedWindowName.isEmpty())
-		{
-			hitLocal.setX(qBound(outputRect.left(), hitLocal.x(), outputRect.right()));
-			hitLocal.setY(qBound(outputRect.top(), hitLocal.y(), outputRect.bottom()));
-		}
-		else
+		if (m_capturedWindowName.isEmpty())
 		{
 			handleMiniWindowMouseLeave();
 			return false;
@@ -10613,7 +10646,7 @@ bool WorldView::handleMiniWindowMouseMove(const QMouseEvent *event, const QWidge
 	{
 		MiniWindow *captured = m_runtime->miniWindow(m_capturedWindowName);
 		if (captured)
-			captured->clientMousePosition = callbackLocal;
+			setMiniWindowCallbackMousePosition(*captured, callbackLocal, true);
 		if (!m_tooltipHotspot.isEmpty())
 		{
 			QToolTip::hideText();
@@ -10736,10 +10769,8 @@ bool WorldView::handleMiniWindowMousePress(const QMouseEvent *event, bool double
 	if (!window)
 		return false;
 
-	m_hoverWindowName           = windowName;
-	window->clientMousePosition = local;
-	window->lastMousePosition   = miniWindowDisplayToContent(window, local - window->rect.topLeft());
-	window->lastMouseUpdate++;
+	m_hoverWindowName = windowName;
+	setMiniWindowCallbackMousePosition(*window, local, true);
 	if (!window->mouseOverHotspot.isEmpty())
 		cancelMouseOver(window, window->mouseOverHotspot);
 
@@ -10809,16 +10840,9 @@ bool WorldView::handleMiniWindowMouseRelease(const QMouseEvent *event, const QWi
 	if (!m_runtime || !m_mouseCaptured)
 		return false;
 
-	const QPoint local        = mapEventToOutputStack(event->position(), source);
-	QPoint       boundedLocal = local;
-	const QRect  outputRect   = m_outputStack->rect();
-	if (!outputRect.contains(boundedLocal))
-	{
-		boundedLocal.setX(qBound(outputRect.left(), boundedLocal.x(), outputRect.right()));
-		boundedLocal.setY(qBound(outputRect.top(), boundedLocal.y(), outputRect.bottom()));
-	}
-	m_lastMousePos    = boundedLocal;
-	m_hasLastMousePos = true;
+	const QPoint local = mapEventToOutputStack(event->position(), source);
+	m_lastMousePos     = local;
+	m_hasLastMousePos  = true;
 	QString     hotspotId;
 	QString     windowName;
 	MiniWindow *windowUnderCursor = hitTestMiniWindow(local, hotspotId, windowName, true);
@@ -10838,17 +10862,15 @@ bool WorldView::handleMiniWindowMouseRelease(const QMouseEvent *event, const QWi
 	    !m_capturedWindowName.isEmpty() ? m_runtime->miniWindow(m_capturedWindowName) : nullptr;
 	if (pressedWindow && m_hasPendingCapturedMiniWindowDragMove)
 	{
-		m_pendingCapturedMiniWindowDragMoveLocal = boundedLocal;
-		m_capturedMiniWindowDragMoveDrainQueued  = false;
-		dispatchPendingCapturedMiniWindowDragMove();
+		flushPendingCapturedMiniWindowDragMove(local);
 		pressedWindow =
 		    !m_capturedWindowName.isEmpty() ? m_runtime->miniWindow(m_capturedWindowName) : nullptr;
 	}
 	QString previousDownHotspot;
 	if (pressedWindow)
 	{
-		pressedWindow->clientMousePosition = boundedLocal;
-		previousDownHotspot                = pressedWindow->mouseDownHotspot;
+		setMiniWindowCallbackMousePosition(*pressedWindow, local, true);
+		previousDownHotspot = pressedWindow->mouseDownHotspot;
 		pressedWindow->mouseDownHotspot.clear();
 	}
 
@@ -10893,7 +10915,7 @@ bool WorldView::handleMiniWindowMouseRelease(const QMouseEvent *event, const QWi
 	if (windowUnderCursor)
 	{
 		windowUnderCursor->lastMousePosition =
-		    miniWindowDisplayToContent(windowUnderCursor, boundedLocal - windowUnderCursor->rect.topLeft());
+		    miniWindowDisplayToContent(windowUnderCursor, local - windowUnderCursor->rect.topLeft());
 		windowUnderCursor->lastMouseUpdate++;
 	}
 	if (windowUnderCursor)

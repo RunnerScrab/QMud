@@ -58,6 +58,7 @@
 #include <QContextMenuEvent>
 #include <QCoreApplication>
 #include <QCryptographicHash>
+#include <QDebug>
 #include <QElapsedTimer>
 #include <QEvent>
 #include <QEventLoop>
@@ -13622,6 +13623,13 @@ LuaBatchDispatchResult WorldRuntime::queuePluginCallbackDispatch(const LuaBatchD
 	if (!callbackRequest.miniWindowSnapshotArg)
 		callbackRequest.miniWindowSnapshotArg = captureLuaCallbackSnapshotForDispatch(
 		    callbackRequest.engines, callbackRequest.lineSnapshotPolicy);
+	if (m_currentActionSource == eHotspotCallback && callbackRequest.miniWindowSnapshotArg)
+	{
+		const auto &values = callbackRequest.miniWindowSnapshotArg->commandUiValues;
+		qInfo().noquote() << "MINIWIN_CALLBACK" << callbackRequest.functionName
+		                  << values.value(QStringLiteral("lastMouseX"), -1).toInt()
+		                  << values.value(QStringLiteral("lastMouseY"), -1).toInt();
+	}
 	revalidateObservedCallbackRecipients(callbackRequest);
 	if (callbackRequest.engines.isEmpty())
 		return fallback;
@@ -15032,26 +15040,23 @@ WorldRuntime::CommandUiSnapshot WorldRuntime::commandUiSnapshot(const bool inclu
 		snapshot.commandInputText          = m_view->inputText();
 		if (includeHistory)
 			snapshot.commandHistory = m_view->commandHistoryList();
-		snapshot.outputSelectionEndColumn     = m_view->outputSelectionEndColumn();
-		snapshot.outputSelectionEndLine       = m_view->outputSelectionEndLine();
-		snapshot.outputSelectionStartColumn   = m_view->outputSelectionStartColumn();
-		snapshot.outputSelectionStartLine     = m_view->outputSelectionStartLine();
-		snapshot.hasView                      = true;
-		snapshot.outputScrollBarWanted        = m_view->outputScrollBarWanted();
-		snapshot.outputScrollPosition         = m_view->outputScrollPosition();
-		snapshot.outputClientHeight           = m_view->outputClientHeight();
-		snapshot.outputClientWidth            = m_view->outputClientWidth();
-		snapshot.viewHeight                   = m_view->height();
-		snapshot.viewWidth                    = m_view->width();
-		const bool  textRectangleCompatActive = m_textRectangle.left != 0 || m_textRectangle.top != 0 ||
-		                                        m_textRectangle.right != 0 || m_textRectangle.bottom != 0;
-		const QRect outputRect        = textRectangleCompatActive ? m_view->outputTextRectangleUnreserved()
-		                                                          : m_view->outputTextRectangle();
-		snapshot.outputTextRectLeft   = outputRect.left();
-		snapshot.outputTextRectTop    = outputRect.top();
-		snapshot.outputTextRectRight  = outputRect.left() + outputRect.width();
-		snapshot.outputTextRectBottom = outputRect.top() + outputRect.height();
-		snapshot.hasLastMousePosition = m_view->hasLastMousePosition();
+		snapshot.outputSelectionEndColumn   = m_view->outputSelectionEndColumn();
+		snapshot.outputSelectionEndLine     = m_view->outputSelectionEndLine();
+		snapshot.outputSelectionStartColumn = m_view->outputSelectionStartColumn();
+		snapshot.outputSelectionStartLine   = m_view->outputSelectionStartLine();
+		snapshot.hasView                    = true;
+		snapshot.outputScrollBarWanted      = m_view->outputScrollBarWanted();
+		snapshot.outputScrollPosition       = m_view->outputScrollPosition();
+		snapshot.outputClientHeight         = m_view->outputClientHeight();
+		snapshot.outputClientWidth          = m_view->outputClientWidth();
+		snapshot.viewHeight                 = m_view->height();
+		snapshot.viewWidth                  = m_view->width();
+		const QRect outputRect              = m_view->outputTextRectangle();
+		snapshot.outputTextRectLeft         = outputRect.left();
+		snapshot.outputTextRectTop          = outputRect.top();
+		snapshot.outputTextRectRight        = outputRect.left() + outputRect.width();
+		snapshot.outputTextRectBottom       = outputRect.top() + outputRect.height();
+		snapshot.hasLastMousePosition       = m_view->hasLastMousePosition();
 		if (snapshot.hasLastMousePosition)
 		{
 			snapshot.lastMouseX = m_view->lastMousePosition().x();
@@ -23061,6 +23066,7 @@ int WorldRuntime::windowResize(const QString &name, int width, int height, long 
 	MiniWindow *window = miniWindow(name);
 	if (!window)
 		return eNoSuchWindow;
+	qInfo().noquote() << "MINIWIN_RESIZE" << name << width << height;
 	if (window->width == width && window->height == height)
 		return eOK;
 	MiniWindowUtils::resize(*window, width, height, colour);

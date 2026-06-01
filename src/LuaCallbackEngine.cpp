@@ -43321,6 +43321,43 @@ static int luaTestGetInfo(lua_State *L)
 		lua_pushstring(L, "");
 		return 1;
 	}
+	if (infoType >= 290 && infoType <= 293)
+	{
+		const auto *snapshot = engine->currentDispatchMiniWindowSnapshot();
+		if (!snapshot)
+		{
+			lua_pushnumber(L, 0);
+			return 1;
+		}
+		const QString key = [infoType]()
+		{
+			switch (infoType)
+			{
+			case 290:
+				return QStringLiteral("outputTextRectLeft");
+			case 291:
+				return QStringLiteral("outputTextRectTop");
+			case 292:
+				return QStringLiteral("outputTextRectRight");
+			default:
+				return QStringLiteral("outputTextRectBottom");
+			}
+		}();
+		lua_pushnumber(L, snapshot->commandUiValues.value(key).toInt());
+		return 1;
+	}
+	if (infoType == 283 || infoType == 284)
+	{
+		const auto *snapshot = engine->currentDispatchMiniWindowSnapshot();
+		if (!snapshot)
+		{
+			lua_pushnumber(L, -1);
+			return 1;
+		}
+		const QString key = (infoType == 283) ? QStringLiteral("lastMouseX") : QStringLiteral("lastMouseY");
+		lua_pushnumber(L, snapshot->commandUiValues.value(key, -1).toInt());
+		return 1;
+	}
 
 	const auto pushRelative = [L, engine](const QString &path, const bool trailingSlash)
 	{
@@ -43553,6 +43590,15 @@ static int luaTestWindowInfo(lua_State *L)
 		break;
 	case 15:
 		value = window.lastMouseY;
+		break;
+	case 16:
+		value = window.lastMouseUpdate;
+		break;
+	case 17:
+		value = window.clientMouseX;
+		break;
+	case 18:
+		value = window.clientMouseY;
 		break;
 	default:
 		value = QVariant();

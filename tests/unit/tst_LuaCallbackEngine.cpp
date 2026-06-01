@@ -515,6 +515,7 @@ namespace
 			void executeScriptNoteUsesRuntimeNoteColour();
 			void triggerAnchoredColourOutputKeepsNativePromptText();
 			void callbackSnapshotSuppliesGetInfoAndMiniWindowReads();
+			void miniWindowDragReleaseSeesResizedCallbackState();
 			void deferredRuntimeMutationSkipsDestroyedRuntime();
 			// NOLINTEND(readability-convert-member-functions-to-static)
 	};
@@ -1572,14 +1573,15 @@ void tst_LuaCallbackEngine::callbackSnapshotSuppliesGetInfoAndMiniWindowReads()
 	setEngineScript(*engine, QStringLiteral(R"lua(
 snapshot_seen = ""
 function OnPluginEnable()
-  snapshot_seen = string.format("%s|%dx%d|%d,%d|%s|%s",
+  snapshot_seen = string.format("%s|%dx%d|%d,%d|%s|%s|%d,%d,%d,%d",
     tostring(GetInfo(86)),
     WindowInfo("map", 3) or -1,
     WindowInfo("map", 4) or -1,
     WindowInfo("map", 14) or -1,
     WindowInfo("map", 15) or -1,
     table.concat(WindowList() or {}, ","),
-    table.concat(WindowHotspotList("map") or {}, ","))
+    table.concat(WindowHotspotList("map") or {}, ","),
+    GetInfo(290), GetInfo(291), GetInfo(292), GetInfo(293))
 end
 function snapshot_status(value)
   return snapshot_seen
@@ -1591,6 +1593,10 @@ end
 	snapshot->commandUiHasFrameData = true;
 	snapshot->commandUiValues[QStringLiteral("selectedWord")]         = QStringLiteral("sextant");
 	snapshot->commandUiValues[QStringLiteral("selectedWordResolved")] = true;
+	snapshot->commandUiValues[QStringLiteral("outputTextRectLeft")]   = 19;
+	snapshot->commandUiValues[QStringLiteral("outputTextRectTop")]    = 14;
+	snapshot->commandUiValues[QStringLiteral("outputTextRectRight")]  = 318;
+	snapshot->commandUiValues[QStringLiteral("outputTextRectBottom")] = 252;
 	snapshot->windowNames.push_back(QStringLiteral("map"));
 	LuaCallbackMiniWindowSnapshot::WindowInfoSnapshot windowInfo;
 	windowInfo.width                                    = 120;
@@ -1613,7 +1619,112 @@ end
 	request.functionName                = QStringLiteral("snapshot_status");
 	request.stringArg                   = QStringLiteral("ignored");
 	const LuaBatchDispatchResult result = executor.dispatchBatch(request);
-	QCOMPARE(result.stringResult, QStringLiteral("sextant|120x80|33,44|map|move"));
+	QCOMPARE(result.stringResult, QStringLiteral("sextant|120x80|33,44|map|move|19,14,318,252"));
+}
+
+void tst_LuaCallbackEngine::miniWindowDragReleaseSeesResizedCallbackState()
+{
+	WorldRuntime runtime;
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QStringLiteral(R"lua(
+events = {}
+function OnResizeMove(flags, hotspot_id)
+  table.insert(events, string.format("move:%d,%d:%d,%d:%d,%d",
+    GetInfo(283), GetInfo(284), WindowInfo("win", 14), WindowInfo("win", 15),
+    WindowInfo("win", 17), WindowInfo("win", 18)))
+  WindowResize("win", 240, 160, 0)
+  return false
+end
+function OnResizeRelease(flags, hotspot_id)
+  table.insert(events, string.format("release:%d,%d:%d,%d",
+    WindowInfo("win", 3), WindowInfo("win", 4), GetInfo(283), GetInfo(284)))
+  return false
+end
+function resize_status(value)
+  return table.concat(events, "|")
+end
+)lua"));
+
+	QVERIFY(runtime.windowCreate(QStringLiteral("win"), 20, 30, 100, 80, 4, 0, QColor(), QString()) == 0);
+	QVERIFY(runtime.windowAddHotspot(QStringLiteral("win"), QStringLiteral("resizer"), 88, 68, 100, 80,
+	                                 QString(), QString(), QStringLiteral("OnResizeDown"), QString(),
+	                                 QString(), QString(), 0, 0, QString()) == 0);
+
+	const auto makeSnapshot = [&runtime](const int mouseX, const int mouseY)
+	{
+		const RuntimeStubState    &state    = runtimeStubState(&runtime);
+		const QString              windowId = QStringLiteral("win");
+		const QHash<int, QVariant> info     = state.windowInfo.value(windowId);
+		const int                  left     = info.value(1).toInt();
+		const int                  top      = info.value(2).toInt();
+		const int                  width    = info.value(3).toInt();
+		const int                  height   = info.value(4).toInt();
+
+		auto                       snapshot   = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+		snapshot->hasCommandUiSnapshot        = true;
+		snapshot->commandUiHasView            = true;
+		snapshot->commandUiHasFrameData       = true;
+		snapshot->commandUiOutputClientWidth  = 640;
+		snapshot->commandUiOutputClientHeight = 480;
+		snapshot->commandUiValues.insert(QStringLiteral("hasView"), true);
+		snapshot->commandUiValues.insert(QStringLiteral("hasFrameData"), true);
+		snapshot->commandUiValues.insert(QStringLiteral("hasLastMousePosition"), true);
+		snapshot->commandUiValues.insert(QStringLiteral("lastMouseX"), mouseX);
+		snapshot->commandUiValues.insert(QStringLiteral("lastMouseY"), mouseY);
+		snapshot->commandUiValues.insert(QStringLiteral("outputClientWidth"), 640);
+		snapshot->commandUiValues.insert(QStringLiteral("outputClientHeight"), 480);
+
+		snapshot->windowNames.push_back(windowId);
+		LuaCallbackMiniWindowSnapshot::WindowInfoSnapshot windowInfo;
+		windowInfo.locationX                   = left;
+		windowInfo.locationY                   = top;
+		windowInfo.width                       = width;
+		windowInfo.height                      = height;
+		windowInfo.position                    = info.value(7).toInt();
+		windowInfo.flags                       = info.value(8).toInt();
+		windowInfo.rectLeft                    = left;
+		windowInfo.rectTop                     = top;
+		windowInfo.rectRight                   = left + width;
+		windowInfo.rectBottom                  = top + height;
+		windowInfo.lastMouseX                  = mouseX - left;
+		windowInfo.lastMouseY                  = mouseY - top;
+		windowInfo.clientMouseX                = mouseX;
+		windowInfo.clientMouseY                = mouseY;
+		windowInfo.mouseDownHotspot            = QStringLiteral("resizer");
+		snapshot->windowInfoByWindow[windowId] = windowInfo;
+		snapshot->hotspotIdsByWindow[windowId] = {QStringLiteral("resizer")};
+		snapshot->rebuildMiniWindowLookupCaches();
+		return snapshot;
+	};
+
+	LuaExecutorDirect       executor;
+	LuaBatchDispatchRequest request;
+	request.engines                   = {engine};
+	request.kind                      = LuaBatchDispatchKind::NumberAndStringStopOnTrue;
+	request.numberArg1                = 0;
+	request.stringArg2                = QStringLiteral("resizer");
+	request.functionName              = QStringLiteral("OnResizeMove");
+	request.miniWindowSnapshotArg     = makeSnapshot(145, 165);
+	LuaBatchDispatchResult moveResult = executor.dispatchBatch(request);
+	QVERIFY(moveResult.boolResultValid);
+	QVERIFY(!moveResult.boolResult);
+	executeDeferredMutations(moveResult);
+	QCOMPARE(runtimeStubState(&runtime).windowInfo.value(QStringLiteral("win")).value(3).toInt(), 240);
+	QCOMPARE(runtimeStubState(&runtime).windowInfo.value(QStringLiteral("win")).value(4).toInt(), 160);
+
+	request.functionName                 = QStringLiteral("OnResizeRelease");
+	request.miniWindowSnapshotArg        = makeSnapshot(145, 165);
+	LuaBatchDispatchResult releaseResult = executor.dispatchBatch(request);
+	QVERIFY(releaseResult.boolResultValid);
+	QVERIFY(!releaseResult.boolResult);
+
+	request.kind                        = LuaBatchDispatchKind::StringInOut;
+	request.functionName                = QStringLiteral("resize_status");
+	request.stringArg                   = QStringLiteral("ignored");
+	request.miniWindowSnapshotArg       = {};
+	const LuaBatchDispatchResult result = executor.dispatchBatch(request);
+	QCOMPARE(result.stringResult, QStringLiteral("move:145,165:125,135:145,165|release:240,160:145,165"));
 }
 
 void tst_LuaCallbackEngine::deferredRuntimeMutationSkipsDestroyedRuntime()

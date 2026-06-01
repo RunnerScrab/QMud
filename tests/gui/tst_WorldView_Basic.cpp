@@ -76,6 +76,10 @@ namespace
 	QString                             g_lastWorldHotspotId;
 	long                                g_lastWorldHotspotFlags{0};
 	QPoint                              g_lastResizeHotspotPressOffset;
+	QSize                               g_expectedReleaseResizeSize;
+	QPoint                              g_expectedReleaseMousePosition;
+	int                                 g_resizeMoveCallbackCount{0};
+	bool                                g_releaseCallbackSawFlushedResize{false};
 	WorldView                          *g_runtimeView{nullptr};
 	unsigned short                      g_currentActionSource{WorldRuntime::eUnknownActionSource};
 	bool                                g_connected{false};
@@ -227,13 +231,17 @@ namespace
 		g_worldHotspotCallbackCount = 0;
 		g_lastWorldHotspotFunction.clear();
 		g_lastWorldHotspotId.clear();
-		g_lastWorldHotspotFlags        = 0;
-		g_lastResizeHotspotPressOffset = {};
-		g_runtimeView                  = nullptr;
-		g_currentActionSource          = WorldRuntime::eUnknownActionSource;
-		g_connected                    = false;
-		g_nawsNegotiated               = false;
-		g_useFakeAppController         = false;
+		g_lastWorldHotspotFlags           = 0;
+		g_lastResizeHotspotPressOffset    = {};
+		g_expectedReleaseResizeSize       = {};
+		g_expectedReleaseMousePosition    = {};
+		g_resizeMoveCallbackCount         = 0;
+		g_releaseCallbackSawFlushedResize = false;
+		g_runtimeView                     = nullptr;
+		g_currentActionSource             = WorldRuntime::eUnknownActionSource;
+		g_connected                       = false;
+		g_nawsNegotiated                  = false;
+		g_useFakeAppController            = false;
 		g_virtualKeyMap.clear();
 		g_acceleratorCommands.clear();
 		g_acceleratorExecutionCount      = 0;
@@ -545,6 +553,16 @@ namespace
 		QMouseEvent  moveEvent(QEvent::MouseMove, QPointF(local), QPointF(local), QPointF(global),
 		                       Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
 		QCoreApplication::sendEvent(viewport, &moveEvent);
+		QCoreApplication::processEvents();
+	}
+
+	void sendMiniWindowMouseRelease(QWidget *viewport, const QWidget *outputStack, const QPoint &pointInStack)
+	{
+		const QPoint local  = viewport->mapFrom(outputStack, pointInStack);
+		const QPoint global = viewport->mapToGlobal(local);
+		QMouseEvent  releaseEvent(QEvent::MouseButtonRelease, QPointF(local), QPointF(local), QPointF(global),
+		                          Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+		QCoreApplication::sendEvent(viewport, &releaseEvent);
 		QCoreApplication::processEvents();
 	}
 
@@ -1032,6 +1050,7 @@ bool WorldRuntime::callWorldHotspotFunction(const QString &functionName, long fl
 	}
 	else if (functionName == QStringLiteral("drag_test_resize"))
 	{
+		++g_resizeMoveCallbackCount;
 		for (MiniWindow &window : g_testMiniWindows)
 		{
 			if (window.mouseDownHotspot != hotspotId)
@@ -1048,6 +1067,15 @@ bool WorldRuntime::callWorldHotspotFunction(const QString &functionName, long fl
 			if (g_runtimeView)
 				g_runtimeView->onMiniWindowsChanged();
 			break;
+		}
+	}
+	else if (functionName == QStringLiteral("drag_test_release_after_resize"))
+	{
+		if (!g_testMiniWindows.isEmpty())
+		{
+			const MiniWindow &window          = g_testMiniWindows.constFirst();
+			g_releaseCallbackSawFlushedResize = window.rect.size() == g_expectedReleaseResizeSize &&
+			                                    window.clientMousePosition == g_expectedReleaseMousePosition;
 		}
 	}
 	return true;
@@ -7299,6 +7327,8 @@ class tst_WorldView_Basic : public QObject
 			QCOMPARE(firstResizeRect.topLeft(), startRect.topLeft());
 			QCOMPARE(firstResizeRect.width(), firstMoveInStack.x() - startRect.left() + 1);
 			QCOMPARE(firstResizeRect.height(), firstMoveInStack.y() - startRect.top() + 1);
+			QCOMPARE(g_testMiniWindows.constFirst().lastMousePosition,
+			         firstMoveInStack - startRect.topLeft());
 
 			const QPoint fastMoveInStack = pressInStack + QPoint(74, 33);
 			sendMiniWindowMouseMove(viewport, outputStack, fastMoveInStack);
@@ -7307,11 +7337,138 @@ class tst_WorldView_Basic : public QObject
 			QCOMPARE(fastResizeRect.topLeft(), startRect.topLeft());
 			QCOMPARE(fastResizeRect.width(), fastMoveInStack.x() - startRect.left() + 1);
 			QCOMPARE(fastResizeRect.height(), fastMoveInStack.y() - startRect.top() + 1);
+			QCOMPARE(g_testMiniWindows.constFirst().lastMousePosition, fastMoveInStack - startRect.topLeft());
 			QTRY_VERIFY(widgetRectMostlyMatchesColor(outputStack, fastResizeRect, overlayColour, 75));
 
 			QTest::mouseRelease(viewport, Qt::LeftButton, Qt::NoModifier,
 			                    viewport->mapFrom(outputStack, fastMoveInStack));
 			QCoreApplication::processEvents();
+			QTRY_VERIFY(!view.isMiniWindowCaptureActive());
+			resetTestState();
+		}
+
+		void nativeOutputRendererMiniWindowCapturedResizeUsesUnclampedDragPoint()
+		{
+			resetTestState();
+
+			WorldView view;
+			view.setRuntimeObserver(fakeRuntimePointer());
+			view.resize(760, 460);
+			view.show();
+			QCoreApplication::processEvents();
+
+			QSplitter *outputSplitter = findOutputSplitter(view);
+			QVERIFY(outputSplitter);
+			QWidget *outputStack = outputSplitter->parentWidget();
+			QVERIFY(outputStack);
+			QTextBrowser *browser = findVisibleOutputBrowser(view);
+			QVERIFY(browser);
+			QWidget *viewport = browser->viewport();
+			QVERIFY(viewport);
+
+			const QRect viewportInStack(viewport->mapTo(outputStack, QPoint(0, 0)), viewport->size());
+			QVERIFY(viewportInStack.width() > 260);
+			QVERIFY(viewportInStack.height() > 160);
+
+			constexpr QColor overlayColour(40, 90, 210, 255);
+			const QRect      startRect(viewportInStack.left() + 30, viewportInStack.bottom() - 58, 96, 54);
+			QVERIFY(viewportInStack.contains(startRect.topLeft()));
+			QVERIFY(viewportInStack.contains(startRect.bottomRight()));
+
+			MiniWindow &window =
+			    appendTestMiniWindow(QStringLiteral("native-resize-unclamped"), startRect, 0, overlayColour);
+			MiniWindowHotspot hotspot;
+			hotspot.rect         = QRect(startRect.width() - 12, startRect.height() - 12, 12, 12);
+			hotspot.mouseDown    = QStringLiteral("drag_test_resize_down");
+			hotspot.moveCallback = QStringLiteral("drag_test_resize");
+			window.hotspots.insert(QStringLiteral("resize"), hotspot);
+			view.onMiniWindowsChanged();
+			QCoreApplication::processEvents();
+
+			const QPoint pressInStack    = QPoint(startRect.right() - 2, startRect.bottom() - 2);
+			const QPoint pressInViewport = viewport->mapFrom(outputStack, pressInStack);
+			QVERIFY(viewport->rect().contains(pressInViewport));
+			QTest::mousePress(viewport, Qt::LeftButton, Qt::NoModifier, pressInViewport);
+			QCoreApplication::processEvents();
+			QTRY_VERIFY(view.isMiniWindowCaptureActive());
+
+			const QPoint outsideMoveInStack(pressInStack.x() + 18, viewportInStack.bottom() + 32);
+			QVERIFY(!viewportInStack.contains(outsideMoveInStack));
+			sendMiniWindowMouseMove(viewport, outputStack, outsideMoveInStack);
+			QCoreApplication::processEvents();
+
+			const QRect resizedRect = g_testMiniWindows.constFirst().rect;
+			QCOMPARE(resizedRect.topLeft(), startRect.topLeft());
+			QCOMPARE(resizedRect.width(), outsideMoveInStack.x() - startRect.left() + 1);
+			QCOMPARE(resizedRect.height(), outsideMoveInStack.y() - startRect.top() + 1);
+			QCOMPARE(g_testMiniWindows.constFirst().lastMousePosition,
+			         outsideMoveInStack - startRect.topLeft());
+			QCOMPARE(g_testMiniWindows.constFirst().clientMousePosition, outsideMoveInStack);
+
+			sendMiniWindowMouseRelease(viewport, outputStack, outsideMoveInStack);
+			QTRY_VERIFY(!view.isMiniWindowCaptureActive());
+			resetTestState();
+		}
+
+		void nativeOutputRendererMiniWindowReleaseFlushesPendingResizeDrag()
+		{
+			resetTestState();
+
+			WorldView view;
+			view.setRuntimeObserver(fakeRuntimePointer());
+			view.resize(760, 460);
+			view.show();
+			QCoreApplication::processEvents();
+
+			QSplitter *outputSplitter = findOutputSplitter(view);
+			QVERIFY(outputSplitter);
+			QWidget *outputStack = outputSplitter->parentWidget();
+			QVERIFY(outputStack);
+			QTextBrowser *browser = findVisibleOutputBrowser(view);
+			QVERIFY(browser);
+			QWidget *viewport = browser->viewport();
+			QVERIFY(viewport);
+
+			const QRect viewportInStack(viewport->mapTo(outputStack, QPoint(0, 0)), viewport->size());
+			QVERIFY(viewportInStack.width() > 260);
+			QVERIFY(viewportInStack.height() > 160);
+
+			constexpr QColor  overlayColour(40, 90, 210, 255);
+			const QRect       startRect(viewportInStack.left() + 30, viewportInStack.top() + 30, 96, 54);
+			MiniWindow       &window = appendTestMiniWindow(QStringLiteral("native-release-flush-resize"),
+			                                                startRect, 0, overlayColour);
+			MiniWindowHotspot hotspot;
+			hotspot.rect            = QRect(startRect.width() - 12, startRect.height() - 12, 12, 12);
+			hotspot.mouseDown       = QStringLiteral("drag_test_resize_down");
+			hotspot.moveCallback    = QStringLiteral("drag_test_resize");
+			hotspot.releaseCallback = QStringLiteral("drag_test_release_after_resize");
+			window.hotspots.insert(QStringLiteral("resize"), hotspot);
+			view.onMiniWindowsChanged();
+			QCoreApplication::processEvents();
+
+			const QPoint pressInStack    = QPoint(startRect.right() - 2, startRect.bottom() - 2);
+			const QPoint pressInViewport = viewport->mapFrom(outputStack, pressInStack);
+			QVERIFY(viewport->rect().contains(pressInViewport));
+			QTest::mousePress(viewport, Qt::LeftButton, Qt::NoModifier, pressInViewport);
+			QCoreApplication::processEvents();
+			QTRY_VERIFY(view.isMiniWindowCaptureActive());
+
+			const QPoint moveInStack    = pressInStack + QPoint(64, 28);
+			const QPoint moveInViewport = viewport->mapFrom(outputStack, moveInStack);
+			const QPoint moveGlobal     = viewport->mapToGlobal(moveInViewport);
+			QMouseEvent  moveEvent(QEvent::MouseMove, QPointF(moveInViewport), QPointF(moveInViewport),
+			                       QPointF(moveGlobal), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+			QCoreApplication::sendEvent(viewport, &moveEvent);
+			QCOMPARE(g_resizeMoveCallbackCount, 0);
+
+			g_expectedReleaseResizeSize =
+			    QSize(moveInStack.x() - startRect.left() + 1, moveInStack.y() - startRect.top() + 1);
+			g_expectedReleaseMousePosition = moveInStack;
+			QTest::mouseRelease(viewport, Qt::LeftButton, Qt::NoModifier, moveInViewport);
+			QCoreApplication::processEvents();
+
+			QCOMPARE(g_resizeMoveCallbackCount, 1);
+			QVERIFY(g_releaseCallbackSawFlushedResize);
 			QTRY_VERIFY(!view.isMiniWindowCaptureActive());
 			resetTestState();
 		}
