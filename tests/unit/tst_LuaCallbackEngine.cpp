@@ -25,6 +25,7 @@
 #include <QtTest/QTest>
 
 #include <atomic>
+#include <clocale>
 #include <limits>
 #include <memory>
 
@@ -493,6 +494,7 @@ namespace
 
 		private slots:
 			// NOLINTBEGIN(readability-convert-member-functions-to-static)
+			void initTestCase();
 			void directCallbackShapesRoundTrip();
 			void wildcardAndStyleCallbackReceivesContextTables();
 			void mxpCallbacksMarshalArguments();
@@ -505,6 +507,7 @@ namespace
 			void deferredRuntimeMutationBatchesPreserveOrderAndOwnership();
 			void directExecutorDispatchesRealEngines();
 			void callPluginMarshallingUsesTargetEngineState();
+			void noArgsDispatchReportsCallbackFailure();
 			void workerDispatchesPluginLifecycleCallbacksOnRealEngines();
 			void workerCallbackBatchCapturesOutputMiniWindowAndSaveStateMutations();
 			void workerColourOutputMatchesMushclientGroupingAndNewlineSemantics();
@@ -626,6 +629,11 @@ namespace
 } // namespace
 
 // NOLINTBEGIN(readability-convert-member-functions-to-static)
+void tst_LuaCallbackEngine::initTestCase()
+{
+	std::setlocale(LC_NUMERIC, "C");
+}
+
 void tst_LuaCallbackEngine::directCallbackShapesRoundTrip()
 {
 	LuaCallbackEngine engine;
@@ -1252,6 +1260,50 @@ end
 	QCOMPARE(lua_gettop(caller.get()), 4);
 	QCOMPARE(QString::fromUtf8(lua_tostring(caller.get(), 3)), QStringLiteral("input:42.0"));
 	QVERIFY(lua_toboolean(caller.get(), 4) != 0);
+}
+
+void tst_LuaCallbackEngine::noArgsDispatchReportsCallbackFailure()
+{
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
+function successful_install()
+  return true
+end
+function failed_install()
+  return false
+end
+)lua"));
+
+	LuaBatchDispatchRequest request;
+	request.engines       = {engine};
+	request.kind          = LuaBatchDispatchKind::NoArgs;
+	request.functionName  = QStringLiteral("successful_install");
+	request.defaultResult = true;
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	QVERIFY(result.boolResultValid);
+	QVERIFY(result.boolResult);
+	QVERIFY(result.hasFunctionValid);
+	QVERIFY(result.hasFunction);
+
+	request.functionName = QStringLiteral("failed_install");
+	dispatchWorkerAndWait(executor, request, result);
+	QVERIFY(result.boolResultValid);
+	QVERIFY(!result.boolResult);
+	QVERIFY(result.hasFunctionValid);
+	QVERIFY(result.hasFunction);
+
+	request.functionName = QStringLiteral("missing_install");
+	dispatchWorkerAndWait(executor, request, result);
+	QVERIFY(result.boolResultValid);
+	QVERIFY(result.boolResult);
+	QVERIFY(result.hasFunctionValid);
+	QVERIFY(!result.hasFunction);
+
+	request.kind    = LuaBatchDispatchKind::TeardownEnginesMany;
+	request.engines = {engine};
+	dispatchWorkerAndWait(executor, request);
 }
 
 void tst_LuaCallbackEngine::workerDispatchesPluginLifecycleCallbacksOnRealEngines()

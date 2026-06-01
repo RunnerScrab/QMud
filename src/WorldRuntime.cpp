@@ -24,6 +24,7 @@
 #include "LuaHeaders.h"
 #include "MainFrame.h"
 #include "MainFrameActionUtils.h"
+#include "MainFrameMdiUtils.h"
 #include "MainWindowHostResolver.h"
 #include "MiniWindowUtils.h"
 #include "MxpDiagnostics.h"
@@ -233,39 +234,19 @@ namespace
 			    if (!main)
 				    return false;
 
-			    TextChildWindow               *target          = nullptr;
-			    TextChildWindow               *unnamedFallback = nullptr;
-			    const QList<TextChildWindow *> notepads        = main->findChildren<TextChildWindow *>();
+			    TextChildWindow               *target   = nullptr;
+			    const QList<TextChildWindow *> notepads = main->findChildren<TextChildWindow *>();
 			    for (TextChildWindow *text : notepads)
 			    {
 				    if (!text || text->windowTitle().compare(trimmedTitle, Qt::CaseInsensitive) != 0)
 					    continue;
 
-				    const qulonglong relatedToken = text->property("worldRuntimeToken").toULongLong();
-				    if (relatedToken == ownerToken)
+				    if (QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(text, ownerToken, worldId, false))
 				    {
 					    target = text;
 					    break;
 				    }
-				    if (relatedToken != 0)
-					    continue;
-
-				    if (worldId.isEmpty())
-				    {
-					    target = text;
-					    break;
-				    }
-				    const QString related = text->property("worldId").toString().trimmed();
-				    if (related.compare(worldId, Qt::CaseInsensitive) == 0)
-				    {
-					    target = text;
-					    break;
-				    }
-				    if (related.isEmpty() && !unnamedFallback)
-					    unnamedFallback = text;
 			    }
-			    if (!target)
-				    target = unnamedFallback;
 
 			    if (!target)
 				    return false;
@@ -23674,7 +23655,7 @@ void WorldRuntime::continuePendingPluginInstallAsync(QVector<QString> pendingPlu
 		queuePluginCallbackDispatchAsync(
 		    installRequest,
 		    [this, pluginId, pendingPluginIds = std::move(pendingPluginIds)](
-		        const LuaBatchDispatchResult & /*unused*/) mutable
+		        const LuaBatchDispatchResult &dispatchResult) mutable
 		    {
 			    const int currentIndex = findPluginIndex(m_plugins, pluginId);
 			    if (currentIndex < 0)
@@ -23692,6 +23673,19 @@ void WorldRuntime::continuePendingPluginInstallAsync(QVector<QString> pendingPlu
 				    currentPlugin.installPending = false;
 				    invalidatePluginCallbackPresenceCache();
 			    };
+			    if (dispatchResult.boolResultValid && !dispatchResult.boolResult)
+			    {
+				    currentPlugin.enabled = false;
+				    currentPlugin.attributes.insert(QStringLiteral("enabled"), QStringLiteral("0"));
+				    currentPlugin.disableAfterInstall = false;
+				    clearInstallPending();
+				    invalidateLuaCallbackDispatchSnapshot();
+				    if (!m_loadingDocument)
+					    m_worldFileModified = true;
+				    popForceScriptErrorOutputToWorld();
+				    continuePendingPluginInstallAsync(std::move(pendingPluginIds), true);
+				    return;
+			    }
 			    if (!currentPlugin.disableAfterInstall)
 			    {
 				    clearInstallPending();

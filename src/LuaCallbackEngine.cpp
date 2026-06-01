@@ -38,6 +38,7 @@
 #include "WorldView.h"
 #include "dialogs/SpellCheckDialog.h"
 #include "helpers/LuaExecutionUtils.h"
+#include "helpers/MainFrameMdiUtils.h"
 #include "helpers/MiniWindowUtils.h"
 #include "helpers/PluginPathUtils.h"
 #include "helpers/WorldCommandProcessorUtils.h"
@@ -18760,8 +18761,8 @@ static TextChildWindow *findNotepadWindow(const QString &title, WorldRuntime *ow
 	auto *mdi = frame->findChild<QMdiArea *>();
 	if (!mdi)
 		return nullptr;
-	const qulonglong ownerToken           = ownerRuntime ? reinterpret_cast<quintptr>(ownerRuntime) : 0;
-	TextChildWindow *unnamedOwnerFallback = nullptr;
+	const qulonglong ownerToken = ownerRuntime ? reinterpret_cast<quintptr>(ownerRuntime) : 0;
+	const bool       hasOwner   = ownerRuntime || !worldId.isEmpty();
 	for (const QList<QMdiSubWindow *> windows = mdi->subWindowList(QMdiArea::CreationOrder);
 	     QMdiSubWindow *sub : windows)
 	{
@@ -18770,21 +18771,15 @@ static TextChildWindow *findNotepadWindow(const QString &title, WorldRuntime *ow
 			continue;
 		if (text->windowTitle().compare(title, Qt::CaseInsensitive) == 0)
 		{
-			const qulonglong relatedToken = text->property("worldRuntimeToken").toULongLong();
-			if (ownerToken != 0 && relatedToken == ownerToken)
+			const bool matchesOwner =
+			    hasOwner
+			        ? QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(text, ownerToken, worldId, false)
+			        : QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(text, 0, QString(), false);
+			if (matchesOwner)
 				return text;
-			if (ownerToken != 0 && relatedToken != 0 && relatedToken != ownerToken)
-				continue;
-			if (worldId.isEmpty())
-				return text;
-			const QString related = text->property("worldId").toString().trimmed();
-			if (related.compare(worldId, Qt::CaseInsensitive) == 0)
-				return text;
-			if (related.isEmpty() && !unnamedOwnerFallback)
-				unnamedOwnerFallback = text;
 		}
 	}
-	return unnamedOwnerFallback;
+	return nullptr;
 }
 
 static int luaMoveWorldWindow(lua_State *L)

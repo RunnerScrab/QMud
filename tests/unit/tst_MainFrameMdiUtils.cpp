@@ -103,6 +103,22 @@ class tst_MainFrameMdiUtils : public QObject
 			                                                            QStringLiteral("world-a"), true));
 		}
 
+		void windowMatchesRuntimeIdentityWithoutOwnerOnlyAcceptsUnownedWindows()
+		{
+			QMdiSubWindow unowned;
+			QVERIFY(QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(&unowned, 0, QString(), false));
+
+			QMdiSubWindow relatedByToken;
+			relatedByToken.setProperty("worldRuntimeToken", QVariant::fromValue<qulonglong>(42));
+			QVERIFY(
+			    !QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(&relatedByToken, 0, QString(), false));
+
+			QMdiSubWindow relatedByWorldId;
+			relatedByWorldId.setProperty("worldId", QStringLiteral("world-a"));
+			QVERIFY(
+			    !QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(&relatedByWorldId, 0, QString(), false));
+		}
+
 		void firstWindowMatchingRuntimeIdentityUsesCreationOrder()
 		{
 			QMdiSubWindow unrelated;

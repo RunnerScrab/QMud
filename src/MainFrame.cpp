@@ -2733,7 +2733,6 @@ bool                 MainWindow::switchToNotepad()
 	const QString          defaultTitle = defaultNotepadTitleForWorld(owner, world);
 
 	QList<QMdiSubWindow *> matchingCandidates;
-	TextChildWindow       *defaultTitleFallback = nullptr;
 	for (QMdiSubWindow *sub : m_mdiArea->subWindowList(QMdiArea::CreationOrder))
 	{
 		auto *text = qobject_cast<TextChildWindow *>(sub);
@@ -2741,14 +2740,10 @@ bool                 MainWindow::switchToNotepad()
 			continue;
 
 		matchingCandidates.append(text);
-		if (!defaultTitleFallback && text->windowTitle().compare(defaultTitle, Qt::CaseInsensitive) == 0)
-			defaultTitleFallback = text;
 	}
 
 	QMdiSubWindow *target = QMudMainFrameMdiUtils::firstWindowMatchingRuntimeIdentity(
 	    matchingCandidates, ownerToken, ownerWorldId, false);
-	if (!target)
-		target = defaultTitleFallback;
 	if (!target)
 	{
 		auto *created = new TextChildWindow(defaultTitle, QString());
@@ -2777,6 +2772,7 @@ bool MainWindow::activateNotepad(const QString &title, WorldRuntime *relatedRunt
 	const qulonglong ownerToken = runtimeOwnerToken(owner);
 	const QString    ownerWorldId =
 	    owner ? owner->worldAttributes().value(QStringLiteral("id")).trimmed() : QString();
+	const bool hasOwner = owner != nullptr;
 	for (QMdiSubWindow *sub : m_mdiArea->subWindowList(QMdiArea::CreationOrder))
 	{
 		auto *text = qobject_cast<TextChildWindow *>(sub);
@@ -2785,25 +2781,14 @@ bool MainWindow::activateNotepad(const QString &title, WorldRuntime *relatedRunt
 		if (text->windowTitle().compare(title, Qt::CaseInsensitive) != 0)
 			continue;
 
-		if (ownerToken != 0)
+		if (hasOwner)
 		{
-			const qulonglong relatedToken = text->property("worldRuntimeToken").toULongLong();
-			if (relatedToken == ownerToken)
-			{
-				m_mdiArea->setActiveSubWindow(text);
-				text->show();
-				text->raise();
-				return true;
-			}
-			if (relatedToken != 0 && relatedToken != ownerToken)
+			if (!QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(text, ownerToken, ownerWorldId, false))
 				continue;
-			if (!ownerWorldId.isEmpty())
-			{
-				if (const QString related = text->property("worldId").toString().trimmed();
-				    !related.isEmpty() && related.compare(ownerWorldId, Qt::CaseInsensitive) != 0)
-					continue;
-			}
 		}
+		else if (!QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(text, 0, QString(), false))
+			continue;
+
 		m_mdiArea->setActiveSubWindow(text);
 		text->show();
 		text->raise();
@@ -2896,40 +2881,26 @@ bool MainWindow::appendToNotepad(const QString &title, const QString &text, cons
 	const qulonglong ownerToken = runtimeOwnerToken(owner);
 	const QString    ownerWorldId =
 	    owner ? owner->worldAttributes().value(QStringLiteral("id")).trimmed() : QString();
-	TextChildWindow *target       = nullptr;
-	TextChildWindow *unnamedMatch = nullptr;
+	const bool       hasOwner = owner != nullptr;
+	TextChildWindow *target   = nullptr;
 	for (QMdiSubWindow *sub : m_mdiArea->subWindowList(QMdiArea::CreationOrder))
 	{
 		auto *textWindow = qobject_cast<TextChildWindow *>(sub);
 		if (!textWindow)
 			continue;
-		if (textWindow->windowTitle().compare(title, Qt::CaseInsensitive) == 0)
-		{
-			const qulonglong relatedToken = textWindow->property("worldRuntimeToken").toULongLong();
-			if (ownerToken != 0 && relatedToken == ownerToken)
-			{
-				target = textWindow;
-				break;
-			}
-			if (ownerToken != 0 && relatedToken != 0 && relatedToken != ownerToken)
-				continue;
-			if (ownerWorldId.isEmpty())
-			{
-				target = textWindow;
-				break;
-			}
-			const QString related = textWindow->property("worldId").toString().trimmed();
-			if (related.compare(ownerWorldId, Qt::CaseInsensitive) == 0)
-			{
-				target = textWindow;
-				break;
-			}
-			if (related.isEmpty() && !unnamedMatch)
-				unnamedMatch = textWindow;
-		}
+		if (textWindow->windowTitle().compare(title, Qt::CaseInsensitive) != 0)
+			continue;
+
+		const bool matchesOwner =
+		    hasOwner ? QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(textWindow, ownerToken,
+		                                                                   ownerWorldId, false)
+		             : QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(textWindow, 0, QString(), false);
+		if (!matchesOwner)
+			continue;
+
+		target = textWindow;
+		break;
 	}
-	if (!target && unnamedMatch)
-		target = unnamedMatch;
 
 	if (!target)
 	{
