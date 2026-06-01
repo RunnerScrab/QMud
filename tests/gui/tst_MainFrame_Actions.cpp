@@ -42,9 +42,18 @@ class tst_MainFrame_Actions : public QObject
 			QTest::addColumn<int>("slot");
 			QTest::addColumn<QString>("expected");
 
-			QTest::newRow("first-slot") << 1 << QStringLiteral("Activates world #1 (Ctrl+1)");
-			QTest::newRow("ninth-slot") << 9 << QStringLiteral("Activates world #9 (Ctrl+9)");
-			QTest::newRow("tenth-slot") << 10 << QStringLiteral("Activates world #10 (Ctrl+0)");
+			QTest::newRow("first-slot")
+			    << 1
+			    << QMudMainFrameActionUtils::toolbarTooltipWithShortcut(QStringLiteral("Activates world #1"),
+			                                                            QStringLiteral("Ctrl+1"));
+			QTest::newRow("ninth-slot")
+			    << 9
+			    << QMudMainFrameActionUtils::toolbarTooltipWithShortcut(QStringLiteral("Activates world #9"),
+			                                                            QStringLiteral("Ctrl+9"));
+			QTest::newRow("tenth-slot")
+			    << 10
+			    << QMudMainFrameActionUtils::toolbarTooltipWithShortcut(QStringLiteral("Activates world #10"),
+			                                                            QStringLiteral("Ctrl+0"));
 			QTest::newRow("overflow-slot") << 12 << QStringLiteral("Activates world #12");
 		}
 
@@ -53,6 +62,75 @@ class tst_MainFrame_Actions : public QObject
 			QFETCH(int, slot);
 			QFETCH(QString, expected);
 			QCOMPARE(QMudMainFrameActionUtils::worldButtonTooltipForSlot(slot), expected);
+		}
+
+		void menuRoleForCommand_data()
+		{
+			QTest::addColumn<QString>("commandName");
+			QTest::addColumn<QAction::MenuRole>("expected");
+
+			QTest::newRow("application-quit") << QStringLiteral("ExitClient") << QAction::QuitRole;
+#ifdef Q_OS_MACOS
+			QTest::newRow("world-quit") << QStringLiteral("QuitFromWorld") << QAction::NoRole;
+			QTest::newRow("ordinary-action") << QStringLiteral("Open") << QAction::NoRole;
+			QTest::newRow("preferences-action") << QStringLiteral("Preferences") << QAction::NoRole;
+#else
+			QTest::newRow("world-quit") << QStringLiteral("QuitFromWorld") << QAction::NoRole;
+			QTest::newRow("ordinary-action") << QStringLiteral("Open") << QAction::TextHeuristicRole;
+#endif
+		}
+
+		void menuRoleForCommand()
+		{
+			QFETCH(QString, commandName);
+			QFETCH(QAction::MenuRole, expected);
+			QCOMPARE(QMudMainFrameActionUtils::menuRoleForCommand(commandName), expected);
+		}
+
+		void shortcutForCommand_data()
+		{
+			QTest::addColumn<QString>("commandName");
+			QTest::addColumn<QString>("configuredShortcutText");
+			QTest::addColumn<bool>("expectedStandardQuit");
+			QTest::addColumn<QString>("expectedShortcutText");
+
+			QTest::newRow("application-quit-default")
+			    << QStringLiteral("ExitClient") << QString() << true << QString();
+			QTest::newRow("application-quit-explicit")
+			    << QStringLiteral("ExitClient") << QStringLiteral("Ctrl+Alt+Q") << false
+			    << QStringLiteral("Ctrl+Alt+Q");
+			QTest::newRow("world-quit") << QStringLiteral("QuitFromWorld") << QStringLiteral("Ctrl+Shift+Q")
+			                            << false << QStringLiteral("Ctrl+Shift+Q");
+		}
+
+		void shortcutForCommand()
+		{
+			QFETCH(QString, commandName);
+			QFETCH(QString, configuredShortcutText);
+			QFETCH(bool, expectedStandardQuit);
+			QFETCH(QString, expectedShortcutText);
+
+			const QKeySequence configuredShortcut =
+			    QKeySequence::fromString(configuredShortcutText, QKeySequence::PortableText);
+			const QKeySequence actual =
+			    QMudMainFrameActionUtils::shortcutForCommand(commandName, configuredShortcut);
+			if (expectedStandardQuit)
+				QCOMPARE(actual, QKeySequence(QKeySequence::Quit));
+			else
+				QCOMPARE(actual.toString(QKeySequence::PortableText), expectedShortcutText);
+		}
+
+		void toolbarTooltipWithShortcut()
+		{
+			const QString nativeShortcut =
+			    QKeySequence::fromString(QStringLiteral("Shift+Ctrl+8"), QKeySequence::PortableText)
+			        .toString(QKeySequence::NativeText);
+			QCOMPARE(QMudMainFrameActionUtils::toolbarTooltipWithShortcut(QStringLiteral("Triggers"),
+			                                                              QStringLiteral("Shift+Ctrl+8")),
+			         QStringLiteral("Triggers (%1)").arg(nativeShortcut));
+			QCOMPARE(
+			    QMudMainFrameActionUtils::toolbarTooltipWithShortcut(QStringLiteral("Triggers"), QString()),
+			    QStringLiteral("Triggers"));
 		}
 
 		void shouldAttemptIncomingLineTaskbarFlash_data()
@@ -166,7 +244,7 @@ class tst_MainFrame_Actions : public QObject
 		// NOLINTEND(readability-convert-member-functions-to-static)
 };
 
-QTEST_APPLESS_MAIN(tst_MainFrame_Actions)
+QTEST_MAIN(tst_MainFrame_Actions)
 
 #if __has_include("tst_MainFrame_Actions.moc")
 #include "tst_MainFrame_Actions.moc"

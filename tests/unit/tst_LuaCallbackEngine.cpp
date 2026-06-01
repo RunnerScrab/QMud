@@ -25,6 +25,7 @@
 #include <QtTest/QTest>
 
 #include <atomic>
+#include <clocale>
 #include <limits>
 #include <memory>
 
@@ -493,6 +494,7 @@ namespace
 
 		private slots:
 			// NOLINTBEGIN(readability-convert-member-functions-to-static)
+			void initTestCase();
 			void directCallbackShapesRoundTrip();
 			void wildcardAndStyleCallbackReceivesContextTables();
 			void mxpCallbacksMarshalArguments();
@@ -505,10 +507,12 @@ namespace
 			void deferredRuntimeMutationBatchesPreserveOrderAndOwnership();
 			void directExecutorDispatchesRealEngines();
 			void callPluginMarshallingUsesTargetEngineState();
+			void noArgsDispatchReportsCallbackFailure();
 			void workerDispatchesPluginLifecycleCallbacksOnRealEngines();
 			void workerCallbackBatchCapturesOutputMiniWindowAndSaveStateMutations();
 			void workerColourOutputMatchesMushclientGroupingAndNewlineSemantics();
 			void colourTellIgnoresTrailingLuaGsubReturnAndKeepsFollowingNote();
+			void executeScriptNoteUsesRuntimeNoteColour();
 			void triggerAnchoredColourOutputKeepsNativePromptText();
 			void callbackSnapshotSuppliesGetInfoAndMiniWindowReads();
 			void deferredRuntimeMutationSkipsDestroyedRuntime();
@@ -625,6 +629,11 @@ namespace
 } // namespace
 
 // NOLINTBEGIN(readability-convert-member-functions-to-static)
+void tst_LuaCallbackEngine::initTestCase()
+{
+	std::setlocale(LC_NUMERIC, "C");
+}
+
 void tst_LuaCallbackEngine::directCallbackShapesRoundTrip()
 {
 	LuaCallbackEngine engine;
@@ -1253,6 +1262,50 @@ end
 	QVERIFY(lua_toboolean(caller.get(), 4) != 0);
 }
 
+void tst_LuaCallbackEngine::noArgsDispatchReportsCallbackFailure()
+{
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
+function successful_install()
+  return true
+end
+function failed_install()
+  return false
+end
+)lua"));
+
+	LuaBatchDispatchRequest request;
+	request.engines       = {engine};
+	request.kind          = LuaBatchDispatchKind::NoArgs;
+	request.functionName  = QStringLiteral("successful_install");
+	request.defaultResult = true;
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	QVERIFY(result.boolResultValid);
+	QVERIFY(result.boolResult);
+	QVERIFY(result.hasFunctionValid);
+	QVERIFY(result.hasFunction);
+
+	request.functionName = QStringLiteral("failed_install");
+	dispatchWorkerAndWait(executor, request, result);
+	QVERIFY(result.boolResultValid);
+	QVERIFY(!result.boolResult);
+	QVERIFY(result.hasFunctionValid);
+	QVERIFY(result.hasFunction);
+
+	request.functionName = QStringLiteral("missing_install");
+	dispatchWorkerAndWait(executor, request, result);
+	QVERIFY(result.boolResultValid);
+	QVERIFY(result.boolResult);
+	QVERIFY(result.hasFunctionValid);
+	QVERIFY(!result.hasFunction);
+
+	request.kind    = LuaBatchDispatchKind::TeardownEnginesMany;
+	request.engines = {engine};
+	dispatchWorkerAndWait(executor, request);
+}
+
 void tst_LuaCallbackEngine::workerDispatchesPluginLifecycleCallbacksOnRealEngines()
 {
 	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
@@ -1422,6 +1475,43 @@ end
 	QCOMPARE(logicalOutputLinesFromEntries(state.lineEntries),
 	         QStringList({QStringLiteral("You made 10,000 gold!")}));
 	teardownWorkerEngine(executor, engine);
+}
+
+void tst_LuaCallbackEngine::executeScriptNoteUsesRuntimeNoteColour()
+{
+	WorldRuntime runtime;
+	auto        &state  = runtimeStubState(&runtime);
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QString());
+
+	auto snapshot                        = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+	snapshot->hasRuntimeCountersSnapshot = true;
+	snapshot->runtimeCounterValues.insert(QStringLiteral("notesInRgb"), true);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("noteColourFore"),
+	                                      QVariant::fromValue<qlonglong>(0x00FFFF00));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("noteColourBack"),
+	                                      QVariant::fromValue<qlonglong>(0));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("noteTextColour"), -1);
+
+	LuaExecutorDirect       executor;
+	LuaBatchDispatchRequest request;
+	request.engines               = {engine};
+	request.kind                  = LuaBatchDispatchKind::ExecuteScript;
+	request.stringArg             = QStringLiteral("Note('test')");
+	request.stringArg2            = QStringLiteral("immediate note colour");
+	request.miniWindowSnapshotArg = snapshot;
+	LuaBatchDispatchResult result = executor.dispatchBatch(request);
+	QVERIFY(result.boolResultValid);
+	QVERIFY(result.boolResult);
+	executeDeferredMutations(result);
+
+	QCOMPARE(state.lineEntries.size(), 1);
+	const WorldRuntime::LineEntry &entry = state.lineEntries.constFirst();
+	QCOMPARE(entry.text, QStringLiteral("test"));
+	QVERIFY(!entry.spans.isEmpty());
+	QCOMPARE(entry.spans.constFirst().fore, QColor(0, 255, 255));
+	QCOMPARE(entry.spans.constFirst().back, QColor(Qt::black));
 }
 
 void tst_LuaCallbackEngine::triggerAnchoredColourOutputKeepsNativePromptText()

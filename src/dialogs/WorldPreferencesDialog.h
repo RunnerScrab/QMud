@@ -282,6 +282,10 @@ class WorldPreferencesDialog : public QDialog
 		 */
 		void                          updateScriptNoteSwatches() const;
 		/**
+		 * @brief Updates scripting note colour combo item roles from custom colours.
+		 */
+		void                          updateScriptNoteColourItems() const;
+		/**
 		 * @brief Recalculates memory usage estimates for scripts/rules.
 		 * @param allowProgress Show progress UI for expensive runs when `true`.
 		 */

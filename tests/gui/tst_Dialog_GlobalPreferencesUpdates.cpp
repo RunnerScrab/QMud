@@ -19,6 +19,7 @@
 // ReSharper disable once CppUnusedIncludeDirective
 #include <QDir>
 #include <QFile>
+#include <QFont>
 #include <QLabel>
 #include <QPushButton>
 #include <QSpinBox>
@@ -80,6 +81,10 @@ namespace
 		state.globalOptions.insert(QStringLiteral("UpdateCheckIntervalHours"), 1);
 		state.globalOptions.insert(QStringLiteral("EnableReloadFeature"), 1);
 		state.globalOptions.insert(QStringLiteral("ReloadMccpDisableTimeoutMs"), 1000);
+		state.globalOptions.insert(QStringLiteral("PrinterFont"), QStringLiteral("Courier"));
+		state.globalOptions.insert(QStringLiteral("PrinterFontSize"), 10);
+		state.globalOptions.insert(QStringLiteral("PrinterFontWeight"), QFont::Normal);
+		state.globalOptions.insert(QStringLiteral("PrinterFontItalic"), 0);
 
 		QFile::remove(testIniFilePath());
 	}
@@ -482,6 +487,33 @@ class tst_Dialog_GlobalPreferencesUpdates : public QObject
 			QCOMPARE(stubState().globalOptions.value(QStringLiteral("ReloadMccpDisableTimeoutMs")).toInt(),
 			         850);
 			QCOMPARE(stubState().applyGlobalPreferencesCallCount, 1);
+		}
+
+		/**
+		 * @brief Verifies printer font family and style are displayed and persisted separately.
+		 */
+		void printerFontStyleLoadsAndPersists()
+		{
+			resetStubState();
+			stubState().globalOptions.insert(QStringLiteral("PrinterFont"), QStringLiteral("Menlo"));
+			stubState().globalOptions.insert(QStringLiteral("PrinterFontSize"), 11);
+			stubState().globalOptions.insert(QStringLiteral("PrinterFontWeight"), QFont::Bold);
+			stubState().globalOptions.insert(QStringLiteral("PrinterFontItalic"), 1);
+
+			GlobalPreferencesDialog dialog;
+			dialog.show();
+
+			QVERIFY(findLabelByText(dialog, QStringLiteral("Menlo")));
+			QVERIFY(findLabelByText(dialog, QStringLiteral("11 pt. Bold Italic")));
+
+			dialog.accept();
+
+			QCOMPARE(stubState().globalOptions.value(QStringLiteral("PrinterFont")).toString(),
+			         QStringLiteral("Menlo"));
+			QCOMPARE(stubState().globalOptions.value(QStringLiteral("PrinterFontSize")).toInt(), 11);
+			QCOMPARE(stubState().globalOptions.value(QStringLiteral("PrinterFontWeight")).toInt(),
+			         static_cast<int>(QFont::Bold));
+			QCOMPARE(stubState().globalOptions.value(QStringLiteral("PrinterFontItalic")).toInt(), 1);
 		}
 
 		/**

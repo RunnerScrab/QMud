@@ -200,13 +200,41 @@ QAction *MainWindow::actionForCommand(const QString &cmdName) const
 	return m_actions.value(cmdName, nullptr);
 }
 
+static void applyExplicitMacMenuRole(QAction *action)
+{
+#ifdef Q_OS_MACOS
+	if (action)
+		action->setMenuRole(QAction::NoRole);
+#else
+	Q_UNUSED(action);
+#endif
+}
+
+static QMenu *addMainFrameMenu(QMenuBar *menuBar, const QString &title)
+{
+	QMenu *menu = menuBar ? menuBar->addMenu(title) : nullptr;
+	if (menu)
+		applyExplicitMacMenuRole(menu->menuAction());
+	return menu;
+}
+
+static QMenu *addMainFrameSubMenu(QMenu *parent, const QString &title)
+{
+	QMenu *menu = parent ? parent->addMenu(title) : nullptr;
+	if (menu)
+		applyExplicitMacMenuRole(menu->menuAction());
+	return menu;
+}
+
 QAction *MainWindow::addActionToMenu(QMenu *menu, const QString &cmdName, const QString &text,
                                      const QKeySequence &shortcut)
 {
-	auto *a = new QAction(text, this);
-	if (!shortcut.isEmpty())
-		a->setShortcut(shortcut);
+	auto              *a                = new QAction(text, this);
+	const QKeySequence resolvedShortcut = QMudMainFrameActionUtils::shortcutForCommand(cmdName, shortcut);
+	if (!resolvedShortcut.isEmpty())
+		a->setShortcut(resolvedShortcut);
 	a->setShortcutContext(Qt::ApplicationShortcut);
+	a->setMenuRole(QMudMainFrameActionUtils::menuRoleForCommand(cmdName));
 	a->setObjectName(cmdName); // preserve original command-name for lookup
 	a->setIconVisibleInMenu(false);
 	QString tipText = text;
@@ -225,7 +253,7 @@ QAction *MainWindow::addActionToMenu(QMenu *menu, const QString &cmdName, const 
 void MainWindow::buildMenus()
 {
 	// File menu
-	m_fileMenu = menuBar()->addMenu(QStringLiteral("&File"));
+	m_fileMenu = addMainFrameMenu(menuBar(), QStringLiteral("&File"));
 	addActionToMenu(m_fileMenu, QStringLiteral("New"), QStringLiteral("&New World...\tCtrl+N"),
 	                QKeySequence::New);
 	addActionToMenu(m_fileMenu, QStringLiteral("Open"), QStringLiteral("&Open World...\tCtrl+O"),
@@ -287,7 +315,7 @@ void MainWindow::buildMenus()
 	addActionToMenu(m_fileMenu, QStringLiteral("ExitClient"), QStringLiteral("E&xit"));
 
 	// Edit menu
-	QMenu *editMenu = menuBar()->addMenu(QStringLiteral("&Edit"));
+	QMenu *editMenu = addMainFrameMenu(menuBar(), QStringLiteral("&Edit"));
 	addActionToMenu(editMenu, QStringLiteral("Undo"), QStringLiteral("&Undo\tCtrl+Z"), QKeySequence::Undo);
 	editMenu->addSeparator();
 	addActionToMenu(editMenu, QStringLiteral("Cut"), QStringLiteral("Cu&t\tCtrl+X"), QKeySequence::Cut);
@@ -348,7 +376,7 @@ void MainWindow::buildMenus()
 	                QStringLiteral("&Refresh Recalled Data"));
 
 	// View menu
-	QMenu *viewMenu    = menuBar()->addMenu(QStringLiteral("&View"));
+	QMenu *viewMenu    = addMainFrameMenu(menuBar(), QStringLiteral("&View"));
 	auto  *viewToolbar = addActionToMenu(viewMenu, QStringLiteral("ViewToolbar"), QStringLiteral("&Toolbar"));
 	viewToolbar->setCheckable(true);
 	viewToolbar->setChecked(true);
@@ -400,7 +428,7 @@ void MainWindow::buildMenus()
 	fullScreen->setCheckable(true);
 
 	// Connection menu
-	QMenu *connectionMenu = menuBar()->addMenu(QStringLiteral("&Connection"));
+	QMenu *connectionMenu = addMainFrameMenu(menuBar(), QStringLiteral("&Connection"));
 	addActionToMenu(connectionMenu, QStringLiteral("QuickConnect"),
 	                QStringLiteral("&Quick Connect...\tCtrl+Alt+Shift+K"),
 	                QKeySequence(QStringLiteral("Ctrl+Alt+Shift+K")));
@@ -424,7 +452,7 @@ void MainWindow::buildMenus()
 	                QStringLiteral("Connect To Worlds &In Startup List"));
 
 	// Input menu
-	QMenu *inputMenu = menuBar()->addMenu(QStringLiteral("&Input"));
+	QMenu *inputMenu = addMainFrameMenu(menuBar(), QStringLiteral("&Input"));
 	addActionToMenu(inputMenu, QStringLiteral("ActivateInputArea"),
 	                QStringLiteral("Activate &Input Area\tTab"), QKeySequence(QStringLiteral("Tab")));
 	inputMenu->addSeparator();
@@ -457,7 +485,7 @@ void MainWindow::buildMenus()
 	addActionToMenu(inputMenu, QStringLiteral("KeyName"), QStringLiteral("&Key Name..."));
 
 	// Display menu
-	QMenu *displayMenu = menuBar()->addMenu(QStringLiteral("&Display"));
+	QMenu *displayMenu = addMainFrameMenu(menuBar(), QStringLiteral("&Display"));
 	addActionToMenu(displayMenu, QStringLiteral("DisplayStart"), QStringLiteral("&Start\tCtrl+Home"),
 	                QKeySequence(QStringLiteral("Ctrl+Home")));
 	addActionToMenu(displayMenu, QStringLiteral("DisplayPageUp"), QStringLiteral("Page &Up\tPageUp"),
@@ -516,8 +544,8 @@ void MainWindow::buildMenus()
 	                QKeySequence(QStringLiteral("Ctrl+Alt+E")));
 
 	// Game / World menu
-	QMenu   *gameMenu               = menuBar()->addMenu(QStringLiteral("&Game"));
-	QMenu   *configureMenu          = gameMenu->addMenu(QStringLiteral("&Configure"));
+	QMenu   *gameMenu               = addMainFrameMenu(menuBar(), QStringLiteral("&Game"));
+	QMenu   *configureMenu          = addMainFrameSubMenu(gameMenu, QStringLiteral("&Configure"));
 	QAction *allConfigurationAction = addActionToMenu(configureMenu, QStringLiteral("Preferences"),
 	                                                  QStringLiteral("All &Configuration...\tAlt+Enter"),
 	                                                  QKeySequence(QStringLiteral("Alt+Return")));
@@ -622,7 +650,7 @@ void MainWindow::buildMenus()
 	                QKeySequence(QStringLiteral("Ctrl+Alt+Shift+D")));
 
 	// Window menu
-	m_windowMenu = menuBar()->addMenu(QStringLiteral("&Window"));
+	m_windowMenu = addMainFrameMenu(menuBar(), QStringLiteral("&Window"));
 	addActionToMenu(m_windowMenu, QStringLiteral("NewWindow"), QStringLiteral("&New Window"));
 	addActionToMenu(m_windowMenu, QStringLiteral("CascadeWindows"), QStringLiteral("&Cascade"));
 	addActionToMenu(m_windowMenu, QStringLiteral("TileWindows"), QStringLiteral("&Tile Horizontally"));
@@ -637,7 +665,7 @@ void MainWindow::buildMenus()
 	connect(m_windowMenu, &QMenu::aboutToShow, this, &MainWindow::updateWindowMenu);
 
 	// Help menu
-	QMenu *helpMenu = menuBar()->addMenu(QStringLiteral("&Help"));
+	QMenu *helpMenu = addMainFrameMenu(menuBar(), QStringLiteral("&Help"));
 	addActionToMenu(helpMenu, QStringLiteral("TipOfTheDay"), QStringLiteral("&Tip Of The Day..."));
 	helpMenu->addSeparator();
 	addActionToMenu(helpMenu, QStringLiteral("GettingStarted"), QStringLiteral("&Getting Started..."));
@@ -842,45 +870,53 @@ void MainWindow::buildToolbars()
 	// Main and game toolbars now use standalone PNG icons from resources/qmud/res/toolbar/.
 
 	const QHash<QString, QString> tooltipOverrides = {
-	    {QStringLiteral("New"),                  QStringLiteral("New world")                   },
-	    {QStringLiteral("Open"),                 QStringLiteral("Open world")                  },
-	    {QStringLiteral("Save"),                 QStringLiteral("Save world")                  },
-	    {QStringLiteral("Print"),                QStringLiteral("Print")                       },
-	    {QStringLiteral("NotesWorkArea"),        QStringLiteral("Notepad")                     },
-	    {QStringLiteral("Cut"),                  QStringLiteral("Cut")                         },
-	    {QStringLiteral("Copy"),                 QStringLiteral("Copy")                        },
-	    {QStringLiteral("Paste"),                QStringLiteral("Paste")                       },
-	    {QStringLiteral("About"),                QStringLiteral("About")                       },
-	    {QStringLiteral("ContextHelp"),          QStringLiteral("Help")                        },
-	    {QStringLiteral("GameWrapLines"),        QStringLiteral("Line wrap")                   },
-	    {QStringLiteral("LogSession"),           QStringLiteral("Log session (Shift+Ctrl+J)")  },
-	    {QStringLiteral("Connect_Or_Reconnect"), QStringLiteral("Connect / Disconnect")        },
-	    {QStringLiteral("Preferences"),          QStringLiteral("World details (Ctrl+G)")      },
-	    {QStringLiteral("ConfigureTriggers"),    QStringLiteral("Triggers (Shift+Ctrl+8)")     },
-	    {QStringLiteral("ConfigureAliases"),     QStringLiteral("Aliases (Shift+Ctrl+9)")      },
-	    {QStringLiteral("ConfigureTimers"),      QStringLiteral("Timers (Shift+Ctrl+0)")       },
-	    {QStringLiteral("ConfigureOutput"),      QStringLiteral("Output (Alt+5)")              },
-	    {QStringLiteral("ConfigureCommands"),    QStringLiteral("Commands (Alt+0)")            },
-	    {QStringLiteral("ConfigureScripting"),   QStringLiteral("Scripting (Shift+Ctrl+6)")    },
-	    {QStringLiteral("ConfigureNotes"),       QStringLiteral("Notes (Alt+4)")               },
-	    {QStringLiteral("ConfigureVariables"),   QStringLiteral("Variables (Shift+Ctrl+7)")    },
-	    {QStringLiteral("ResetAllTimers"),       QStringLiteral("Reset timers (Shift+Ctrl+T)") },
-	    {QStringLiteral("ReloadScriptFile"),     QStringLiteral("Reload script (Shift+Ctrl+R)")},
-	    {QStringLiteral("AutoSay"),              QStringLiteral("Auto Say (Shift+Ctrl+A)")     },
-	    {QStringLiteral("FreezeOutput"),         QStringLiteral("Pause (Ctrl+Space)")          },
-	    {QStringLiteral("Find"),                 QStringLiteral("Find (Ctrl+F)")               },
-	    {QStringLiteral("FindAgain"),            QStringLiteral("Find again (Shift+Ctrl+F)")   },
-	    {QStringLiteral("FindAgainBackwards"),   QStringLiteral("Find again backwards")        },
-	    {QStringLiteral("World1"),               QStringLiteral("Activates world #1 (Ctrl+1)") },
-	    {QStringLiteral("World2"),               QStringLiteral("Activates world #2 (Ctrl+2)") },
-	    {QStringLiteral("World3"),               QStringLiteral("Activates world #3 (Ctrl+3)") },
-	    {QStringLiteral("World4"),               QStringLiteral("Activates world #4 (Ctrl+4)") },
-	    {QStringLiteral("World5"),               QStringLiteral("Activates world #5 (Ctrl+5)") },
-	    {QStringLiteral("World6"),               QStringLiteral("Activates world #6 (Ctrl+6)") },
-	    {QStringLiteral("World7"),               QStringLiteral("Activates world #7 (Ctrl+7)") },
-	    {QStringLiteral("World8"),               QStringLiteral("Activates world #8 (Ctrl+8)") },
-	    {QStringLiteral("World9"),               QStringLiteral("Activates world #9 (Ctrl+9)") },
-	    {QStringLiteral("World10"),              QStringLiteral("Activates world #10 (Ctrl+0)")}
+	    {QStringLiteral("New"),                  QStringLiteral("New world")           },
+	    {QStringLiteral("Open"),                 QStringLiteral("Open world")          },
+	    {QStringLiteral("Save"),                 QStringLiteral("Save world")          },
+	    {QStringLiteral("Print"),                QStringLiteral("Print")               },
+	    {QStringLiteral("NotesWorkArea"),        QStringLiteral("Notepad")             },
+	    {QStringLiteral("Cut"),                  QStringLiteral("Cut")                 },
+	    {QStringLiteral("Copy"),                 QStringLiteral("Copy")                },
+	    {QStringLiteral("Paste"),                QStringLiteral("Paste")               },
+	    {QStringLiteral("About"),                QStringLiteral("About")               },
+	    {QStringLiteral("ContextHelp"),          QStringLiteral("Help")                },
+	    {QStringLiteral("GameWrapLines"),        QStringLiteral("Line wrap")           },
+	    {QStringLiteral("LogSession"),           QStringLiteral("Log session")         },
+	    {QStringLiteral("Connect_Or_Reconnect"), QStringLiteral("Connect / Disconnect")},
+	    {QStringLiteral("Preferences"),          QStringLiteral("World details")       },
+	    {QStringLiteral("ConfigureTriggers"),    QStringLiteral("Triggers")            },
+	    {QStringLiteral("ConfigureAliases"),     QStringLiteral("Aliases")             },
+	    {QStringLiteral("ConfigureTimers"),      QStringLiteral("Timers")              },
+	    {QStringLiteral("ConfigureOutput"),      QStringLiteral("Output")              },
+	    {QStringLiteral("ConfigureCommands"),    QStringLiteral("Commands")            },
+	    {QStringLiteral("ConfigureScripting"),   QStringLiteral("Scripting")           },
+	    {QStringLiteral("ConfigureNotes"),       QStringLiteral("Notes")               },
+	    {QStringLiteral("ConfigureVariables"),   QStringLiteral("Variables")           },
+	    {QStringLiteral("ResetAllTimers"),       QStringLiteral("Reset timers")        },
+	    {QStringLiteral("ReloadScriptFile"),     QStringLiteral("Reload script")       },
+	    {QStringLiteral("AutoSay"),              QStringLiteral("Auto Say")            },
+	    {QStringLiteral("FreezeOutput"),         QStringLiteral("Pause")               },
+	    {QStringLiteral("Find"),                 QStringLiteral("Find")                },
+	    {QStringLiteral("FindAgainForwards"),    QStringLiteral("Find again")          },
+	    {QStringLiteral("FindAgainBackwards"),   QStringLiteral("Find again backwards")}
+    };
+	const QHash<QString, QString> tooltipShortcutOverrides = {
+	    {QStringLiteral("LogSession"),         QStringLiteral("Shift+Ctrl+J")},
+	    {QStringLiteral("Preferences"),        QStringLiteral("Ctrl+G")      },
+	    {QStringLiteral("ConfigureTriggers"),  QStringLiteral("Shift+Ctrl+8")},
+	    {QStringLiteral("ConfigureAliases"),   QStringLiteral("Shift+Ctrl+9")},
+	    {QStringLiteral("ConfigureTimers"),    QStringLiteral("Shift+Ctrl+0")},
+	    {QStringLiteral("ConfigureOutput"),    QStringLiteral("Alt+5")       },
+	    {QStringLiteral("ConfigureCommands"),  QStringLiteral("Alt+0")       },
+	    {QStringLiteral("ConfigureScripting"), QStringLiteral("Shift+Ctrl+6")},
+	    {QStringLiteral("ConfigureNotes"),     QStringLiteral("Alt+4")       },
+	    {QStringLiteral("ConfigureVariables"), QStringLiteral("Shift+Ctrl+7")},
+	    {QStringLiteral("ResetAllTimers"),     QStringLiteral("Shift+Ctrl+T")},
+	    {QStringLiteral("ReloadScriptFile"),   QStringLiteral("Shift+Ctrl+R")},
+	    {QStringLiteral("AutoSay"),            QStringLiteral("Shift+Ctrl+A")},
+	    {QStringLiteral("FreezeOutput"),       QStringLiteral("Ctrl+Space")  },
+	    {QStringLiteral("Find"),               QStringLiteral("Ctrl+F")      },
+	    {QStringLiteral("FindAgainForwards"),  QStringLiteral("Shift+Ctrl+F")}
     };
 
 	auto prettyName = [](const QString &cmd) -> QString
@@ -913,8 +949,8 @@ void MainWindow::buildToolbars()
 		return text.trimmed();
 	};
 
-	auto applyTooltip = [tooltipOverrides, prettyName, sanitizeTip](QAction *action, const QString &cmdName,
-	                                                                const QString &fallback)
+	auto applyTooltip = [tooltipOverrides, tooltipShortcutOverrides, prettyName,
+	                     sanitizeTip](QAction *action, const QString &cmdName, const QString &fallback)
 	{
 		if (!action)
 			return;
@@ -924,6 +960,9 @@ void MainWindow::buildToolbars()
 		else
 			tip = fallback.isEmpty() ? prettyName(cmdName) : fallback;
 		tip = sanitizeTip(tip);
+		if (tooltipShortcutOverrides.contains(cmdName))
+			tip = QMudMainFrameActionUtils::toolbarTooltipWithShortcut(
+			    tip, tooltipShortcutOverrides.value(cmdName));
 		if (tip.isEmpty())
 			return;
 		action->setToolTip(tip);
@@ -2731,7 +2770,6 @@ bool                 MainWindow::switchToNotepad()
 	const QString          defaultTitle = defaultNotepadTitleForWorld(owner, world);
 
 	QList<QMdiSubWindow *> matchingCandidates;
-	TextChildWindow       *defaultTitleFallback = nullptr;
 	for (QMdiSubWindow *sub : m_mdiArea->subWindowList(QMdiArea::CreationOrder))
 	{
 		auto *text = qobject_cast<TextChildWindow *>(sub);
@@ -2739,14 +2777,10 @@ bool                 MainWindow::switchToNotepad()
 			continue;
 
 		matchingCandidates.append(text);
-		if (!defaultTitleFallback && text->windowTitle().compare(defaultTitle, Qt::CaseInsensitive) == 0)
-			defaultTitleFallback = text;
 	}
 
 	QMdiSubWindow *target = QMudMainFrameMdiUtils::firstWindowMatchingRuntimeIdentity(
 	    matchingCandidates, ownerToken, ownerWorldId, false);
-	if (!target)
-		target = defaultTitleFallback;
 	if (!target)
 	{
 		auto *created = new TextChildWindow(defaultTitle, QString());
@@ -2775,6 +2809,7 @@ bool MainWindow::activateNotepad(const QString &title, WorldRuntime *relatedRunt
 	const qulonglong ownerToken = runtimeOwnerToken(owner);
 	const QString    ownerWorldId =
 	    owner ? owner->worldAttributes().value(QStringLiteral("id")).trimmed() : QString();
+	const bool hasOwner = owner != nullptr;
 	for (QMdiSubWindow *sub : m_mdiArea->subWindowList(QMdiArea::CreationOrder))
 	{
 		auto *text = qobject_cast<TextChildWindow *>(sub);
@@ -2783,25 +2818,14 @@ bool MainWindow::activateNotepad(const QString &title, WorldRuntime *relatedRunt
 		if (text->windowTitle().compare(title, Qt::CaseInsensitive) != 0)
 			continue;
 
-		if (ownerToken != 0)
+		if (hasOwner)
 		{
-			const qulonglong relatedToken = text->property("worldRuntimeToken").toULongLong();
-			if (relatedToken == ownerToken)
-			{
-				m_mdiArea->setActiveSubWindow(text);
-				text->show();
-				text->raise();
-				return true;
-			}
-			if (relatedToken != 0 && relatedToken != ownerToken)
+			if (!QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(text, ownerToken, ownerWorldId, false))
 				continue;
-			if (!ownerWorldId.isEmpty())
-			{
-				if (const QString related = text->property("worldId").toString().trimmed();
-				    !related.isEmpty() && related.compare(ownerWorldId, Qt::CaseInsensitive) != 0)
-					continue;
-			}
 		}
+		else if (!QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(text, 0, QString(), false))
+			continue;
+
 		m_mdiArea->setActiveSubWindow(text);
 		text->show();
 		text->raise();
@@ -2894,40 +2918,26 @@ bool MainWindow::appendToNotepad(const QString &title, const QString &text, cons
 	const qulonglong ownerToken = runtimeOwnerToken(owner);
 	const QString    ownerWorldId =
 	    owner ? owner->worldAttributes().value(QStringLiteral("id")).trimmed() : QString();
-	TextChildWindow *target       = nullptr;
-	TextChildWindow *unnamedMatch = nullptr;
+	const bool       hasOwner = owner != nullptr;
+	TextChildWindow *target   = nullptr;
 	for (QMdiSubWindow *sub : m_mdiArea->subWindowList(QMdiArea::CreationOrder))
 	{
 		auto *textWindow = qobject_cast<TextChildWindow *>(sub);
 		if (!textWindow)
 			continue;
-		if (textWindow->windowTitle().compare(title, Qt::CaseInsensitive) == 0)
-		{
-			const qulonglong relatedToken = textWindow->property("worldRuntimeToken").toULongLong();
-			if (ownerToken != 0 && relatedToken == ownerToken)
-			{
-				target = textWindow;
-				break;
-			}
-			if (ownerToken != 0 && relatedToken != 0 && relatedToken != ownerToken)
-				continue;
-			if (ownerWorldId.isEmpty())
-			{
-				target = textWindow;
-				break;
-			}
-			const QString related = textWindow->property("worldId").toString().trimmed();
-			if (related.compare(ownerWorldId, Qt::CaseInsensitive) == 0)
-			{
-				target = textWindow;
-				break;
-			}
-			if (related.isEmpty() && !unnamedMatch)
-				unnamedMatch = textWindow;
-		}
+		if (textWindow->windowTitle().compare(title, Qt::CaseInsensitive) != 0)
+			continue;
+
+		const bool matchesOwner =
+		    hasOwner ? QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(textWindow, ownerToken,
+		                                                                   ownerWorldId, false)
+		             : QMudMainFrameMdiUtils::windowMatchesRuntimeIdentity(textWindow, 0, QString(), false);
+		if (!matchesOwner)
+			continue;
+
+		target = textWindow;
+		break;
 	}
-	if (!target && unnamedMatch)
-		target = unnamedMatch;
 
 	if (!target)
 	{

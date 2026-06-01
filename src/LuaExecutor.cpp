@@ -60,12 +60,19 @@ LuaBatchDispatchResult ILuaExecutor::dispatchBatch(const LuaBatchDispatchRequest
 	switch (request.kind)
 	{
 	case LuaBatchDispatchKind::NoArgs:
+		result.boolResult  = true;
+		result.hasFunction = false;
 		forEachEngine(
 		    [&](LuaCallbackEngine *engine)
 		    {
-			    static_cast<void>(
-			        engine->callFunctionNoArgs(request.functionName, nullptr, request.defaultResult));
+			    bool       hasFunction = false;
+			    const bool ok =
+			        engine->callFunctionNoArgs(request.functionName, &hasFunction, request.defaultResult);
+			    result.boolResult  = result.boolResult && ok;
+			    result.hasFunction = result.hasFunction || hasFunction;
 		    });
+		result.boolResultValid  = true;
+		result.hasFunctionValid = true;
 		return result;
 	case LuaBatchDispatchKind::HasFunction:
 	{
