@@ -2371,7 +2371,8 @@ class tst_WorldView_Basic : public QObject
 			resetTestState();
 		}
 
-		void outputNavigationKeysFromInputUseSplitPagingAndShiftHomeEndWhenAllTypingToCommandWindowEnabled()
+		void
+		outputNavigationKeysFromInputUseSplitPagingAndCtrlShiftHomeEndWhenAllTypingToCommandWindowEnabled()
 		{
 			resetTestState();
 
@@ -2440,6 +2441,11 @@ class tst_WorldView_Basic : public QObject
 
 			QTest::keyClick(input, Qt::Key_Home, Qt::ShiftModifier);
 			QCoreApplication::processEvents();
+			QVERIFY(!view.isScrollbackSplitActive());
+			QCOMPARE(view.outputScrollPosition(), scrollBeforePlainHomeEnd);
+
+			QTest::keyClick(input, Qt::Key_Home, Qt::ControlModifier | Qt::ShiftModifier);
+			QCoreApplication::processEvents();
 			QTRY_VERIFY(view.isScrollbackSplitActive());
 			std::tie(splitTop, splitBottom) = findSplitOutputBrowsers(view);
 			QVERIFY(splitTop);
@@ -2449,6 +2455,11 @@ class tst_WorldView_Basic : public QObject
 			QTRY_COMPARE(topBar->value(), topBar->minimum());
 
 			QTest::keyClick(input, Qt::Key_End, Qt::ShiftModifier);
+			QCoreApplication::processEvents();
+			QTRY_VERIFY(view.isScrollbackSplitActive());
+			QTRY_COMPARE(topBar->value(), topBar->minimum());
+
+			QTest::keyClick(input, Qt::Key_End, Qt::ControlModifier | Qt::ShiftModifier);
 			QCoreApplication::processEvents();
 			QTRY_VERIFY(!view.isScrollbackSplitActive());
 			QTRY_COMPARE(view.outputScrollPosition(), bar->maximum());

@@ -3983,10 +3983,10 @@ bool WorldView::nativeLayoutCacheReadyFor(const QVector<NativeOutputRenderLine> 
 	    static_cast<qreal>(qMax(1, QFontMetrics(layoutFont).lineSpacing())) * lineSpacingFactor;
 	const quint64 styleKey             = nativeLayoutStyleKey();
 	const bool    cacheDimensionsMatch = m_nativeLayoutCumulativeHeights.size() == lines.size() + 1 &&
-	                                  m_nativeLayoutVisualRows.size() == lines.size() &&
-	                                  m_nativeLayoutLineLayouts.size() == lines.size() &&
-	                                  m_nativeLayoutLineContentHashes.size() == lines.size() &&
-	                                  m_nativeLayoutRowsExact.size() == lines.size();
+	                                     m_nativeLayoutVisualRows.size() == lines.size() &&
+	                                     m_nativeLayoutLineLayouts.size() == lines.size() &&
+	                                     m_nativeLayoutLineContentHashes.size() == lines.size() &&
+	                                     m_nativeLayoutRowsExact.size() == lines.size();
 	return m_nativeLayoutCacheValid && cacheDimensionsMatch &&
 	       m_nativeLayoutCachedRenderRevision == m_nativeRenderLineCacheRevision &&
 	       m_nativeLayoutCachedWrapWidth == wrapWidthPixels &&
@@ -4381,10 +4381,10 @@ void WorldView::ensureNativeLayoutCaches(const QVector<NativeOutputRenderLine> &
 				break;
 			}
 
-			const NativeOutputRenderLine &line               = lines.at(reusablePrefix);
-			const bool                    exactLineHasLayout = m_nativeLayoutRowsExact.at(sourceIndex) == 0 ||
-			                                line.text.isEmpty() ||
-			                                static_cast<bool>(m_nativeLayoutLineLayouts.at(sourceIndex));
+			const NativeOutputRenderLine &line = lines.at(reusablePrefix);
+			const bool exactLineHasLayout      = m_nativeLayoutRowsExact.at(sourceIndex) == 0 ||
+			                                     line.text.isEmpty() ||
+			                                     static_cast<bool>(m_nativeLayoutLineLayouts.at(sourceIndex));
 			if (m_nativeLayoutVisualRows.at(sourceIndex) <= 0 || !exactLineHasLayout ||
 			    m_nativeLayoutLineContentHashes.at(sourceIndex) != lineContentHashForWidth(line))
 			{
@@ -4666,14 +4666,14 @@ void WorldView::ensureNativeLayoutCaches(const QVector<NativeOutputRenderLine> &
 	}
 
 	const bool layoutRangesMatch      = renderDeltaFastPathApplied ? true : [&]
-    {
-        if (m_nativeLayoutRuntimeLineKeys.size() != lines.size())
-            return false;
-        if (lines.isEmpty())
-            return true;
-        return m_nativeLayoutRuntimeLineKeys.constFirst() == runtimeLineKeyForLine(lines.constFirst()) &&
-               m_nativeLayoutRuntimeLineKeys.constLast() == runtimeLineKeyForLine(lines.constLast());
-    }();
+	{
+		if (m_nativeLayoutRuntimeLineKeys.size() != lines.size())
+			return false;
+		if (lines.isEmpty())
+			return true;
+		return m_nativeLayoutRuntimeLineKeys.constFirst() == runtimeLineKeyForLine(lines.constFirst()) &&
+		       m_nativeLayoutRuntimeLineKeys.constLast() == runtimeLineKeyForLine(lines.constLast());
+	}();
 	const bool layoutRangesFullyMatch = (!renderDeltaFastPathApplied && renderRevisionChanged) ? [&]
 	{
 		if (m_nativeLayoutRuntimeLineKeys.size() != lines.size())
@@ -4982,7 +4982,7 @@ void WorldView::ensureNativeLayoutCaches(const QVector<NativeOutputRenderLine> &
 		const int  effectiveWrapWidth = hasLocalContent ? localWrapWidthPixels : wrapWidthPixels;
 		const quint64 contentHash     = lineContentHashForWidth(line);
 		const bool    hashMatches     = i < m_nativeLayoutLineContentHashes.size() &&
-		                         m_nativeLayoutLineContentHashes.at(i) == contentHash;
+		                                m_nativeLayoutLineContentHashes.at(i) == contentHash;
 		if (!hashMatches)
 		{
 			m_nativeLayoutLineLayouts[i].clear();
@@ -5679,9 +5679,9 @@ const QVector<WorldView::NativeOutputRenderLine> &WorldView::nativeOutputRenderL
 	const qint64 oldFirstLineNumber   = m_nativeCachedRuntimeFirstLineNumber;
 	const qint64 oldLastLineNumber    = m_nativeCachedRuntimeLastLineNumber;
 	const bool   runtimeNowContiguous = newLastLineNumber >= newFirstLineNumber &&
-	                                  (newLastLineNumber - newFirstLineNumber + 1) == runtimeLines.size();
+	                                    (newLastLineNumber - newFirstLineNumber + 1) == runtimeLines.size();
 
-	auto renderLineBeforeRuntimeLine = [](const NativeOutputRenderLine &line, const qint64 lineNumber)
+	auto         renderLineBeforeRuntimeLine = [](const NativeOutputRenderLine &line, const qint64 lineNumber)
 	{ return line.lastRuntimeLineNumber > 0 && line.lastRuntimeLineNumber < lineNumber; };
 
 	auto renderLineStraddlesRuntimeLine = [](const NativeOutputRenderLine &line, const qint64 lineNumber)
@@ -5864,7 +5864,7 @@ const QVector<WorldView::NativeOutputRenderLine> &WorldView::nativeOutputRenderL
 		{
 			const WorldRuntime::LineEntry &previousEntry       = runtimeLines.at(previousRuntimeIndex);
 			const int                      previousRenderIndex = renderIndexForRuntimeLineNumberNear(
-                previousEntry.lineNumber, previousRuntimeIndex, searchRenderCacheFromTail);
+			    previousEntry.lineNumber, previousRuntimeIndex, searchRenderCacheFromTail);
 			if (previousRenderIndex >= 0)
 			{
 				if (previousEntry.hardReturn)
@@ -6474,16 +6474,16 @@ bool WorldView::nativeOutputHitTest(const WrapTextBrowser *view, const QPoint &v
 	if (viewportRect.width() <= 0 || viewportRect.height() <= 0)
 		return false;
 
-	const int   x = qBound(0, viewPos.x(), viewportRect.width() - 1);
-	const int   y = qBound(0, viewPos.y(), viewportRect.height() - 1);
+	const int    x = qBound(0, viewPos.x(), viewportRect.width() - 1);
+	const int    y = qBound(0, viewPos.y(), viewportRect.height() - 1);
 
-	const bool  wrapEnabled          = view->lineWrapMode() != WrapTextBrowser::NoWrap;
-	const int   wrapWidthPixels      = nativeWrapWidthPixels(viewportRect.width(), wrapEnabled);
-	const int   localWrapWidthPixels = nativeLocalWrapWidthPixels(viewportRect.width(), wrapEnabled);
-	const int   lineSpacing          = qMax(0, m_lineSpacing);
-	const qreal lineAdvance          = static_cast<qreal>(qMax(1, QFontMetrics(view->font()).lineSpacing())) *
-	                          ((100.0 + static_cast<qreal>(lineSpacing)) / 100.0);
-	const QFont &layoutFont = view->font();
+	const bool   wrapEnabled          = view->lineWrapMode() != WrapTextBrowser::NoWrap;
+	const int    wrapWidthPixels      = nativeWrapWidthPixels(viewportRect.width(), wrapEnabled);
+	const int    localWrapWidthPixels = nativeLocalWrapWidthPixels(viewportRect.width(), wrapEnabled);
+	const int    lineSpacing          = qMax(0, m_lineSpacing);
+	const qreal  lineAdvance = static_cast<qreal>(qMax(1, QFontMetrics(view->font()).lineSpacing())) *
+	                           ((100.0 + static_cast<qreal>(lineSpacing)) / 100.0);
+	const QFont &layoutFont  = view->font();
 	const bool   cacheReadyForHitTest =
 	    nativeLayoutCacheReadyFor(lines, wrapWidthPixels, localWrapWidthPixels, lineSpacing, layoutFont);
 	if (!allowCacheBuild && !cacheReadyForHitTest)
@@ -6674,7 +6674,7 @@ bool WorldView::nativeOutputCharacterRect(const WrapTextBrowser *view, const Nat
 	const int    lineSpacing          = qMax(0, m_lineSpacing);
 	const QFont &layoutFont           = view->font();
 	const qreal  fallbackLineAdvance  = static_cast<qreal>(qMax(1, QFontMetrics(layoutFont).lineSpacing())) *
-	                                  ((100.0 + static_cast<qreal>(lineSpacing)) / 100.0);
+	                                    ((100.0 + static_cast<qreal>(lineSpacing)) / 100.0);
 
 	if (!nativeLayoutCacheReadyFor(lines, wrapWidthPixels, localWrapWidthPixels, lineSpacing, layoutFont))
 		ensureNativeLayoutCaches(lines, wrapWidthPixels, localWrapWidthPixels, lineSpacing, layoutFont);
@@ -6940,10 +6940,10 @@ void WorldView::applyResolvedOutputSelection(const bool hasSelection, const int 
 
 void WorldView::clearNativeOutputSelection(const bool notify)
 {
-	const bool hadNativeState = m_nativeOutputSelection.hasSelection || m_nativeOutputSelection.dragging ||
-	                            m_nativeOutputSelection.sourceView != nullptr;
-	const QRect oldPaneRect               = nativeOutputPaneRect(m_nativeOutputSelection.sourceView);
-	m_nativeOutputSelection               = {};
+	const bool  hadNativeState = m_nativeOutputSelection.hasSelection || m_nativeOutputSelection.dragging ||
+	                             m_nativeOutputSelection.sourceView != nullptr;
+	const QRect oldPaneRect    = nativeOutputPaneRect(m_nativeOutputSelection.sourceView);
+	m_nativeOutputSelection    = {};
 	m_nativeSelectionPendingHeadTrimLines = 0;
 	requestNativeOutputRepaint(oldPaneRect);
 	if (notify && hadNativeState)
@@ -7222,8 +7222,8 @@ QString WorldView::nativeOutputSelectionHtml() const
 				continue;
 			const QString segment = line.text.mid(selectStart, selectEnd - selectStart).toHtmlEscaped();
 			const QString style   = htmlStyleForSpan(
-                span, defaultTextColour, m_useCustomLinkColour, m_hyperlinkColour, m_showBold, m_showItalic,
-                m_showUnderline, m_alternativeInverse, m_underlineHyperlinks);
+			    span, defaultTextColour, m_useCustomLinkColour, m_hyperlinkColour, m_showBold, m_showItalic,
+			    m_showUnderline, m_alternativeInverse, m_underlineHyperlinks);
 			if (style.isEmpty())
 				html += segment;
 			else
@@ -7648,8 +7648,8 @@ void WorldView::paintNativeOutputCanvas(QPainter *painter, const QRegion &update
 		int   nativeMaxScroll  = qMax(0, static_cast<int>(std::ceil(docY)) - pane.textRect.height());
 		int   effectiveScrollY = nativeMaxScroll > 0 ? qBound(0, pane.scrollY, nativeMaxScroll) : 0;
 
-		qreal visibleTop = static_cast<qreal>(effectiveScrollY) +
-		                   static_cast<qreal>(clippedPaneRect.top() - pane.textRect.top());
+		qreal visibleTop    = static_cast<qreal>(effectiveScrollY) +
+		                      static_cast<qreal>(clippedPaneRect.top() - pane.textRect.top());
 		qreal visibleBottom = static_cast<qreal>(effectiveScrollY) +
 		                      static_cast<qreal>(clippedPaneRect.bottom() - pane.textRect.top());
 
@@ -7686,9 +7686,9 @@ void WorldView::paintNativeOutputCanvas(QPainter *painter, const QRegion &update
 			nativeMaxScroll  = qMax(0, static_cast<int>(std::ceil(docY)) - pane.textRect.height());
 			effectiveScrollY = nativeMaxScroll > 0 ? qBound(0, pane.scrollY, nativeMaxScroll) : 0;
 			visibleTop       = static_cast<qreal>(effectiveScrollY) +
-			             static_cast<qreal>(clippedPaneRect.top() - pane.textRect.top());
-			visibleBottom = static_cast<qreal>(effectiveScrollY) +
-			                static_cast<qreal>(clippedPaneRect.bottom() - pane.textRect.top());
+			                   static_cast<qreal>(clippedPaneRect.top() - pane.textRect.top());
+			visibleBottom    = static_cast<qreal>(effectiveScrollY) +
+			                   static_cast<qreal>(clippedPaneRect.bottom() - pane.textRect.top());
 			firstVisibleIt =
 			    std::ranges::upper_bound(std::ranges::subrange(m_nativeLayoutCumulativeHeights.cbegin() + 1,
 			                                                   m_nativeLayoutCumulativeHeights.cend()),
@@ -7709,7 +7709,7 @@ void WorldView::paintNativeOutputCanvas(QPainter *painter, const QRegion &update
 			const qreal                   lineBottom  = m_nativeLayoutCumulativeHeights.at(i + 1);
 			const qreal                   lineOpacity = qBound(0.0, line.opacity, 1.0);
 			const int                     lineY       = static_cast<int>(
-                std::floor(static_cast<qreal>(pane.textRect.top() - effectiveScrollY) + lineTop));
+			    std::floor(static_cast<qreal>(pane.textRect.top() - effectiveScrollY) + lineTop));
 			const int lineBottomY = static_cast<int>(
 			    std::ceil(static_cast<qreal>(pane.textRect.top() - effectiveScrollY) + lineBottom));
 			QRect lineBackgroundRect(pane.textRect.left(), lineY, pane.textRect.width(),
@@ -7732,7 +7732,7 @@ void WorldView::paintNativeOutputCanvas(QPainter *painter, const QRegion &update
 				{
 					const qreal lineHeight = qMax<qreal>(1.0, lineBottom - lineTop);
 					const int   baseY      = static_cast<int>(
-                        std::round(pane.textRect.top() - effectiveScrollY + lineTop + (lineHeight / 2.0)));
+					    std::round(pane.textRect.top() - effectiveScrollY + lineTop + (lineHeight / 2.0)));
 					painter->save();
 					if (lineOpacity < 0.999)
 						painter->setOpacity(painter->opacity() * lineOpacity);
@@ -7995,18 +7995,18 @@ void WorldView::requestNativeRuntimeOutputPresentationSync(const bool allowLayou
 	m_nativeRuntimeOutputPresentationQueued = true;
 	QPointer<WorldView> that(this);
 	const bool          queued = QMetaObject::invokeMethod(
-        this,
-        [that]
-        {
-            if (!that)
-                return;
-            const bool allowLayoutBuild = that->m_nativeRuntimeOutputPresentationNeedsLayoutSync;
-            const bool followTail       = that->m_nativeRuntimeOutputPresentationFollowTail;
-            that->m_nativeRuntimeOutputPresentationQueued          = false;
-            that->m_nativeRuntimeOutputPresentationNeedsLayoutSync = false;
-            that->m_nativeRuntimeOutputPresentationFollowTail      = false;
-            const QVector<NativeOutputRenderLine> &lines =
-                that->synchronizeNativeRuntimeOutputPresentation(allowLayoutBuild, followTail);
+	    this,
+	    [that]
+	    {
+		    if (!that)
+			    return;
+		    const bool allowLayoutBuild = that->m_nativeRuntimeOutputPresentationNeedsLayoutSync;
+		    const bool followTail       = that->m_nativeRuntimeOutputPresentationFollowTail;
+		    that->m_nativeRuntimeOutputPresentationQueued          = false;
+		    that->m_nativeRuntimeOutputPresentationNeedsLayoutSync = false;
+		    that->m_nativeRuntimeOutputPresentationFollowTail      = false;
+		    const QVector<NativeOutputRenderLine> &lines =
+		        that->synchronizeNativeRuntimeOutputPresentation(allowLayoutBuild, followTail);
 #ifndef NDEBUG
 		    if (that->m_nativeRangeRestitchDiagCount > 0)
 		    {
@@ -8087,33 +8087,33 @@ void WorldView::requestOutputScrollToEnd(const bool allowLayoutBuild)
 	m_scrollToEndQueued = true;
 	QPointer<WorldView> that(this);
 	const bool          queued = QMetaObject::invokeMethod(
-        this,
-        [that]
-        {
-            if (!that)
-                return;
-            const bool allowLayoutBuild        = that->m_scrollToEndNeedsLayoutSync;
-            that->m_scrollToEndQueued          = false;
-            that->m_scrollToEndNeedsLayoutSync = false;
-            if (that->m_frozen)
-                return;
-            if (traceOutputBackfillEnabled())
-            {
-                const QScrollBar *const bar = that->m_output ? that->m_output->verticalScrollBar() : nullptr;
-                qInfo().noquote() << QStringLiteral(
-                                         "[OutputBackfill] scroll-to-end fire world=%1 value=%2 max=%3 "
-			                                      "split=%4")
-                                         .arg(traceWorldName(that->m_runtime))
-                                         .arg(bar ? bar->value() : -1)
-                                         .arg(bar ? bar->maximum() : -1)
-                                         .arg(that->m_scrollbackSplitActive ? QStringLiteral("1")
-			                                                                         : QStringLiteral("0"));
-            }
-            const QVector<NativeOutputRenderLine> &lines =
-                that->synchronizeNativeRuntimeOutputPresentation(allowLayoutBuild, true);
-            that->requestNativeOutputPresentationRepaint(true, lines);
-        },
-        Qt::QueuedConnection);
+	    this,
+	    [that]
+	    {
+		    if (!that)
+			    return;
+		    const bool allowLayoutBuild        = that->m_scrollToEndNeedsLayoutSync;
+		    that->m_scrollToEndQueued          = false;
+		    that->m_scrollToEndNeedsLayoutSync = false;
+		    if (that->m_frozen)
+			    return;
+		    if (traceOutputBackfillEnabled())
+		    {
+			    const QScrollBar *const bar = that->m_output ? that->m_output->verticalScrollBar() : nullptr;
+			    qInfo().noquote() << QStringLiteral(
+			                             "[OutputBackfill] scroll-to-end fire world=%1 value=%2 max=%3 "
+			                             "split=%4")
+			                             .arg(traceWorldName(that->m_runtime))
+			                             .arg(bar ? bar->value() : -1)
+			                             .arg(bar ? bar->maximum() : -1)
+			                             .arg(that->m_scrollbackSplitActive ? QStringLiteral("1")
+			                                                                : QStringLiteral("0"));
+		    }
+		    const QVector<NativeOutputRenderLine> &lines =
+		        that->synchronizeNativeRuntimeOutputPresentation(allowLayoutBuild, true);
+		    that->requestNativeOutputPresentationRepaint(true, lines);
+	    },
+	    Qt::QueuedConnection);
 	if (!queued)
 	{
 		m_scrollToEndQueued          = false;
@@ -11258,8 +11258,8 @@ void WorldView::applyRuntimeSettingsImpl(const bool rebuildOutput)
 	const int     wrapColumn     = attrs.value(QStringLiteral("wrap_column")).toInt();
 	const QString wrapEnabled    = attrs.value(QStringLiteral("wrap"));
 	const bool    wrapOutput     = (wrapEnabled.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
-                             wrapEnabled == QStringLiteral("1") ||
-                             wrapEnabled.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0);
+	                                wrapEnabled == QStringLiteral("1") ||
+	                                wrapEnabled.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0);
 	const bool    nawsNegotiated = m_runtime && m_runtime->isNawsNegotiated();
 	if (m_output)
 	{
@@ -11844,7 +11844,7 @@ bool WorldView::eventFilter(QObject *watched, QEvent *event)
 {
 	const QWidget *outputViewport     = m_output ? m_output->viewport() : nullptr;
 	const QWidget *liveOutputViewport = m_liveOutput ? m_liveOutput->viewport() : nullptr;
-	const bool     isOutputWidget     = watched == m_outputContainer || watched == m_outputStack ||
+	const bool isOutputWidget = watched == m_outputContainer || watched == m_outputStack ||
 	                            watched == m_outputSplitter || watched == m_outputScrollBar ||
 	                            watched == m_output || watched == m_liveOutput || watched == outputViewport ||
 	                            watched == liveOutputViewport;
@@ -12668,9 +12668,9 @@ bool WorldView::executeMacroByName(const QString &name)
 	{
 		const QMap<QString, QString> &attrs = m_runtime->worldAttributes();
 		const QString noHistoryFlag = attrs.value(QStringLiteral("do_not_add_macros_to_command_history"));
-		const bool    noHistory     = (noHistoryFlag == QStringLiteral("1") ||
-                                noHistoryFlag.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
-                                noHistoryFlag.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0);
+		const bool    noHistory = (noHistoryFlag == QStringLiteral("1") ||
+		                           noHistoryFlag.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
+		                           noHistoryFlag.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0);
 		m_runtime->setCurrentActionSource(WorldRuntime::eUserMacro);
 		(void)m_runtime->sendCommand(send, true, false, true, !noHistory, true);
 		m_runtime->setCurrentActionSource(WorldRuntime::eUnknownActionSource);
@@ -12825,7 +12825,7 @@ bool WorldView::handleWorldHotkey(QKeyEvent *event)
 	const bool keypadRepeatFallback = !keypadModifier && isRepeat && m_keypadRepeatArmed &&
 	                                  event->key() == m_keypadRepeatQtKey && hasCtrl == m_keypadRepeatCtrl &&
 	                                  !hasMeta && !hasAlt && !hasShift;
-	const bool keypad = keypadModifier || keypadRepeatFallback;
+	const bool keypad               = keypadModifier || keypadRepeatFallback;
 
 	auto       tryAccelerator = [&]() -> bool
 	{
@@ -12893,11 +12893,11 @@ bool WorldView::handleWorldHotkey(QKeyEvent *event)
 	// 2) World keypad mapping from world properties.
 	if (keypad)
 	{
-		const QMap<QString, QString> &attrs         = m_runtime->worldAttributes();
-		const QString                 enabled       = attrs.value(QStringLiteral("keypad_enable"));
-		const bool                    keypadEnabled = (enabled == QStringLiteral("1") ||
-                                    enabled.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
-                                    enabled.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0);
+		const QMap<QString, QString> &attrs   = m_runtime->worldAttributes();
+		const QString                 enabled = attrs.value(QStringLiteral("keypad_enable"));
+		const bool keypadEnabled = (enabled == QStringLiteral("1") ||
+		                            enabled.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
+		                            enabled.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0);
 		if (keypadEnabled)
 		{
 			QString token;
@@ -13448,10 +13448,10 @@ void InputTextEdit::keyPressEvent(QKeyEvent *event)
 	if (m_view && m_view->m_allTypingToCommandWindow)
 	{
 		const Qt::KeyboardModifiers modifiers = event->modifiers();
-		const bool                  shiftOnlyScroll =
-		    (modifiers & Qt::ShiftModifier) != 0 &&
-		    (modifiers & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) == 0;
-		auto topScrollBar = [this]() -> QScrollBar *
+		const bool ctrlShiftOnlyScroll        = (modifiers & Qt::ControlModifier) != 0 &&
+		                                        (modifiers & Qt::ShiftModifier) != 0 &&
+		                                        (modifiers & (Qt::AltModifier | Qt::MetaModifier)) == 0;
+		auto       topScrollBar               = [this]() -> QScrollBar *
 		{
 			if (!m_view || !m_view->m_output)
 				return nullptr;
@@ -13479,7 +13479,7 @@ void InputTextEdit::keyPressEvent(QKeyEvent *event)
 				handled = false;
 			break;
 		case Qt::Key_Home:
-			if (shiftOnlyScroll)
+			if (ctrlShiftOnlyScroll)
 			{
 				m_view->setScrollbackSplitActive(true);
 				if (QScrollBar *const topBar = topScrollBar())
@@ -13493,7 +13493,7 @@ void InputTextEdit::keyPressEvent(QKeyEvent *event)
 			}
 			break;
 		case Qt::Key_End:
-			if (shiftOnlyScroll)
+			if (ctrlShiftOnlyScroll)
 			{
 				m_view->setScrollbackSplitActive(false);
 				m_view->scrollOutputToEnd();
@@ -13551,7 +13551,7 @@ void InputTextEdit::keyPressEvent(QKeyEvent *event)
 			const bool scriptingEnabled = isEnabled(attrs.value(QStringLiteral("enable_scripts"))) &&
 			                              attrs.value(QStringLiteral("script_language"))
 			                                      .compare(QStringLiteral("Lua"), Qt::CaseInsensitive) == 0;
-			const QString scriptPrefix = attrs.value(QStringLiteral("script_prefix"));
+			const QString scriptPrefix  = attrs.value(QStringLiteral("script_prefix"));
 			const bool    scriptCommand =
 			    scriptingEnabled && !scriptPrefix.isEmpty() && text.startsWith(scriptPrefix);
 			if (spellOnSend && !scriptCommand)
@@ -13703,9 +13703,9 @@ bool InputTextEdit::event(QEvent *event)
 		{
 			const Qt::KeyboardModifiers modifiers = keyEvent->modifiers();
 			const bool                  plainCtrl = (modifiers & Qt::ControlModifier) != 0 &&
-			                       (modifiers & (Qt::AltModifier | Qt::MetaModifier)) == 0;
-			const bool isCtrlBackspace = plainCtrl && keyEvent->key() == Qt::Key_Backspace;
-			const bool isCopyShortcut =
+			                                        (modifiers & (Qt::AltModifier | Qt::MetaModifier)) == 0;
+			const bool                  isCtrlBackspace = plainCtrl && keyEvent->key() == Qt::Key_Backspace;
+			const bool                  isCopyShortcut =
 			    keyEvent->matches(QKeySequence::Copy) || (plainCtrl && keyEvent->key() == Qt::Key_C);
 			if (isCtrlBackspace)
 			{
