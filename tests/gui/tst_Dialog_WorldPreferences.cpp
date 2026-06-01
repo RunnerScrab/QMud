@@ -232,6 +232,40 @@ class tst_Dialog_WorldPreferences : public QObject
 				         qPrintable(QStringLiteral("Unexpected fixed-width policy for %1").arg(spinName)));
 			}
 		}
+
+		void scriptingNoteColourApplyUpdatesRuntimeState()
+		{
+			const QString sourcePath =
+			    QDir(QStringLiteral(QMUD_TEST_SOURCE_DIR))
+			        .filePath(QStringLiteral("src/dialogs/WorldPreferencesDialog.cpp"));
+			QFile sourceFile(sourcePath);
+			QVERIFY2(sourceFile.open(QIODevice::ReadOnly | QIODevice::Text),
+			         qPrintable(QStringLiteral("Failed to open %1").arg(sourcePath)));
+			const QString sourceText = QString::fromUtf8(sourceFile.readAll());
+
+			QVERIFY2(sourceText.contains(QStringLiteral("QMudNoteColour::worldAttributeFromPublicIndex")),
+			         "Expected scripting Note colour persistence to use shared note-colour encoding.");
+			QVERIFY2(sourceText.contains(QStringLiteral("m_runtime->setNoteTextColour(notePublicIndex)")),
+			         "Expected scripting Note colour apply path to update runtime Note() colour state.");
+		}
+
+		void scriptingNoteColourComboItemsUseCustomColours()
+		{
+			const QString sourcePath =
+			    QDir(QStringLiteral(QMUD_TEST_SOURCE_DIR))
+			        .filePath(QStringLiteral("src/dialogs/WorldPreferencesDialog.cpp"));
+			QFile sourceFile(sourcePath);
+			QVERIFY2(sourceFile.open(QIODevice::ReadOnly | QIODevice::Text),
+			         qPrintable(QStringLiteral("Failed to open %1").arg(sourcePath)));
+			const QString sourceText = QString::fromUtf8(sourceFile.readAll());
+
+			QVERIFY2(sourceText.contains(QStringLiteral("updateScriptNoteColourItems")),
+			         "Expected scripting Note colour combo item role updater.");
+			QVERIFY2(sourceText.contains(QStringLiteral("Qt::ForegroundRole")),
+			         "Expected scripting Note colour combo entries to carry foreground colours.");
+			QVERIFY2(sourceText.contains(QStringLiteral("Qt::BackgroundRole")),
+			         "Expected scripting Note colour combo entries to carry background colours.");
+		}
 };
 // NOLINTEND(readability-convert-member-functions-to-static)
 

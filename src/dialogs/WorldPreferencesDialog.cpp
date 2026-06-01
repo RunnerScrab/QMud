@@ -20,6 +20,7 @@
 #include "dialogs/WorldAliasDialog.h"
 #include "dialogs/WorldTimerDialog.h"
 #include "dialogs/WorldTriggerDialog.h"
+#include "helpers/NoteColourUtils.h"
 #include "scripting/ScriptingErrors.h"
 
 #include <QApplication>
@@ -716,8 +717,8 @@ static void browseSoundFile(WorldRuntime *runtime, QWidget *parent, QLineEdit *t
 	const QString startDir    = runtime ? runtime->fileBrowsingDirectory() : QString();
 	const QString initialPath = start.isEmpty() ? startDir : start;
 	const QString fileName    = QFileDialog::getOpenFileName(
-        parent, QStringLiteral("Select sound to play"), initialPath,
-        QStringLiteral("Waveaudio files (*.wav);;MIDI files (*.mid);;Sequencer files (*.rmi)"));
+	    parent, QStringLiteral("Select sound to play"), initialPath,
+	    QStringLiteral("Waveaudio files (*.wav);;MIDI files (*.mid);;Sequencer files (*.rmi)"));
 	if (!fileName.isEmpty())
 	{
 		if (runtime)
@@ -1771,11 +1772,10 @@ void WorldPreferencesDialog::accept()
 			                             QString::number(m_scriptReloadOption->currentData().toInt()));
 		if (m_scriptTextColour && m_scriptTextColour->currentIndex() >= 0)
 		{
-			int noteValue = m_scriptTextColour->currentIndex() - 1;
-			if (noteValue < 0)
-				noteValue = WorldRuntime::kSameColour;
-			const QString encoded = fromColourRef(noteValue).name(QColor::HexRgb);
+			const int     notePublicIndex = qBound(0, m_scriptTextColour->currentIndex(), MAX_CUSTOM);
+			const QString encoded         = QMudNoteColour::worldAttributeFromPublicIndex(notePublicIndex);
 			m_runtime->setWorldAttribute(QStringLiteral("note_text_colour"), encoded);
+			m_runtime->setNoteTextColour(notePublicIndex);
 		}
 		if (m_warnIfScriptingInactive)
 			m_runtime->setWorldAttribute(QStringLiteral("warn_if_scripting_inactive"),
@@ -5700,8 +5700,13 @@ void WorldPreferencesDialog::buildUi()
 		m_echoColour->setItemText(itemIndex, text.isEmpty() ? fallback : text);
 		if (m_scriptTextColour && index >= 0 && index < m_scriptTextColour->count())
 		{
-			const QString scriptFallback = QStringLiteral("Custom%1").arg(index + 1);
-			m_scriptTextColour->setItemText(index, text.isEmpty() ? scriptFallback : text);
+			const int     scriptItemIndex = index + 1;
+			const QString scriptFallback  = QStringLiteral("Custom%1").arg(scriptItemIndex);
+			if (scriptItemIndex < m_scriptTextColour->count())
+			{
+				m_scriptTextColour->setItemText(scriptItemIndex, text.isEmpty() ? scriptFallback : text);
+				updateScriptNoteColourItems();
+			}
 		}
 	};
 	for (int i = 0; i < m_customColourNames.size(); ++i)
@@ -6093,6 +6098,7 @@ void WorldPreferencesDialog::buildUi()
 			name = QStringLiteral("Custom%1").arg(i + 1);
 		m_scriptTextColour->addItem(name);
 	}
+	updateScriptNoteColourItems();
 	m_scriptTextColour->setFixedWidth(120);
 	connect(m_scriptTextColour, qOverload<int>(&QComboBox::currentIndexChanged), this,
 	        [this](const int) { updateScriptNoteSwatches(); });
@@ -6264,7 +6270,7 @@ void WorldPreferencesDialog::buildUi()
 			        AppController *app              = AppController::instance();
 			        const QString  resolvedFileName = app ? app->makeAbsolutePath(fileName) : fileName;
 			        const QString  editorWindowName =
-                        m_editorWindowName ? m_editorWindowName->text().trimmed() : QString();
+			            m_editorWindowName ? m_editorWindowName->text().trimmed() : QString();
 			        const auto tryRaiseConfiguredEditorWindow = [&]
 			        {
 				        if (editorWindowName.isEmpty())
@@ -7176,8 +7182,8 @@ void WorldPreferencesDialog::buildUi()
 	// Printing
 	auto *printingLayout     = new QVBoxLayout(printingPage);
 	auto  buildPrintingGroup = [](const QString &title, QVector<QCheckBox *> &boldChecks,
-                                 QVector<QCheckBox *> &italicChecks, QVector<QCheckBox *> &underlineChecks,
-                                 QWidget *parent) -> QGroupBox *
+	                              QVector<QCheckBox *> &italicChecks, QVector<QCheckBox *> &underlineChecks,
+	                              QWidget *parent) -> QGroupBox *
 	{
 		static const QStringList colours = {QStringLiteral("Black"), QStringLiteral("Red"),
 		                                    QStringLiteral("Green"), QStringLiteral("Yellow"),
@@ -7415,7 +7421,7 @@ void WorldPreferencesDialog::buildUi()
 	        {
 		        const QString startDir = m_runtime ? m_runtime->fileBrowsingDirectory() : QString();
 		        const QString dirName  = QFileDialog::getExistingDirectory(
-                    this, QStringLiteral("Save chat files folder"), startDir);
+		            this, QStringLiteral("Save chat files folder"), startDir);
 		        if (!dirName.isEmpty())
 		        {
 			        if (m_runtime)
@@ -8910,8 +8916,8 @@ void WorldPreferencesDialog::buildUi()
 	const int      treeHeight = rowHeight * treeItems + (m_pageTree->frameWidth() * 2) + 12;
 	const QMargins margins    = layout->contentsMargins();
 	const int      minHeight  = treeHeight + buttons->sizeHint().height() + margins.top() + margins.bottom() +
-	                      (layout->spacing() * 2);
-	const int minHeightWithPadding = minHeight + ((minHeight * 2) / 10);
+	                            (layout->spacing() * 2);
+	const int      minHeightWithPadding = minHeight + ((minHeight * 2) / 10);
 	setMinimumHeight(qMax(minHeightWithPadding, minimumHeight()));
 	int baseWidth = qMax(minimumWidth(), sizeHint().width());
 	baseWidth += (baseWidth * 1) / 20;
@@ -9067,6 +9073,7 @@ void WorldPreferencesDialog::populateCustomColours()
 		setSwatchButtonColour(m_customTextSwatches.value(i), textColours[i]);
 		setSwatchButtonColour(m_customBackSwatches.value(i), backColours[i]);
 	}
+	updateScriptNoteColourItems();
 }
 
 void WorldPreferencesDialog::populateLogging() const
@@ -9595,29 +9602,18 @@ void WorldPreferencesDialog::populateScripting() const
 	}
 	if (m_scriptTextColour)
 	{
-		const QString raw   = attrs.value(QStringLiteral("note_text_colour"));
-		bool          ok    = false;
-		int           value = raw.toInt(&ok);
-		if (!ok)
+		QVector<QColor> customTextColours;
+		if (m_customTextSwatches.size() >= MAX_CUSTOM)
 		{
-			const QColor decoded = parseColourValue(raw);
-			if (decoded.isValid())
-			{
-				value = static_cast<int>(toColourRef(decoded));
-				ok    = true;
-			}
+			customTextColours.reserve(MAX_CUSTOM);
+			for (int i = 0; i < MAX_CUSTOM; ++i)
+				customTextColours.push_back(swatchButtonColour(m_customTextSwatches.value(i)));
 		}
-		int index = 0;
-		if (ok)
-		{
-			if (value == WorldRuntime::kSameColour || value < 0)
-				index = 0;
-			else
-				index = value + 1;
-		}
-		else
-			index = 5;
-		const int maxIndex = m_scriptTextColour->count() - 1;
+		const QString raw      = attrs.value(QStringLiteral("note_text_colour"));
+		int           index    = customTextColours.size() == MAX_CUSTOM
+		                             ? QMudNoteColour::publicIndexFromWorldAttribute(raw, customTextColours)
+		                             : QMudNoteColour::publicIndexFromWorldAttribute(raw);
+		const int     maxIndex = m_scriptTextColour->count() - 1;
 		if (maxIndex >= 0)
 		{
 			index = qBound(0, index, maxIndex);
@@ -9680,6 +9676,7 @@ void WorldPreferencesDialog::updateScriptNoteSwatches() const
 {
 	if (!m_scriptTextColour || !m_scriptTextSwatch || !m_scriptBackSwatch)
 		return;
+	updateScriptNoteColourItems();
 	const int  index = m_scriptTextColour->currentIndex() - 1;
 	const bool valid =
 	    index >= 0 && index < m_customTextSwatches.size() && index < m_customBackSwatches.size();
@@ -9693,6 +9690,35 @@ void WorldPreferencesDialog::updateScriptNoteSwatches() const
 	}
 	setSwatchButtonColour(m_scriptTextSwatch, swatchButtonColour(m_customTextSwatches.value(index)));
 	setSwatchButtonColour(m_scriptBackSwatch, swatchButtonColour(m_customBackSwatches.value(index)));
+}
+
+void WorldPreferencesDialog::updateScriptNoteColourItems() const
+{
+	if (!m_scriptTextColour)
+		return;
+
+	m_scriptTextColour->setItemData(0, QVariant(), Qt::ForegroundRole);
+	m_scriptTextColour->setItemData(0, QVariant(), Qt::BackgroundRole);
+	for (int i = 0; i < MAX_CUSTOM; ++i)
+	{
+		const int itemIndex = i + 1;
+		if (itemIndex >= m_scriptTextColour->count())
+			break;
+		if (i >= m_customTextSwatches.size() || i >= m_customBackSwatches.size())
+			continue;
+
+		QColor foreground = swatchButtonColour(m_customTextSwatches.value(i));
+		QColor background = swatchButtonColour(m_customBackSwatches.value(i));
+		if (!foreground.isValid() || !background.isValid())
+			continue;
+		if (foreground == background)
+		{
+			foreground = Qt::black;
+			background = Qt::white;
+		}
+		m_scriptTextColour->setItemData(itemIndex, foreground, Qt::ForegroundRole);
+		m_scriptTextColour->setItemData(itemIndex, background, Qt::BackgroundRole);
+	}
 }
 
 void WorldPreferencesDialog::calculateMemoryUsage(const bool allowProgress)

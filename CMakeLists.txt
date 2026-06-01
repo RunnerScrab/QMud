@@ -183,6 +183,7 @@ set(QMUD_SOURCES
         Accelerators.cpp
         helpers/AliasMatchUtils.cpp
         helpers/HyperlinkActionUtils.cpp
+        helpers/NoteColourUtils.cpp
         helpers/WorldCommandProcessorUtils.cpp
         helpers/LuaExecutionUtils.cpp
         helpers/AccessibleTextUtils.cpp
@@ -270,6 +271,7 @@ set(QMUD_HEADERS
         Accelerators.h
         helpers/AcceleratorUtils.h
         helpers/AliasMatchUtils.h
+        helpers/NoteColourUtils.h
         CommandMappingTypes.h
         helpers/WorldCommandProcessorUtils.h
         ErrorDescriptions.h

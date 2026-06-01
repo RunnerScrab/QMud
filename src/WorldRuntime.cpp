@@ -45,6 +45,7 @@
 #include "WorldSocket.h"
 #include "WorldView.h"
 #include "helpers/LuaExecutionUtils.h"
+#include "helpers/NoteColourUtils.h"
 #include "helpers/OutputWrapUtils.h"
 #include "helpers/PluginPathUtils.h"
 #include "scripting/ScriptingErrors.h"
@@ -120,6 +121,9 @@ static int         colourSeqFromAttributes(const QMap<QString, QString> &attribu
 static QString     convertToRegularExpression(const QString &text);
 static void        buildCustomColours(const QList<WorldRuntime::Colour> &colours, QVector<QColor> &normalAnsi,
                                       QVector<QColor> &customText, QVector<QColor> &customBack);
+static int         publicNoteColourIndexFromWorldAttribute(const QString                     &value,
+                                                           const QList<WorldRuntime::Colour> &colours,
+                                                           int                                fallbackPublicIndex);
 static QStringList macroDescriptionList();
 static QStringList keypadNameList();
 
@@ -12034,6 +12038,17 @@ static void buildCustomColours(const QList<WorldRuntime::Colour> &colours, QVect
 	}
 }
 
+static int publicNoteColourIndexFromWorldAttribute(const QString                     &value,
+                                                   const QList<WorldRuntime::Colour> &colours,
+                                                   const int                          fallbackPublicIndex)
+{
+	QVector<QColor> normalAnsi;
+	QVector<QColor> customText;
+	QVector<QColor> customBack;
+	buildCustomColours(colours, normalAnsi, customText, customBack);
+	return QMudNoteColour::publicIndexFromWorldAttribute(value, customText, fallbackPublicIndex);
+}
+
 static long colorToLong(const QColor &color)
 {
 	if (!color.isValid())
@@ -12111,8 +12126,11 @@ void WorldRuntime::setNoteTextColour(int value)
 	qmudAssertObjectThreadAffinity(this, "WorldRuntime::setNoteTextColour");
 	if (value < 0 || value > MAX_CUSTOM)
 		return;
+	if (m_noteTextColour == value - 1 && !m_notesInRgb)
+		return;
 	m_noteTextColour = value - 1;
 	m_notesInRgb     = false;
+	invalidateLuaCallbackDispatchSnapshot();
 }
 
 long WorldRuntime::noteColourFore() const
@@ -14604,9 +14622,13 @@ void WorldRuntime::outputAnsiText(const QString &text, bool note)
 	QColor defaultBack = parseColorValue(m_worldAttributes.value(QStringLiteral("output_background_colour")));
 	if (note)
 	{
-		const QColor noteFore = parseColorValue(m_worldAttributes.value(QStringLiteral("note_text_colour")));
-		if (noteFore.isValid())
-			defaultFore = noteFore;
+		const auto colourFromLong = [](const long value) -> QColor
+		{
+			return {static_cast<int>(value & 0xFF), static_cast<int>((value >> 8) & 0xFF),
+			        static_cast<int>((value >> 16) & 0xFF)};
+		};
+		defaultFore = colourFromLong(noteColourFore());
+		defaultBack = colourFromLong(noteColourBack());
 	}
 	if (!defaultFore.isValid())
 		defaultFore = normalAnsi.value(7);
@@ -15956,6 +15978,9 @@ void WorldRuntime::applyFromDocument(const WorldDocument &doc)
 			rc.attributes.insert(QStringLiteral("seq_index"), QString::number(seq - 1));
 		m_colours.push_back(rc);
 	}
+	setNoteTextColour(
+	    publicNoteColourIndexFromWorldAttribute(m_worldAttributes.value(QStringLiteral("note_text_colour")),
+	                                            m_colours, QMudNoteColour::kDefaultPublicIndex));
 	m_keypadEntries.clear();
 	const QStringList keypadNames = keypadNameList();
 	for (const auto &k : doc.keypadEntries())
@@ -16219,6 +16244,11 @@ void WorldRuntime::setWorldAttribute(const QString &key, const QString &value)
 		normalizedValue = normalizePathForRuntime(normalizedValue);
 	if (key == QStringLiteral("auto_log_file_name"))
 		normalizedValue = normalizeAutoLogFileNameValue(normalizedValue);
+	if (key == QStringLiteral("note_text_colour"))
+	{
+		const int fallbackIndex = QMudNoteColour::publicIndexFromRuntimeIndex(m_noteTextColour);
+		setNoteTextColour(publicNoteColourIndexFromWorldAttribute(normalizedValue, m_colours, fallbackIndex));
+	}
 	const auto existing = m_worldAttributes.constFind(key);
 	if (existing != m_worldAttributes.constEnd() && existing.value() == normalizedValue)
 	{

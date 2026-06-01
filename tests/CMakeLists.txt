@@ -305,6 +305,15 @@ qmud_add_qtest(tst_ColorUtils
         LABELS
         unit)
 
+qmud_add_qtest(tst_NoteColourUtils
+        SOURCES
+        unit/tst_NoteColourUtils.cpp
+        "${CMAKE_SOURCE_DIR}/src/helpers/NoteColourUtils.cpp"
+        LIBRARIES
+        Qt6::Gui
+        LABELS
+        unit)
+
 qmud_add_qtest(tst_FontUtils
         GUI
         SOURCES

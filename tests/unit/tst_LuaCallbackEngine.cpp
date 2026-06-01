@@ -509,6 +509,7 @@ namespace
 			void workerCallbackBatchCapturesOutputMiniWindowAndSaveStateMutations();
 			void workerColourOutputMatchesMushclientGroupingAndNewlineSemantics();
 			void colourTellIgnoresTrailingLuaGsubReturnAndKeepsFollowingNote();
+			void executeScriptNoteUsesRuntimeNoteColour();
 			void triggerAnchoredColourOutputKeepsNativePromptText();
 			void callbackSnapshotSuppliesGetInfoAndMiniWindowReads();
 			void deferredRuntimeMutationSkipsDestroyedRuntime();
@@ -1422,6 +1423,43 @@ end
 	QCOMPARE(logicalOutputLinesFromEntries(state.lineEntries),
 	         QStringList({QStringLiteral("You made 10,000 gold!")}));
 	teardownWorkerEngine(executor, engine);
+}
+
+void tst_LuaCallbackEngine::executeScriptNoteUsesRuntimeNoteColour()
+{
+	WorldRuntime runtime;
+	auto        &state  = runtimeStubState(&runtime);
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QString());
+
+	auto snapshot                        = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+	snapshot->hasRuntimeCountersSnapshot = true;
+	snapshot->runtimeCounterValues.insert(QStringLiteral("notesInRgb"), true);
+	snapshot->runtimeCounterValues.insert(QStringLiteral("noteColourFore"),
+	                                      QVariant::fromValue<qlonglong>(0x00FFFF00));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("noteColourBack"),
+	                                      QVariant::fromValue<qlonglong>(0));
+	snapshot->runtimeCounterValues.insert(QStringLiteral("noteTextColour"), -1);
+
+	LuaExecutorDirect       executor;
+	LuaBatchDispatchRequest request;
+	request.engines               = {engine};
+	request.kind                  = LuaBatchDispatchKind::ExecuteScript;
+	request.stringArg             = QStringLiteral("Note('test')");
+	request.stringArg2            = QStringLiteral("immediate note colour");
+	request.miniWindowSnapshotArg = snapshot;
+	LuaBatchDispatchResult result = executor.dispatchBatch(request);
+	QVERIFY(result.boolResultValid);
+	QVERIFY(result.boolResult);
+	executeDeferredMutations(result);
+
+	QCOMPARE(state.lineEntries.size(), 1);
+	const WorldRuntime::LineEntry &entry = state.lineEntries.constFirst();
+	QCOMPARE(entry.text, QStringLiteral("test"));
+	QVERIFY(!entry.spans.isEmpty());
+	QCOMPARE(entry.spans.constFirst().fore, QColor(0, 255, 255));
+	QCOMPARE(entry.spans.constFirst().back, QColor(Qt::black));
 }
 
 void tst_LuaCallbackEngine::triggerAnchoredColourOutputKeepsNativePromptText()
