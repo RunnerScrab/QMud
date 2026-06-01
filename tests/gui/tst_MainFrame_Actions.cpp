@@ -42,9 +42,18 @@ class tst_MainFrame_Actions : public QObject
 			QTest::addColumn<int>("slot");
 			QTest::addColumn<QString>("expected");
 
-			QTest::newRow("first-slot") << 1 << QStringLiteral("Activates world #1 (Ctrl+1)");
-			QTest::newRow("ninth-slot") << 9 << QStringLiteral("Activates world #9 (Ctrl+9)");
-			QTest::newRow("tenth-slot") << 10 << QStringLiteral("Activates world #10 (Ctrl+0)");
+			QTest::newRow("first-slot")
+			    << 1
+			    << QMudMainFrameActionUtils::toolbarTooltipWithShortcut(QStringLiteral("Activates world #1"),
+			                                                            QStringLiteral("Ctrl+1"));
+			QTest::newRow("ninth-slot")
+			    << 9
+			    << QMudMainFrameActionUtils::toolbarTooltipWithShortcut(QStringLiteral("Activates world #9"),
+			                                                            QStringLiteral("Ctrl+9"));
+			QTest::newRow("tenth-slot")
+			    << 10
+			    << QMudMainFrameActionUtils::toolbarTooltipWithShortcut(QStringLiteral("Activates world #10"),
+			                                                            QStringLiteral("Ctrl+0"));
 			QTest::newRow("overflow-slot") << 12 << QStringLiteral("Activates world #12");
 		}
 
@@ -109,6 +118,19 @@ class tst_MainFrame_Actions : public QObject
 				QCOMPARE(actual, QKeySequence(QKeySequence::Quit));
 			else
 				QCOMPARE(actual.toString(QKeySequence::PortableText), expectedShortcutText);
+		}
+
+		void toolbarTooltipWithShortcut()
+		{
+			const QString nativeShortcut =
+			    QKeySequence::fromString(QStringLiteral("Shift+Ctrl+8"), QKeySequence::PortableText)
+			        .toString(QKeySequence::NativeText);
+			QCOMPARE(QMudMainFrameActionUtils::toolbarTooltipWithShortcut(QStringLiteral("Triggers"),
+			                                                              QStringLiteral("Shift+Ctrl+8")),
+			         QStringLiteral("Triggers (%1)").arg(nativeShortcut));
+			QCOMPARE(
+			    QMudMainFrameActionUtils::toolbarTooltipWithShortcut(QStringLiteral("Triggers"), QString()),
+			    QStringLiteral("Triggers"));
 		}
 
 		void shouldAttemptIncomingLineTaskbarFlash_data()

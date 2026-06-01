@@ -870,45 +870,53 @@ void MainWindow::buildToolbars()
 	// Main and game toolbars now use standalone PNG icons from resources/qmud/res/toolbar/.
 
 	const QHash<QString, QString> tooltipOverrides = {
-	    {QStringLiteral("New"),                  QStringLiteral("New world")                   },
-	    {QStringLiteral("Open"),                 QStringLiteral("Open world")                  },
-	    {QStringLiteral("Save"),                 QStringLiteral("Save world")                  },
-	    {QStringLiteral("Print"),                QStringLiteral("Print")                       },
-	    {QStringLiteral("NotesWorkArea"),        QStringLiteral("Notepad")                     },
-	    {QStringLiteral("Cut"),                  QStringLiteral("Cut")                         },
-	    {QStringLiteral("Copy"),                 QStringLiteral("Copy")                        },
-	    {QStringLiteral("Paste"),                QStringLiteral("Paste")                       },
-	    {QStringLiteral("About"),                QStringLiteral("About")                       },
-	    {QStringLiteral("ContextHelp"),          QStringLiteral("Help")                        },
-	    {QStringLiteral("GameWrapLines"),        QStringLiteral("Line wrap")                   },
-	    {QStringLiteral("LogSession"),           QStringLiteral("Log session (Shift+Ctrl+J)")  },
-	    {QStringLiteral("Connect_Or_Reconnect"), QStringLiteral("Connect / Disconnect")        },
-	    {QStringLiteral("Preferences"),          QStringLiteral("World details (Ctrl+G)")      },
-	    {QStringLiteral("ConfigureTriggers"),    QStringLiteral("Triggers (Shift+Ctrl+8)")     },
-	    {QStringLiteral("ConfigureAliases"),     QStringLiteral("Aliases (Shift+Ctrl+9)")      },
-	    {QStringLiteral("ConfigureTimers"),      QStringLiteral("Timers (Shift+Ctrl+0)")       },
-	    {QStringLiteral("ConfigureOutput"),      QStringLiteral("Output (Alt+5)")              },
-	    {QStringLiteral("ConfigureCommands"),    QStringLiteral("Commands (Alt+0)")            },
-	    {QStringLiteral("ConfigureScripting"),   QStringLiteral("Scripting (Shift+Ctrl+6)")    },
-	    {QStringLiteral("ConfigureNotes"),       QStringLiteral("Notes (Alt+4)")               },
-	    {QStringLiteral("ConfigureVariables"),   QStringLiteral("Variables (Shift+Ctrl+7)")    },
-	    {QStringLiteral("ResetAllTimers"),       QStringLiteral("Reset timers (Shift+Ctrl+T)") },
-	    {QStringLiteral("ReloadScriptFile"),     QStringLiteral("Reload script (Shift+Ctrl+R)")},
-	    {QStringLiteral("AutoSay"),              QStringLiteral("Auto Say (Shift+Ctrl+A)")     },
-	    {QStringLiteral("FreezeOutput"),         QStringLiteral("Pause (Ctrl+Space)")          },
-	    {QStringLiteral("Find"),                 QStringLiteral("Find (Ctrl+F)")               },
-	    {QStringLiteral("FindAgain"),            QStringLiteral("Find again (Shift+Ctrl+F)")   },
-	    {QStringLiteral("FindAgainBackwards"),   QStringLiteral("Find again backwards")        },
-	    {QStringLiteral("World1"),               QStringLiteral("Activates world #1 (Ctrl+1)") },
-	    {QStringLiteral("World2"),               QStringLiteral("Activates world #2 (Ctrl+2)") },
-	    {QStringLiteral("World3"),               QStringLiteral("Activates world #3 (Ctrl+3)") },
-	    {QStringLiteral("World4"),               QStringLiteral("Activates world #4 (Ctrl+4)") },
-	    {QStringLiteral("World5"),               QStringLiteral("Activates world #5 (Ctrl+5)") },
-	    {QStringLiteral("World6"),               QStringLiteral("Activates world #6 (Ctrl+6)") },
-	    {QStringLiteral("World7"),               QStringLiteral("Activates world #7 (Ctrl+7)") },
-	    {QStringLiteral("World8"),               QStringLiteral("Activates world #8 (Ctrl+8)") },
-	    {QStringLiteral("World9"),               QStringLiteral("Activates world #9 (Ctrl+9)") },
-	    {QStringLiteral("World10"),              QStringLiteral("Activates world #10 (Ctrl+0)")}
+	    {QStringLiteral("New"),                  QStringLiteral("New world")           },
+	    {QStringLiteral("Open"),                 QStringLiteral("Open world")          },
+	    {QStringLiteral("Save"),                 QStringLiteral("Save world")          },
+	    {QStringLiteral("Print"),                QStringLiteral("Print")               },
+	    {QStringLiteral("NotesWorkArea"),        QStringLiteral("Notepad")             },
+	    {QStringLiteral("Cut"),                  QStringLiteral("Cut")                 },
+	    {QStringLiteral("Copy"),                 QStringLiteral("Copy")                },
+	    {QStringLiteral("Paste"),                QStringLiteral("Paste")               },
+	    {QStringLiteral("About"),                QStringLiteral("About")               },
+	    {QStringLiteral("ContextHelp"),          QStringLiteral("Help")                },
+	    {QStringLiteral("GameWrapLines"),        QStringLiteral("Line wrap")           },
+	    {QStringLiteral("LogSession"),           QStringLiteral("Log session")         },
+	    {QStringLiteral("Connect_Or_Reconnect"), QStringLiteral("Connect / Disconnect")},
+	    {QStringLiteral("Preferences"),          QStringLiteral("World details")       },
+	    {QStringLiteral("ConfigureTriggers"),    QStringLiteral("Triggers")            },
+	    {QStringLiteral("ConfigureAliases"),     QStringLiteral("Aliases")             },
+	    {QStringLiteral("ConfigureTimers"),      QStringLiteral("Timers")              },
+	    {QStringLiteral("ConfigureOutput"),      QStringLiteral("Output")              },
+	    {QStringLiteral("ConfigureCommands"),    QStringLiteral("Commands")            },
+	    {QStringLiteral("ConfigureScripting"),   QStringLiteral("Scripting")           },
+	    {QStringLiteral("ConfigureNotes"),       QStringLiteral("Notes")               },
+	    {QStringLiteral("ConfigureVariables"),   QStringLiteral("Variables")           },
+	    {QStringLiteral("ResetAllTimers"),       QStringLiteral("Reset timers")        },
+	    {QStringLiteral("ReloadScriptFile"),     QStringLiteral("Reload script")       },
+	    {QStringLiteral("AutoSay"),              QStringLiteral("Auto Say")            },
+	    {QStringLiteral("FreezeOutput"),         QStringLiteral("Pause")               },
+	    {QStringLiteral("Find"),                 QStringLiteral("Find")                },
+	    {QStringLiteral("FindAgainForwards"),    QStringLiteral("Find again")          },
+	    {QStringLiteral("FindAgainBackwards"),   QStringLiteral("Find again backwards")}
+    };
+	const QHash<QString, QString> tooltipShortcutOverrides = {
+	    {QStringLiteral("LogSession"),         QStringLiteral("Shift+Ctrl+J")},
+	    {QStringLiteral("Preferences"),        QStringLiteral("Ctrl+G")      },
+	    {QStringLiteral("ConfigureTriggers"),  QStringLiteral("Shift+Ctrl+8")},
+	    {QStringLiteral("ConfigureAliases"),   QStringLiteral("Shift+Ctrl+9")},
+	    {QStringLiteral("ConfigureTimers"),    QStringLiteral("Shift+Ctrl+0")},
+	    {QStringLiteral("ConfigureOutput"),    QStringLiteral("Alt+5")       },
+	    {QStringLiteral("ConfigureCommands"),  QStringLiteral("Alt+0")       },
+	    {QStringLiteral("ConfigureScripting"), QStringLiteral("Shift+Ctrl+6")},
+	    {QStringLiteral("ConfigureNotes"),     QStringLiteral("Alt+4")       },
+	    {QStringLiteral("ConfigureVariables"), QStringLiteral("Shift+Ctrl+7")},
+	    {QStringLiteral("ResetAllTimers"),     QStringLiteral("Shift+Ctrl+T")},
+	    {QStringLiteral("ReloadScriptFile"),   QStringLiteral("Shift+Ctrl+R")},
+	    {QStringLiteral("AutoSay"),            QStringLiteral("Shift+Ctrl+A")},
+	    {QStringLiteral("FreezeOutput"),       QStringLiteral("Ctrl+Space")  },
+	    {QStringLiteral("Find"),               QStringLiteral("Ctrl+F")      },
+	    {QStringLiteral("FindAgainForwards"),  QStringLiteral("Shift+Ctrl+F")}
     };
 
 	auto prettyName = [](const QString &cmd) -> QString
@@ -941,8 +949,8 @@ void MainWindow::buildToolbars()
 		return text.trimmed();
 	};
 
-	auto applyTooltip = [tooltipOverrides, prettyName, sanitizeTip](QAction *action, const QString &cmdName,
-	                                                                const QString &fallback)
+	auto applyTooltip = [tooltipOverrides, tooltipShortcutOverrides, prettyName,
+	                     sanitizeTip](QAction *action, const QString &cmdName, const QString &fallback)
 	{
 		if (!action)
 			return;
@@ -952,6 +960,9 @@ void MainWindow::buildToolbars()
 		else
 			tip = fallback.isEmpty() ? prettyName(cmdName) : fallback;
 		tip = sanitizeTip(tip);
+		if (tooltipShortcutOverrides.contains(cmdName))
+			tip = QMudMainFrameActionUtils::toolbarTooltipWithShortcut(
+			    tip, tooltipShortcutOverrides.value(cmdName));
 		if (tip.isEmpty())
 			return;
 		action->setToolTip(tip);

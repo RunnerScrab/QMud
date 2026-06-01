@@ -20,9 +20,11 @@ namespace QMudMainFrameActionUtils
 	QString worldButtonTooltipForSlot(const int slot)
 	{
 		if (slot >= 1 && slot <= 9)
-			return QStringLiteral("Activates world #%1 (Ctrl+%1)").arg(slot);
+			return toolbarTooltipWithShortcut(QStringLiteral("Activates world #%1").arg(slot),
+			                                  QStringLiteral("Ctrl+%1").arg(slot));
 		if (slot == 10)
-			return QStringLiteral("Activates world #10 (Ctrl+0)");
+			return toolbarTooltipWithShortcut(QStringLiteral("Activates world #10"),
+			                                  QStringLiteral("Ctrl+0"));
 		return QStringLiteral("Activates world #%1").arg(slot);
 	}
 
@@ -45,6 +47,15 @@ namespace QMudMainFrameActionUtils
 		if (commandName == QStringLiteral("ExitClient") && configuredShortcut.isEmpty())
 			return {QKeySequence::Quit};
 		return configuredShortcut;
+	}
+
+	QString toolbarTooltipWithShortcut(const QString &label, const QString &portableShortcut)
+	{
+		const QKeySequence shortcut = QKeySequence::fromString(portableShortcut, QKeySequence::PortableText);
+		const QString      nativeShortcut = shortcut.toString(QKeySequence::NativeText);
+		if (nativeShortcut.isEmpty())
+			return label;
+		return QStringLiteral("%1 (%2)").arg(label, nativeShortcut);
 	}
 
 	bool shouldAttemptIncomingLineTaskbarFlash(const bool worldFlashEnabled, const bool appFocused)
