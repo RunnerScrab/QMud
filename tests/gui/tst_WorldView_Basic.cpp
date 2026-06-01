@@ -28,6 +28,7 @@
 #include <QElapsedTimer>
 #include <QImage>
 #include <QInputMethodEvent>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMimeData>
@@ -6100,6 +6101,49 @@ class tst_WorldView_Basic : public QObject
 
 			QVERIFY(view.doOutputFind(false));
 			QCOMPARE(view.outputSelectionText(), QStringLiteral("new"));
+
+			resetTestState();
+		}
+
+		void outputFindSelectsExistingTextWhenDialogOpens()
+		{
+			resetTestState();
+
+			WorldView view;
+			view.setRuntimeObserver(fakeRuntimePointer());
+			view.appendOutputText(QStringLiteral("Alpha beta gamma"), true);
+
+			scheduleDialogInteraction(
+			    [](const QDialog *dialog)
+			    { return dialog->windowTitle() == QStringLiteral("Find in output buffer..."); },
+			    [](const QDialog *dialog)
+			    {
+				    if (auto *combo = dialog->findChild<QComboBox *>())
+					    combo->setCurrentText(QStringLiteral("beta"));
+				    if (QPushButton *findButton = findButtonByText(*dialog, QStringLiteral("Find")))
+					    QMetaObject::invokeMethod(findButton, "click", Qt::QueuedConnection);
+			    });
+			QVERIFY(view.doOutputFind(false));
+
+			bool inspected = false;
+			bool selected  = false;
+			scheduleDialogInteraction(
+			    [](const QDialog *dialog)
+			    { return dialog->windowTitle() == QStringLiteral("Find in output buffer..."); },
+			    [&inspected, &selected](const QDialog *dialog)
+			    {
+				    inspected = true;
+				    if (auto *combo = dialog->findChild<QComboBox *>())
+				    {
+					    if (QLineEdit *edit = combo->lineEdit())
+						    selected = edit->selectedText() == QStringLiteral("beta");
+				    }
+				    QMetaObject::invokeMethod(const_cast<QDialog *>(dialog), "reject", Qt::QueuedConnection);
+			    });
+
+			QVERIFY(!view.doOutputFind(false));
+			QVERIFY(inspected);
+			QVERIFY(selected);
 
 			resetTestState();
 		}
