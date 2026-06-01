@@ -27,7 +27,6 @@
 #include <QGuiApplication>
 #include <QIcon>
 #include <QImageReader>
-#include <QInputDialog>
 #include <QLabel>
 #include <QMdiArea>
 #include <QMdiSubWindow>
@@ -2705,67 +2704,61 @@ void MainWindow::infoBarSetBackground(const QColor &color) const
 
 static WorldRuntime *resolveRelatedRuntime(const MainWindow *frame, WorldRuntime *explicitRuntime);
 static qulonglong    runtimeOwnerToken(WorldRuntime *runtime);
+static QString       defaultNotepadTitleForWorld(const WorldRuntime *runtime, const WorldChildWindow *world);
+static void          assignNotepadOwner(TextChildWindow *notepad, WorldRuntime *runtime);
+static WorldRuntime *resolveRuntimeForNotepad(const MainWindow *frame, const TextChildWindow *notepad);
 
 bool                 MainWindow::switchToNotepad()
 {
 	if (!m_mdiArea)
 		return false;
 
-	WorldRuntime    *owner      = resolveRelatedRuntime(this, nullptr);
+	if (const auto *activeText = activeTextChildWindow())
+	{
+		if (WorldRuntime *runtime = resolveRuntimeForNotepad(this, activeText))
+			return activateWorldRuntime(runtime);
+		return false;
+	}
+
+	WorldChildWindow *world = activeWorldChildWindow();
+	WorldRuntime     *owner = world ? world->runtime() : nullptr;
+	if (!owner)
+		return false;
+
 	const qulonglong ownerToken = runtimeOwnerToken(owner);
 	const QString    ownerWorldId =
 	    owner ? owner->worldAttributes().value(QStringLiteral("id")).trimmed() : QString();
+	const QString          defaultTitle = defaultNotepadTitleForWorld(owner, world);
 
-	QList<TextChildWindow *> notepads;
+	QList<QMdiSubWindow *> matchingCandidates;
+	TextChildWindow       *defaultTitleFallback = nullptr;
 	for (QMdiSubWindow *sub : m_mdiArea->subWindowList(QMdiArea::CreationOrder))
 	{
 		auto *text = qobject_cast<TextChildWindow *>(sub);
 		if (!text)
 			continue;
 
-		if (ownerToken != 0)
-		{
-			const qulonglong relatedToken = text->property("worldRuntimeToken").toULongLong();
-			if (relatedToken == ownerToken)
-			{
-				notepads.append(text);
-				continue;
-			}
-			if (relatedToken != 0 && relatedToken != ownerToken)
-				continue;
-			if (!ownerWorldId.isEmpty())
-			{
-				if (const QString related = text->property("worldId").toString().trimmed();
-				    !related.isEmpty() && related.compare(ownerWorldId, Qt::CaseInsensitive) != 0)
-					continue;
-			}
-		}
-		notepads.append(text);
+		matchingCandidates.append(text);
+		if (!defaultTitleFallback && text->windowTitle().compare(defaultTitle, Qt::CaseInsensitive) == 0)
+			defaultTitleFallback = text;
 	}
 
-	if (notepads.isEmpty())
-		return false;
-
-	if (notepads.size() == 1)
+	QMdiSubWindow *target = QMudMainFrameMdiUtils::firstWindowMatchingRuntimeIdentity(
+	    matchingCandidates, ownerToken, ownerWorldId, false);
+	if (!target)
+		target = defaultTitleFallback;
+	if (!target)
 	{
-		m_mdiArea->setActiveSubWindow(notepads.front());
-		notepads.front()->show();
-		notepads.front()->raise();
+		auto *created = new TextChildWindow(defaultTitle, QString());
+		assignNotepadOwner(created, owner);
+		addMdiSubWindow(created, true);
 		return true;
 	}
 
-	QStringList titles;
-	for (const TextChildWindow *text : notepads)
-		titles.append(text->windowTitle());
-
-	bool          ok = false;
-	const QString choice =
-	    QInputDialog::getItem(this, QStringLiteral("Choose Notepad"),
-	                          QStringLiteral("Choose a notepad to activate:"), titles, 0, false, &ok);
-	if (!ok || choice.isEmpty())
-		return false;
-
-	return activateNotepad(choice);
+	m_mdiArea->setActiveSubWindow(target);
+	target->show();
+	target->raise();
+	return true;
 }
 
 bool MainWindow::activateNotepad(const QString &title) const
@@ -2835,6 +2828,18 @@ static qulonglong runtimeOwnerToken(WorldRuntime *runtime)
 	return runtime ? reinterpret_cast<quintptr>(runtime) : 0;
 }
 
+static QString defaultNotepadTitleForWorld(const WorldRuntime *runtime, const WorldChildWindow *world)
+{
+	QString worldName;
+	if (runtime)
+		worldName = runtime->worldAttributes().value(QStringLiteral("name")).trimmed();
+	if (worldName.isEmpty() && world)
+		worldName = world->windowTitle().trimmed();
+	if (worldName.isEmpty())
+		worldName = QStringLiteral("World");
+	return QStringLiteral("Notepad: %1").arg(worldName);
+}
+
 static void assignNotepadOwner(TextChildWindow *notepad, WorldRuntime *runtime)
 {
 	if (!notepad || !runtime)
@@ -2843,6 +2848,37 @@ static void assignNotepadOwner(TextChildWindow *notepad, WorldRuntime *runtime)
 	if (const QString worldId = runtime->worldAttributes().value(QStringLiteral("id")).trimmed();
 	    !worldId.isEmpty())
 		notepad->setProperty("worldId", worldId);
+}
+
+static WorldRuntime *resolveRuntimeForNotepad(const MainWindow *frame, const TextChildWindow *notepad)
+{
+	if (!frame || !notepad)
+		return nullptr;
+
+	const qulonglong relatedToken   = notepad->property("worldRuntimeToken").toULongLong();
+	const QString    relatedWorldId = notepad->property("worldId").toString().trimmed();
+	const QString    notepadTitle   = notepad->windowTitle();
+	const QString    relatedName = notepadTitle.startsWith(QStringLiteral("Notepad: "), Qt::CaseInsensitive)
+	                                   ? notepadTitle.mid(QStringLiteral("Notepad: ").size()).trimmed()
+	                                   : QString();
+
+	for (const WorldWindowDescriptor &descriptor : frame->worldWindowDescriptors())
+	{
+		WorldRuntime *runtime = descriptor.runtime;
+		if (!runtime)
+			continue;
+		if (relatedToken != 0 && runtimeOwnerToken(runtime) == relatedToken)
+			return runtime;
+		const QMap<QString, QString> &attrs = runtime->worldAttributes();
+		if (!relatedWorldId.isEmpty() &&
+		    attrs.value(QStringLiteral("id")).trimmed().compare(relatedWorldId, Qt::CaseInsensitive) == 0)
+			return runtime;
+		if (!relatedName.isEmpty() &&
+		    attrs.value(QStringLiteral("name")).trimmed().compare(relatedName, Qt::CaseInsensitive) == 0)
+			return runtime;
+	}
+
+	return nullptr;
 }
 
 bool MainWindow::appendToNotepad(const QString &title, const QString &text, const bool replace,

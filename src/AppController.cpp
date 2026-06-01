@@ -143,6 +143,7 @@ extern "C"
 #include <QTimer>
 #include <QTranslator>
 #include <QUrl>
+#include <QVariant>
 #include <QtSql/QSqlDatabase>
 #include <QtSql/QSqlError>
 #include <QtSql/QSqlQuery>
@@ -11496,6 +11497,17 @@ void AppController::onCommandTriggered(const QString &cmdName)
 			}
 		}
 		auto *text = new TextChildWindow(title, QString());
+		if (auto *world = m_mainWindow->activeWorldChildWindow())
+		{
+			if (auto *runtime = world->runtime())
+			{
+				text->setProperty("worldRuntimeToken", QVariant::fromValue(static_cast<qulonglong>(
+				                                           reinterpret_cast<quintptr>(runtime))));
+				if (const auto worldId = runtime->worldAttributes().value(QStringLiteral("id")).trimmed();
+				    !worldId.isEmpty())
+					text->setProperty("worldId", worldId);
+			}
+		}
 		m_mainWindow->addMdiSubWindow(text);
 	}
 	else if (cmdName == QStringLiteral("FlipToNotepad"))
