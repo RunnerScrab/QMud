@@ -1727,6 +1727,8 @@ void WorldCommandProcessor::handleWorldConnected()
 	if (!m_runtime)
 		return;
 
+	++m_autoConnectDelayGeneration;
+
 	const QMap<QString, QString> &attrs     = m_runtime->worldAttributes();
 	const QMap<QString, QString> &multi     = m_runtime->worldMultilineAttributes();
 	auto                          isEnabled = [](const QString &value)
@@ -1828,10 +1830,10 @@ void WorldCommandProcessor::handleWorldConnected()
 
 	const QString displayInput = attrs.value(QStringLiteral("display_my_input"));
 	const bool    echoInput    = isEnabledValue(displayInput);
+	const int     connectDelay = qBound(0, attrs.value(QStringLiteral("connect_delay")).toInt(), 10000);
 
-	const bool    needsPassword =
-	    password.isEmpty() && ((connectMethod != 0 && !player.isEmpty()) ||
-	                           connectText.contains(QStringLiteral("%password%"), Qt::CaseInsensitive));
+	const bool    needsPassword = password.isEmpty() && ((connectMethod != 0 && !player.isEmpty()) ||
+	                                                     connectText.contains(QStringLiteral("%password%")));
 	if (needsPassword)
 	{
 		bool          ok     = false;
@@ -1843,16 +1845,43 @@ void WorldCommandProcessor::handleWorldConnected()
 			password.clear();
 	}
 
+	if (connectDelay > 0 && (connectMethod == eConnectMUSH || connectMethod == eConnectDiku))
+	{
+		const QPointer<WorldCommandProcessor> self(this);
+		const QPointer<WorldRuntime>          runtime(m_runtime);
+		const quint64                         generation = m_autoConnectDelayGeneration;
+		QTimer::singleShot(
+		    connectDelay, this,
+		    [self, runtime, generation, connectMethod, player, password, connectText, echoInput]
+		    {
+			    if (!self || !runtime || self->m_runtime != runtime.data() ||
+			        self->m_autoConnectDelayGeneration != generation || !runtime->isConnected())
+				    return;
+			    self->runWorldConnectActions(connectMethod, player, password, connectText, echoInput);
+		    });
+		return;
+	}
+
+	runWorldConnectActions(connectMethod, player, password, connectText, echoInput);
+}
+
+void WorldCommandProcessor::runWorldConnectActions(const int connectMethod, const QString &player,
+                                                   const QString &password, const QString &connectText,
+                                                   const bool echoInput)
+{
+	if (!m_runtime)
+		return;
+
 	switch (connectMethod)
 	{
-	case 1: // eConnectMUSH
+	case eConnectMUSH:
 		if (!player.isEmpty() && !password.isEmpty())
 		{
 			const QString cmd = QStringLiteral("connect %1 %2").arg(player, password);
 			sendMsg(cmd, false, false, false);
 		}
 		break;
-	case 2: // eConnectDiku
+	case eConnectDiku:
 		if (!player.isEmpty())
 			sendMsg(player, echoInput, false, false);
 		if (!password.isEmpty())
@@ -1873,8 +1902,10 @@ void WorldCommandProcessor::handleWorldConnected()
 	m_runtime->fireWorldConnectHandlers();
 }
 
-void WorldCommandProcessor::handleWorldDisconnected() const
+void WorldCommandProcessor::handleWorldDisconnected()
 {
+	++m_autoConnectDelayGeneration;
+
 	if (!m_runtime)
 		return;
 	m_runtime->fireWorldDisconnectHandlers();

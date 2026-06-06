@@ -15,11 +15,62 @@
 #include <QDebug>
 #include <QMetaObject>
 #include <QPointer>
-#include <QScopeGuard>
 #include <QThread>
 
 #include <algorithm>
 #include <utility>
+
+namespace
+{
+#ifndef NDEBUG
+	bool qmudMmStartupDiagIsWatchedPluginId(const QString &pluginId)
+	{
+		const QString normalized = pluginId.trimmed().toLower();
+		return normalized == QStringLiteral("c97329b91f12ca48d14c3db2") ||
+		       normalized == QStringLiteral("adc3a873d4e47348da7cb426") ||
+		       normalized == QStringLiteral("f973af093e715dece34dc25f") ||
+		       normalized == QStringLiteral("f67c4339ed0591a5b010d05b");
+	}
+
+	bool qmudMmStartupDiagIsLifecycleCallback(const QString &functionName)
+	{
+		return functionName == QStringLiteral("OnPluginInstall") ||
+		       functionName == QStringLiteral("OnPluginEnable") ||
+		       functionName == QStringLiteral("OnPluginConnect") ||
+		       functionName == QStringLiteral("OnPluginDisable") ||
+		       functionName == QStringLiteral("OnPluginBroadcast") ||
+		       functionName == QStringLiteral("OnPluginTelnetRequest") ||
+		       functionName == QStringLiteral("OnPluginTelnetSubnegotiation");
+	}
+
+	bool qmudMmStartupDiagShouldLogEngine(const LuaCallbackEngine *engine, const QString &functionName)
+	{
+		return engine && qmudMmStartupDiagIsLifecycleCallback(functionName) &&
+		       qmudMmStartupDiagIsWatchedPluginId(engine->pluginId());
+	}
+
+	QString qmudMmStartupDiagEngineLabel(const LuaCallbackEngine *engine)
+	{
+		if (!engine)
+			return QStringLiteral("<null>");
+		const QString id   = engine->pluginId().trimmed();
+		const QString name = engine->pluginName().trimmed();
+		if (name.isEmpty())
+			return id;
+		return QStringLiteral("%1/%2").arg(id, name);
+	}
+
+	QString qmudMmStartupDiagDeferredLabel(const QVector<LuaDeferredRuntimeMutationBatch> &batches)
+	{
+		qsizetype mutationCount = 0;
+		for (const LuaDeferredRuntimeMutationBatch &batch : batches)
+			mutationCount += batch.mutations.size();
+		return QStringLiteral("deferredBatches=%1 deferredMutations=%2")
+		    .arg(batches.size())
+		    .arg(mutationCount);
+	}
+#endif
+} // namespace
 
 LuaBatchDispatchResult ILuaExecutor::dispatchBatch(const LuaBatchDispatchRequest &request) const
 {
@@ -33,11 +84,31 @@ LuaBatchDispatchResult ILuaExecutor::dispatchBatch(const LuaBatchDispatchRequest
 			engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
 			const auto popSnapshot = qScopeGuard([engine] { engine->popDispatchMiniWindowSnapshot(); });
 			fn(engine);
-			result.deferredRuntimeMutationBatches += engine->takeDeferredRuntimeMutationBatches();
+			QVector<LuaDeferredRuntimeMutationBatch> batches = engine->takeDeferredRuntimeMutationBatches();
+#ifndef NDEBUG
+			if (qmudMmStartupDiagShouldLogEngine(engine, request.functionName))
+			{
+				qInfo().noquote() << QStringLiteral(
+				                         "[QMud][MMStartupDiag] executor-deferred callback=%1 engine=%2 %3")
+				                         .arg(request.functionName, qmudMmStartupDiagEngineLabel(engine),
+				                              qmudMmStartupDiagDeferredLabel(batches));
+			}
+#endif
+			result.deferredRuntimeMutationBatches += batches;
 			return;
 		}
 		fn(engine);
-		result.deferredRuntimeMutationBatches += engine->takeDeferredRuntimeMutationBatches();
+		QVector<LuaDeferredRuntimeMutationBatch> batches = engine->takeDeferredRuntimeMutationBatches();
+#ifndef NDEBUG
+		if (qmudMmStartupDiagShouldLogEngine(engine, request.functionName))
+		{
+			qInfo().noquote() << QStringLiteral(
+			                         "[QMud][MMStartupDiag] executor-deferred callback=%1 engine=%2 %3")
+			                         .arg(request.functionName, qmudMmStartupDiagEngineLabel(engine),
+			                              qmudMmStartupDiagDeferredLabel(batches));
+		}
+#endif
+		result.deferredRuntimeMutationBatches += batches;
 	};
 	const auto forEachEngine = [&](auto &&fn)
 	{
@@ -57,20 +128,108 @@ LuaBatchDispatchResult ILuaExecutor::dispatchBatch(const LuaBatchDispatchRequest
 			                           return true;
 		                           });
 	};
+	const auto withFirstEngineIndexed = [&](auto &&fn) -> bool
+	{
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			const auto &engine = request.engines.at(engineIndex);
+			if (!engine)
+				continue;
+			invokeForEngine(engine.data(),
+			                [&](LuaCallbackEngine *targetEngine) { fn(engineIndex, targetEngine); });
+			return true;
+		}
+		return false;
+	};
+	const auto forEachEngineIndexed = [&](auto &&fn) -> bool
+	{
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			const auto &engine = request.engines.at(engineIndex);
+			if (!engine)
+				continue;
+			bool keepGoing = true;
+			invokeForEngine(engine.data(), [&](LuaCallbackEngine *targetEngine)
+			                { keepGoing = fn(engineIndex, targetEngine); });
+			if (!keepGoing)
+				return false;
+		}
+		return true;
+	};
+	const auto collectDeferredBatches = [&](LuaCallbackEngine *engine)
+	{
+		QVector<LuaDeferredRuntimeMutationBatch> batches = engine->takeDeferredRuntimeMutationBatches();
+#ifndef NDEBUG
+		if (qmudMmStartupDiagShouldLogEngine(engine, request.functionName))
+		{
+			qInfo().noquote() << QStringLiteral(
+			                         "[QMud][MMStartupDiag] executor-deferred callback=%1 engine=%2 %3")
+			                         .arg(request.functionName, qmudMmStartupDiagEngineLabel(engine),
+			                              qmudMmStartupDiagDeferredLabel(batches));
+		}
+#endif
+		result.deferredRuntimeMutationBatches += batches;
+	};
+	const auto storeSuspension =
+	    [&](const int engineIndex, const quint64 resumeId, LuaPendingModalStringRequest &&modalRequest)
+	{
+		result.suspended                    = true;
+		result.modalResumeId                = resumeId;
+		result.suspendedEngineIndex         = engineIndex;
+		result.hasPendingModalStringRequest = true;
+		result.pendingModalStringRequest    = std::move(modalRequest);
+	};
 	switch (request.kind)
 	{
 	case LuaBatchDispatchKind::NoArgs:
 		result.boolResult  = true;
 		result.hasFunction = false;
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    bool       hasFunction = false;
-			    const bool ok =
-			        engine->callFunctionNoArgs(request.functionName, &hasFunction, request.defaultResult);
-			    result.boolResult  = result.boolResult && ok;
-			    result.hasFunction = result.hasFunction || hasFunction;
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         hasFunction = false;
+			bool                         suspended   = false;
+			quint64                      resumeId    = 0;
+			LuaPendingModalStringRequest modalRequest;
+			const bool                   ok =
+			    engine->callFunctionNoArgs(request.functionName, &hasFunction, request.defaultResult,
+			                               &suspended, &resumeId, &modalRequest);
+			collectDeferredBatches(engine);
+#ifndef NDEBUG
+			if (qmudMmStartupDiagShouldLogEngine(engine, request.functionName))
+			{
+				qInfo().noquote() << QStringLiteral(
+				                         "[QMud][MMStartupDiag] executor-noargs callback=%1 engine=%2 "
+				                         "hasFunction=%3 ok=%4 "
+				                         "defaultResult=%5")
+				                         .arg(request.functionName, qmudMmStartupDiagEngineLabel(engine),
+				                              hasFunction ? QStringLiteral("1") : QStringLiteral("0"),
+				                              ok ? QStringLiteral("1") : QStringLiteral("0"),
+				                              request.defaultResult ? QStringLiteral("1")
+				                                                    : QStringLiteral("0"));
+			}
+#endif
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				result.boolResultValid  = false;
+				result.hasFunctionValid = false;
+				return result;
+			}
+			result.boolResult  = result.boolResult && ok;
+			result.hasFunction = result.hasFunction || hasFunction;
+		}
 		result.boolResultValid  = true;
 		result.hasFunctionValid = true;
 		return result;
@@ -84,199 +243,605 @@ LuaBatchDispatchResult ILuaExecutor::dispatchBatch(const LuaBatchDispatchRequest
 		return result;
 	}
 	case LuaBatchDispatchKind::String:
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    static_cast<void>(engine->callFunctionWithString(request.functionName, request.stringArg,
-			                                                     nullptr, request.defaultResult));
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         suspended = false;
+			quint64                      resumeId  = 0;
+			LuaPendingModalStringRequest modalRequest;
+			static_cast<void>(engine->callFunctionWithString(request.functionName, request.stringArg, nullptr,
+			                                                 request.defaultResult, &suspended, &resumeId,
+			                                                 &modalRequest));
+			collectDeferredBatches(engine);
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				return result;
+			}
+		}
 		return result;
 	case LuaBatchDispatchKind::StringStopOnFalse:
 		result.boolResult = true;
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    bool       hasFunction = false;
-			    const bool ok = engine->callFunctionWithString(request.functionName, request.stringArg,
-			                                                   &hasFunction, request.defaultResult);
-			    if (hasFunction && !ok)
-				    result.boolResult = false;
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         hasFunction = false;
+			bool                         suspended   = false;
+			quint64                      resumeId    = 0;
+			LuaPendingModalStringRequest modalRequest;
+			const bool                   ok =
+			    engine->callFunctionWithString(request.functionName, request.stringArg, &hasFunction,
+			                                   request.defaultResult, &suspended, &resumeId, &modalRequest);
+			collectDeferredBatches(engine);
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				result.boolResultValid = false;
+				return result;
+			}
+			if (hasFunction && !ok)
+				result.boolResult = false;
+		}
 		result.boolResultValid = true;
 		return result;
 	case LuaBatchDispatchKind::StringHandled:
 		result.boolResult = false;
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    if (result.boolResult)
-				    return;
-			    bool hasFunction = false;
-			    static_cast<void>(engine->callFunctionWithString(request.functionName, request.stringArg,
-			                                                     &hasFunction, false));
-			    // Legacy SendToFirstPluginCallbacks semantics: handled if callback exists,
-			    // regardless of the callback's boolean return value.
-			    if (hasFunction)
-				    result.boolResult = true;
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			if (result.boolResult)
+				break;
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         hasFunction = false;
+			bool                         suspended   = false;
+			quint64                      resumeId    = 0;
+			LuaPendingModalStringRequest modalRequest;
+			static_cast<void>(engine->callFunctionWithString(request.functionName, request.stringArg,
+			                                                 &hasFunction, false, &suspended, &resumeId,
+			                                                 &modalRequest));
+			collectDeferredBatches(engine);
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				result.boolResultValid = false;
+				return result;
+			}
+			if (hasFunction)
+				result.boolResult = true;
+		}
 		result.boolResultValid = true;
 		return result;
 	case LuaBatchDispatchKind::Bytes:
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    static_cast<void>(engine->callFunctionWithBytes(request.functionName, request.bytesArg,
-			                                                    nullptr, request.defaultResult));
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         suspended = false;
+			quint64                      resumeId  = 0;
+			LuaPendingModalStringRequest modalRequest;
+			static_cast<void>(engine->callFunctionWithBytes(request.functionName, request.bytesArg, nullptr,
+			                                                request.defaultResult, &suspended, &resumeId,
+			                                                &modalRequest));
+			collectDeferredBatches(engine);
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				return result;
+			}
+		}
 		return result;
 	case LuaBatchDispatchKind::BytesInOut:
 		result.bytesResult = request.bytesArg;
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    static_cast<void>(
-			        engine->callFunctionWithBytesInOut(request.functionName, result.bytesResult, nullptr));
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         suspended = false;
+			quint64                      resumeId  = 0;
+			LuaPendingModalStringRequest modalRequest;
+			static_cast<void>(engine->callFunctionWithBytesInOut(
+			    request.functionName, result.bytesResult, nullptr, &suspended, &resumeId, &modalRequest));
+			collectDeferredBatches(engine);
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				return result;
+			}
+		}
 		return result;
 	case LuaBatchDispatchKind::StringInOut:
 		result.stringResult = request.stringArg;
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    static_cast<void>(
-			        engine->callFunctionWithStringInOut(request.functionName, result.stringResult, nullptr));
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         suspended = false;
+			quint64                      resumeId  = 0;
+			LuaPendingModalStringRequest modalRequest;
+			static_cast<void>(engine->callFunctionWithStringInOut(
+			    request.functionName, result.stringResult, nullptr, &suspended, &resumeId, &modalRequest));
+			collectDeferredBatches(engine);
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				return result;
+			}
+		}
 		return result;
 	case LuaBatchDispatchKind::NumberAndStringStopOnTrue:
 		result.boolResult = false;
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    if (result.boolResult)
-				    return;
-			    bool       hasFunction = false;
-			    const bool ok          = engine->callFunctionWithNumberAndString(
-			        request.functionName, request.numberArg1, request.stringArg2, &hasFunction,
-			        request.defaultResult);
-			    if (hasFunction && ok)
-				    result.boolResult = true;
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			if (result.boolResult)
+				break;
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         hasFunction = false;
+			bool                         suspended   = false;
+			quint64                      resumeId    = 0;
+			LuaPendingModalStringRequest modalRequest;
+			const bool                   ok = engine->callFunctionWithNumberAndString(
+			    request.functionName, request.numberArg1, request.stringArg2, &hasFunction,
+			    request.defaultResult, request.hasActionSourceOverride ? request.actionSourceOverride : -1,
+			    &suspended, &resumeId, &modalRequest);
+			QVector<LuaDeferredRuntimeMutationBatch> batches = engine->takeDeferredRuntimeMutationBatches();
+#ifndef NDEBUG
+			if (qmudMmStartupDiagShouldLogEngine(engine, request.functionName))
+			{
+				qInfo().noquote() << QStringLiteral(
+				                         "[QMud][MMStartupDiag] executor-deferred callback=%1 engine=%2 %3")
+				                         .arg(request.functionName, qmudMmStartupDiagEngineLabel(engine),
+				                              qmudMmStartupDiagDeferredLabel(batches));
+			}
+#endif
+			result.deferredRuntimeMutationBatches += batches;
+			if (suspended)
+			{
+				result.suspended                    = true;
+				result.modalResumeId                = resumeId;
+				result.suspendedEngineIndex         = engineIndex;
+				result.boolResultValid              = false;
+				result.hasPendingModalStringRequest = true;
+				result.pendingModalStringRequest    = std::move(modalRequest);
+				return result;
+			}
+			if (hasFunction && ok)
+				result.boolResult = true;
+		}
 		result.boolResultValid = true;
 		return result;
 	case LuaBatchDispatchKind::NumberAndStringStopOnFalse:
 		result.boolResult = true;
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    bool       hasFunction = false;
-			    const bool ok          = engine->callFunctionWithNumberAndString(
-			        request.functionName, request.numberArg1, request.stringArg2, &hasFunction,
-			        request.defaultResult);
-			    if (hasFunction && !ok)
-				    result.boolResult = false;
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         hasFunction = false;
+			bool                         suspended   = false;
+			quint64                      resumeId    = 0;
+			LuaPendingModalStringRequest modalRequest;
+			const bool                   ok = engine->callFunctionWithNumberAndString(
+			    request.functionName, request.numberArg1, request.stringArg2, &hasFunction,
+			    request.defaultResult, request.hasActionSourceOverride ? request.actionSourceOverride : -1,
+			    &suspended, &resumeId, &modalRequest);
+			QVector<LuaDeferredRuntimeMutationBatch> batches = engine->takeDeferredRuntimeMutationBatches();
+#ifndef NDEBUG
+			if (qmudMmStartupDiagShouldLogEngine(engine, request.functionName))
+			{
+				qInfo().noquote() << QStringLiteral(
+				                         "[QMud][MMStartupDiag] executor-deferred callback=%1 engine=%2 %3")
+				                         .arg(request.functionName, qmudMmStartupDiagEngineLabel(engine),
+				                              qmudMmStartupDiagDeferredLabel(batches));
+			}
+#endif
+			result.deferredRuntimeMutationBatches += batches;
+			if (suspended)
+			{
+				result.suspended                    = true;
+				result.modalResumeId                = resumeId;
+				result.suspendedEngineIndex         = engineIndex;
+				result.boolResultValid              = false;
+				result.hasPendingModalStringRequest = true;
+				result.pendingModalStringRequest    = std::move(modalRequest);
+				return result;
+			}
+			if (hasFunction && !ok)
+				result.boolResult = false;
+		}
 		result.boolResultValid = true;
 		return result;
 	case LuaBatchDispatchKind::NumberAndString:
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    static_cast<void>(engine->callFunctionWithNumberAndString(
-			        request.functionName, request.numberArg1, request.stringArg2, nullptr,
-			        request.defaultResult));
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         suspended = false;
+			quint64                      resumeId  = 0;
+			LuaPendingModalStringRequest modalRequest;
+			static_cast<void>(engine->callFunctionWithNumberAndString(
+			    request.functionName, request.numberArg1, request.stringArg2, nullptr, request.defaultResult,
+			    request.hasActionSourceOverride ? request.actionSourceOverride : -1, &suspended, &resumeId,
+			    &modalRequest));
+			QVector<LuaDeferredRuntimeMutationBatch> batches = engine->takeDeferredRuntimeMutationBatches();
+#ifndef NDEBUG
+			if (qmudMmStartupDiagShouldLogEngine(engine, request.functionName))
+			{
+				qInfo().noquote() << QStringLiteral(
+				                         "[QMud][MMStartupDiag] executor-deferred callback=%1 engine=%2 %3")
+				                         .arg(request.functionName, qmudMmStartupDiagEngineLabel(engine),
+				                              qmudMmStartupDiagDeferredLabel(batches));
+			}
+#endif
+			result.deferredRuntimeMutationBatches += batches;
+			if (suspended)
+			{
+				result.suspended                    = true;
+				result.modalResumeId                = resumeId;
+				result.suspendedEngineIndex         = engineIndex;
+				result.hasPendingModalStringRequest = true;
+				result.pendingModalStringRequest    = std::move(modalRequest);
+				return result;
+			}
+		}
 		return result;
 	case LuaBatchDispatchKind::TwoNumbersAndStringStopOnFalse:
 		result.boolResult = true;
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    bool       hasFunction = false;
-			    const bool ok          = engine->callFunctionWithTwoNumbersAndString(
-			        request.functionName, request.numberArg1, request.numberArg2, request.stringArg2,
-			        &hasFunction, request.defaultResult);
-			    if (hasFunction && !ok)
-				    result.boolResult = false;
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         hasFunction = false;
+			bool                         suspended   = false;
+			quint64                      resumeId    = 0;
+			LuaPendingModalStringRequest modalRequest;
+			const bool                   ok = engine->callFunctionWithTwoNumbersAndString(
+			    request.functionName, request.numberArg1, request.numberArg2, request.stringArg2,
+			    &hasFunction, request.defaultResult, &suspended, &resumeId, &modalRequest);
+			collectDeferredBatches(engine);
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				result.boolResultValid = false;
+				return result;
+			}
+			if (hasFunction && !ok)
+				result.boolResult = false;
+		}
 		result.boolResultValid = true;
 		return result;
 	case LuaBatchDispatchKind::TwoNumbersAndString:
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    static_cast<void>(engine->callFunctionWithTwoNumbersAndString(
-			        request.functionName, request.numberArg1, request.numberArg2, request.stringArg2, nullptr,
-			        request.defaultResult));
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         suspended = false;
+			quint64                      resumeId  = 0;
+			LuaPendingModalStringRequest modalRequest;
+			static_cast<void>(engine->callFunctionWithTwoNumbersAndString(
+			    request.functionName, request.numberArg1, request.numberArg2, request.stringArg2, nullptr,
+			    request.defaultResult, &suspended, &resumeId, &modalRequest));
+			collectDeferredBatches(engine);
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				return result;
+			}
+		}
 		return result;
 	case LuaBatchDispatchKind::NumberAndBytesStopOnTrue:
 		result.boolResult = false;
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    if (result.boolResult)
-				    return;
-			    bool       hasFunction = false;
-			    const bool ok = engine->callFunctionWithNumberAndBytes(request.functionName,
-			                                                           request.numberArg1, request.bytesArg,
-			                                                           &hasFunction, request.defaultResult);
-			    if (hasFunction && ok)
-				    result.boolResult = true;
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			if (result.boolResult)
+				break;
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         hasFunction = false;
+			bool                         suspended   = false;
+			quint64                      resumeId    = 0;
+			LuaPendingModalStringRequest modalRequest;
+			const bool                   ok = engine->callFunctionWithNumberAndBytes(
+			    request.functionName, request.numberArg1, request.bytesArg, &hasFunction,
+			    request.defaultResult, &suspended, &resumeId, &modalRequest);
+			collectDeferredBatches(engine);
+#ifndef NDEBUG
+			if (qmudMmStartupDiagShouldLogEngine(engine, request.functionName))
+			{
+				qInfo().noquote() << QStringLiteral(
+				                         "[QMud][MMStartupDiag] executor-number-bytes-stop-true callback=%1 "
+				                         "engine=%2 number=%3 bytes=%4 sample=%5 hasFunction=%6 ok=%7")
+				                         .arg(request.functionName, qmudMmStartupDiagEngineLabel(engine))
+				                         .arg(request.numberArg1)
+				                         .arg(request.bytesArg.size())
+				                         .arg(QString::fromLatin1(request.bytesArg.left(120)),
+				                              hasFunction ? QStringLiteral("1") : QStringLiteral("0"),
+				                              ok ? QStringLiteral("1") : QStringLiteral("0"));
+			}
+#endif
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				result.boolResultValid = false;
+				return result;
+			}
+			if (hasFunction && ok)
+				result.boolResult = true;
+		}
 		result.boolResultValid = true;
 		return result;
 	case LuaBatchDispatchKind::NumberAndBytes:
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    static_cast<void>(engine->callFunctionWithNumberAndBytes(request.functionName,
-			                                                             request.numberArg1, request.bytesArg,
-			                                                             nullptr, request.defaultResult));
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         hasFunction = false;
+			bool                         suspended   = false;
+			quint64                      resumeId    = 0;
+			LuaPendingModalStringRequest modalRequest;
+#ifndef NDEBUG
+			const bool ok = engine->callFunctionWithNumberAndBytes(
+			    request.functionName, request.numberArg1, request.bytesArg, &hasFunction,
+			    request.defaultResult, &suspended, &resumeId, &modalRequest);
+#else
+			static_cast<void>(engine->callFunctionWithNumberAndBytes(
+			    request.functionName, request.numberArg1, request.bytesArg, &hasFunction,
+			    request.defaultResult, &suspended, &resumeId, &modalRequest));
+#endif
+			collectDeferredBatches(engine);
+#ifndef NDEBUG
+			if (qmudMmStartupDiagShouldLogEngine(engine, request.functionName))
+			{
+				qInfo().noquote() << QStringLiteral(
+				                         "[QMud][MMStartupDiag] executor-number-bytes callback=%1 engine=%2 "
+				                         "number=%3 bytes=%4 sample=%5 hasFunction=%6 ok=%7")
+				                         .arg(request.functionName, qmudMmStartupDiagEngineLabel(engine))
+				                         .arg(request.numberArg1)
+				                         .arg(request.bytesArg.size())
+				                         .arg(QString::fromLatin1(request.bytesArg.left(120)),
+				                              hasFunction ? QStringLiteral("1") : QStringLiteral("0"),
+				                              ok ? QStringLiteral("1") : QStringLiteral("0"));
+			}
+#endif
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				return result;
+			}
+		}
 		return result;
 	case LuaBatchDispatchKind::NumberAndUtf8StringsCount:
 		result.countResult = 0;
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    {
-			    bool hasFunction = false;
-			    static_cast<void>(engine->callFunctionWithNumberAndUtf8Strings(
-			        request.functionName, request.numberArg1, request.bytesArg, request.bytesArg2,
-			        request.bytesArg3, &hasFunction, request.defaultResult));
-			    if (hasFunction)
-				    ++result.countResult;
-		    });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         hasFunction = false;
+			bool                         suspended   = false;
+			quint64                      resumeId    = 0;
+			LuaPendingModalStringRequest modalRequest;
+			static_cast<void>(engine->callFunctionWithNumberAndUtf8Strings(
+			    request.functionName, request.numberArg1, request.bytesArg, request.bytesArg2,
+			    request.bytesArg3, &hasFunction, request.defaultResult, &suspended, &resumeId,
+			    &modalRequest));
+			collectDeferredBatches(engine);
+#ifndef NDEBUG
+			if (qmudMmStartupDiagShouldLogEngine(engine, request.functionName))
+			{
+				qInfo().noquote()
+				    << QStringLiteral(
+				           "[QMud][MMStartupDiag] executor-broadcast callback=%1 engine=%2 message=%3 "
+				           "sender=%4 text=%5 hasFunction=%6 defaultResult=%7")
+				           .arg(request.functionName, qmudMmStartupDiagEngineLabel(engine))
+				           .arg(request.numberArg1)
+				           .arg(QString::fromUtf8(request.bytesArg),
+				                QString::fromUtf8(request.bytesArg3).left(120),
+				                hasFunction ? QStringLiteral("1") : QStringLiteral("0"),
+				                request.defaultResult ? QStringLiteral("1") : QStringLiteral("0"));
+			}
+#endif
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				result.countResultValid = false;
+				return result;
+			}
+			if (hasFunction)
+				++result.countResult;
+		}
 		result.countResultValid = true;
 		return result;
 	case LuaBatchDispatchKind::StringsAndWildcards:
 		result.hasFunction      = false;
 		result.hasFunctionValid = true;
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
+		static_cast<void>(forEachEngineIndexed(
+		    [&](const int engineIndex, LuaCallbackEngine *engine) -> bool
 		    {
-			    bool hasFunction = false;
+			    bool                         hasFunction = false;
+			    bool                         suspended   = false;
+			    quint64                      resumeId    = 0;
+			    LuaPendingModalStringRequest modalRequest;
 			    static_cast<void>(engine->callFunctionWithStringsAndWildcards(
 			        request.functionName, request.stringListArg, request.stringListArg2, request.mapArg,
 			        request.styleRunsArg ? request.styleRunsArg.data() : nullptr,
 			        request.miniWindowSnapshotArg ? request.miniWindowSnapshotArg.data() : nullptr,
 			        &hasFunction, request.hasActionSourceOverride ? request.actionSourceOverride : -1,
 			        request.triggerOutputReplacesMatchedLine, request.triggerMatchedLineBufferIndex,
-			        request.triggerMatchedLineAbsoluteNumber));
+			        request.triggerMatchedLineAbsoluteNumber, &suspended, &resumeId, &modalRequest));
+			    if (suspended)
+			    {
+				    storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				    result.hasFunctionValid = false;
+				    return false;
+			    }
 			    result.hasFunction = result.hasFunction || hasFunction;
-		    });
+			    return true;
+		    }));
 		return result;
 	case LuaBatchDispatchKind::ExecuteScript:
 	{
 		result.boolResult = false;
-		static_cast<void>(withFirstEngine(
-		    [&](LuaCallbackEngine *engine)
+		static_cast<void>(withFirstEngineIndexed(
+		    [&](const int engineIndex, LuaCallbackEngine *engine)
 		    {
+			    bool                         suspended = false;
+			    quint64                      resumeId  = 0;
+			    LuaPendingModalStringRequest modalRequest;
 			    result.boolResult = engine->executeScript(
 			        request.stringArg, request.stringArg2,
 			        request.styleRunsArg ? request.styleRunsArg.data() : nullptr,
 			        request.executeScriptHasTriggerContext, request.triggerOutputReplacesMatchedLine,
-			        request.triggerMatchedLineBufferIndex, request.triggerMatchedLineAbsoluteNumber);
+			        request.triggerMatchedLineBufferIndex, request.triggerMatchedLineAbsoluteNumber,
+			        &suspended, &resumeId, &modalRequest);
+			    if (suspended)
+			    {
+				    storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				    result.boolResultValid = false;
+			    }
 		    }));
+		if (result.suspended)
+			return result;
 		result.boolResultValid = true;
 		return result;
 	}
@@ -299,6 +864,15 @@ LuaBatchDispatchResult ILuaExecutor::dispatchBatch(const LuaBatchDispatchRequest
 			{
 				if (!initRequest.engine)
 					continue;
+#ifndef NDEBUG
+				if (qmudMmStartupDiagIsWatchedPluginId(initRequest.pluginId))
+				{
+					qInfo().noquote() << QStringLiteral("[QMud][MMStartupDiag] executor-init-observed "
+					                                    "plugin=%1 name=%2 callbackCount=%3")
+					                         .arg(initRequest.pluginId, initRequest.pluginName)
+					                         .arg(initRequest.callbackNames.size());
+				}
+#endif
 				initRequest.engine->setWorldRuntime(initRequest.runtime);
 				initRequest.engine->setScriptText(initRequest.scriptText);
 				if (!initRequest.pluginId.isEmpty() || !initRequest.pluginName.isEmpty() ||
@@ -313,8 +887,21 @@ LuaBatchDispatchResult ILuaExecutor::dispatchBatch(const LuaBatchDispatchRequest
 		}
 		return result;
 	case LuaBatchDispatchKind::UpdateObservedCallbacksMany:
-		forEachEngine([&](LuaCallbackEngine *engine)
-		              { engine->setObservedPluginCallbacks(request.observedCallbackNamesArg); });
+		forEachEngine(
+		    [&](LuaCallbackEngine *engine)
+		    {
+#ifndef NDEBUG
+			    if (qmudMmStartupDiagShouldLogEngine(engine, QStringLiteral("OnPluginBroadcast")))
+			    {
+				    qInfo().noquote()
+				        << QStringLiteral(
+				               "[QMud][MMStartupDiag] executor-update-observed engine=%1 callbackCount=%2")
+				               .arg(qmudMmStartupDiagEngineLabel(engine))
+				               .arg(request.observedCallbackNamesArg.size());
+			    }
+#endif
+			    engine->setObservedPluginCallbacks(request.observedCallbackNamesArg);
+		    });
 		return result;
 	case LuaBatchDispatchKind::TeardownEnginesMany:
 		for (const auto &engine : request.engines)
@@ -364,12 +951,12 @@ LuaBatchDispatchResult ILuaExecutor::dispatchBatch(const LuaBatchDispatchRequest
 			    const CallPluginLuaMarshallingResult marshalling =
 			        engine->callPluginLuaWithMarshalling(request.luaStateArg, request.functionName,
 			                                             request.intArg1, {}, request.miniWindowSnapshotArg);
-			    result.boolResult              = true;
-			    lua_State *const targetState   = engine->luaState();
-			    result.marshallingSameState    = (targetState == request.luaStateArg);
-			    result.marshallingError        = static_cast<int>(marshalling.error);
-			    result.marshallingIndex        = marshalling.index;
-			    result.marshallingTypeName     = marshalling.typeName;
+			    result.boolResult            = true;
+			    lua_State *const targetState = engine->luaState();
+			    result.marshallingSameState  = qmudLuaStatesShareMainThread(targetState, request.luaStateArg);
+			    result.marshallingError      = static_cast<int>(marshalling.error);
+			    result.marshallingIndex      = marshalling.index;
+			    result.marshallingTypeName   = marshalling.typeName;
 			    result.marshallingRuntimeError = marshalling.runtimeError;
 			    result.marshallingReturnCount  = marshalling.returnCount;
 			    if (request.refreshCallbackCatalogAfter)
@@ -393,8 +980,8 @@ LuaBatchDispatchResult ILuaExecutor::dispatchBatch(const LuaBatchDispatchRequest
 	{
 		bool hasFunction  = false;
 		result.boolResult = false;
-		static_cast<void>(withFirstEngine(
-		    [&](LuaCallbackEngine *engine)
+		static_cast<void>(withFirstEngineIndexed(
+		    [&](const int engineIndex, LuaCallbackEngine *engine)
 		    {
 			    if (request.applyCallingPluginContext)
 				    engine->pushCallingPluginId(request.callingPluginId);
@@ -404,9 +991,21 @@ LuaBatchDispatchResult ILuaExecutor::dispatchBatch(const LuaBatchDispatchRequest
 				        if (request.applyCallingPluginContext)
 					        engine->popCallingPluginId();
 			        });
+			    bool                         suspended = false;
+			    quint64                      resumeId  = 0;
+			    LuaPendingModalStringRequest modalRequest;
 			    result.boolResult =
-			        engine->callProcedureWithString(request.functionName, request.stringArg, &hasFunction);
+			        engine->callProcedureWithString(request.functionName, request.stringArg, &hasFunction,
+			                                        &suspended, &resumeId, &modalRequest);
+			    if (suspended)
+			    {
+				    storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				    result.boolResultValid  = false;
+				    result.hasFunctionValid = false;
+			    }
 		    }));
+		if (result.suspended)
+			return result;
 		result.boolResultValid  = true;
 		result.hasFunction      = hasFunction;
 		result.hasFunctionValid = true;
@@ -415,43 +1014,167 @@ LuaBatchDispatchResult ILuaExecutor::dispatchBatch(const LuaBatchDispatchRequest
 	case LuaBatchDispatchKind::MxpError:
 	{
 		result.boolResult = false;
-		static_cast<void>(withFirstEngine(
-		    [&](LuaCallbackEngine *engine)
+		static_cast<void>(withFirstEngineIndexed(
+		    [&](const int engineIndex, LuaCallbackEngine *engine)
 		    {
-			    result.boolResult =
-			        engine->callMxpError(request.functionName, request.intArg1, request.numberArg1,
-			                             request.intArg2, request.stringArg);
+			    bool                         suspended = false;
+			    quint64                      resumeId  = 0;
+			    LuaPendingModalStringRequest modalRequest;
+			    result.boolResult = engine->callMxpError(
+			        request.functionName, request.intArg1, request.numberArg1, request.intArg2,
+			        request.stringArg, &suspended, &resumeId, &modalRequest);
+			    if (suspended)
+			    {
+				    storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				    result.boolResultValid = false;
+			    }
 		    }));
+		if (result.suspended)
+			return result;
 		result.boolResultValid = true;
 		return result;
 	}
 	case LuaBatchDispatchKind::MxpStartUp:
-		forEachEngine([&](LuaCallbackEngine *engine) { engine->callMxpStartUp(request.functionName); });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         suspended = false;
+			quint64                      resumeId  = 0;
+			LuaPendingModalStringRequest modalRequest;
+			engine->callMxpStartUp(request.functionName, &suspended, &resumeId, &modalRequest);
+			collectDeferredBatches(engine);
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				return result;
+			}
+		}
 		return result;
 	case LuaBatchDispatchKind::MxpShutDown:
-		forEachEngine([&](LuaCallbackEngine *engine) { engine->callMxpShutDown(request.functionName); });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         suspended = false;
+			quint64                      resumeId  = 0;
+			LuaPendingModalStringRequest modalRequest;
+			engine->callMxpShutDown(request.functionName, &suspended, &resumeId, &modalRequest);
+			collectDeferredBatches(engine);
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				return result;
+			}
+		}
 		return result;
 	case LuaBatchDispatchKind::MxpStartTag:
 	{
 		result.boolResult = false;
-		static_cast<void>(withFirstEngine(
-		    [&](LuaCallbackEngine *engine)
+		static_cast<void>(withFirstEngineIndexed(
+		    [&](const int engineIndex, LuaCallbackEngine *engine)
 		    {
-			    result.boolResult = engine->callMxpStartTag(request.functionName, request.stringArg,
-			                                                request.stringArg2, request.mapArg);
+			    bool                         suspended = false;
+			    quint64                      resumeId  = 0;
+			    LuaPendingModalStringRequest modalRequest;
+			    result.boolResult =
+			        engine->callMxpStartTag(request.functionName, request.stringArg, request.stringArg2,
+			                                request.mapArg, &suspended, &resumeId, &modalRequest);
+			    if (suspended)
+			    {
+				    storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				    result.boolResultValid = false;
+			    }
 		    }));
+		if (result.suspended)
+			return result;
 		result.boolResultValid = true;
 		return result;
 	}
 	case LuaBatchDispatchKind::MxpEndTag:
-		forEachEngine(
-		    [&](LuaCallbackEngine *engine)
-		    { engine->callMxpEndTag(request.functionName, request.stringArg, request.stringArg2); });
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         suspended = false;
+			quint64                      resumeId  = 0;
+			LuaPendingModalStringRequest modalRequest;
+			engine->callMxpEndTag(request.functionName, request.stringArg, request.stringArg2, &suspended,
+			                      &resumeId, &modalRequest);
+			collectDeferredBatches(engine);
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				return result;
+			}
+		}
 		return result;
 	case LuaBatchDispatchKind::MxpSetVariable:
-		forEachEngine(
+		for (int engineIndex = 0; engineIndex < request.engines.size(); ++engineIndex)
+		{
+			LuaCallbackEngine *engine = request.engines.at(engineIndex).data();
+			if (!engine)
+				continue;
+			if (request.miniWindowSnapshotArg)
+				engine->pushDispatchMiniWindowSnapshot(request.miniWindowSnapshotArg);
+			const auto popSnapshot = qScopeGuard(
+			    [engine, hasSnapshot = static_cast<bool>(request.miniWindowSnapshotArg)]
+			    {
+				    if (hasSnapshot)
+					    engine->popDispatchMiniWindowSnapshot();
+			    });
+			Q_UNUSED(popSnapshot);
+			bool                         suspended = false;
+			quint64                      resumeId  = 0;
+			LuaPendingModalStringRequest modalRequest;
+			engine->callMxpSetVariable(request.functionName, request.stringArg, request.stringArg2,
+			                           &suspended, &resumeId, &modalRequest);
+			collectDeferredBatches(engine);
+			if (suspended)
+			{
+				storeSuspension(engineIndex, resumeId, std::move(modalRequest));
+				return result;
+			}
+		}
+		return result;
+	case LuaBatchDispatchKind::CancelSuspendedModalString:
+		static_cast<void>(withFirstEngine([&](LuaCallbackEngine *engine)
+		                                  { engine->cancelSuspendedModalString(request.modalResumeId); }));
+		return result;
+	case LuaBatchDispatchKind::ResumeSuspendedModalString:
+		static_cast<void>(withFirstEngine(
 		    [&](LuaCallbackEngine *engine)
-		    { engine->callMxpSetVariable(request.functionName, request.stringArg, request.stringArg2); });
+		    { result = engine->resumeSuspendedModalString(request.modalResumeId, request.stringArg); }));
 		return result;
 	}
 	return result;

@@ -1453,14 +1453,42 @@ class WorldView : public QWidget
 		 */
 		bool        handleMiniWindowMouseMove(const QMouseEvent *event, const QWidget *source);
 		/**
+		 * @brief Updates script-visible miniwindow mouse coordinates for a callback.
+		 * @param window Miniwindow receiving the callback.
+		 * @param callbackLocal Output-stack-local mouse coordinate to expose to Lua.
+		 * @param updateWindowRelativePosition Update WindowInfo 14/15 when `true`.
+		 */
+		void        setMiniWindowCallbackMousePosition(MiniWindow &window, const QPoint &callbackLocal,
+		                                               bool updateWindowRelativePosition);
+		/**
 		 * @brief Queues a captured miniwindow drag callback for the latest mouse position.
 		 * @param callbackLocal Output-stack-local mouse coordinate to expose to Lua.
 		 */
 		void        scheduleCapturedMiniWindowDragMove(const QPoint &callbackLocal);
 		/**
+		 * @brief Dispatches the pending captured miniwindow drag callback before release processing.
+		 * @param callbackLocal Output-stack-local mouse coordinate to expose to Lua.
+		 */
+		void        flushPendingCapturedMiniWindowDragMove(const QPoint &callbackLocal);
+		/**
 		 * @brief Dispatches the latest queued captured miniwindow drag callback.
 		 */
 		void        dispatchPendingCapturedMiniWindowDragMove();
+		/**
+		 * @brief Starts logical miniwindow mouse capture without requesting a platform mouse grab.
+		 */
+		void        startMiniWindowMouseCapture();
+		/**
+		 * @brief Ends logical miniwindow mouse capture and removes temporary event routing.
+		 */
+		void        stopMiniWindowMouseCapture();
+		/**
+		 * @brief Routes captured miniwindow mouse events from any widget in this view window.
+		 * @param watched Object receiving the original event.
+		 * @param event Mouse event payload.
+		 * @return `true` when the captured event was consumed.
+		 */
+		bool        handleCapturedMiniWindowMouseEvent(QObject *watched, const QMouseEvent *event);
 		/**
 		 * @brief Returns hyperlink currently under global cursor, if any.
 		 * @return Hyperlink href under cursor, or empty when none.
@@ -1508,9 +1536,10 @@ class WorldView : public QWidget
 		 * @param hotspotId Hotspot identifier.
 		 * @param callbackName Callback function name.
 		 * @param flags Callback mouse/keyboard flags.
+		 * @param queueWhenCallbackLaneBusy Queue instead of synchronously waiting when the callback lane is busy.
 		 */
 		void callHotspotCallback(MiniWindow *window, const QString &hotspotId, const QString &callbackName,
-		                         int flags) const;
+		                         int flags, bool queueWhenCallbackLaneBusy = false) const;
 		/**
 		 * @brief Clears currently applied hotspot cursor override.
 		 */
@@ -1905,6 +1934,7 @@ class WorldView : public QWidget
 		NativeOutputSelectionState              m_nativeOutputSelection;
 		mutable int                             m_nativeSelectionPendingHeadTrimLines{0};
 		bool                                    m_mouseCaptured{false};
+		bool                                    m_miniWindowCaptureEventFilterInstalled{false};
 		bool                                    m_hasCapturedMiniWindowPressLocal{false};
 		bool                                    m_hasPendingCapturedMiniWindowDragMove{false};
 		bool                                    m_capturedMiniWindowDragMoveDrainQueued{false};

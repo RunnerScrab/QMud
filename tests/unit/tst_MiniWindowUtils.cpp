@@ -87,6 +87,21 @@ class tst_MiniWindowUtils : public QObject
 			QCOMPARE(window.backingSurface().pixelColor(0, 0), QColor(Qt::red));
 		}
 
+		void apiRectKeepsAbsoluteMiniWindowScalerInternal()
+		{
+			MiniWindow window;
+			MiniWindowUtils::create(window, QStringLiteral("absolute-api"), 100, 200, 50, 40, 0,
+			                        kMiniWindowAbsoluteLocation, QColor(Qt::black), QString());
+			window.rect = QRect(25, 50, 13, 10);
+
+			QCOMPARE(window.apiRect(), QRect(100, 200, 50, 40));
+
+			MiniWindowUtils::position(window, 4, 6, 0, 0);
+			window.rect = QRect(4, 6, 50, 40);
+
+			QCOMPARE(window.apiRect(), QRect(4, 6, 50, 40));
+		}
+
 		void highDpiCreateKeepsLogicalGeometryAndUsesPhysicalBacking()
 		{
 			MiniWindow window;

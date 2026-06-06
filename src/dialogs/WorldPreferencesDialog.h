@@ -282,7 +282,7 @@ class WorldPreferencesDialog : public QDialog
 		 */
 		void                          updateScriptNoteSwatches() const;
 		/**
-		 * @brief Updates scripting note colour combo item roles from custom colours.
+		 * @brief Updates scripting note color combo item roles from custom colors.
 		 */
 		void                          updateScriptNoteColourItems() const;
 		/**
@@ -777,6 +777,7 @@ class WorldPreferencesDialog : public QDialog
 		QLineEdit                    *m_password{nullptr};
 		QTextEdit                    *m_connectText{nullptr};
 		QComboBox                    *m_connectMethod{nullptr};
+		QSpinBox                     *m_connectDelay{nullptr};
 		QCheckBox                    *m_onlyNegotiateTelnetOptionsOnce{nullptr};
 		QLabel                       *m_connectLineCount{nullptr};
 

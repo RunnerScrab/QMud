@@ -62,6 +62,44 @@ class tst_StringUtils : public QObject
 			QCOMPARE(qmudReplaceString(input, QString(), QStringLiteral("bar"), true), input);
 		}
 
+		void splitLegacyMenuItemsTrimsWhitespaceAndPreservesSeparators()
+		{
+			const QStringList parts = qmudSplitLegacyMenuItems(
+			    QStringLiteral(">Channels | +tell | shout | < | - | New Tab | ^Delete Tab | "));
+
+			QCOMPARE(parts.size(), 8);
+			QCOMPARE(parts.at(0), QStringLiteral(">Channels"));
+			QCOMPARE(parts.at(1), QStringLiteral("+tell"));
+			QCOMPARE(parts.at(2), QStringLiteral("shout"));
+			QCOMPARE(parts.at(3), QStringLiteral("<"));
+			QCOMPARE(parts.at(4), QStringLiteral("-"));
+			QCOMPARE(parts.at(5), QStringLiteral("New Tab"));
+			QCOMPARE(parts.at(6), QStringLiteral("^Delete Tab"));
+			QCOMPARE(parts.at(7), QString());
+		}
+
+		void splitLegacyMenuItemsKeepsTrailingStateMarkersLiteral()
+		{
+			const QStringList parts = qmudSplitLegacyMenuItems(
+			    QStringLiteral("Rename | New Tab^ | Delete Tab | Notify+ | Configure"));
+
+			QCOMPARE(parts.size(), 5);
+			QCOMPARE(parts.at(0), QStringLiteral("Rename"));
+			QCOMPARE(parts.at(1), QStringLiteral("New Tab^"));
+			QCOMPARE(parts.at(2), QStringLiteral("Delete Tab"));
+			QCOMPARE(parts.at(3), QStringLiteral("Notify+"));
+			QCOMPARE(parts.at(4), QStringLiteral("Configure"));
+		}
+
+		void splitLegacyMenuItemsKeepsPlusPlusLabels()
+		{
+			const QStringList parts = qmudSplitLegacyMenuItems(QStringLiteral("C++ | Other"));
+
+			QCOMPARE(parts.size(), 2);
+			QCOMPARE(parts.at(0), QStringLiteral("C++"));
+			QCOMPARE(parts.at(1), QStringLiteral("Other"));
+		}
+
 		void editDistance()
 		{
 			QCOMPARE(qmudEditDistance(QStringView{QStringLiteral("kitten")},

@@ -28,6 +28,7 @@
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 struct lua_State;
 struct CallPluginLuaMarshallingResult;
+struct LuaSuspendedCallback;
 
 struct LuaStateDeleter
 {
@@ -36,6 +37,14 @@ struct LuaStateDeleter
 		 * @param state Lua state pointer to close.
 		 */
 		void operator()(lua_State *state) const;
+};
+
+enum class LuaPreparedCallbackResultMode
+{
+	Bool,
+	NoResult,
+	Bytes,
+	String
 };
 #endif
 
@@ -157,62 +166,101 @@ class LuaCallbackEngine
 		 * @param messageNumber Protocol message number.
 		 * @param lineNumber Related line number.
 		 * @param message Error message text.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return `true` when callback returns truthy/continue semantics.
 		 */
 		bool callMxpError(const QString &functionName, int level, long messageNumber, int lineNumber,
-		                  const QString &message);
+		                  const QString &message, bool *suspended = nullptr, quint64 *modalResumeId = nullptr,
+		                  LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls MXP startup callback.
 		 * @param functionName Callback function name.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 */
-		void callMxpStartUp(const QString &functionName);
+		void callMxpStartUp(const QString &functionName, bool *suspended = nullptr,
+		                    quint64                      *modalResumeId             = nullptr,
+		                    LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls MXP shutdown callback.
 		 * @param functionName Callback function name.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 */
-		void callMxpShutDown(const QString &functionName);
+		void callMxpShutDown(const QString &functionName, bool *suspended = nullptr,
+		                     quint64                      *modalResumeId             = nullptr,
+		                     LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls MXP start-tag callback.
 		 * @param functionName Callback function name.
 		 * @param name Tag name.
 		 * @param args Raw argument string.
 		 * @param table Parsed attribute table.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return `true` when callback returns truthy/continue semantics.
 		 */
 		bool callMxpStartTag(const QString &functionName, const QString &name, const QString &args,
-		                     const QMap<QString, QString> &table);
+		                     const QMap<QString, QString> &table, bool *suspended = nullptr,
+		                     quint64                      *modalResumeId             = nullptr,
+		                     LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls MXP end-tag callback.
 		 * @param functionName Callback function name.
 		 * @param name Tag name.
 		 * @param text Tag text content.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 */
-		void callMxpEndTag(const QString &functionName, const QString &name, const QString &text);
+		void callMxpEndTag(const QString &functionName, const QString &name, const QString &text,
+		                   bool *suspended = nullptr, quint64 *modalResumeId = nullptr,
+		                   LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls MXP variable callback.
 		 * @param functionName Callback function name.
 		 * @param name Variable name.
 		 * @param contents Variable contents.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 */
-		void callMxpSetVariable(const QString &functionName, const QString &name, const QString &contents);
+		void callMxpSetVariable(const QString &functionName, const QString &name, const QString &contents,
+		                        bool *suspended = nullptr, quint64 *modalResumeId = nullptr,
+		                        LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls function with no arguments and boolean result.
 		 * @param functionName Callback function name.
 		 * @param hasFunction Optional output flag indicating function existence.
 		 * @param defaultResult Result when function is missing/error.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return Callback result.
 		 */
 		bool callFunctionNoArgs(const QString &functionName, bool *hasFunction = nullptr,
-		                        bool defaultResult = true);
+		                        bool defaultResult = true, bool *suspended = nullptr,
+		                        quint64                      *modalResumeId             = nullptr,
+		                        LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls function with one string argument and ignores return value semantics.
 		 * @param functionName Callback function name.
 		 * @param arg String argument.
 		 * @param hasFunction Optional output flag indicating function existence.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return `true` when function exists and executes without Lua error.
 		 */
 		bool callProcedureWithString(const QString &functionName, const QString &arg,
-		                             bool *hasFunction = nullptr);
+		                             bool *hasFunction = nullptr, bool *suspended = nullptr,
+		                             quint64                      *modalResumeId             = nullptr,
+		                             LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls a dotted Lua routine and marshals arguments/returns to another Lua state.
 		 *
@@ -238,38 +286,58 @@ class LuaCallbackEngine
 		 * @param arg String argument.
 		 * @param hasFunction Optional output flag indicating function existence.
 		 * @param defaultResult Result when function is missing/error.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return Callback result.
 		 */
 		bool callFunctionWithString(const QString &functionName, const QString &arg,
-		                            bool *hasFunction = nullptr, bool defaultResult = true);
+		                            bool *hasFunction = nullptr, bool defaultResult = true,
+		                            bool *suspended = nullptr, quint64 *modalResumeId = nullptr,
+		                            LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls function with one byte-array argument.
 		 * @param functionName Callback function name.
 		 * @param arg Byte-array argument.
 		 * @param hasFunction Optional output flag indicating function existence.
 		 * @param defaultResult Result when function is missing/error.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return Callback result.
 		 */
 		bool callFunctionWithBytes(const QString &functionName, const QByteArray &arg,
-		                           bool *hasFunction = nullptr, bool defaultResult = true);
+		                           bool *hasFunction = nullptr, bool defaultResult = true,
+		                           bool *suspended = nullptr, quint64 *modalResumeId = nullptr,
+		                           LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls function with mutable byte-array in/out argument.
 		 * @param functionName Callback function name.
 		 * @param arg Byte-array argument modified in place.
 		 * @param hasFunction Optional output flag indicating function existence.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return Callback result.
 		 */
 		bool callFunctionWithBytesInOut(const QString &functionName, QByteArray &arg,
-		                                bool *hasFunction = nullptr);
+		                                bool *hasFunction = nullptr, bool *suspended = nullptr,
+		                                quint64                      *modalResumeId             = nullptr,
+		                                LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls function with mutable string in/out argument.
 		 * @param functionName Callback function name.
 		 * @param arg String argument modified in place.
 		 * @param hasFunction Optional output flag indicating function existence.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return Callback result.
 		 */
 		bool callFunctionWithStringInOut(const QString &functionName, QString &arg,
-		                                 bool *hasFunction = nullptr);
+		                                 bool *hasFunction = nullptr, bool *suspended = nullptr,
+		                                 quint64                      *modalResumeId             = nullptr,
+		                                 LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls function with one number and one string argument.
 		 * @param functionName Callback function name.
@@ -277,10 +345,18 @@ class LuaCallbackEngine
 		 * @param arg String argument.
 		 * @param hasFunction Optional output flag indicating function existence.
 		 * @param defaultResult Result when function is missing/error.
+		 * @param actionSourceOverride Optional callback-local action source, or `-1` to use runtime state.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return Callback result.
 		 */
-		bool callFunctionWithNumberAndString(const QString &functionName, long arg1, const QString &arg,
-		                                     bool *hasFunction = nullptr, bool defaultResult = true);
+		bool
+		callFunctionWithNumberAndString(const QString &functionName, long arg1, const QString &arg,
+		                                bool *hasFunction = nullptr, bool defaultResult = true,
+		                                int actionSourceOverride = -1, bool *suspended = nullptr,
+		                                quint64                      *modalResumeId             = nullptr,
+		                                LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls function with one number and three string arguments.
 		 * @param functionName Callback function name.
@@ -304,12 +380,16 @@ class LuaCallbackEngine
 		 * @param arg4Utf8 Third string argument encoded as UTF-8 bytes.
 		 * @param hasFunction Optional output flag indicating function existence.
 		 * @param defaultResult Result when function is missing/error.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return Callback result.
 		 */
-		bool callFunctionWithNumberAndUtf8Strings(const QString &functionName, long arg1,
-		                                          const QByteArray &arg2Utf8, const QByteArray &arg3Utf8,
-		                                          const QByteArray &arg4Utf8, bool *hasFunction = nullptr,
-		                                          bool defaultResult = true);
+		bool callFunctionWithNumberAndUtf8Strings(
+		    const QString &functionName, long arg1, const QByteArray &arg2Utf8, const QByteArray &arg3Utf8,
+		    const QByteArray &arg4Utf8, bool *hasFunction = nullptr, bool defaultResult = true,
+		    bool *suspended = nullptr, quint64 *modalResumeId = nullptr,
+		    LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls function with two numbers and one string argument.
 		 * @param functionName Callback function name.
@@ -318,11 +398,16 @@ class LuaCallbackEngine
 		 * @param arg String argument.
 		 * @param hasFunction Optional output flag indicating function existence.
 		 * @param defaultResult Result when function is missing/error.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return Callback result.
 		 */
-		bool callFunctionWithTwoNumbersAndString(const QString &functionName, long arg1, long arg2,
-		                                         const QString &arg, bool *hasFunction = nullptr,
-		                                         bool defaultResult = true);
+		bool callFunctionWithTwoNumbersAndString(
+		    const QString &functionName, long arg1, long arg2, const QString &arg,
+		    bool *hasFunction = nullptr, bool defaultResult = true, bool *suspended = nullptr,
+		    quint64                      *modalResumeId             = nullptr,
+		    LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls function with one number and byte-array argument.
 		 * @param functionName Callback function name.
@@ -330,10 +415,16 @@ class LuaCallbackEngine
 		 * @param arg Byte-array argument.
 		 * @param hasFunction Optional output flag indicating function existence.
 		 * @param defaultResult Result when function is missing/error.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return Callback result.
 		 */
-		bool callFunctionWithNumberAndBytes(const QString &functionName, long arg1, const QByteArray &arg,
-		                                    bool *hasFunction = nullptr, bool defaultResult = true);
+		bool
+		callFunctionWithNumberAndBytes(const QString &functionName, long arg1, const QByteArray &arg,
+		                               bool *hasFunction = nullptr, bool defaultResult = true,
+		                               bool *suspended = nullptr, quint64 *modalResumeId = nullptr,
+		                               LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Calls function with argument list, wildcard sets, and optional style runs.
 		 * @param functionName Callback function name.
@@ -347,6 +438,9 @@ class LuaCallbackEngine
 		 * @param triggerOutputReplacesMatchedLine Whether trigger output should replace the matched line.
 		 * @param triggerMatchedLineBufferIndex Buffer index of the trigger-matched line.
 		 * @param triggerMatchedLineAbsoluteNumber Absolute line number of the trigger-matched line.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return Callback result.
 		 */
 		bool callFunctionWithStringsAndWildcards(
@@ -354,7 +448,9 @@ class LuaCallbackEngine
 		    const QMap<QString, QString> &namedWildcards, const QVector<LuaStyleRun> *styleRuns,
 		    const LuaCallbackMiniWindowSnapshot *miniWindowSnapshot, bool *hasFunction = nullptr,
 		    int actionSourceOverride = -1, bool triggerOutputReplacesMatchedLine = false,
-		    int triggerMatchedLineBufferIndex = 0, qint64 triggerMatchedLineAbsoluteNumber = 0);
+		    int triggerMatchedLineBufferIndex = 0, qint64 triggerMatchedLineAbsoluteNumber = 0,
+		    bool *suspended = nullptr, quint64 *modalResumeId = nullptr,
+		    LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Executes arbitrary Lua code chunk.
 		 * @param code Lua code text.
@@ -364,13 +460,17 @@ class LuaCallbackEngine
 		 * @param triggerOutputReplacesMatchedLine Whether trigger output should replace the matched line.
 		 * @param triggerMatchedLineBufferIndex Buffer index of the trigger-matched line.
 		 * @param triggerMatchedLineAbsoluteNumber Absolute line number of the trigger-matched line.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
 		 * @return `true` on successful execution.
 		 */
 		bool executeScript(const QString &code, const QString &description,
 		                   const QVector<LuaStyleRun> *styleRuns = nullptr, bool hasTriggerContext = false,
-		                   bool   triggerOutputReplacesMatchedLine = false,
-		                   int    triggerMatchedLineBufferIndex    = 0,
-		                   qint64 triggerMatchedLineAbsoluteNumber = 0);
+		                   bool triggerOutputReplacesMatchedLine = false,
+		                   int triggerMatchedLineBufferIndex = 0, qint64 triggerMatchedLineAbsoluteNumber = 0,
+		                   bool *suspended = nullptr, quint64 *modalResumeId = nullptr,
+		                   LuaPendingModalStringRequest *pendingModalStringRequest = nullptr);
 		/**
 		 * @brief Enables/disables package loading restrictions.
 		 * @param enablePackage Enable package access when `true`.
@@ -446,6 +546,12 @@ class LuaCallbackEngine
 		 */
 		[[nodiscard]] const LuaCallbackMiniWindowSnapshot *currentDispatchMiniWindowSnapshot() const;
 		/**
+		 * @brief Returns shared ownership of the active per-dispatch miniwindow snapshot.
+		 * @return Snapshot shared pointer, or null when unset.
+		 */
+		[[nodiscard]] QSharedPointer<const LuaCallbackMiniWindowSnapshot>
+		     currentDispatchMiniWindowSnapshotShared() const;
+		/**
 		 * @brief Appends a deferred runtime mutation journal produced by callback scope teardown.
 		 * @param runtime Runtime that owns the mutations.
 		 * @param mutations Ordered mutation callables to execute on the runtime thread.
@@ -464,6 +570,19 @@ class LuaCallbackEngine
 		 * @return Ordered mutation batches for runtime-thread application.
 		 */
 		[[nodiscard]] QVector<LuaDeferredRuntimeMutationBatch> takeDeferredRuntimeMutationBatches();
+		/**
+		 * @brief Resumes a callback previously suspended by a modal string-result API.
+		 * @param resumeId Suspended callback id.
+		 * @param result Modal result string to return to Lua.
+		 * @return Dispatch result carrying deferred mutations produced by resumed execution.
+		 */
+		[[nodiscard]] LuaBatchDispatchResult resumeSuspendedModalString(quint64        resumeId,
+		                                                                const QString &result);
+		/**
+		 * @brief Cancels a callback coroutine previously suspended by a modal API.
+		 * @param resumeId Suspended callback id.
+		 */
+		void                                 cancelSuspendedModalString(quint64 resumeId);
 
 	private:
 		/**
@@ -491,10 +610,31 @@ class LuaCallbackEngine
 		mutable bool                                                 m_reportedRuntimeThreadMismatch{false};
 
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
-		std::unique_ptr<lua_State, LuaStateDeleter> m_ownedState;
-		lua_State                                  *m_state{nullptr};
-		bool                                        m_packageRestrictionsApplied{false};
-		bool                                        m_packageRestrictionsAppliedValue{true};
+		/**
+		 * @brief Executes a prepared callback function on a yieldable coroutine.
+		 * @param functionName Callback function name used for diagnostics.
+		 * @param argCount Number of arguments already pushed after the function.
+		 * @param expectedResults Number of return values expected by legacy caller semantics.
+		 * @param defaultResult Result when the callback errors or suspends.
+		 * @param suspended Optional output flag set when callback yielded at a modal API.
+		 * @param modalResumeId Optional output id for the suspended modal callback.
+		 * @param pendingModalStringRequest Optional output request for the yielded modal API.
+		 * @param resultMode Selects the expected return-value conversion mode.
+		 * @param bytesResult Optional output byte-array result when `resultMode` is `Bytes`.
+		 * @param stringResult Optional output string result when `resultMode` is `String`.
+		 * @return Callback boolean result for non-suspended execution.
+		 */
+		bool callPreparedYieldableCallback(
+		    const QString &functionName, int argCount, int expectedResults, bool defaultResult,
+		    bool *suspended, quint64 *modalResumeId, LuaPendingModalStringRequest *pendingModalStringRequest,
+		    LuaPreparedCallbackResultMode resultMode = LuaPreparedCallbackResultMode::Bool,
+		    QByteArray *bytesResult = nullptr, QString *stringResult = nullptr);
+		std::unique_ptr<lua_State, LuaStateDeleter>           m_ownedState;
+		lua_State                                            *m_state{nullptr};
+		bool                                                  m_packageRestrictionsApplied{false};
+		bool                                                  m_packageRestrictionsAppliedValue{true};
+		QHash<quint64, std::shared_ptr<LuaSuspendedCallback>> m_suspendedCallbacks;
+		quint64                                               m_nextSuspendedCallbackId{1};
 #endif
 		QSet<QString>                            m_luaFunctionsSet;
 		QSet<QString>                            m_observedPluginCallbacks;

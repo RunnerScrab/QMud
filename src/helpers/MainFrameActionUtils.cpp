@@ -58,6 +58,20 @@ namespace QMudMainFrameActionUtils
 		return QStringLiteral("%1 (%2)").arg(label, nativeShortcut);
 	}
 
+	int adjacentTabShortcutStep(const int key, const Qt::KeyboardModifiers modifiers)
+	{
+		const bool hasOnlyCtrlShift =
+		    modifiers.testFlag(Qt::ControlModifier) && modifiers.testFlag(Qt::ShiftModifier) &&
+		    !modifiers.testFlag(Qt::AltModifier) && !modifiers.testFlag(Qt::MetaModifier);
+		if (!hasOnlyCtrlShift)
+			return 0;
+		if (key == Qt::Key_Left)
+			return -1;
+		if (key == Qt::Key_Right)
+			return 1;
+		return 0;
+	}
+
 	bool shouldAttemptIncomingLineTaskbarFlash(const bool worldFlashEnabled, const bool appFocused)
 	{
 		return worldFlashEnabled && !appFocused;

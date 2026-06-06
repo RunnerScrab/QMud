@@ -77,6 +77,14 @@ CallPluginLuaMarshallingResult qmudCallPluginLuaWithMarshalling(lua_State     *c
                                                                 const QString &routine, int firstArg);
 
 /**
+ * @brief Returns whether two Lua thread handles share the same main Lua state.
+ * @param left First Lua state/thread handle.
+ * @param right Second Lua state/thread handle.
+ * @return `true` when both handles belong to the same Lua VM.
+ */
+[[nodiscard]] bool             qmudLuaStatesShareMainThread(lua_State *left, lua_State *right);
+
+/**
  * @brief Debug-only assertion that verifies an object is used from its owning Qt thread.
  * @param object Object whose affinity should match current thread.
  * @param context Assertion context label.
@@ -150,6 +158,20 @@ bool    qmudLuaBridgeIsExecutingRequestOnCurrentThread();
  * @return `true` when callback was executed, `false` when target/context is invalid.
  */
 bool    qmudLuaBridgeInvokeOnObjectThread(const QObject *target, const std::function<void()> &fn);
+/**
+ * @brief Synchronously executes modal dialog work on `target` object's thread.
+ *
+ * This is intentionally narrower than qmudLuaBridgeInvokeOnObjectThread(): the caller blocks only on this
+ * modal request's completion condition and does not pump caller-side bridge, callback-lane, or runtime work
+ * while the modal UI is open. The invoke timeout only cancels work that is still queued before dispatch; once
+ * the GUI thread has started the modal callable, the caller waits for the dialog result.
+ *
+ * @param target Target QObject whose owning thread should execute the modal callback.
+ * @param fn Modal callback to execute on target thread.
+ * @return `true` when callback dispatch completed successfully, `false` when target/context is invalid or queued
+ * dispatch was canceled before execution.
+ */
+bool    qmudLuaBridgeInvokeModalOnObjectThread(const QObject *target, const std::function<void()> &fn);
 /**
  * @brief Returns current Lua bridge invoke timeout in milliseconds.
  * @return Active invoke timeout in milliseconds.

@@ -51,6 +51,13 @@ namespace QMudMainFrameActionUtils
 	 */
 	[[nodiscard]] QString toolbarTooltipWithShortcut(const QString &label, const QString &portableShortcut);
 	/**
+	 * @brief Returns tab-navigation step for main-frame keyboard shortcut.
+	 * @param key Qt key code.
+	 * @param modifiers Keyboard modifiers active for the key event.
+	 * @return `-1` for previous tab, `+1` for next tab, `0` when shortcut does not match.
+	 */
+	[[nodiscard]] int     adjacentTabShortcutStep(int key, Qt::KeyboardModifiers modifiers);
+	/**
 	 * @brief Returns whether incoming server line should attempt taskbar flash.
 	 * @param worldFlashEnabled `true` when world flash option is enabled.
 	 * @param appFocused `true` when QMud currently has application focus.

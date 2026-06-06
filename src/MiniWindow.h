@@ -99,6 +99,7 @@ struct MiniWindow
 		QRect                            rect;
 		bool                             temporarilyHide{false};
 		int                              zOrder{0};
+		int                              executingScriptDepth{0};
 		bool                             executingScript{false};
 		QString                          creatingPlugin;
 		QString                          callbackPlugin;
@@ -177,6 +178,19 @@ struct MiniWindow
 		[[nodiscard]] QRect logicalRect() const
 		{
 			return {QPoint(0, 0), logicalSize()};
+		}
+
+		/**
+		 * @brief Returns the script-visible miniwindow rectangle for WindowInfo APIs.
+		 *
+		 * Absolute miniwindows keep their plugin coordinate space even when QMud scales their
+		 * painted rectangle to fit the current view.
+		 */
+		[[nodiscard]] QRect apiRect() const
+		{
+			if ((flags & kMiniWindowAbsoluteLocation) != 0)
+				return {location, logicalSize()};
+			return rect;
 		}
 
 		/**

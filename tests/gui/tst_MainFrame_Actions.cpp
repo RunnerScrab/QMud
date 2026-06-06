@@ -133,6 +133,38 @@ class tst_MainFrame_Actions : public QObject
 			    QStringLiteral("Triggers"));
 		}
 
+		void adjacentTabShortcutStep_data()
+		{
+			QTest::addColumn<int>("key");
+			QTest::addColumn<Qt::KeyboardModifiers>("modifiers");
+			QTest::addColumn<int>("expected");
+
+			QTest::newRow("ctrl-shift-left")
+			    << static_cast<int>(Qt::Key_Left) << (Qt::ControlModifier | Qt::ShiftModifier) << -1;
+			QTest::newRow("ctrl-shift-right")
+			    << static_cast<int>(Qt::Key_Right) << (Qt::ControlModifier | Qt::ShiftModifier) << 1;
+			QTest::newRow("shift-left-old-binding")
+			    << static_cast<int>(Qt::Key_Left) << Qt::KeyboardModifiers(Qt::ShiftModifier) << 0;
+			QTest::newRow("shift-right-old-binding")
+			    << static_cast<int>(Qt::Key_Right) << Qt::KeyboardModifiers(Qt::ShiftModifier) << 0;
+			QTest::newRow("ctrl-left")
+			    << static_cast<int>(Qt::Key_Left) << Qt::KeyboardModifiers(Qt::ControlModifier) << 0;
+			QTest::newRow("ctrl-shift-alt-left")
+			    << static_cast<int>(Qt::Key_Left)
+			    << (Qt::ControlModifier | Qt::ShiftModifier | Qt::AltModifier) << 0;
+			QTest::newRow("ctrl-shift-up")
+			    << static_cast<int>(Qt::Key_Up) << (Qt::ControlModifier | Qt::ShiftModifier) << 0;
+		}
+
+		void adjacentTabShortcutStep()
+		{
+			QFETCH(int, key);
+			QFETCH(Qt::KeyboardModifiers, modifiers);
+			QFETCH(int, expected);
+
+			QCOMPARE(QMudMainFrameActionUtils::adjacentTabShortcutStep(key, modifiers), expected);
+		}
+
 		void shouldAttemptIncomingLineTaskbarFlash_data()
 		{
 			QTest::addColumn<bool>("worldFlashEnabled");

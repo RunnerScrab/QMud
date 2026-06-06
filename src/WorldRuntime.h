@@ -2408,16 +2408,23 @@ class WorldRuntime : public QObject
 		 */
 		void               receiveRawData(const QByteArray &data);
 		/**
+		 * @brief Queues resumption of a Lua callback suspended by a modal string-result API.
+		 * @param pluginId Plugin id that owns the suspended callback, or empty for the world script.
+		 * @param resumeId Suspended callback id in the owning Lua engine.
+		 * @param result Modal result string to return to Lua.
+		 */
+		void queueLuaModalCallbackResume(const QString &pluginId, quint64 resumeId, const QString &result);
+		/**
 		 * @brief Opens world socket connection.
 		 * @param host Remote host name or IP.
 		 * @param port Remote port number.
 		 * @return `true` when the connect attempt was started.
 		 */
-		bool               connectToWorld(const QString &host, quint16 port);
+		bool connectToWorld(const QString &host, quint16 port);
 		/**
 		 * @brief Closes active world socket connection.
 		 */
-		void               disconnectFromWorld();
+		void disconnectFromWorld();
 		/**
 		 * @brief Returns native descriptor of current world socket.
 		 * @return Native descriptor, or `-1` when unavailable.
@@ -4922,8 +4929,10 @@ class WorldRuntime : public QObject
 		 * @param completionBarrier Wait for command completion when `true`.
 		 * @return Callback command result payload.
 		 */
-		LuaBatchDispatchResult    queuePluginCallbackDispatch(const LuaBatchDispatchRequest &request,
-		                                                      bool                           completionBarrier);
+		struct PluginCallbackDispatchCommand;
+		struct SuspendedPluginCallbackDispatch;
+		LuaBatchDispatchResult queuePluginCallbackDispatch(const LuaBatchDispatchRequest &request,
+		                                                   bool                           completionBarrier);
 		/**
 		 * @brief Captures callback-lane snapshot data used by bridge-forbidden Lua API reads.
 		 * @param recipients Target plugin engines for this dispatch.
@@ -4992,6 +5001,15 @@ class WorldRuntime : public QObject
 		queuePluginCallbackDispatchAsync(const LuaBatchDispatchRequest                      &request,
 		                                 std::function<void(const LuaBatchDispatchResult &)> completion = {});
 		/**
+		 * @brief Enqueues one plugin callback command from the runtime thread.
+		 * @param request Structured callback command payload.
+		 * @param completion Optional callback receiving dispatch result after worker completion.
+		 * @return `true` when the command was accepted for dispatch.
+		 */
+		[[nodiscard]] bool tryQueuePluginCallbackDispatchAsyncOnRuntimeThread(
+		    const LuaBatchDispatchRequest                      &request,
+		    std::function<void(const LuaBatchDispatchResult &)> completion = {});
+		/**
 		 * @brief Drains queued plugin callback commands.
 		 * @param completionCommandId Optional command-id barrier; `0` drains all currently queued commands.
 		 */
@@ -5004,6 +5022,85 @@ class WorldRuntime : public QObject
 		 * @brief Executes one queued plugin callback command.
 		 */
 		void processNextPluginCallbackDispatchCommand();
+		/**
+		 * @brief Starts request-scoped miniwindow script execution protection.
+		 * @param command Dispatch command that may carry miniwindow execution state.
+		 */
+		void beginPluginCallbackDispatchCommandGuard(PluginCallbackDispatchCommand &command);
+		/**
+		 * @brief Ends request-scoped miniwindow script execution protection.
+		 * @param command Dispatch command that may carry miniwindow execution state.
+		 */
+		void endPluginCallbackDispatchCommandGuard(PluginCallbackDispatchCommand &command);
+		/**
+		 * @brief Completes a non-suspended plugin callback dispatch command.
+		 * @param command Completed dispatch command.
+		 * @param result Completed dispatch result.
+		 */
+		void finishPluginCallbackDispatchCommand(PluginCallbackDispatchCommand &&command,
+		                                         LuaBatchDispatchResult        &&result);
+		/**
+		 * @brief Applies and routes a completed plugin callback dispatch result.
+		 * @param command Completed dispatch command.
+		 * @param result Completed dispatch result before deferred mutation application.
+		 */
+		void handleCompletedPluginCallbackDispatchCommand(PluginCallbackDispatchCommand &&command,
+		                                                  LuaBatchDispatchResult        &&result);
+		/**
+		 * @brief Stores a modal-yielded callback command until the modal result resumes it.
+		 * @param command Suspended original dispatch command.
+		 * @param result Suspended result carrying the modal resume id.
+		 * @param nextEngineIndex Next original recipient index to dispatch after resumed engine completes.
+		 */
+		void storeSuspendedPluginCallbackDispatch(PluginCallbackDispatchCommand &&command,
+		                                          LuaBatchDispatchResult &&result, int nextEngineIndex);
+		/**
+		 * @brief Posts the GUI modal request for a stored suspended callback.
+		 * @param resumeId Runtime resume id associated with the suspended command.
+		 * @param request Modal request to execute.
+		 */
+		void postLuaModalStringRequest(quint64 resumeId, LuaPendingModalStringRequest &&request);
+		/**
+		 * @brief Returns whether a retained command is suspended.
+		 * @param commandId Dispatch command id.
+		 * @return `true` when a suspended dispatch owns the command id.
+		 */
+		[[nodiscard]] bool hasSuspendedPluginCallbackDispatchCommand(quint64 commandId) const;
+		/**
+		 * @brief Cancels suspended dispatches that target any listed Lua engine.
+		 * @param engines Engines being unloaded or torn down.
+		 */
+		void               cancelSuspendedPluginCallbackDispatchesForEngines(
+		    const QVector<QSharedPointer<LuaCallbackEngine>> &engines);
+		/**
+		 * @brief Abandons one suspended dispatch and completes its original command with fallback.
+		 * @param resumeId Runtime resume id for the suspended dispatch.
+		 * @param cancelLuaCoroutine Whether to cancel the engine-owned suspended Lua coroutine.
+		 */
+		void finishSuspendedPluginCallbackDispatchWithFallback(quint64 resumeId, bool cancelLuaCoroutine);
+		/**
+		 * @brief Applies a modal resume result to its suspended original dispatch command.
+		 * @param resumeId Resume id returned by the modal API.
+		 * @param result Result produced by resuming the Lua coroutine.
+		 */
+		void handleModalResumeDispatchResult(quint64 resumeId, LuaBatchDispatchResult &&result);
+		/**
+		 * @brief Continues remaining recipients for a suspended callback dispatch.
+		 * @param suspended Suspended original command state.
+		 * @param resumeResult Result produced by the resumed recipient.
+		 */
+		void continueSuspendedPluginCallbackDispatch(SuspendedPluginCallbackDispatch &&suspended,
+		                                             LuaBatchDispatchResult          &&resumeResult);
+		/**
+		 * @brief Marks a miniwindow as executing script from runtime-owned callback dispatch.
+		 * @param windowName Miniwindow name.
+		 */
+		void beginMiniWindowCallbackScriptExecution(const QString &windowName);
+		/**
+		 * @brief Clears one runtime-owned miniwindow script execution mark.
+		 * @param windowName Miniwindow name.
+		 */
+		void endMiniWindowCallbackScriptExecution(const QString &windowName);
 		/**
 		 * @brief Propagates the current observed plugin callback set to loaded Lua engines.
 		 * @param completionBarrier Wait for worker completion when `true`.
@@ -5179,10 +5276,14 @@ class WorldRuntime : public QObject
 		 * @param functionName Callback function name.
 		 * @param flags Mouse/keyboard flags.
 		 * @param hotspotId Hotspot id.
+		 * @param miniWindowName Miniwindow whose callback is executing.
+		 * @param queueWhenCallbackLaneBusy Queue modal-menu hotspot callbacks instead of executing
+		 * synchronously when the callback lane is already busy.
 		 * @return `true` when callback succeeds.
 		 */
 		bool callPluginHotspotFunction(const QString &pluginId, const QString &functionName, long flags,
-		                               const QString &hotspotId);
+		                               const QString &hotspotId, const QString &miniWindowName,
+		                               bool queueWhenCallbackLaneBusy = false);
 		/**
 		 * @brief Emits/coalesces miniwindow-change notification based on active batch depth.
 		 */
@@ -5192,9 +5293,13 @@ class WorldRuntime : public QObject
 		 * @param functionName Callback function name.
 		 * @param flags Mouse/keyboard flags.
 		 * @param hotspotId Hotspot id.
+		 * @param miniWindowName Miniwindow whose callback is executing.
+		 * @param queueWhenCallbackLaneBusy Queue modal-menu hotspot callbacks instead of executing
+		 * synchronously when the callback lane is already busy.
 		 * @return `true` when callback succeeds.
 		 */
-		bool callWorldHotspotFunction(const QString &functionName, long flags, const QString &hotspotId);
+		bool callWorldHotspotFunction(const QString &functionName, long flags, const QString &hotspotId,
+		                              const QString &miniWindowName, bool queueWhenCallbackLaneBusy = false);
 		/**
 		 * @brief Saves one plugin state snapshot.
 		 * @param plugin Plugin instance.
@@ -5393,185 +5498,198 @@ class WorldRuntime : public QObject
 				std::function<void(const LuaBatchDispatchResult &)> completion;
 				qint64                                              enqueuedAtNs{0};
 				int                                                 queueDepthAtEnqueue{0};
+				bool                                                miniWindowExecutionGuardActive{false};
+		};
+		struct SuspendedPluginCallbackDispatch
+		{
+				PluginCallbackDispatchCommand                        command;
+				LuaBatchDispatchResult                               partialResult;
+				QString                                              pluginId;
+				std::function<void(WorldRuntime &, const QString &)> beforeRuntimeResumeCallback;
+				quint64                                              engineModalResumeId{0};
+				int                                                  nextEngineIndex{0};
+				bool                                                 resumeQueued{false};
 		};
 		struct RawIngressPayload
 		{
 				QByteArray data;
 				bool       simulatedInput{false};
 		};
-		QQueue<PluginCallbackDispatchCommand>    m_pluginCallbackDispatchQueue;
-		QHash<quint64, LuaBatchDispatchResult>   m_pluginCallbackDispatchResults;
-		quint64                                  m_nextPluginCallbackDispatchId{1};
-		bool                                     m_pluginCallbackDispatchActive{false};
-		bool                                     m_pluginCallbackDispatchWorkerInFlight{false};
-		bool                                     m_pluginCallbackDispatchDrainQueued{false};
-		bool                                     m_pluginCallbackDispatchShuttingDown{false};
-		QQueue<RawIngressPayload>                m_pendingRawIngressPayloads;
-		bool                                     m_rawIngressProcessing{false};
-		int                                      m_pendingMiniWindowMouseX{0};
-		int                                      m_pendingMiniWindowMouseY{0};
-		QString                                  m_pendingMiniWindowMouseWindowName;
-		bool                                     m_hasPendingMiniWindowMouseMoved{false};
-		bool                                     m_pendingMiniWindowMouseMovedQueued{false};
-		QList<Include>                           m_includes;
-		QList<Script>                            m_scripts;
-		QString                                  m_comments;
-		QVector<LineEntry>                       m_lines;
-		QMap<qint64, int>                        m_acceleratorKeyToCommand;
-		QMap<int, AcceleratorEntry>              m_commandToAcceleratorEntry;
-		int                                      m_nextAcceleratorCommand{kAcceleratorFirstCommand};
-		QMap<QString, MiniWindow>                m_miniWindows;
-		int                                      m_miniWindowMutationBatchDepth{0};
-		bool                                     m_miniWindowsChangedPending{false};
-		bool                                     m_suppressMiniWindowsChangedSignal{false};
-		int                                      m_outputViewMutationBatchDepth{0};
-		bool                                     m_outputViewLineChangedPending{false};
-		int                                      m_outputViewLineChangedIndex{-1};
-		bool                                     m_outputViewRangeChangedPending{false};
-		int                                      m_outputViewFirstChangedIndex{-1};
-		QVector<QMudMemoryImageDecodeCacheEntry> m_memoryImageDecodeCache;
-		qint64                                   m_memoryImageDecodeCacheBytes{0};
-		int                                      m_absoluteReferenceRightOver{0};
-		int                                      m_absoluteReferenceBottomOver{0};
-		int                                      m_absoluteReferenceRightUnder{0};
-		int                                      m_absoluteReferenceBottomUnder{0};
-		QSet<QString>                            m_specialFontPaths;
-		QVector<QString>                         m_specialFontPathOrder;
-		QVector<int>                             m_specialFontIds;
-		QFile                                    m_logFile;
-		QString                                  m_logFileName;
-		QString                                  m_logRotationBaseFileName;
-		bool                                     m_logRotateInProgress{false};
-		QString                                  m_defaultWorldDirectory;
-		QString                                  m_defaultLogDirectory;
-		QString                                  m_startupDirectory;
-		QString                                  m_worldFilePath;
-		QString                                  m_pluginsDirectory;
-		QString                                  m_stateFilesDirectory;
-		QString                                  m_fileBrowsingDirectory;
-		QString                                  m_preferencesDatabaseName;
-		QString                                  m_translatorFile;
-		QString                                  m_locale;
-		QString                                  m_fixedPitchFont;
-		QString                                  m_statusMessage;
-		QString                                  m_wordUnderMenu;
-		bool                                     m_wordUnderMenuResolved{false};
-		bool                                     m_debugIncomingPackets{false};
-		QString                                  m_lastImmediateExpression;
-		QString                                  m_lastCommandSent;
-		QString                                  m_lastTelnetSubnegotiation;
-		int                                      m_totalLinesSent{0};
-		QDateTime                                m_lastUserInput;
-		int                                      m_linesReceived{0};
-		int                                      m_utf8ErrorCount{0};
-		int                                      m_lastLineWithIacGa{0};
-		unsigned short                           m_currentActionSource{eUnknownActionSource};
-		int                                      m_newLines{0};
-		bool                                     m_doingSimulate{false};
-		bool                                     m_tabCompleteFunctions{false};
-		QSet<QString>                            m_shiftTabCompleteItems;
-		bool                                     m_active{false};
-		int                                      m_triggersMatchedThisSession{0};
-		int                                      m_triggersEvaluatedCount{0};
-		int                                      m_aliasesMatchedThisSession{0};
-		int                                      m_aliasesEvaluatedCount{0};
-		int                                      m_timersFiredThisSession{0};
-		int                                      m_connectPhase{eConnectNotConnected};
-		bool                                     m_connectViaProxy{false};
-		bool                                     m_tlsEncryptionEnabled{false};
-		int                                      m_tlsMethod{0};
-		bool                                     m_tlsDisableCertificateValidation{false};
-		bool                                     m_socketReadyForWorld{false};
-		quint64                                  m_startTlsFallbackGeneration{0};
-		QString                                  m_proxyAddressString;
-		quint32                                  m_proxyAddressV4{0};
-		int                                      m_lastPreferencesPage{0};
-		QString                                  m_lastTriggerTreeExpandedGroup;
-		QString                                  m_lastAliasTreeExpandedGroup;
-		QString                                  m_lastTimerTreeExpandedGroup;
-		bool                                     m_hasCachedIp{false};
-		QDateTime                                m_connectTime;
-		bool                                     m_disconnectOk{true};
-		bool                                     m_reconnectOnLinkFailure{false};
-		bool                                     m_incomingSocketDataPaused{false};
-		bool                                     m_reloadReattachSuppressConnectActions{false};
-		bool                                     m_reloadReattachMccpProbePending{false};
-		bool                                     m_reloadReattachMccpResumePending{false};
-		bool                                     m_reloadReattachLookProbeSent{false};
-		bool                                     m_reloadReattachUseDeferredMxpReplay{false};
-		qsizetype                                m_reloadReattachMccpProbeDecisionOffset{0};
-		int                                      m_reloadMccpProbeTimeoutPass{0};
-		QByteArray                               m_reloadReattachMccpProbeBuffer;
-		QList<TelnetProcessor::MxpEvent>         m_reloadReattachMxpProbeEvents;
-		QList<TelnetProcessor::MxpModeChange>    m_reloadReattachMxpProbeModeChanges;
-		quint64                                  m_reloadMccpProbeGeneration{0};
-		QDateTime                                m_statusTime;
-		QDateTime                                m_lastFlushTime;
-		QDateTime                                m_clientStartTime;
-		QDateTime                                m_worldStartTime;
-		int                                      m_mxpErrors{0};
-		bool                                     m_mxpActive{false};
-		bool                                     m_outputFrozen{false};
-		TextRectangleSettings                    m_textRectangle;
-		QMap<int, UdpListener>                   m_udpListeners;
-		QVector<SoundBuffer>                     m_soundBuffers;
-		int                                      m_outputFontHeight{0};
-		int                                      m_outputFontWidth{0};
-		int                                      m_inputFontHeight{0};
-		int                                      m_inputFontWidth{0};
-		int                                      m_queuedCommandCount{0};
-		bool                                     m_removeMapReverses{true};
-		qint64                                   m_bytesIn{0};
-		qint64                                   m_bytesOut{0};
-		int                                      m_inputPacketCount{0};
-		int                                      m_outputPacketCount{0};
-		bool                                     m_isMapping{false};
-		bool                                     m_variablesChanged{false};
-		bool                                     m_lineOmittedFromOutput{false};
-		bool                                     m_traceEnabled{false};
-		bool                                     m_worldFileModified{false};
-		qint64                                   m_newlinesReceived{0};
-		bool                                     m_scriptFileChanged{false};
-		bool                                     m_loadingDocument{false};
-		bool                                     m_inPlaySoundPluginCallback{false};
-		bool                                     m_inCancelSoundPluginCallback{false};
-		bool                                     m_inScreendrawCallback{false};
-		bool                                     m_inDrawOutputWindowCallback{false};
-		int                                      m_forceScriptErrorOutputDepth{0};
-		int                                      m_suppressWorldOutputResizedCallbacks{0};
-		bool                                     m_pluginInstallDeferred{false};
-		bool                                     m_pluginInstallInProgress{false};
-		bool                                     m_pluginInstallRetryQueued{false};
-		QVector<std::function<void()>>           m_pluginInstallCommittedWaiters;
-		bool                                     m_deferredConnectAfterPluginInstallPending{false};
-		bool                                     m_deferredWorldConnectHandlersPending{false};
-		QString                                  m_deferredConnectHost;
-		quint16                                  m_deferredConnectPort{0};
-		int                                      m_outputWindowRedrawCount{0};
-		QFileSystemWatcher                      *m_scriptWatcher{nullptr};
-		QVector<MxpTagFrame>                     m_mxpTagStack;
-		QVector<MxpOpenTag>                      m_mxpOpenTags;
-		QByteArray                               m_mxpTextBuffer;
-		QString                                  m_windowTitleOverride;
-		QString                                  m_mainTitleOverride;
-		class LuaCallbackEngine                 *m_luaCallbacks{nullptr};
-		std::unique_ptr<ILuaExecutor>            m_luaExecutor;
-		QString                                  m_luaScriptText;
-		WorldCommandProcessor                   *m_commandProcessor{nullptr};
-		int                                      m_lastGoTo{1};
-		QList<QString>                           m_mappingList;
-		qint64                                   m_triggerTimeNs{0};
-		qint64                                   m_aliasTimeNs{0};
-		QElapsedTimer                            m_lineTimer;
-		qint64                                   m_nextLineNumber{1};
-		bool                                     m_luaContextLineActive{false};
-		bool                                     m_luaContextLineBuffered{false};
-		bool                                     m_luaContextLineCommitted{false};
-		int                                      m_luaContextLineBufferIndex{0};
-		LineEntry                                m_luaContextLineEntry;
-		QHash<qint64, int>                       m_luaCallbackAfterAnchorInsertionOffsets;
-		mutable quint64                          m_luaCallbackLineBufferSnapshotGeneration{0};
-		mutable quint64                          m_luaCallbackLineBufferSnapshotCacheGeneration{0};
+		QQueue<PluginCallbackDispatchCommand>           m_pluginCallbackDispatchQueue;
+		QHash<quint64, LuaBatchDispatchResult>          m_pluginCallbackDispatchResults;
+		QHash<quint64, SuspendedPluginCallbackDispatch> m_suspendedPluginCallbackDispatches;
+		quint64                                         m_nextPluginCallbackDispatchId{1};
+		quint64                                         m_nextSuspendedPluginCallbackResumeId{1};
+		bool                                            m_pluginCallbackDispatchActive{false};
+		bool                                            m_pluginCallbackDispatchWorkerInFlight{false};
+		bool                                            m_pluginCallbackDispatchDrainQueued{false};
+		bool                                            m_pluginCallbackDispatchShuttingDown{false};
+		QQueue<RawIngressPayload>                       m_pendingRawIngressPayloads;
+		bool                                            m_rawIngressProcessing{false};
+		int                                             m_pendingMiniWindowMouseX{0};
+		int                                             m_pendingMiniWindowMouseY{0};
+		QString                                         m_pendingMiniWindowMouseWindowName;
+		bool                                            m_hasPendingMiniWindowMouseMoved{false};
+		bool                                            m_pendingMiniWindowMouseMovedQueued{false};
+		QList<Include>                                  m_includes;
+		QList<Script>                                   m_scripts;
+		QString                                         m_comments;
+		QVector<LineEntry>                              m_lines;
+		QMap<qint64, int>                               m_acceleratorKeyToCommand;
+		QMap<int, AcceleratorEntry>                     m_commandToAcceleratorEntry;
+		int                                             m_nextAcceleratorCommand{kAcceleratorFirstCommand};
+		QMap<QString, MiniWindow>                       m_miniWindows;
+		int                                             m_miniWindowMutationBatchDepth{0};
+		bool                                            m_miniWindowsChangedPending{false};
+		bool                                            m_suppressMiniWindowsChangedSignal{false};
+		int                                             m_outputViewMutationBatchDepth{0};
+		bool                                            m_outputViewLineChangedPending{false};
+		int                                             m_outputViewLineChangedIndex{-1};
+		bool                                            m_outputViewRangeChangedPending{false};
+		int                                             m_outputViewFirstChangedIndex{-1};
+		QVector<QMudMemoryImageDecodeCacheEntry>        m_memoryImageDecodeCache;
+		qint64                                          m_memoryImageDecodeCacheBytes{0};
+		int                                             m_absoluteReferenceRightOver{0};
+		int                                             m_absoluteReferenceBottomOver{0};
+		int                                             m_absoluteReferenceRightUnder{0};
+		int                                             m_absoluteReferenceBottomUnder{0};
+		QSet<QString>                                   m_specialFontPaths;
+		QVector<QString>                                m_specialFontPathOrder;
+		QVector<int>                                    m_specialFontIds;
+		QFile                                           m_logFile;
+		QString                                         m_logFileName;
+		QString                                         m_logRotationBaseFileName;
+		bool                                            m_logRotateInProgress{false};
+		QString                                         m_defaultWorldDirectory;
+		QString                                         m_defaultLogDirectory;
+		QString                                         m_startupDirectory;
+		QString                                         m_worldFilePath;
+		QString                                         m_pluginsDirectory;
+		QString                                         m_stateFilesDirectory;
+		QString                                         m_fileBrowsingDirectory;
+		QString                                         m_preferencesDatabaseName;
+		QString                                         m_translatorFile;
+		QString                                         m_locale;
+		QString                                         m_fixedPitchFont;
+		QString                                         m_statusMessage;
+		QString                                         m_wordUnderMenu;
+		bool                                            m_wordUnderMenuResolved{false};
+		bool                                            m_debugIncomingPackets{false};
+		QString                                         m_lastImmediateExpression;
+		QString                                         m_lastCommandSent;
+		QString                                         m_lastTelnetSubnegotiation;
+		int                                             m_totalLinesSent{0};
+		QDateTime                                       m_lastUserInput;
+		int                                             m_linesReceived{0};
+		int                                             m_utf8ErrorCount{0};
+		int                                             m_lastLineWithIacGa{0};
+		unsigned short                                  m_currentActionSource{eUnknownActionSource};
+		int                                             m_newLines{0};
+		bool                                            m_doingSimulate{false};
+		bool                                            m_tabCompleteFunctions{false};
+		QSet<QString>                                   m_shiftTabCompleteItems;
+		bool                                            m_active{false};
+		int                                             m_triggersMatchedThisSession{0};
+		int                                             m_triggersEvaluatedCount{0};
+		int                                             m_aliasesMatchedThisSession{0};
+		int                                             m_aliasesEvaluatedCount{0};
+		int                                             m_timersFiredThisSession{0};
+		int                                             m_connectPhase{eConnectNotConnected};
+		bool                                            m_connectViaProxy{false};
+		bool                                            m_tlsEncryptionEnabled{false};
+		int                                             m_tlsMethod{0};
+		bool                                            m_tlsDisableCertificateValidation{false};
+		bool                                            m_socketReadyForWorld{false};
+		quint64                                         m_startTlsFallbackGeneration{0};
+		QString                                         m_proxyAddressString;
+		quint32                                         m_proxyAddressV4{0};
+		int                                             m_lastPreferencesPage{0};
+		QString                                         m_lastTriggerTreeExpandedGroup;
+		QString                                         m_lastAliasTreeExpandedGroup;
+		QString                                         m_lastTimerTreeExpandedGroup;
+		bool                                            m_hasCachedIp{false};
+		QDateTime                                       m_connectTime;
+		bool                                            m_disconnectOk{true};
+		bool                                            m_reconnectOnLinkFailure{false};
+		bool                                            m_incomingSocketDataPaused{false};
+		bool                                            m_reloadReattachSuppressConnectActions{false};
+		bool                                            m_reloadReattachMccpProbePending{false};
+		bool                                            m_reloadReattachMccpResumePending{false};
+		bool                                            m_reloadReattachLookProbeSent{false};
+		bool                                            m_reloadReattachUseDeferredMxpReplay{false};
+		qsizetype                                       m_reloadReattachMccpProbeDecisionOffset{0};
+		int                                             m_reloadMccpProbeTimeoutPass{0};
+		QByteArray                                      m_reloadReattachMccpProbeBuffer;
+		QList<TelnetProcessor::MxpEvent>                m_reloadReattachMxpProbeEvents;
+		QList<TelnetProcessor::MxpModeChange>           m_reloadReattachMxpProbeModeChanges;
+		quint64                                         m_reloadMccpProbeGeneration{0};
+		QDateTime                                       m_statusTime;
+		QDateTime                                       m_lastFlushTime;
+		QDateTime                                       m_clientStartTime;
+		QDateTime                                       m_worldStartTime;
+		int                                             m_mxpErrors{0};
+		bool                                            m_mxpActive{false};
+		bool                                            m_outputFrozen{false};
+		TextRectangleSettings                           m_textRectangle;
+		QMap<int, UdpListener>                          m_udpListeners;
+		QVector<SoundBuffer>                            m_soundBuffers;
+		int                                             m_outputFontHeight{0};
+		int                                             m_outputFontWidth{0};
+		int                                             m_inputFontHeight{0};
+		int                                             m_inputFontWidth{0};
+		int                                             m_queuedCommandCount{0};
+		bool                                            m_removeMapReverses{true};
+		qint64                                          m_bytesIn{0};
+		qint64                                          m_bytesOut{0};
+		int                                             m_inputPacketCount{0};
+		int                                             m_outputPacketCount{0};
+		bool                                            m_isMapping{false};
+		bool                                            m_variablesChanged{false};
+		bool                                            m_lineOmittedFromOutput{false};
+		bool                                            m_traceEnabled{false};
+		bool                                            m_worldFileModified{false};
+		qint64                                          m_newlinesReceived{0};
+		bool                                            m_scriptFileChanged{false};
+		bool                                            m_loadingDocument{false};
+		bool                                            m_inPlaySoundPluginCallback{false};
+		bool                                            m_inCancelSoundPluginCallback{false};
+		bool                                            m_inScreendrawCallback{false};
+		bool                                            m_inDrawOutputWindowCallback{false};
+		int                                             m_forceScriptErrorOutputDepth{0};
+		int                                             m_suppressWorldOutputResizedCallbacks{0};
+		bool                                            m_pluginInstallDeferred{false};
+		bool                                            m_pluginInstallInProgress{false};
+		bool                                            m_pluginInstallRetryQueued{false};
+		QVector<std::function<void()>>                  m_pluginInstallCommittedWaiters;
+		bool                                            m_deferredConnectAfterPluginInstallPending{false};
+		bool                                            m_deferredWorldConnectHandlersPending{false};
+		QString                                         m_deferredConnectHost;
+		quint16                                         m_deferredConnectPort{0};
+		int                                             m_outputWindowRedrawCount{0};
+		QFileSystemWatcher                             *m_scriptWatcher{nullptr};
+		QVector<MxpTagFrame>                            m_mxpTagStack;
+		QVector<MxpOpenTag>                             m_mxpOpenTags;
+		QByteArray                                      m_mxpTextBuffer;
+		QString                                         m_windowTitleOverride;
+		QString                                         m_mainTitleOverride;
+		class LuaCallbackEngine                        *m_luaCallbacks{nullptr};
+		std::unique_ptr<ILuaExecutor>                   m_luaExecutor;
+		QString                                         m_luaScriptText;
+		WorldCommandProcessor                          *m_commandProcessor{nullptr};
+		int                                             m_lastGoTo{1};
+		QList<QString>                                  m_mappingList;
+		qint64                                          m_triggerTimeNs{0};
+		qint64                                          m_aliasTimeNs{0};
+		QElapsedTimer                                   m_lineTimer;
+		qint64                                          m_nextLineNumber{1};
+		bool                                            m_luaContextLineActive{false};
+		bool                                            m_luaContextLineBuffered{false};
+		bool                                            m_luaContextLineCommitted{false};
+		int                                             m_luaContextLineBufferIndex{0};
+		LineEntry                                       m_luaContextLineEntry;
+		QHash<qint64, int>                              m_luaCallbackAfterAnchorInsertionOffsets;
+		mutable quint64                                 m_luaCallbackLineBufferSnapshotGeneration{0};
+		mutable quint64                                 m_luaCallbackLineBufferSnapshotCacheGeneration{0};
 		mutable QSharedPointer<const LuaCallbackLineBufferSnapshot> m_luaCallbackLineBufferSnapshotCache;
 		mutable quint64 m_luaCallbackRecentLineBufferSnapshotCacheGeneration{0};
 		mutable QSharedPointer<const LuaCallbackLineBufferSnapshot>

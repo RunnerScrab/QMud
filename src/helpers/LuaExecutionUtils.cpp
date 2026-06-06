@@ -933,6 +933,166 @@ bool qmudLuaBridgeInvokeOnObjectThread(const QObject *target, const std::functio
 	Q_UNREACHABLE_RETURN(false);
 }
 
+bool qmudLuaBridgeInvokeModalOnObjectThread(const QObject *target, const std::function<void()> &fn)
+{
+	clearLuaBridgeError();
+	if (!target || !fn)
+		return setLuaBridgeError(
+		    LuaBridgeInvokeStatus::InvalidTargetOrCallback,
+		    QStringLiteral("[QMud][LuaBridge] Modal invoke failed: invalid target or callback"));
+
+	QThread *const targetThread = target->thread();
+	if (!targetThread)
+	{
+		return setLuaBridgeError(
+		    LuaBridgeInvokeStatus::NoOwningThread,
+		    QStringLiteral("[QMud][LuaBridge] Modal invoke failed for target %1: no owning thread")
+		        .arg(QString::number(reinterpret_cast<quintptr>(target), 16).toUpper()));
+	}
+
+	QThread *const currentThread = QThread::currentThread();
+	if (currentThread == targetThread)
+	{
+		try
+		{
+			fn();
+			return true;
+		}
+		catch (const std::bad_alloc &)
+		{
+			return setLuaBridgeError(
+			    LuaBridgeInvokeStatus::UnknownFailure,
+			    QStringLiteral("[QMud][LuaBridge] Modal invoke callback threw std::bad_alloc"));
+		}
+		catch (const std::exception &ex)
+		{
+			return setLuaBridgeError(
+			    LuaBridgeInvokeStatus::UnknownFailure,
+			    QStringLiteral("[QMud][LuaBridge] Modal invoke callback threw exception: %1")
+			        .arg(QString::fromLocal8Bit(ex.what())));
+		}
+		catch (...)
+		{
+			return setLuaBridgeError(
+			    LuaBridgeInvokeStatus::UnknownFailure,
+			    QStringLiteral("[QMud][LuaBridge] Modal invoke callback threw unknown exception"));
+		}
+	}
+
+	const std::shared_ptr<LuaBridgeThreadContext> targetContext = contextForThread(targetThread);
+	if (!ensureBridgeContextReady(targetContext, QStringLiteral("Modal invoke")))
+		return false;
+
+	const QPointer<const QObject>           targetGuard(target);
+	const std::shared_ptr<LuaBridgeRequest> request = std::make_shared<LuaBridgeRequest>();
+	request->fn                                     = [targetGuard, fn]
+	{
+		if (targetGuard)
+			fn();
+	};
+
+	if (!enqueueBridgeRequest(targetContext, request))
+	{
+		{
+			QMutexLocker locker(&targetContext->mutex);
+			targetContext->queue.removeOne(request);
+		}
+		return setLuaBridgeError(
+		    LuaBridgeInvokeStatus::EnqueueFailed,
+		    QStringLiteral(
+		        "[QMud][LuaBridge] Modal invoke failed for edge %1 -> %2: unable to enqueue bridge request")
+		        .arg(threadLabel(currentThread), threadLabel(targetThread)));
+	}
+
+	const qint64 invokeTimeoutMs =
+	    qMax<qint64>(1, g_luaBridgeInvokeTimeoutMs.load(std::memory_order_relaxed));
+	QDeadlineTimer deadline(invokeTimeoutMs);
+	auto isRequestCompleted = [&](bool &canceled, LuaBridgeInvokeStatus &status, QString &reason) -> bool
+	{
+		QMutexLocker requestLocker(&request->mutex);
+		if (!request->done)
+			return false;
+		canceled = request->canceled;
+		status   = request->cancelStatus;
+		reason   = request->cancelReason;
+		return true;
+	};
+	auto completeStatusOrSuccess = [&](const bool canceled, const LuaBridgeInvokeStatus status,
+	                                   const QString &reason) -> bool
+	{
+		if (!canceled)
+			return true;
+		const QString fallbackReason =
+		    QStringLiteral("[QMud][LuaBridge] Modal invoke failed for edge %1 -> %2: request canceled")
+		        .arg(threadLabel(currentThread), threadLabel(targetThread));
+		return setLuaBridgeError(status, reason.isEmpty() ? fallbackReason : reason);
+	};
+	const QString targetThreadStoppedReason =
+	    QStringLiteral("[QMud][LuaBridge] Modal invoke failed for edge %1 -> %2: target thread stopped while "
+	                   "request was executing")
+	        .arg(threadLabel(currentThread), threadLabel(targetThread));
+	bool                  requestCanceled = false;
+	LuaBridgeInvokeStatus cancelStatus    = LuaBridgeInvokeStatus::Success;
+	QString               cancelReason;
+	for (;;)
+	{
+		if (isRequestCompleted(requestCanceled, cancelStatus, cancelReason))
+			return completeStatusOrSuccess(requestCanceled, cancelStatus, cancelReason);
+		if (!targetThread->isRunning())
+			return setLuaBridgeError(LuaBridgeInvokeStatus::RequestCanceledTargetThreadStopped,
+			                         targetThreadStoppedReason);
+		if (deadline.hasExpired())
+			break;
+
+		QMutexLocker requestLocker(&request->mutex);
+		if (request->done)
+			continue;
+		const qint64 waitMs = qMax<qint64>(1, qMin<qint64>(deadline.remainingTime(), 100));
+		request->wake.wait(&request->mutex, static_cast<unsigned long>(waitMs));
+	}
+
+	bool canceledBeforeDispatch = false;
+	{
+		QMutexLocker contextLocker(&targetContext->mutex);
+		canceledBeforeDispatch = targetContext->queue.removeOne(request);
+	}
+	if (canceledBeforeDispatch)
+	{
+		QMutexLocker requestLocker(&request->mutex);
+		if (!request->done)
+		{
+			request->canceled     = true;
+			request->cancelStatus = LuaBridgeInvokeStatus::RequestCanceledBeforeDispatch;
+			request->cancelReason =
+			    QStringLiteral(
+			        "[QMud][LuaBridge] Modal invoke timed out and canceled queued request for edge %1 -> %2")
+			        .arg(threadLabel(currentThread), threadLabel(targetThread));
+			request->done = true;
+			request->wake.wakeAll();
+		}
+		const QString reason = request->cancelReason.isEmpty()
+		                           ? QStringLiteral("[QMud][LuaBridge] Modal invoke timed out and canceled "
+		                                            "queued request for edge %1 -> %2")
+		                                 .arg(threadLabel(currentThread), threadLabel(targetThread))
+		                           : request->cancelReason;
+		return setLuaBridgeError(request->cancelStatus, reason);
+	}
+
+	for (;;)
+	{
+		if (isRequestCompleted(requestCanceled, cancelStatus, cancelReason))
+			return completeStatusOrSuccess(requestCanceled, cancelStatus, cancelReason);
+		if (!targetThread->isRunning())
+			return setLuaBridgeError(LuaBridgeInvokeStatus::RequestCanceledTargetThreadStopped,
+			                         targetThreadStoppedReason);
+
+		QMutexLocker requestLocker(&request->mutex);
+		if (!request->done)
+			request->wake.wait(&request->mutex, 100UL);
+	}
+	Q_UNREACHABLE_RETURN(false);
+}
+
 int qmudLuaBridgeInvokeTimeoutMs()
 {
 	return static_cast<int>(qMax<qint64>(1, g_luaBridgeInvokeTimeoutMs.load(std::memory_order_relaxed)));
@@ -954,6 +1114,30 @@ LuaBridgeInvokeStatus qmudLuaBridgeLastStatus()
 	return t_luaBridgeLastStatus;
 }
 
+bool qmudLuaStatesShareMainThread(lua_State *left, lua_State *right)
+{
+#ifdef QMUD_ENABLE_LUA_SCRIPTING
+	if (!left || !right)
+		return false;
+	if (left == right)
+		return true;
+	const auto mainThreadForState = [](lua_State *state) -> lua_State *
+	{
+		if (!lua_checkstack(state, 1))
+			return state;
+		lua_rawgeti(state, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
+		lua_State *mainThread = lua_tothread(state, -1);
+		lua_pop(state, 1);
+		return mainThread ? mainThread : state;
+	};
+	return mainThreadForState(left) == mainThreadForState(right);
+#else
+	Q_UNUSED(left);
+	Q_UNUSED(right);
+	return false;
+#endif
+}
+
 CallPluginLuaMarshallingResult qmudCallPluginLuaWithMarshalling(lua_State     *callerState,
                                                                 lua_State     *targetState,
                                                                 const QString &routine, const int firstArg)
@@ -968,25 +1152,25 @@ CallPluginLuaMarshallingResult qmudCallPluginLuaWithMarshalling(lua_State     *c
 
 	const int top      = lua_gettop(callerState);
 	const int argCount = qMax(0, top - firstArg + 1);
-	if (targetState == callerState)
+	if (qmudLuaStatesShareMainThread(callerState, targetState))
 	{
-		if (!pushNestedFunction(targetState, routine))
+		if (!pushNestedFunction(callerState, routine))
 		{
 			result.error = CallPluginLuaMarshallingError::NoSuchRoutine;
 			return result;
 		}
 
-		lua_insert(targetState, firstArg);
-		if (QMudLuaSupport::callLuaProtected(targetState, argCount, LUA_MULTRET, 0) != 0)
+		lua_insert(callerState, firstArg);
+		if (QMudLuaSupport::callLuaProtected(callerState, argCount, LUA_MULTRET, 0) != 0)
 		{
-			const char *err     = lua_tostring(targetState, -1);
+			const char *err     = lua_tostring(callerState, -1);
 			result.error        = CallPluginLuaMarshallingError::RuntimeError;
 			result.runtimeError = QString::fromUtf8(err ? err : "unknown");
-			lua_pop(targetState, 1);
+			lua_settop(callerState, firstArg - 1);
 			return result;
 		}
 
-		result.returnCount = lua_gettop(targetState) - firstArg + 1;
+		result.returnCount = lua_gettop(callerState) - firstArg + 1;
 		return result;
 	}
 

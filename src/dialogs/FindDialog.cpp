@@ -15,6 +15,7 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QRadioButton>
@@ -106,6 +107,11 @@ int FindDialog::execModal()
 		findCombo.setCurrentText(m_findText);
 	else if (findCombo.count() > 0)
 		findCombo.setCurrentIndex(0);
+	if (QLineEdit *findEdit = findCombo.lineEdit())
+	{
+		findEdit->selectAll();
+		findEdit->setFocus(Qt::OtherFocusReason);
+	}
 	findLabel.setBuddy(&findCombo);
 
 	findLayout.addWidget(&findLabel);
