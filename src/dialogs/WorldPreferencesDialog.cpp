@@ -1930,6 +1930,9 @@ void WorldPreferencesDialog::accept()
 		if (m_connectMethod && m_connectMethod->currentIndex() >= 0)
 			m_runtime->setWorldAttribute(QStringLiteral("connect_method"),
 			                             QString::number(m_connectMethod->currentData().toInt()));
+		if (m_connectDelay)
+			m_runtime->setWorldAttribute(QStringLiteral("connect_delay"),
+			                             QString::number(m_connectDelay->value()));
 		if (m_onlyNegotiateTelnetOptionsOnce)
 			m_runtime->setWorldAttribute(QStringLiteral("only_negotiate_telnet_options_once"),
 			                             m_onlyNegotiateTelnetOptionsOnce->isChecked() ? QStringLiteral("1")
@@ -7233,12 +7236,25 @@ void WorldPreferencesDialog::buildUi()
 	m_password->setEchoMode(QLineEdit::Password);
 	m_connectMethod = new QComboBox(connectGroup);
 	m_connectMethod->addItem(QStringLiteral("No auto-connect"), eNoAutoConnect);
-	m_connectMethod->addItem(QStringLiteral("QMud"), eConnectMUSH);
+	m_connectMethod->addItem(QStringLiteral("MUSH"), eConnectMUSH);
 	m_connectMethod->addItem(QStringLiteral("Diku"), eConnectDiku);
 	m_connectMethod->addItem(QStringLiteral("MXP"), eConnectMXP);
+	m_connectDelay = new QSpinBox(connectGroup);
+	m_connectDelay->setRange(0, 10000);
+	m_connectDelay->setSingleStep(100);
+	m_connectDelay->setSuffix(QStringLiteral(" ms"));
+	configureSpinBoxWidthForRange(m_connectDelay);
+	auto *connectRow       = new QWidget(connectGroup);
+	auto *connectRowLayout = new QHBoxLayout(connectRow);
+	connectRowLayout->setContentsMargins(0, 0, 0, 0);
+	connectRowLayout->setSpacing(8);
+	connectRowLayout->addWidget(m_connectMethod);
+	connectRowLayout->addWidget(new QLabel(QStringLiteral("Delay"), connectRow));
+	connectRowLayout->addWidget(m_connectDelay);
+	connectRowLayout->addStretch(1);
 	connectForm->addRow(QStringLiteral("Name"), m_playerName);
 	connectForm->addRow(QStringLiteral("Password"), m_password);
-	connectForm->addRow(QStringLiteral("Connect"), m_connectMethod);
+	connectForm->addRow(QStringLiteral("Connect"), connectRow);
 	connectingLayout->addWidget(connectGroup);
 
 	auto *connectTextGroup  = new QGroupBox(QStringLiteral("Connect Text"), connectingPage);
@@ -10967,6 +10983,8 @@ void WorldPreferencesDialog::populateConnecting() const
 		if (const int index = m_connectMethod->findData(method); index >= 0)
 			m_connectMethod->setCurrentIndex(index);
 	}
+	if (m_connectDelay)
+		m_connectDelay->setValue(attrs.value(QStringLiteral("connect_delay")).toInt());
 	if (m_onlyNegotiateTelnetOptionsOnce)
 	{
 		m_onlyNegotiateTelnetOptionsOnce->setChecked(

@@ -141,7 +141,7 @@ class WorldCommandProcessor : public QObject
 		/**
 		 * @brief Stops connection-dependent processing after disconnect.
 		 */
-		void handleWorldDisconnected() const;
+		void handleWorldDisconnected();
 		/**
 		 * @brief Emits note text to output path.
 		 * @param text Note text.
@@ -526,6 +526,16 @@ class WorldCommandProcessor : public QObject
 		bool canExecuteWorldScript(const QString &functionType, const QString &functionName,
 		                           const LuaCallbackEngine *lua) const;
 		/**
+		 * @brief Sends configured auto-connect strings and fires connect callbacks.
+		 * @param connectMethod Auto-connect method value.
+		 * @param player Character/player name.
+		 * @param password Password text.
+		 * @param connectText Configured connect text.
+		 * @param echoInput Echo player-name send when `true`.
+		 */
+		void runWorldConnectActions(int connectMethod, const QString &player, const QString &password,
+		                            const QString &connectText, bool echoInput);
+		/**
 		 * @brief Emits world-script missing-function warning when configured.
 		 * @param functionType Callback type label.
 		 * @param functionName Callback function name.
@@ -549,6 +559,7 @@ class WorldCommandProcessor : public QObject
 		bool                                         m_regexpMatchEmpty{true};
 		bool                                         m_utf8{false};
 		int                                          m_spamLineCount{0};
+		quint64                                      m_autoConnectDelayGeneration{0};
 		QString                                      m_spamMessage;
 		QString                                      m_lastCommandSent;
 		int                                          m_lastCommandCount{0};
