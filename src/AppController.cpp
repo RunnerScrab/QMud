@@ -4659,7 +4659,7 @@ bool AppController::recoverReloadStartupState()
 		        << "adopt_failures=" << asyncContext->adoptFailures;
 		m_reloadRecoveryReattached += asyncContext->reattachedCount;
 		m_reloadRecoveryReconnectQueued += asyncContext->reconnectCount;
-		qInfo() << kReloadLogTag << "Telemetry:"
+		qInfo() << kReloadLogTag << "Counters:"
 		        << "attempts=" << m_reloadAttempts << "exec_failures=" << m_reloadExecFailures
 		        << "recoveries=" << m_reloadRecoveryRuns << "reattached_total=" << m_reloadRecoveryReattached
 		        << "reconnect_queued_total=" << m_reloadRecoveryReconnectQueued;
