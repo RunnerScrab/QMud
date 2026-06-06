@@ -1521,9 +1521,10 @@ class WorldView : public QWidget
 		 * @param hotspotId Hotspot identifier.
 		 * @param callbackName Callback function name.
 		 * @param flags Callback mouse/keyboard flags.
+		 * @param queueWhenCallbackLaneBusy Queue instead of synchronously waiting when the callback lane is busy.
 		 */
 		void callHotspotCallback(MiniWindow *window, const QString &hotspotId, const QString &callbackName,
-		                         int flags) const;
+		                         int flags, bool queueWhenCallbackLaneBusy = false) const;
 		/**
 		 * @brief Clears currently applied hotspot cursor override.
 		 */

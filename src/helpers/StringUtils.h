@@ -9,57 +9,59 @@
 #ifndef QMUD_STRINGUTILS_H
 #define QMUD_STRINGUTILS_H
 
+// ReSharper disable once CppUnusedIncludeDirective
 #include <QString>
+#include <QStringList>
 
 /**
  * @brief Converts command id to canonical command string.
  * @param id Command identifier.
  * @return Canonical command string.
  */
-QString qmudCommandIdToString(int id);
+QString     qmudCommandIdToString(int id);
 /**
  * @brief Converts command string to command id.
  * @param command Command string.
  * @return Command identifier, or 0 when unknown.
  */
-int     qmudStringToCommandId(const QString &command);
+int         qmudStringToCommandId(const QString &command);
 /**
  * @brief Expands escape sequences in user-facing text.
  * @param source Source text.
  * @return Text with escape sequences expanded.
  */
-QString qmudFixupEscapeSequences(const QString &source);
+QString     qmudFixupEscapeSequences(const QString &source);
 /**
  * @brief Applies German character fixups used by legacy behavior.
  * @param message Source text.
  * @return Text with legacy German fixups applied.
  */
-QString qmudFixUpGerman(const QString &message);
+QString     qmudFixUpGerman(const QString &message);
 /**
  * @brief Removes ANSI CSI escape sequences from text.
  * @param input Source text that may include terminal escape codes.
  * @return Text with ANSI control sequences removed.
  */
-QString qmudStripAnsiEscapeCodes(const QString &input);
+QString     qmudStripAnsiEscapeCodes(const QString &input);
 /**
  * @brief Parses enabled flag strings (y/n/true/false).
  * @param value Flag text.
  * @return Parsed boolean flag value.
  */
-bool    qmudIsEnabledFlag(const QString &value);
+bool        qmudIsEnabledFlag(const QString &value);
 /**
  * @brief Converts boolean to legacy y/n string.
  * @param value Boolean value.
  * @return Legacy `y`/`n` string.
  */
-QString qmudBoolToYn(bool value);
+QString     qmudBoolToYn(bool value);
 /**
  * @brief Computes edit distance between two strings.
  * @param source Source text.
  * @param target Target text.
  * @return Edit distance.
  */
-int     qmudEditDistance(QStringView source, QStringView target);
+int         qmudEditDistance(QStringView source, QStringView target);
 /**
  * @brief Replaces target substring in source with replacement text.
  * @param source Source text.
@@ -68,7 +70,13 @@ int     qmudEditDistance(QStringView source, QStringView target);
  * @param replaceAll Replace all matches when `true`, only first otherwise.
  * @return Resulting string.
  */
-QString qmudReplaceString(const QString &source, const QString &target, const QString &replacement,
-                          bool replaceAll = true);
+QString     qmudReplaceString(const QString &source, const QString &target, const QString &replacement,
+                              bool replaceAll = true);
+/**
+ * @brief Splits a legacy pipe-delimited menu string and trims spaces around each token.
+ * @param items Source menu text.
+ * @return Menu tokens preserving empty fields after trimming.
+ */
+QStringList qmudSplitLegacyMenuItems(const QString &items);
 
 #endif // QMUD_STRINGUTILS_H

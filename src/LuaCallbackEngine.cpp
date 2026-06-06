@@ -38,6 +38,7 @@
 #include "WorldView.h"
 #include "dialogs/SpellCheckDialog.h"
 #include "helpers/LuaExecutionUtils.h"
+#include "helpers/LuaModalDialogUtils.h"
 #include "helpers/MainFrameMdiUtils.h"
 #include "helpers/MiniWindowUtils.h"
 #include "helpers/PluginPathUtils.h"
@@ -69,6 +70,9 @@
 #include <QGuiApplication>
 #include <QHostInfo>
 #include <QImageReader>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -655,10 +659,23 @@ namespace
 			int  value{0};
 	};
 
+	enum class DeferredRuntimeMutationFlushPolicy
+	{
+		AllowSynchronousBridge,
+		ForbidSynchronousBridge
+	};
+
+	struct YieldableCallbackInvocation
+	{
+			LuaPendingModalStringRequest pendingModalString;
+			bool                         hasPendingModalString{false};
+	};
+
 	thread_local QHash<const LuaCallbackEngine *, QVector<LuaCallbackExecutionContext>>
 	                                                g_luaCallbackExecutionContexts;
 	thread_local QVector<const LuaCallbackEngine *> g_activeLuaCallbackContextStack;
 	thread_local int                                g_activeDeferredMutationContextCount{0};
+	thread_local YieldableCallbackInvocation       *g_yieldableCallbackInvocation{nullptr};
 
 	void updateDeferredMutationPendingState(LuaCallbackExecutionContext &context)
 	{
@@ -683,6 +700,37 @@ namespace
 		context.hasPendingDeferredRuntimeMutations = false;
 		if (g_activeDeferredMutationContextCount > 0)
 			--g_activeDeferredMutationContextCount;
+	}
+
+	void pushActiveCallbackContext(const LuaCallbackEngine *engine, LuaCallbackExecutionContext &&context)
+	{
+		if (!engine)
+			return;
+		g_luaCallbackExecutionContexts[engine].push_back(std::move(context));
+		g_activeLuaCallbackContextStack.push_back(engine);
+	}
+
+	LuaCallbackExecutionContext takeActiveCallbackContext(const LuaCallbackEngine *engine)
+	{
+		LuaCallbackExecutionContext context{};
+		if (!engine)
+			return context;
+		if (!g_activeLuaCallbackContextStack.isEmpty() && g_activeLuaCallbackContextStack.last() == engine)
+			g_activeLuaCallbackContextStack.removeLast();
+		else
+		{
+			const qsizetype stackIndex = g_activeLuaCallbackContextStack.lastIndexOf(engine);
+			if (stackIndex >= 0)
+				g_activeLuaCallbackContextStack.removeAt(stackIndex);
+		}
+		auto it = g_luaCallbackExecutionContexts.find(engine);
+		if (it == g_luaCallbackExecutionContexts.end() || it->isEmpty())
+			return context;
+		context = std::move(it->last());
+		it->removeLast();
+		if (it->isEmpty())
+			g_luaCallbackExecutionContexts.erase(it);
+		return context;
 	}
 
 	QString normalizeCallbackLabel(const QString &name)
@@ -736,7 +784,7 @@ namespace
 		if (it != g_luaCallbackExecutionContexts.end() && !it->isEmpty())
 			return &it->last();
 
-		if (g_activeLuaCallbackContextStack.isEmpty() || !qmudLuaBridgeIsExecutingRequestOnCurrentThread())
+		if (g_activeLuaCallbackContextStack.isEmpty())
 			return nullptr;
 		const LuaCallbackEngine *fallbackEngine = g_activeLuaCallbackContextStack.last();
 		if (!fallbackEngine || fallbackEngine == engine)
@@ -757,7 +805,7 @@ namespace
 		if (it != g_luaCallbackExecutionContexts.constEnd() && !it->isEmpty())
 			return &it->last();
 
-		if (g_activeLuaCallbackContextStack.isEmpty() || !qmudLuaBridgeIsExecutingRequestOnCurrentThread())
+		if (g_activeLuaCallbackContextStack.isEmpty())
 			return nullptr;
 		const LuaCallbackEngine *fallbackEngine = g_activeLuaCallbackContextStack.last();
 		if (!fallbackEngine || fallbackEngine == engine)
@@ -770,6 +818,11 @@ namespace
 		return &fallbackIt->last();
 	}
 
+	bool
+	flushDeferredRuntimeMutationsFromContext(const LuaCallbackEngine     *engine,
+	                                         LuaCallbackExecutionContext &context, WorldRuntime *runtime,
+	                                         DeferredRuntimeMutationFlushPolicy policy =
+	                                             DeferredRuntimeMutationFlushPolicy::AllowSynchronousBridge);
 	bool flushDeferredRuntimeMutations(const LuaCallbackEngine *engine, WorldRuntime *runtime);
 
 	void finishDeferredMiniWindowBatch(WorldRuntime *runtime)
@@ -779,7 +832,9 @@ namespace
 		runtime->endMiniWindowMutationBatch();
 	}
 
-	bool closeDeferredMiniWindowBatchBlocking(LuaCallbackExecutionContext &context)
+	bool closeDeferredMiniWindowBatchBlocking(LuaCallbackExecutionContext       &context,
+	                                          DeferredRuntimeMutationFlushPolicy policy =
+	                                              DeferredRuntimeMutationFlushPolicy::AllowSynchronousBridge)
 	{
 		if (!context.deferredMiniWindowBatchOpen)
 		{
@@ -820,7 +875,9 @@ namespace
 		}
 		else
 		{
-			const bool forbidsSyncBridge = callbackScopeSyncBridgeForbidden();
+			const bool forbidsSyncBridge =
+			    policy == DeferredRuntimeMutationFlushPolicy::ForbidSynchronousBridge ||
+			    callbackScopeSyncBridgeForbidden();
 			if (!forbidsSyncBridge)
 			{
 				if (!qmudLuaBridgeInvokeOnObjectThread(runtime, close))
@@ -841,6 +898,68 @@ namespace
 		context.deferredMiniWindowBatchOpen = false;
 		context.deferredMiniWindowBatchRuntime.clear();
 		return closed;
+	}
+
+	bool closeDeferredMiniWindowBatchNonBlocking(LuaCallbackExecutionContext &context)
+	{
+		if (!context.deferredMiniWindowBatchOpen)
+		{
+			context.deferredMiniWindowBatchRuntime.clear();
+			return true;
+		}
+
+		WorldRuntime *runtime               = context.deferredMiniWindowBatchRuntime.data();
+		context.deferredMiniWindowBatchOpen = false;
+		context.deferredMiniWindowBatchRuntime.clear();
+		if (!runtime)
+			return false;
+		if (QThread::currentThread() == runtime->thread())
+		{
+			finishDeferredMiniWindowBatch(runtime);
+			return true;
+		}
+
+		const QPointer<WorldRuntime> runtimeGuard(runtime);
+		return QMetaObject::invokeMethod(
+		    runtime,
+		    [runtimeGuard]
+		    {
+			    if (runtimeGuard)
+				    finishDeferredMiniWindowBatch(runtimeGuard.data());
+		    },
+		    Qt::QueuedConnection);
+	}
+
+	bool teardownCallbackContext(const LuaCallbackEngine *engine, LuaCallbackExecutionContext &context)
+	{
+		bool ok = true;
+		if (!flushDeferredRuntimeMutationsFromContext(
+		        engine, context, nullptr, DeferredRuntimeMutationFlushPolicy::ForbidSynchronousBridge))
+		{
+			qWarning().noquote() << QStringLiteral(
+			    "[QMud][LuaBridge] callback scope teardown failed to flush "
+			    "deferred runtime mutations");
+			ok = false;
+		}
+		if (!closeDeferredMiniWindowBatchBlocking(
+		        context, DeferredRuntimeMutationFlushPolicy::ForbidSynchronousBridge))
+		{
+			qWarning().noquote() << QStringLiteral(
+			    "[QMud][LuaBridge] callback scope teardown failed to close deferred miniwindow "
+			    "mutation batch");
+			ok = false;
+		}
+		clearDeferredMutationPendingState(context);
+		return ok;
+	}
+
+	void discardSuspendedCallbackContext(LuaCallbackExecutionContext &context)
+	{
+		static_cast<void>(closeDeferredMiniWindowBatchNonBlocking(context));
+		context.deferredRuntimeMutations.clear();
+		context.deferredRuntimeTarget.clear();
+		context.flushingDeferredRuntimeMutations = false;
+		clearDeferredMutationPendingState(context);
 	}
 
 	class ScopedLuaCallbackExecutionContext
@@ -8784,47 +8903,60 @@ namespace
 		context->missingMiniWindowHotspots.clear();
 	}
 
-	bool flushDeferredRuntimeMutations(const LuaCallbackEngine *engine, WorldRuntime *runtime)
+	bool flushDeferredRuntimeMutationsFromContext(const LuaCallbackEngine     *engine,
+	                                              LuaCallbackExecutionContext &context, WorldRuntime *runtime,
+	                                              DeferredRuntimeMutationFlushPolicy policy)
 	{
-		auto *context = activeCallbackContext(engine);
-		if (!context || context->deferredRuntimeMutations.isEmpty())
+		if (context.deferredRuntimeMutations.isEmpty())
 			return true;
 
-		WorldRuntime *targetRuntime = context->deferredRuntimeTarget.data();
+		WorldRuntime *targetRuntime = context.deferredRuntimeTarget.data();
 		if (!targetRuntime)
 			targetRuntime = runtime;
 		if (!targetRuntime)
 		{
-			context->deferredRuntimeMutations.clear();
-			context->deferredRuntimeTarget.clear();
-			updateDeferredMutationPendingState(*context);
+			context.deferredRuntimeMutations.clear();
+			context.deferredRuntimeTarget.clear();
+			updateDeferredMutationPendingState(context);
 			return false;
 		}
-		if (context->flushingDeferredRuntimeMutations)
+		if (context.flushingDeferredRuntimeMutations)
 			return true;
-		if (context->deferredMiniWindowBatchOpen &&
-		    context->deferredMiniWindowBatchRuntime.data() != targetRuntime)
+		if (context.deferredMiniWindowBatchOpen &&
+		    context.deferredMiniWindowBatchRuntime.data() != targetRuntime)
 		{
-			if (!closeDeferredMiniWindowBatchBlocking(*context))
+			if (!closeDeferredMiniWindowBatchBlocking(context, policy))
 				return false;
 		}
 
-		context->flushingDeferredRuntimeMutations = true;
+		context.flushingDeferredRuntimeMutations = true;
 		QVector<std::function<void()>> pendingMutations;
-		pendingMutations.swap(context->deferredRuntimeMutations);
-		updateDeferredMutationPendingState(*context);
-		const bool hadOpenMiniWindowBatch = context->deferredMiniWindowBatchOpen &&
-		                                    context->deferredMiniWindowBatchRuntime.data() == targetRuntime;
+		pendingMutations.swap(context.deferredRuntimeMutations);
+		updateDeferredMutationPendingState(context);
+		const bool hadOpenMiniWindowBatch = context.deferredMiniWindowBatchOpen &&
+		                                    context.deferredMiniWindowBatchRuntime.data() == targetRuntime;
+		const bool forbidSyncBridge = policy == DeferredRuntimeMutationFlushPolicy::ForbidSynchronousBridge ||
+		                              callbackScopeSyncBridgeForbidden();
 
 		bool       flushed = false;
-		if (QThread::currentThread() != targetRuntime->thread() && callbackScopeSyncBridgeForbidden())
+		if (QThread::currentThread() != targetRuntime->thread() && forbidSyncBridge)
 		{
 			if (auto *mutableEngine = const_cast<LuaCallbackEngine *>(engine); mutableEngine)
 			{
+				if (hadOpenMiniWindowBatch)
+				{
+					const QPointer<WorldRuntime> runtimeGuard(targetRuntime);
+					pendingMutations.push_back(
+					    [runtimeGuard]
+					    {
+						    if (runtimeGuard)
+							    finishDeferredMiniWindowBatch(runtimeGuard.data());
+					    });
+				}
 				mutableEngine->appendDeferredRuntimeMutationBatch(targetRuntime, std::move(pendingMutations));
 				flushed = true;
-				context->deferredMiniWindowBatchRuntime.clear();
-				context->deferredMiniWindowBatchOpen = false;
+				context.deferredMiniWindowBatchRuntime.clear();
+				context.deferredMiniWindowBatchOpen = false;
 			}
 		}
 		else
@@ -8853,22 +8985,28 @@ namespace
 			    false);
 		}
 
-		context->flushingDeferredRuntimeMutations = false;
+		context.flushingDeferredRuntimeMutations = false;
 		if (!flushed)
 		{
-			context->deferredRuntimeMutations = std::move(pendingMutations);
-			updateDeferredMutationPendingState(*context);
+			context.deferredRuntimeMutations = std::move(pendingMutations);
+			updateDeferredMutationPendingState(context);
 			return false;
 		}
 
 		if (!hadOpenMiniWindowBatch &&
-		    !(QThread::currentThread() != targetRuntime->thread() && callbackScopeSyncBridgeForbidden()))
+		    !(QThread::currentThread() != targetRuntime->thread() && forbidSyncBridge))
 		{
-			context->deferredMiniWindowBatchRuntime = targetRuntime;
-			context->deferredMiniWindowBatchOpen    = true;
+			context.deferredMiniWindowBatchRuntime = targetRuntime;
+			context.deferredMiniWindowBatchOpen    = true;
 		}
-		context->deferredRuntimeTarget.clear();
+		context.deferredRuntimeTarget.clear();
 		return true;
+	}
+
+	bool flushDeferredRuntimeMutations(const LuaCallbackEngine *engine, WorldRuntime *runtime)
+	{
+		auto *context = activeCallbackContext(engine);
+		return !context || flushDeferredRuntimeMutationsFromContext(engine, *context, runtime);
 	}
 
 	bool flushDeferredMutationsForRuntimeAcrossActiveContexts(WorldRuntime *runtime)
@@ -9526,13 +9664,29 @@ namespace
 		return immediateLines;
 	}
 
+	void pushLuaUtf8String(lua_State *L, const QString &value)
+	{
+		const QByteArray bytes = value.toUtf8();
+		lua_pushlstring(L, bytes.constData(), bytes.size());
+	}
+
+	void pushLuaUtf8String(lua_State *L, const QByteArray &value)
+	{
+		lua_pushlstring(L, value.constData(), value.size());
+	}
+
+	void pushLuaUtf8String(lua_State *L, const char *value)
+	{
+		lua_pushstring(L, value ? value : "");
+	}
+
 	void registerErrorDescriptions(lua_State *L)
 	{
 		lua_newtable(L);
 		for (const IntFlagsPair *p = kErrorDescriptionMappingTable; p->value != nullptr; ++p)
 		{
 			lua_pushinteger(L, p->key);
-			lua_pushstring(L, p->value);
+			pushLuaUtf8String(L, p->value);
 			lua_rawset(L, -3);
 		}
 		lua_setglobal(L, "error_desc");
@@ -9546,7 +9700,7 @@ namespace
 			const QColor color(name);
 			if (!color.isValid())
 				continue;
-			lua_pushstring(L, name.toLatin1().constData());
+			pushLuaUtf8String(L, name);
 			lua_pushinteger(L, colorValue(color));
 			lua_rawset(L, -3);
 		}
@@ -9589,6 +9743,23 @@ namespace
 		lua_setglobal(L, tableName);
 	}
 } // namespace
+
+struct LuaSuspendedCallback
+{
+		lua_State                                          *thread{nullptr};
+		int                                                 registryRef{LUA_NOREF};
+		LuaCallbackExecutionContext                         context;
+		QSharedPointer<const LuaCallbackMiniWindowSnapshot> dispatchSnapshot;
+		std::function<void(const QString &)>                beforeResumeCallback;
+		LuaPreparedCallbackResultMode                       resultMode{LuaPreparedCallbackResultMode::Bool};
+		QVector<QString>                                    callingPluginIdStack;
+		QByteArray                                          defaultBytesResult;
+		QString                                             defaultStringResult;
+		qint64                                              elapsedNsecs{0};
+		QString                                             functionName;
+		bool                                                defaultResult{false};
+		bool                                                hasFunction{false};
+};
 #endif
 
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
@@ -9679,6 +9850,12 @@ void LuaCallbackEngine::resetState()
 {
 	bindOrAssertExecutionThread("LuaCallbackEngine::resetState");
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
+	for (const std::shared_ptr<LuaSuspendedCallback> &suspended : std::as_const(m_suspendedCallbacks))
+	{
+		if (suspended)
+			discardSuspendedCallbackContext(suspended->context);
+	}
+	m_suspendedCallbacks.clear();
 	m_ownedState.reset();
 	m_state = nullptr;
 	m_luaFunctionsSet.clear();
@@ -9902,6 +10079,15 @@ const LuaCallbackMiniWindowSnapshot *LuaCallbackEngine::currentDispatchMiniWindo
 	return snapshot ? snapshot.data() : nullptr;
 }
 
+QSharedPointer<const LuaCallbackMiniWindowSnapshot>
+LuaCallbackEngine::currentDispatchMiniWindowSnapshotShared() const
+{
+	bindOrAssertExecutionThread("LuaCallbackEngine::currentDispatchMiniWindowSnapshotShared");
+	if (m_dispatchMiniWindowSnapshotStack.isEmpty())
+		return {};
+	return m_dispatchMiniWindowSnapshotStack.constLast();
+}
+
 void LuaCallbackEngine::appendDeferredRuntimeMutationBatch(WorldRuntime                    *runtime,
                                                            QVector<std::function<void()>> &&mutations)
 {
@@ -9919,7 +10105,7 @@ bool LuaCallbackEngine::appendDeferredRuntimeMutationBatchToActiveCallback(
 {
 	if (!batch.runtime || batch.mutations.isEmpty())
 		return true;
-	if (g_activeLuaCallbackContextStack.isEmpty() || !qmudLuaBridgeIsExecutingRequestOnCurrentThread())
+	if (g_activeLuaCallbackContextStack.isEmpty())
 		return false;
 
 	for (const LuaCallbackEngine *engine : g_activeLuaCallbackContextStack | std::views::reverse)
@@ -10008,6 +10194,388 @@ static bool callbackScopeSyncBridgeForbidden()
 	return !g_activeLuaCallbackContextStack.isEmpty();
 }
 
+static QString luaModalStringResultArgument(lua_State *L)
+{
+	if (!L || lua_gettop(L) < 1 || !lua_isstring(L, -1))
+		return {};
+	size_t      len = 0;
+	const char *str = lua_tolstring(L, -1, &len);
+	return str ? QString::fromUtf8(str, sizeToInt(static_cast<qsizetype>(len))) : QString();
+}
+
+static QString luaModalJsonResult(const QJsonObject &object)
+{
+	return QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Compact));
+}
+
+static QJsonObject luaModalJsonResultArgument(lua_State *L)
+{
+	const QJsonDocument document = QJsonDocument::fromJson(luaModalStringResultArgument(L).toUtf8());
+	return document.isObject() ? document.object() : QJsonObject();
+}
+
+static QString luaModalAcceptedStringResult(const bool accepted, const QString &value)
+{
+	QJsonObject object;
+	object.insert(QStringLiteral("accepted"), accepted);
+	if (accepted)
+		object.insert(QStringLiteral("value"), value);
+	return luaModalJsonResult(object);
+}
+
+enum class LuaChoiceKeyType
+{
+	String,
+	Integer,
+	Number
+};
+
+struct LuaChoiceKey
+{
+		LuaChoiceKeyType type{LuaChoiceKeyType::String};
+		QString          stringValue;
+		lua_Integer      integerValue{0};
+		lua_Number       numberValue{0};
+};
+
+static QString luaChoiceNumberText(const lua_Number value)
+{
+	return QString::number(static_cast<double>(value), 'g', std::numeric_limits<lua_Number>::max_digits10);
+}
+
+static LuaChoiceKey luaChoiceKeyFromStack(lua_State *L, const int index)
+{
+	LuaChoiceKey key;
+	const int    absoluteIndex = lua_absindex(L, index);
+	if (lua_type(L, absoluteIndex) == LUA_TSTRING)
+	{
+		size_t      len = 0;
+		const char *str = lua_tolstring(L, absoluteIndex, &len);
+		key.type        = LuaChoiceKeyType::String;
+		key.stringValue = str ? QString::fromUtf8(str, sizeToInt(static_cast<qsizetype>(len))) : QString();
+		return key;
+	}
+	if (lua_isinteger(L, absoluteIndex))
+	{
+		key.type         = LuaChoiceKeyType::Integer;
+		key.integerValue = lua_tointeger(L, absoluteIndex);
+		return key;
+	}
+	key.type        = LuaChoiceKeyType::Number;
+	key.numberValue = lua_tonumber(L, absoluteIndex);
+	return key;
+}
+
+static bool luaChoiceKeysEqual(const LuaChoiceKey &lhs, const LuaChoiceKey &rhs)
+{
+	if (lhs.type != rhs.type)
+		return false;
+	switch (lhs.type)
+	{
+	case LuaChoiceKeyType::String:
+		return lhs.stringValue == rhs.stringValue;
+	case LuaChoiceKeyType::Integer:
+		return lhs.integerValue == rhs.integerValue;
+	case LuaChoiceKeyType::Number:
+		return lhs.numberValue == rhs.numberValue;
+	}
+	return false;
+}
+
+static void pushLuaChoiceKey(lua_State *L, const LuaChoiceKey &key)
+{
+	switch (key.type)
+	{
+	case LuaChoiceKeyType::String:
+		pushLuaUtf8String(L, key.stringValue);
+		break;
+	case LuaChoiceKeyType::Integer:
+		lua_pushinteger(L, key.integerValue);
+		break;
+	case LuaChoiceKeyType::Number:
+		lua_pushnumber(L, key.numberValue);
+		break;
+	}
+}
+
+static void insertLuaChoiceKey(QJsonObject &object, const LuaChoiceKey &key)
+{
+	switch (key.type)
+	{
+	case LuaChoiceKeyType::String:
+		object.insert(QStringLiteral("keyType"), QStringLiteral("string"));
+		object.insert(QStringLiteral("key"), key.stringValue);
+		break;
+	case LuaChoiceKeyType::Integer:
+		object.insert(QStringLiteral("keyType"), QStringLiteral("integer"));
+		object.insert(QStringLiteral("key"), QString::number(static_cast<qlonglong>(key.integerValue)));
+		break;
+	case LuaChoiceKeyType::Number:
+		object.insert(QStringLiteral("keyType"), QStringLiteral("number"));
+		object.insert(QStringLiteral("key"), luaChoiceNumberText(key.numberValue));
+		break;
+	}
+}
+
+static void pushLuaChoiceKeyFromJson(lua_State *L, const QJsonObject &object)
+{
+	const QString keyType = object.value(QStringLiteral("keyType")).toString();
+	const QString keyText = object.value(QStringLiteral("key")).toString();
+	if (keyType == QStringLiteral("integer"))
+	{
+		bool       ok    = false;
+		const auto value = keyText.toLongLong(&ok);
+		lua_pushinteger(L, ok ? static_cast<lua_Integer>(value) : 0);
+		return;
+	}
+	if (keyType == QStringLiteral("number"))
+	{
+		bool         ok    = false;
+		const double value = keyText.toDouble(&ok);
+		lua_pushnumber(L, ok ? static_cast<lua_Number>(value) : 0);
+		return;
+	}
+	pushLuaUtf8String(L, keyText);
+}
+
+static int luaModalAcceptedStringContinuation(lua_State *L, int status, lua_KContext context)
+{
+	Q_UNUSED(status);
+	Q_UNUSED(context);
+	const QJsonObject object = luaModalJsonResultArgument(L);
+	if (!object.value(QStringLiteral("accepted")).toBool(false))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	pushLuaUtf8String(L, object.value(QStringLiteral("value")).toString());
+	return 1;
+}
+
+static int luaModalStringContinuation(lua_State *L, int status, lua_KContext context)
+{
+	Q_UNUSED(status);
+	Q_UNUSED(context);
+	if (lua_gettop(L) < 1)
+		pushLuaUtf8String(L, "");
+	return 1;
+}
+
+static int luaModalNumberContinuation(lua_State *L, int status, lua_KContext context)
+{
+	Q_UNUSED(status);
+	Q_UNUSED(context);
+	bool         ok     = false;
+	const double result = luaModalStringResultArgument(L).toDouble(&ok);
+	lua_pushnumber(L, ok ? result : -1);
+	return 1;
+}
+
+static int luaModalListKeyContinuation(lua_State *L, int status, lua_KContext context)
+{
+	Q_UNUSED(status);
+	Q_UNUSED(context);
+	const QJsonObject object = luaModalJsonResultArgument(L);
+	if (!object.value(QStringLiteral("accepted")).toBool(false))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	pushLuaChoiceKeyFromJson(L, object);
+	return 1;
+}
+
+static int luaModalMultiListContinuation(lua_State *L, int status, lua_KContext context)
+{
+	Q_UNUSED(status);
+	Q_UNUSED(context);
+	const QJsonObject object = luaModalJsonResultArgument(L);
+	if (!object.value(QStringLiteral("accepted")).toBool(false))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	lua_newtable(L);
+	const QJsonArray items = object.value(QStringLiteral("items")).toArray();
+	for (const auto &itemValue : items)
+	{
+		const QJsonObject item = itemValue.toObject();
+		pushLuaChoiceKeyFromJson(L, item);
+		lua_pushboolean(L, 1);
+		lua_rawset(L, -3);
+	}
+	return 1;
+}
+
+static int luaModalFontPickerContinuation(lua_State *L, int status, lua_KContext context)
+{
+	Q_UNUSED(status);
+	Q_UNUSED(context);
+	const QJsonObject object = luaModalJsonResultArgument(L);
+	if (!object.value(QStringLiteral("accepted")).toBool(false))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+
+	lua_newtable(L);
+	pushLuaUtf8String(L, object.value(QStringLiteral("name")).toString());
+	lua_setfield(L, -2, "name");
+	pushLuaUtf8String(L, object.value(QStringLiteral("style")).toString());
+	lua_setfield(L, -2, "style");
+	lua_pushnumber(L, object.value(QStringLiteral("size")).toDouble());
+	lua_setfield(L, -2, "size");
+	lua_pushnumber(L, object.value(QStringLiteral("colour")).toDouble());
+	lua_setfield(L, -2, "colour");
+	lua_pushboolean(L, object.value(QStringLiteral("bold")).toBool(false));
+	lua_setfield(L, -2, "bold");
+	lua_pushboolean(L, object.value(QStringLiteral("italic")).toBool(false));
+	lua_setfield(L, -2, "italic");
+	lua_pushboolean(L, object.value(QStringLiteral("underline")).toBool(false));
+	lua_setfield(L, -2, "underline");
+	lua_pushboolean(L, object.value(QStringLiteral("strikeout")).toBool(false));
+	lua_setfield(L, -2, "strikeout");
+	lua_pushnumber(L, 0);
+	lua_setfield(L, -2, "charset");
+	return 1;
+}
+
+static int luaModalSpellCheckContinuation(lua_State *L, int status, lua_KContext context)
+{
+	Q_UNUSED(status);
+	Q_UNUSED(context);
+	const QJsonObject object = luaModalJsonResultArgument(L);
+	if (!object.value(QStringLiteral("accepted")).toBool(false))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	pushLuaUtf8String(L, object.value(QStringLiteral("action")).toString());
+	pushLuaUtf8String(L, object.value(QStringLiteral("replacement")).toString());
+	return 2;
+}
+
+static bool canYieldModalResult(lua_State *L)
+{
+	return L && g_yieldableCallbackInvocation && lua_isyieldable(L);
+}
+
+static bool beginModalStringYield(lua_State *L, const LuaCallbackEngine *engine,
+                                  LuaPendingModalStringRequest &&request)
+{
+	if (!canYieldModalResult(L))
+		return false;
+	if (engine && !flushDeferredRuntimeMutations(engine, nullptr))
+	{
+		qWarning().noquote() << QStringLiteral(
+		    "[QMud][LuaBridge] modal yield failed to flush deferred runtime mutations");
+		return false;
+	}
+	if (auto *context = activeCallbackContext(engine);
+	    context && !closeDeferredMiniWindowBatchBlocking(*context))
+	{
+		qWarning().noquote() << QStringLiteral(
+		    "[QMud][LuaBridge] modal yield failed to close deferred miniwindow batch");
+		return false;
+	}
+	g_yieldableCallbackInvocation->pendingModalString    = std::move(request);
+	g_yieldableCallbackInvocation->hasPendingModalString = true;
+	return true;
+}
+
+static void setLuaModalResumeCallback(LuaPendingModalStringRequest &request, WorldRuntime *runtime,
+                                      const QString &pluginId)
+{
+	const QPointer<WorldRuntime> runtimeGuard(runtime);
+	request.resultCallback = [runtimeGuard, pluginId](const quint64 resumeId, const QString &result) mutable
+	{
+		if (!runtimeGuard)
+			return;
+		auto deliverResume = [runtimeGuard, pluginId, resumeId, result]() mutable
+		{
+			if (!runtimeGuard)
+				return;
+			runtimeGuard->queueLuaModalCallbackResume(pluginId, resumeId, result);
+		};
+		if (QThread::currentThread() == runtimeGuard->thread())
+		{
+			deliverResume();
+			return;
+		}
+		const bool queued =
+		    QMetaObject::invokeMethod(runtimeGuard.data(), std::move(deliverResume), Qt::QueuedConnection);
+		if (!queued)
+		{
+			qWarning().noquote() << QStringLiteral(
+			    "[QMud][LuaBridge] failed to queue modal resume delivery to runtime thread");
+		}
+	};
+}
+
+static int yieldModalStringResult(lua_State *L, const LuaCallbackEngine *engine,
+                                  LuaPendingModalStringRequest &&request,
+                                  lua_KFunction                  continuation = luaModalStringContinuation)
+{
+	if (!beginModalStringYield(L, engine, std::move(request)))
+	{
+		lua_settop(L, 0);
+		pushLuaUtf8String(L, "");
+		return continuation(L, LUA_OK, 0);
+	}
+	return lua_yieldk(L, 0, 0, continuation);
+}
+
+#ifdef QMUD_LUACALLBACKENGINE_TEST_MINIMAL_BINDINGS
+static int luaTestYieldModalNumber(lua_State *L)
+{
+	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	LuaPendingModalStringRequest request;
+	request.guiCallable    = []() -> QString { return {}; };
+	request.resultCallback = [](quint64, const QString &) {};
+	return yieldModalStringResult(L, engine, std::move(request), luaModalNumberContinuation);
+}
+
+static int luaTestYieldModalString(lua_State *L)
+{
+	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	LuaPendingModalStringRequest request;
+	request.guiCallable    = []() -> QString { return {}; };
+	request.resultCallback = [](quint64, const QString &) {};
+	return yieldModalStringResult(L, engine, std::move(request));
+}
+#endif
+
+#ifndef NDEBUG
+static QString qmudMmStartupDiagEngineLabel(const LuaCallbackEngine *engine)
+{
+	if (!engine)
+		return QStringLiteral("<null>");
+	QString       id   = engine->pluginId().trimmed();
+	const QString name = engine->pluginName().trimmed();
+	if (name.isEmpty())
+		return id;
+	return QStringLiteral("%1/%2").arg(id, name);
+}
+
+static bool qmudMmStartupDiagIsWatchedPluginId(const QString &pluginId)
+{
+	const QString normalized = pluginId.trimmed().toLower();
+	return normalized == QStringLiteral("c97329b91f12ca48d14c3db2") ||
+	       normalized == QStringLiteral("adc3a873d4e47348da7cb426") ||
+	       normalized == QStringLiteral("f973af093e715dece34dc25f") ||
+	       normalized == QStringLiteral("f67c4339ed0591a5b010d05b");
+}
+
+static QString qmudMmStartupDiagEngineLabels(const QVector<QSharedPointer<LuaCallbackEngine>> &engines)
+{
+	QStringList labels;
+	labels.reserve(engines.size());
+	for (const auto &engine : engines)
+		labels.push_back(qmudMmStartupDiagEngineLabel(engine.data()));
+	return labels.join(QLatin1Char(','));
+}
+#endif
+
 template <typename Func>
 static auto runOnMainWindowThread(Func &&func, std::invoke_result_t<Func, MainWindow *> fallbackValue,
                                   const bool deferWhenForbidden = false)
@@ -10083,6 +10651,28 @@ static auto runOnMainWindowThreadAllowNestedEvents(Func                         
     -> std::invoke_result_t<Func, MainWindow *>
 {
 	return runOnMainWindowThread(std::forward<Func>(func), std::move(fallbackValue));
+}
+
+template <typename Func>
+static auto
+runOnMainWindowThreadModalDialogSync(Func                                                 &&func,
+                                     std::invoke_result_t<std::decay_t<Func>, MainWindow *> fallbackValue)
+    -> std::invoke_result_t<std::decay_t<Func>, MainWindow *>
+{
+	using DecayedFunc = std::decay_t<Func>;
+	using ReturnType  = std::invoke_result_t<DecayedFunc, MainWindow *>;
+
+	auto       funcCopy         = DecayedFunc(std::forward<Func>(func));
+	ReturnType dispatchFallback = fallbackValue;
+	return qmudRunGuiModalDialogSync(
+	    [funcCopy = std::move(funcCopy), fallbackValue = std::move(fallbackValue)]() mutable -> ReturnType
+	    {
+		    MainWindow *frame = resolveMainWindow();
+		    if (!frame)
+			    return fallbackValue;
+		    return funcCopy(frame);
+	    },
+	    std::move(dispatchFallback));
 }
 
 struct MainWindowMutationDispatchResult
@@ -10452,6 +11042,318 @@ class ScriptExecutionDepthGuard
 		LuaCallbackEngine *m_engine{nullptr};
 };
 
+bool LuaCallbackEngine::callPreparedYieldableCallback(const QString &functionName, const int argCount,
+                                                      const int expectedResults, const bool defaultResult,
+                                                      bool *suspended, quint64 *modalResumeId,
+                                                      LuaPendingModalStringRequest *pendingModalStringRequest,
+                                                      const LuaPreparedCallbackResultMode resultMode,
+                                                      QByteArray *bytesResult, QString *stringResult)
+{
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
+	if (!m_state)
+		return defaultResult;
+
+	const int valuesToMove     = argCount + 1;
+	const int preparedStackTop = lua_gettop(m_state);
+	if (valuesToMove <= 0 || preparedStackTop < valuesToMove)
+	{
+		LuaCallbackExecutionContext failedContext = takeActiveCallbackContext(this);
+		static_cast<void>(teardownCallbackContext(this, failedContext));
+		if (preparedStackTop > 0)
+			lua_pop(m_state, preparedStackTop);
+		reportLuaError(*this,
+		               QStringLiteral("Lua callback stack preparation failed for %1")
+		                   .arg(functionName.isEmpty() ? QStringLiteral("<anonymous>") : functionName));
+		return defaultResult;
+	}
+
+	lua_State *const co          = lua_newthread(m_state);
+	const int        registryRef = luaL_ref(m_state, LUA_REGISTRYINDEX);
+	if (!lua_checkstack(co, valuesToMove))
+	{
+		LuaCallbackExecutionContext failedContext = takeActiveCallbackContext(this);
+		static_cast<void>(teardownCallbackContext(this, failedContext));
+		luaL_unref(m_state, LUA_REGISTRYINDEX, registryRef);
+		lua_pop(m_state, valuesToMove);
+		reportLuaError(*this,
+		               QStringLiteral("Lua callback coroutine stack allocation failed for %1")
+		                   .arg(functionName.isEmpty() ? QStringLiteral("<anonymous>") : functionName));
+		return defaultResult;
+	}
+	lua_xmove(m_state, co, valuesToMove);
+
+	QElapsedTimer timer;
+	timer.start();
+	ScriptExecutionDepthGuard    depthGuard(this);
+	YieldableCallbackInvocation  invocation;
+	YieldableCallbackInvocation *previousInvocation = g_yieldableCallbackInvocation;
+	const bool                   modalYieldAllowed  = suspended && modalResumeId && pendingModalStringRequest;
+	if (modalYieldAllowed)
+		g_yieldableCallbackInvocation = &invocation;
+	int       results = 0;
+	const int status  = lua_resume(co, m_state, argCount, &results);
+	if (modalYieldAllowed)
+		g_yieldableCallbackInvocation = previousInvocation;
+
+	if (status == LUA_YIELD)
+	{
+		if (!invocation.hasPendingModalString)
+		{
+			LuaCallbackExecutionContext yieldedContext = takeActiveCallbackContext(this);
+			static_cast<void>(teardownCallbackContext(this, yieldedContext));
+			luaL_unref(m_state, LUA_REGISTRYINDEX, registryRef);
+			reportLuaError(*this, QStringLiteral("Lua callback yielded without a modal resume request"));
+			return defaultResult;
+		}
+
+		const quint64 resumeId              = m_nextSuspendedCallbackId++;
+		auto          suspendedCallback     = std::make_shared<LuaSuspendedCallback>();
+		suspendedCallback->thread           = co;
+		suspendedCallback->registryRef      = registryRef;
+		suspendedCallback->context          = takeActiveCallbackContext(this);
+		suspendedCallback->dispatchSnapshot = currentDispatchMiniWindowSnapshotShared();
+		suspendedCallback->beforeResumeCallback =
+		    std::move(invocation.pendingModalString.beforeResumeCallback);
+		suspendedCallback->resultMode           = resultMode;
+		suspendedCallback->callingPluginIdStack = m_callingPluginIdStack;
+		if (bytesResult)
+			suspendedCallback->defaultBytesResult = *bytesResult;
+		if (stringResult)
+			suspendedCallback->defaultStringResult = *stringResult;
+		suspendedCallback->elapsedNsecs  = timer.nsecsElapsed();
+		suspendedCallback->functionName  = functionName;
+		suspendedCallback->defaultResult = defaultResult;
+		suspendedCallback->hasFunction   = true;
+		m_suspendedCallbacks.insert(resumeId, suspendedCallback);
+		if (suspended)
+			*suspended = true;
+		if (modalResumeId)
+			*modalResumeId = resumeId;
+		if (pendingModalStringRequest)
+			*pendingModalStringRequest = std::move(invocation.pendingModalString);
+		return defaultResult;
+	}
+
+	LuaCallbackExecutionContext completedContext = takeActiveCallbackContext(this);
+	const auto                  unrefThread =
+	    qScopeGuard([this, registryRef] { luaL_unref(m_state, LUA_REGISTRYINDEX, registryRef); });
+	Q_UNUSED(unrefThread);
+	if (status != LUA_OK)
+	{
+		static_cast<void>(teardownCallbackContext(this, completedContext));
+		const char *err = lua_tostring(co, -1);
+		reportLuaError(
+		    *this, QStringLiteral("Lua callback failed: %1").arg(QString::fromUtf8(err ? err : "unknown")));
+		lua_pop(co, 1);
+		return defaultResult;
+	}
+	static_cast<void>(teardownCallbackContext(this, completedContext));
+	addScriptTimeForEngine(*this, timer.nsecsElapsed());
+
+	bool result = expectedResults <= 0 ? true : defaultResult;
+	if (expectedResults > 0 && results > 0 && lua_gettop(co) > 0)
+	{
+		switch (resultMode)
+		{
+		case LuaPreparedCallbackResultMode::Bool:
+			if (lua_isboolean(co, -1))
+				result = lua_toboolean(co, -1) != 0;
+			else if (lua_isnumber(co, -1))
+				result = lua_tonumber(co, -1) != 0.0;
+			break;
+		case LuaPreparedCallbackResultMode::Bytes:
+			if (bytesResult && lua_isstring(co, -1))
+			{
+				size_t      outLen = 0;
+				const char *out    = lua_tolstring(co, -1, &outLen);
+				*bytesResult       = out ? QByteArray(out, static_cast<int>(outLen)) : QByteArray();
+			}
+			result = true;
+			break;
+		case LuaPreparedCallbackResultMode::String:
+			if (stringResult && lua_isstring(co, -1))
+			{
+				size_t      outLen = 0;
+				const char *out    = lua_tolstring(co, -1, &outLen);
+				*stringResult =
+				    out ? QString::fromUtf8(out, sizeToInt(static_cast<qsizetype>(outLen))) : QString();
+			}
+			result = true;
+			break;
+		case LuaPreparedCallbackResultMode::NoResult:
+			result = true;
+			break;
+		}
+	}
+	if (results > 0)
+		lua_pop(co, results);
+	return result;
+}
+
+LuaBatchDispatchResult LuaCallbackEngine::resumeSuspendedModalString(const quint64  resumeId,
+                                                                     const QString &result)
+{
+	bindOrAssertExecutionThread("LuaCallbackEngine::resumeSuspendedModalString");
+	LuaBatchDispatchResult dispatchResult;
+#ifdef QMUD_ENABLE_LUA_SCRIPTING
+	auto it = m_suspendedCallbacks.find(resumeId);
+	if (it == m_suspendedCallbacks.end() || !it.value())
+		return dispatchResult;
+
+	std::shared_ptr<LuaSuspendedCallback> suspended = std::move(it.value());
+	m_suspendedCallbacks.erase(it);
+	if (!suspended->thread || suspended->registryRef == LUA_NOREF)
+		return dispatchResult;
+
+	if (suspended->dispatchSnapshot)
+		pushDispatchMiniWindowSnapshot(suspended->dispatchSnapshot);
+	const auto popDispatchSnapshot = qScopeGuard(
+	    [this, hasSnapshot = static_cast<bool>(suspended->dispatchSnapshot)]
+	    {
+		    if (hasSnapshot)
+			    popDispatchMiniWindowSnapshot();
+	    });
+	Q_UNUSED(popDispatchSnapshot);
+
+	const QVector<QString> previousCallingPluginIdStack = m_callingPluginIdStack;
+	m_callingPluginIdStack                              = suspended->callingPluginIdStack;
+	const auto restoreCallingPluginIdStack              = qScopeGuard(
+	    [this, previousCallingPluginIdStack] { m_callingPluginIdStack = previousCallingPluginIdStack; });
+	Q_UNUSED(restoreCallingPluginIdStack);
+
+	pushActiveCallbackContext(this, std::move(suspended->context));
+	if (suspended->beforeResumeCallback)
+		suspended->beforeResumeCallback(result);
+	const QByteArray resultBytes = result.toUtf8();
+	lua_pushlstring(suspended->thread, resultBytes.constData(), resultBytes.size());
+
+	QElapsedTimer timer;
+	timer.start();
+	ScriptExecutionDepthGuard    depthGuard(this);
+	YieldableCallbackInvocation  invocation;
+	YieldableCallbackInvocation *previousInvocation = g_yieldableCallbackInvocation;
+	g_yieldableCallbackInvocation                   = &invocation;
+	int       resumeResults                         = 0;
+	const int status              = lua_resume(suspended->thread, m_state, 1, &resumeResults);
+	g_yieldableCallbackInvocation = previousInvocation;
+
+	if (status == LUA_YIELD)
+	{
+		if (!invocation.hasPendingModalString)
+		{
+			LuaCallbackExecutionContext yieldedContext = takeActiveCallbackContext(this);
+			static_cast<void>(teardownCallbackContext(this, yieldedContext));
+			luaL_unref(m_state, LUA_REGISTRYINDEX, suspended->registryRef);
+			reportLuaError(*this, QStringLiteral("Lua callback yielded without a modal resume request"));
+			dispatchResult.deferredRuntimeMutationBatches = takeDeferredRuntimeMutationBatches();
+			return dispatchResult;
+		}
+
+		const quint64 nextResumeId      = m_nextSuspendedCallbackId++;
+		suspended->context              = takeActiveCallbackContext(this);
+		suspended->beforeResumeCallback = std::move(invocation.pendingModalString.beforeResumeCallback);
+		suspended->callingPluginIdStack = m_callingPluginIdStack;
+		suspended->elapsedNsecs += timer.nsecsElapsed();
+		m_suspendedCallbacks.insert(nextResumeId, suspended);
+		dispatchResult.suspended                      = true;
+		dispatchResult.modalResumeId                  = nextResumeId;
+		dispatchResult.suspendedEngineIndex           = 0;
+		dispatchResult.hasPendingModalStringRequest   = true;
+		dispatchResult.pendingModalStringRequest      = std::move(invocation.pendingModalString);
+		dispatchResult.deferredRuntimeMutationBatches = takeDeferredRuntimeMutationBatches();
+		return dispatchResult;
+	}
+
+	LuaCallbackExecutionContext completedContext = takeActiveCallbackContext(this);
+	const auto unrefThread = qScopeGuard([this, registryRef = suspended->registryRef]
+	                                     { luaL_unref(m_state, LUA_REGISTRYINDEX, registryRef); });
+	Q_UNUSED(unrefThread);
+	if (status != LUA_OK)
+	{
+		static_cast<void>(teardownCallbackContext(this, completedContext));
+		const char *err = lua_tostring(suspended->thread, -1);
+		reportLuaError(
+		    *this, QStringLiteral("Lua callback failed: %1").arg(QString::fromUtf8(err ? err : "unknown")));
+		lua_pop(suspended->thread, 1);
+		dispatchResult.deferredRuntimeMutationBatches = takeDeferredRuntimeMutationBatches();
+		return dispatchResult;
+	}
+
+	static_cast<void>(teardownCallbackContext(this, completedContext));
+	addScriptTimeForEngine(*this, suspended->elapsedNsecs + timer.nsecsElapsed());
+	dispatchResult.boolResult       = suspended->defaultResult;
+	dispatchResult.boolResultValid  = true;
+	dispatchResult.hasFunction      = suspended->hasFunction;
+	dispatchResult.hasFunctionValid = true;
+	dispatchResult.bytesResult      = suspended->defaultBytesResult;
+	dispatchResult.stringResult     = suspended->defaultStringResult;
+	if (resumeResults > 0 && lua_gettop(suspended->thread) > 0)
+	{
+		switch (suspended->resultMode)
+		{
+		case LuaPreparedCallbackResultMode::Bool:
+			if (lua_isboolean(suspended->thread, -1))
+				dispatchResult.boolResult = lua_toboolean(suspended->thread, -1) != 0;
+			else if (lua_isnumber(suspended->thread, -1))
+				dispatchResult.boolResult = lua_tonumber(suspended->thread, -1) != 0.0;
+			break;
+		case LuaPreparedCallbackResultMode::Bytes:
+			if (lua_isstring(suspended->thread, -1))
+			{
+				size_t      outLen         = 0;
+				const char *out            = lua_tolstring(suspended->thread, -1, &outLen);
+				dispatchResult.bytesResult = out ? QByteArray(out, static_cast<int>(outLen)) : QByteArray();
+			}
+			dispatchResult.boolResult = true;
+			break;
+		case LuaPreparedCallbackResultMode::String:
+			if (lua_isstring(suspended->thread, -1))
+			{
+				size_t      outLen = 0;
+				const char *out    = lua_tolstring(suspended->thread, -1, &outLen);
+				dispatchResult.stringResult =
+				    out ? QString::fromUtf8(out, sizeToInt(static_cast<qsizetype>(outLen))) : QString();
+			}
+			dispatchResult.boolResult = true;
+			break;
+		case LuaPreparedCallbackResultMode::NoResult:
+			dispatchResult.boolResult = true;
+			break;
+		}
+	}
+	if (resumeResults > 0)
+		lua_pop(suspended->thread, resumeResults);
+	dispatchResult.deferredRuntimeMutationBatches = takeDeferredRuntimeMutationBatches();
+#else
+	Q_UNUSED(resumeId);
+	Q_UNUSED(result);
+#endif
+	return dispatchResult;
+}
+
+void LuaCallbackEngine::cancelSuspendedModalString(const quint64 resumeId)
+{
+	bindOrAssertExecutionThread("LuaCallbackEngine::cancelSuspendedModalString");
+#ifdef QMUD_ENABLE_LUA_SCRIPTING
+	auto it = m_suspendedCallbacks.find(resumeId);
+	if (it == m_suspendedCallbacks.end() || !it.value())
+		return;
+
+	std::shared_ptr<LuaSuspendedCallback> suspended = std::move(it.value());
+	m_suspendedCallbacks.erase(it);
+	discardSuspendedCallbackContext(suspended->context);
+	if (m_state && suspended->registryRef != LUA_NOREF)
+		luaL_unref(m_state, LUA_REGISTRYINDEX, suspended->registryRef);
+#else
+	Q_UNUSED(resumeId);
+#endif
+}
+
 static bool loadAndRunTopLevelLuaChunk(LuaCallbackEngine &engine, lua_State *state,
                                        const QByteArray &codeBytes, const QString &description)
 {
@@ -10816,7 +11718,7 @@ static int luaANSI(lua_State *L)
 	for (int i = 1; i <= count; ++i)
 		parts << QString::number(static_cast<int>(luaL_checkinteger(L, i)));
 	const QString seq = QStringLiteral("\x1b[%1m").arg(parts.join(';'));
-	lua_pushstring(L, seq.toUtf8().constData());
+	pushLuaUtf8String(L, seq);
 	return 1;
 }
 
@@ -10942,6 +11844,26 @@ static int luaBroadcastPlugin(lua_State *L)
 	{
 		const CallbackDispatchSnapshot callbackSnapshot =
 		    buildActiveCallbackDispatchSnapshot(engine, runtime);
+#ifndef NDEBUG
+		const bool    watchedSender = qmudMmStartupDiagIsWatchedPluginId(engine->pluginId());
+		const auto    snapshot      = callbackSnapshot.snapshot;
+		const QString snapshotIds =
+		    snapshot ? snapshot->broadcastPluginIdsSnapshot.join(QLatin1Char(',')) : QString{};
+		if (watchedSender)
+		{
+			qInfo().noquote()
+			    << QStringLiteral("[QMud][MMStartupDiag] broadcast-active-enter sender=%1 message=%2 text=%3 "
+			                      "snapshot=%4 hasBroadcastSnapshot=%5 ids=%6 engines=%7 idList=%8")
+			           .arg(qmudMmStartupDiagEngineLabel(engine))
+			           .arg(message)
+			           .arg(text.left(120), snapshot ? QStringLiteral("1") : QStringLiteral("0"),
+			                snapshot && snapshot->hasBroadcastPluginSnapshot ? QStringLiteral("1")
+			                                                                 : QStringLiteral("0"))
+			           .arg(snapshot ? snapshot->broadcastPluginIdsSnapshot.size() : 0)
+			           .arg(snapshot ? snapshot->broadcastPluginEnginesSnapshot.size() : 0)
+			           .arg(snapshotIds);
+		}
+#endif
 		if (callbackSnapshot.snapshot && callbackSnapshot.snapshot->hasBroadcastPluginSnapshot)
 		{
 			QVector<QSharedPointer<LuaCallbackEngine>> recipients;
@@ -10966,7 +11888,34 @@ static int luaBroadcastPlugin(lua_State *L)
 			}
 			delivered = runtime->broadcastPluginToRecipients(
 			    message, text, callingPluginId, engine->pluginName(), recipients, callbackSnapshot.snapshot);
+#ifndef NDEBUG
+			if (watchedSender)
+			{
+				qInfo().noquote()
+				    << QStringLiteral("[QMud][MMStartupDiag] broadcast-active-dispatch sender=%1 message=%2 "
+				                      "recipientCount=%3 delivered=%4 recipients=%5")
+				           .arg(qmudMmStartupDiagEngineLabel(engine))
+				           .arg(message)
+				           .arg(recipients.size())
+				           .arg(delivered)
+				           .arg(qmudMmStartupDiagEngineLabels(recipients));
+			}
+#endif
 		}
+#ifndef NDEBUG
+		else if (watchedSender)
+		{
+			qInfo().noquote()
+			    << QStringLiteral(
+			           "[QMud][MMStartupDiag] broadcast-active-skip sender=%1 message=%2 snapshot=%3 "
+			           "hasBroadcastSnapshot=%4")
+			           .arg(qmudMmStartupDiagEngineLabel(engine))
+			           .arg(message)
+			           .arg(snapshot ? QStringLiteral("1") : QStringLiteral("0"),
+			                snapshot && snapshot->hasBroadcastPluginSnapshot ? QStringLiteral("1")
+			                                                                 : QStringLiteral("0"));
+		}
+#endif
 	}
 	else
 	{
@@ -12492,30 +13441,31 @@ static void                          resetTimerFields(WorldRuntime::Timer &timer
 static QList<WorldRuntime::Trigger> &mutableTriggerList(WorldRuntime *runtime, WorldRuntime::Plugin *plugin);
 static QList<WorldRuntime::Alias>   &mutableAliasList(WorldRuntime *runtime, WorldRuntime::Plugin *plugin);
 static QList<WorldRuntime::Timer>   &mutableTimerList(WorldRuntime *runtime, WorldRuntime::Plugin *plugin);
-static void commitTriggerListMutation(WorldRuntime *runtime, const WorldRuntime::Plugin *plugin);
-static void commitAliasListMutation(WorldRuntime *runtime, const WorldRuntime::Plugin *plugin);
-static void commitTimerListMutation(WorldRuntime *runtime, const WorldRuntime::Plugin *plugin,
-                                    bool structureChanged = false);
-static bool fetchTriggerListForContext(const LuaCallbackEngine *engine, WorldRuntime *runtime,
-                                       const QString &pluginId, QList<WorldRuntime::Trigger> &triggers,
-                                       bool *pluginMissing = nullptr);
-static bool fetchAliasListForContext(const LuaCallbackEngine *engine, WorldRuntime *runtime,
-                                     const QString &pluginId, QList<WorldRuntime::Alias> &aliases,
-                                     bool *pluginMissing = nullptr);
-static bool fetchTimerListForContext(const LuaCallbackEngine *engine, WorldRuntime *runtime,
-                                     const QString &pluginId, QList<WorldRuntime::Timer> &timers,
-                                     bool *pluginMissing = nullptr);
-static bool resolveVariableEntriesSnapshotForApi(const LuaCallbackEngine *engine, WorldRuntime *runtime,
-                                                 QList<WorldRuntime::Variable> &entries);
-static void cacheCallbackVariableEntryAfterSet(const LuaCallbackEngine *engine, WorldRuntime *runtime,
-                                               const QString &name, const QString &value);
-static bool resolvePluginContextById(WorldRuntime *runtime, const QString &pluginId,
-                                     WorldRuntime::Plugin *&plugin, int &errorCode);
-static int  queryPluginSupportsForCallback(const LuaCallbackEngine *engine, WorldRuntime *runtime,
-                                           const QString &pluginId, const QString &scriptName,
-                                           int fallbackCode);
-static bool luaPluginSupportsScript(const LuaCallbackEngine *engine, WorldRuntime *runtime,
-                                    const QString &pluginId, const QString &scriptName);
+static void    commitTriggerListMutation(WorldRuntime *runtime, const WorldRuntime::Plugin *plugin);
+static void    commitAliasListMutation(WorldRuntime *runtime, const WorldRuntime::Plugin *plugin);
+static void    commitTimerListMutation(WorldRuntime *runtime, const WorldRuntime::Plugin *plugin,
+                                       bool structureChanged = false);
+static bool    fetchTriggerListForContext(const LuaCallbackEngine *engine, WorldRuntime *runtime,
+                                          const QString &pluginId, QList<WorldRuntime::Trigger> &triggers,
+                                          bool *pluginMissing = nullptr);
+static bool    fetchAliasListForContext(const LuaCallbackEngine *engine, WorldRuntime *runtime,
+                                        const QString &pluginId, QList<WorldRuntime::Alias> &aliases,
+                                        bool *pluginMissing = nullptr);
+static bool    fetchTimerListForContext(const LuaCallbackEngine *engine, WorldRuntime *runtime,
+                                        const QString &pluginId, QList<WorldRuntime::Timer> &timers,
+                                        bool *pluginMissing = nullptr);
+static bool    resolveVariableEntriesSnapshotForApi(const LuaCallbackEngine *engine, WorldRuntime *runtime,
+                                                    QList<WorldRuntime::Variable> &entries);
+static void    cacheCallbackVariableEntryAfterSet(const LuaCallbackEngine *engine, WorldRuntime *runtime,
+                                                  const QString &name, const QString &value);
+static QString pluginIdFromLua(lua_State *L);
+static bool    resolvePluginContextById(WorldRuntime *runtime, const QString &pluginId,
+                                        WorldRuntime::Plugin *&plugin, int &errorCode);
+static int     queryPluginSupportsForCallback(const LuaCallbackEngine *engine, WorldRuntime *runtime,
+                                              const QString &pluginId, const QString &scriptName,
+                                              int fallbackCode);
+static bool    luaPluginSupportsScript(const LuaCallbackEngine *engine, WorldRuntime *runtime,
+                                       const QString &pluginId, const QString &scriptName);
 static int pushDispatchSendCommandResult(lua_State *L, const LuaCallbackEngine *engine, WorldRuntime *runtime,
                                          const QString &apiName, const QString &text, bool echo, bool queue,
                                          bool log, bool history, bool immediate);
@@ -12860,53 +13810,6 @@ static int enqueueRuntimeThreadAsyncOkStatusResult(lua_State *L, const LuaCallba
 	return enqueueRuntimeThreadAsyncStatusResult(L, engine, runtime, apiName, eOK, enqueueFailureCode,
 	                                             std::forward<Func>(func),
 	                                             [](const int status) { return status == eOK; });
-}
-
-struct PluginAsyncDialogResult
-{
-		bool    ok{false};
-		int     errorCode{-1};
-		QString payload;
-};
-
-template <typename Func>
-static bool enqueueMainWindowAsyncResult(const LuaCallbackEngine *engine, WorldRuntime *runtime,
-                                         const QString &apiName, Func &&func, quint64 &requestId)
-{
-	using DecayedFunc = std::decay_t<Func>;
-	static_assert(std::is_invocable_r_v<PluginAsyncDialogResult, DecayedFunc, MainWindow *>,
-	              "Main-window async result callable must return PluginAsyncDialogResult");
-
-	requestId                      = 0;
-	const QString callbackPluginId = engine ? engine->pluginId() : QString();
-	if (!callbackPluginId.isEmpty())
-		requestId = nextPluginAsyncResultRequestId();
-
-	auto funcCopy = DecayedFunc(std::forward<Func>(func));
-	return enqueueRuntimeThreadDeferredMutationNoResult(
-	    engine, runtime,
-	    [apiName, callbackPluginId, requestId,
-	     funcCopy = std::move(funcCopy)](WorldRuntime &targetRuntime) mutable
-	    {
-		    const QPointer<WorldRuntime> runtimeGuard(&targetRuntime);
-		    const bool                   queued = enqueueOnMainThread(
-		        [runtimeGuard, apiName, callbackPluginId, requestId, funcCopy = std::move(funcCopy)]() mutable
-		        {
-			        WorldRuntime *targetRuntimeOnMain = runtimeGuard.data();
-			        if (!targetRuntimeOnMain)
-				        return;
-			        PluginAsyncDialogResult result;
-			        if (MainWindow *frame = resolveMainWindow())
-				        result = funcCopy(frame);
-			        emitPluginAsyncResult(*targetRuntimeOnMain, callbackPluginId, requestId, apiName,
-			                              result.ok, result.errorCode, result.payload);
-		        });
-		    if (!queued)
-		    {
-			    emitPluginAsyncResult(targetRuntime, callbackPluginId, requestId, apiName, false, -1,
-			                          QString());
-		    }
-	    });
 }
 
 template <typename Func>
@@ -15686,12 +16589,12 @@ static int luaErrorDesc(lua_State *L)
 	const WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const int     key  = static_cast<int>(luaL_checkinteger(L, 1));
 	const QString desc = WorldRuntime::errorDesc(key);
-	lua_pushstring(L, desc.toLatin1().constData());
+	pushLuaUtf8String(L, desc);
 	return 1;
 }
 
@@ -15701,7 +16604,7 @@ static int luaEvaluateSpeedwalk(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QString input = QString::fromUtf8(luaL_checkstring(L, 1));
@@ -15710,12 +16613,12 @@ static int luaEvaluateSpeedwalk(lua_State *L)
 		QString result;
 		if (!resolveSpeedwalkForApi(engine, runtime, input, result))
 			result.clear();
-		lua_pushstring(L, result.toLocal8Bit().constData());
+		pushLuaUtf8String(L, result);
 		return 1;
 	}
 	const QString result = runOnRuntimeThread(
 	    runtime, [&]() -> QString { return runtime->evaluateSpeedwalk(input); }, QString());
-	lua_pushstring(L, result.toLocal8Bit().constData());
+	pushLuaUtf8String(L, result);
 	return 1;
 }
 
@@ -15749,7 +16652,7 @@ static int luaExportXML(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 
@@ -15758,7 +16661,7 @@ static int luaExportXML(lua_State *L)
 	const QString targetName = rawName.trimmed().toLower();
 	if (targetName.isEmpty())
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 
@@ -15978,7 +16881,7 @@ static int luaExportXML(lua_State *L)
 		default:
 			break;
 		}
-		lua_pushstring(L, xmlOut.toUtf8().constData());
+		pushLuaUtf8String(L, xmlOut);
 		return 1;
 	}
 
@@ -16113,7 +17016,7 @@ static int luaExportXML(lua_State *L)
 		    return {};
 	    },
 	    QString());
-	lua_pushstring(L, xml.toUtf8().constData());
+	pushLuaUtf8String(L, xml);
 	return 1;
 }
 
@@ -16147,7 +17050,7 @@ static int luaFixupEscapeSequences(lua_State *L)
 {
 	const QString input  = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString result = qmudFixupEscapeSequences(input);
-	lua_pushstring(L, result.toUtf8().constData());
+	pushLuaUtf8String(L, result);
 	return 1;
 }
 
@@ -16155,7 +17058,7 @@ static int luaFixupHTML(lua_State *L)
 {
 	const QString input  = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString result = fixupHtmlString(input);
-	lua_pushstring(L, result.toLocal8Bit().constData());
+	pushLuaUtf8String(L, result);
 	return 1;
 }
 
@@ -16243,7 +17146,7 @@ static int luaGenerateName(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	lua_pushstring(L, name.toUtf8().constData());
+	pushLuaUtf8String(L, name);
 	return 1;
 }
 
@@ -16334,23 +17237,23 @@ static int luaGetClipboard(lua_State *L)
 	QString     text;
 	if (!resolveClipboardTextForApi(engine, text))
 		text.clear();
-	lua_pushstring(L, text.toLocal8Bit().constData());
+	pushLuaUtf8String(L, text);
 	return 1;
 }
 
 static void pushWindowPositionTable(lua_State *L, const QRect &rect)
 {
 	lua_newtable(L);
-	lua_pushstring(L, "left");
+	pushLuaUtf8String(L, "left");
 	lua_pushinteger(L, rect.left());
 	lua_rawset(L, -3);
-	lua_pushstring(L, "top");
+	pushLuaUtf8String(L, "top");
 	lua_pushinteger(L, rect.top());
 	lua_rawset(L, -3);
-	lua_pushstring(L, "width");
+	pushLuaUtf8String(L, "width");
 	lua_pushinteger(L, rect.width());
 	lua_rawset(L, -3);
-	lua_pushstring(L, "height");
+	pushLuaUtf8String(L, "height");
 	lua_pushinteger(L, rect.height());
 	lua_rawset(L, -3);
 }
@@ -16361,16 +17264,16 @@ static int luaGetCommand(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	WorldRuntime::CommandUiSnapshot snapshot;
 	if (!resolveCommandUiSnapshotLightForApi(engine, runtime, snapshot))
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
-	lua_pushstring(L, snapshot.commandInputText.toLocal8Bit().constData());
+	pushLuaUtf8String(L, snapshot.commandInputText);
 	return 1;
 }
 
@@ -16402,7 +17305,7 @@ static int luaGetCommandList(lua_State *L)
 	// Legacy behavior: command history list is returned newest-first.
 	for (int i = historySize - 1; i >= 0 && index <= takeCount; --i)
 	{
-		lua_pushstring(L, history.at(i).toLocal8Bit().constData());
+		pushLuaUtf8String(L, history.at(i));
 		lua_rawseti(L, -2, index++);
 	}
 	return 1;
@@ -16480,7 +17383,7 @@ static int luaGetCurrentValue(lua_State *L)
 	const bool    isMultiline   = (alpha->flags & kOptMultiline) != 0;
 	const QString value =
 	    resolveWorldAttributeValueMaybeMultilineForApi(engine, runtime, canonical, isMultiline);
-	lua_pushstring(L, value.toLocal8Bit().constData());
+	pushLuaUtf8String(L, value);
 	return 1;
 }
 
@@ -16491,13 +17394,13 @@ static int luaGetCustomColourName(lua_State *L)
 	const int     which   = static_cast<int>(luaL_checkinteger(L, 1));
 	if (which < 1 || which > 16)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	QString name;
 	if (!resolveCustomColourNameForApi(engine, runtime, which, name))
 		name = QStringLiteral("Custom%1").arg(which);
-	lua_pushstring(L, name.toLocal8Bit().constData());
+	pushLuaUtf8String(L, name);
 	return 1;
 }
 
@@ -16530,7 +17433,7 @@ static int luaGetDefaultValue(lua_State *L)
 		return 1;
 	}
 	const QString value = QString::fromLatin1(alpha->value ? alpha->value : "");
-	lua_pushstring(L, value.toLocal8Bit().constData());
+	pushLuaUtf8String(L, value);
 	return 1;
 }
 
@@ -16550,14 +17453,14 @@ static int luaGetEntity(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QString name = QString::fromUtf8(luaL_checkstring(L, 1));
 	QString       value;
 	if (!resolveEntityValueForApi(engine, runtime, name, value))
 		value.clear();
-	lua_pushstring(L, value.toLocal8Bit().constData());
+	pushLuaUtf8String(L, value);
 	return 1;
 }
 
@@ -16600,7 +17503,7 @@ static int luaGetXMLEntity(lua_State *L)
 {
 	const QString name   = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString result = decodeXmlEntity(name);
-	lua_pushstring(L, result.toUtf8().constData());
+	pushLuaUtf8String(L, result);
 	return 1;
 }
 
@@ -16646,7 +17549,7 @@ static int luaGetGlobalOptionList(lua_State *L)
 	int index = 1;
 	for (const QString &name : options)
 	{
-		lua_pushstring(L, name.toUtf8().constData());
+		pushLuaUtf8String(L, name);
 		lua_rawseti(L, -2, index++);
 	}
 	return 1;
@@ -16679,7 +17582,7 @@ static int luaGetHostAddress(lua_State *L)
 	int index = 1;
 	for (const QString &address : addresses)
 	{
-		lua_pushstring(L, address.toLocal8Bit().constData());
+		pushLuaUtf8String(L, address);
 		lua_rawseti(L, -2, index++);
 	}
 	return 1;
@@ -16690,34 +17593,34 @@ static int luaGetHostName(lua_State *L)
 	const QString address = QString::fromUtf8(luaL_checkstring(L, 1));
 	if (address.isEmpty())
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	QHostAddress parsed;
 	if (!parsed.setAddress(address) || parsed.protocol() != QAbstractSocket::IPv4Protocol)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	// Legacy behavior: inet_addr treats 255.255.255.255 as INADDR_NONE (invalid for reverse lookup path).
 	if (parsed.toIPv4Address() == 0xFFFFFFFFu)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QHostInfo info = QHostInfo::fromName(parsed.toString());
 	if (info.error() != QHostInfo::NoError)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QString hostName = info.hostName().trimmed();
 	if (hostName.isEmpty() || hostName == parsed.toString())
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
-	lua_pushstring(L, hostName.toLocal8Bit().constData());
+	pushLuaUtf8String(L, hostName);
 	return 1;
 }
 
@@ -16740,7 +17643,7 @@ static int luaGetInternalCommandsList(lua_State *L)
 	int index = 1;
 	for (const QString &command : commands)
 	{
-		lua_pushstring(L, command.toLatin1().constData());
+		pushLuaUtf8String(L, command);
 		lua_rawseti(L, -2, index++);
 	}
 	return 1;
@@ -16766,65 +17669,65 @@ static int luaGetLineInfo(lua_State *L)
 
 		lua_newtable(L);
 
-		lua_pushstring(L, "text");
+		pushLuaUtf8String(L, "text");
 		{
 			const QByteArray textBytes = entry.text.toLocal8Bit();
 			lua_pushlstring(L, textBytes.constData(), textBytes.size());
 		}
 		lua_rawset(L, -3);
 
-		lua_pushstring(L, "length");
+		pushLuaUtf8String(L, "length");
 		lua_pushinteger(L, entry.text.length());
 		lua_rawset(L, -3);
 
-		lua_pushstring(L, "newline");
+		pushLuaUtf8String(L, "newline");
 		lua_pushboolean(L, entry.hardReturn);
 		lua_rawset(L, -3);
 
-		lua_pushstring(L, "note");
+		pushLuaUtf8String(L, "note");
 		lua_pushboolean(L, (entry.flags & WorldRuntime::LineNote) != 0);
 		lua_rawset(L, -3);
 
-		lua_pushstring(L, "user");
+		pushLuaUtf8String(L, "user");
 		lua_pushboolean(L, (entry.flags & WorldRuntime::LineInput) != 0);
 		lua_rawset(L, -3);
 
-		lua_pushstring(L, "log");
+		pushLuaUtf8String(L, "log");
 		lua_pushboolean(L, (entry.flags & WorldRuntime::LineLog) != 0);
 		lua_rawset(L, -3);
 
-		lua_pushstring(L, "bookmark");
+		pushLuaUtf8String(L, "bookmark");
 		lua_pushboolean(L, (entry.flags & WorldRuntime::LineBookmark) != 0);
 		lua_rawset(L, -3);
 
-		lua_pushstring(L, "hr");
+		pushLuaUtf8String(L, "hr");
 		lua_pushboolean(L, (entry.flags & WorldRuntime::LineHorizontalRule) != 0);
 		lua_rawset(L, -3);
 
 		const qint64 lineTime = entry.time.isValid() ? entry.time.toSecsSinceEpoch() : 0;
-		lua_pushstring(L, "time");
+		pushLuaUtf8String(L, "time");
 		lua_pushnumber(L, static_cast<lua_Number>(lineTime));
 		lua_rawset(L, -3);
 
-		lua_pushstring(L, "timestr");
+		pushLuaUtf8String(L, "timestr");
 		const QString timeString =
 		    entry.time.isValid() ? QLocale::system().toString(entry.time, QLocale::ShortFormat) : QString();
 		const QByteArray timeBytes = timeString.toLocal8Bit();
 		lua_pushlstring(L, timeBytes.constData(), timeBytes.size());
 		lua_rawset(L, -3);
 
-		lua_pushstring(L, "line");
+		pushLuaUtf8String(L, "line");
 		lua_pushinteger(L, entry.lineNumber > 0 ? entry.lineNumber : lineNumber);
 		lua_rawset(L, -3);
 
-		lua_pushstring(L, "styles");
+		pushLuaUtf8String(L, "styles");
 		lua_pushinteger(L, entry.spans.size());
 		lua_rawset(L, -3);
 
-		lua_pushstring(L, "ticks");
+		pushLuaUtf8String(L, "ticks");
 		lua_pushnumber(L, entry.ticks);
 		lua_rawset(L, -3);
-		lua_pushstring(L, "elapsed");
+		pushLuaUtf8String(L, "elapsed");
 		lua_pushnumber(L, entry.elapsed);
 		lua_rawset(L, -3);
 
@@ -16936,7 +17839,7 @@ static int luaGetLoadedValue(lua_State *L)
 	const bool    isMultiline   = (alpha->flags & kOptMultiline) != 0;
 	const QString value =
 	    resolveWorldAttributeValueMaybeMultilineForApi(engine, runtime, canonical, isMultiline);
-	lua_pushstring(L, value.toLocal8Bit().constData());
+	pushLuaUtf8String(L, value);
 	return 1;
 }
 
@@ -17016,7 +17919,7 @@ static int luaGetMappingItem(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	lua_pushstring(L, entry.toLocal8Bit().constData());
+	pushLuaUtf8String(L, entry);
 	return 1;
 }
 
@@ -17026,13 +17929,13 @@ static int luaGetMappingString(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	QString mapping;
 	if (!resolveMappingStringForApi(engine, runtime, mapping))
 		mapping.clear();
-	lua_pushstring(L, mapping.toLocal8Bit().constData());
+	pushLuaUtf8String(L, mapping);
 	return 1;
 }
 
@@ -17071,7 +17974,7 @@ static int luaGetNotepadList(lua_State *L)
 	int index = 1;
 	for (const QString &title : titles)
 	{
-		lua_pushstring(L, title.toLocal8Bit().constData());
+		pushLuaUtf8String(L, title);
 		lua_rawseti(L, -2, index++);
 	}
 	return 1;
@@ -17086,7 +17989,7 @@ static int luaGetNotepadText(lua_State *L)
 	QString       contents;
 	if (!resolveNotepadTextForApi(engine, runtime, title, worldId, contents))
 		contents.clear();
-	lua_pushstring(L, contents.toLocal8Bit().constData());
+	pushLuaUtf8String(L, contents);
 	return 1;
 }
 
@@ -17096,12 +17999,12 @@ static int luaGetNotes(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QString notes =
 	    resolveWorldAttributeValueMaybeMultilineForApi(engine, runtime, QStringLiteral("notes"), true);
-	lua_pushstring(L, notes.toLocal8Bit().constData());
+	pushLuaUtf8String(L, notes);
 	return 1;
 }
 
@@ -17257,52 +18160,52 @@ static int pushStyleInfoTable(lua_State *L, const WorldRuntime::LineEntry &entry
 	};
 
 	lua_newtable(L);
-	lua_pushstring(L, "text");
+	pushLuaUtf8String(L, "text");
 	{
 		const QByteArray textBytes = entry.text.mid(startColumn, span.length).toLocal8Bit();
 		lua_pushlstring(L, textBytes.constData(), textBytes.size());
 	}
 	lua_rawset(L, -3);
-	lua_pushstring(L, "length");
+	pushLuaUtf8String(L, "length");
 	lua_pushinteger(L, span.length);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "column");
+	pushLuaUtf8String(L, "column");
 	lua_pushinteger(L, startColumn + 1);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "actiontype");
+	pushLuaUtf8String(L, "actiontype");
 	lua_pushinteger(L, actionType());
 	lua_rawset(L, -3);
-	lua_pushstring(L, "action");
-	lua_pushstring(L, span.action.toLocal8Bit().constData());
+	pushLuaUtf8String(L, "action");
+	pushLuaUtf8String(L, span.action);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "hint");
-	lua_pushstring(L, span.hint.toLocal8Bit().constData());
+	pushLuaUtf8String(L, "hint");
+	pushLuaUtf8String(L, span.hint);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "variable");
-	lua_pushstring(L, span.variable.toLocal8Bit().constData());
+	pushLuaUtf8String(L, "variable");
+	pushLuaUtf8String(L, span.variable);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "bold");
+	pushLuaUtf8String(L, "bold");
 	lua_pushboolean(L, span.bold);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "ul");
+	pushLuaUtf8String(L, "ul");
 	lua_pushboolean(L, span.underline);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "blink");
+	pushLuaUtf8String(L, "blink");
 	lua_pushboolean(L, span.blink);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "inverse");
+	pushLuaUtf8String(L, "inverse");
 	lua_pushboolean(L, span.inverse);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "changed");
+	pushLuaUtf8String(L, "changed");
 	lua_pushboolean(L, span.changed);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "starttag");
+	pushLuaUtf8String(L, "starttag");
 	lua_pushboolean(L, span.startTag);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "textcolour");
+	pushLuaUtf8String(L, "textcolour");
 	lua_pushnumber(L, static_cast<lua_Number>(colorValue(span.fore)));
 	lua_rawset(L, -3);
-	lua_pushstring(L, "backcolour");
+	pushLuaUtf8String(L, "backcolour");
 	lua_pushnumber(L, static_cast<lua_Number>(colorValue(span.back)));
 	lua_rawset(L, -3);
 	return 1;
@@ -17382,13 +18285,13 @@ static int luaGetStyleInfo(lua_State *L)
 					}
 					break;
 				case 5:
-					lua_pushstring(L, span.action.toLocal8Bit().constData());
+					pushLuaUtf8String(L, span.action);
 					break;
 				case 6:
-					lua_pushstring(L, span.hint.toLocal8Bit().constData());
+					pushLuaUtf8String(L, span.hint);
 					break;
 				case 7:
-					lua_pushstring(L, span.variable.toLocal8Bit().constData());
+					pushLuaUtf8String(L, span.variable);
 					break;
 				case 8:
 					lua_pushboolean(L, span.bold);
@@ -17470,13 +18373,13 @@ static int luaGetStyleInfo(lua_State *L)
 		}
 		break;
 	case 5:
-		lua_pushstring(L, span.action.toLocal8Bit().constData());
+		pushLuaUtf8String(L, span.action);
 		break;
 	case 6:
-		lua_pushstring(L, span.hint.toLocal8Bit().constData());
+		pushLuaUtf8String(L, span.hint);
 		break;
 	case 7:
-		lua_pushstring(L, span.variable.toLocal8Bit().constData());
+		pushLuaUtf8String(L, span.variable);
 		break;
 	case 8:
 		lua_pushboolean(L, span.bold);
@@ -17733,7 +18636,7 @@ static int pushWorldAttributeList(lua_State *L, const LuaCallbackEngine *engine,
 	int index = 1;
 	for (const QString &value : values)
 	{
-		lua_pushstring(L, value.toLocal8Bit().constData());
+		pushLuaUtf8String(L, value);
 		lua_rawseti(L, -2, index++);
 	}
 	return 1;
@@ -17775,7 +18678,7 @@ static int luaHash(lua_State *L)
 {
 	const QString    text = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QByteArray hash = QCryptographicHash::hash(text.toUtf8(), QCryptographicHash::Sha1);
-	lua_pushstring(L, hash.toHex().constData());
+	pushLuaUtf8String(L, hash.toHex());
 	return 1;
 }
 
@@ -18490,12 +19393,12 @@ static int luaMakeRegularExpression(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QString input = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString regex = WorldRuntime::makeRegularExpression(input);
-	lua_pushstring(L, regex.toLatin1().constData());
+	pushLuaUtf8String(L, regex);
 	return 1;
 }
 
@@ -18540,50 +19443,14 @@ static int luaMapColourList(lua_State *L)
 	return 1;
 }
 
-static QString showMenuDialog(const WorldView *view, const QStringList &items, const QString &def)
+static QString showMenuDialog(WorldView *view, const QStringList &items, const QString &def)
 {
 	if (items.isEmpty())
 		return {};
-	return runOnMainWindowThreadAllowNestedEvents(
-	    [&](MainWindow *frame) -> QString
-	    {
-		    QDialog dialog(frame);
-		    dialog.setWindowTitle(QStringLiteral("Menu"));
-		    dialog.setWindowFlags(dialog.windowFlags() | Qt::Tool);
-		    QVBoxLayout layout(&dialog);
-		    QListWidget list;
-		    list.addItems(items);
-		    layout.addWidget(&list);
-
-		    QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
-		    layout.addWidget(&buttons);
-
-		    QObject::connect(&buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-		    QObject::connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-		    QObject::connect(&list, &QListWidget::itemDoubleClicked, &dialog, &QDialog::accept);
-
-		    if (!def.isEmpty())
-		    {
-			    if (const QList<QListWidgetItem *> matches = list.findItems(def, Qt::MatchExactly);
-			        !matches.isEmpty())
-				    list.setCurrentItem(matches.first());
-		    }
-		    if (view && view->inputEditor())
-		    {
-			    QPlainTextEdit *input  = view->inputEditor();
-			    QTextCursor     cursor = input->textCursor();
-			    cursor.setPosition(cursor.selectionEnd());
-			    const QRect  rect   = input->cursorRect(cursor);
-			    const QPoint global = input->mapToGlobal(rect.bottomLeft());
-			    dialog.move(global);
-		    }
-
-		    if (dialog.exec() != QDialog::Accepted)
-			    return {};
-		    QListWidgetItem *selected = list.currentItem();
-		    return selected ? selected->text() : QString();
-	    },
-	    {});
+	QPointer<WorldView> viewGuard(view);
+	return runOnMainWindowThreadModalDialogSync(
+	    [viewGuard, items, def](MainWindow *frame) -> QString
+	    { return qmudShowLuaMenuDialog(viewGuard.data(), items, def, frame); }, {});
 }
 
 static int luaMenu(lua_State *L)
@@ -18592,76 +19459,39 @@ static int luaMenu(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QString items = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString def   = QString::fromUtf8(luaL_optstring(L, 2, ""));
-	QStringList   parts = items.split(QLatin1Char('|'), Qt::KeepEmptyParts);
+	QStringList   parts = qmudSplitLegacyMenuItems(items);
 	parts.sort(Qt::CaseSensitive);
 	parts.removeDuplicates();
 	if (activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
 	{
-		const QString callbackPluginId = engine->pluginId();
-		const quint64 requestId        = callbackPluginId.isEmpty() ? 0 : nextPluginAsyncResultRequestId();
-		const bool    accepted         = enqueueRuntimeThreadDeferredMutationNoResult(
-		    engine, runtime,
-		    [parts, def, callbackPluginId, requestId](WorldRuntime &targetRuntime)
-		    {
-			    QPointer<QCoreApplication> app = QCoreApplication::instance();
-			    if (!app)
-			    {
-				    emitPluginAsyncResult(targetRuntime, callbackPluginId, requestId, QStringLiteral("Menu"),
-				                          true, 0, QString());
-				    return;
-			    }
-			    QPointer<WorldRuntime> runtimeGuard(&targetRuntime);
-			    QPointer<WorldView>    viewGuard(targetRuntime.view());
-			    const bool             queued = QMetaObject::invokeMethod(
-			        app.data(),
-			        [runtimeGuard, viewGuard, parts, def, callbackPluginId, requestId]
-			        {
-				        WorldRuntime *targetRuntimeOnMain = runtimeGuard.data();
-				        if (!targetRuntimeOnMain)
-					        return;
-				        WorldView *view = viewGuard.data();
-				        if (!view || !view->inputEditor())
-				        {
-					        emitPluginAsyncResult(*targetRuntimeOnMain, callbackPluginId, requestId,
-					                              QStringLiteral("Menu"), true, 0, QString());
-					        return;
-				        }
-				        const QString result = showMenuDialog(view, parts, def);
-				        emitPluginAsyncResult(*targetRuntimeOnMain, callbackPluginId, requestId,
-				                              QStringLiteral("Menu"), true, 0, result);
-			        },
-			        Qt::QueuedConnection);
-			    if (!queued)
-			    {
-				    emitPluginAsyncResult(targetRuntime, callbackPluginId, requestId, QStringLiteral("Menu"),
-				                          false, -1, QString());
-			    }
-		    });
-		lua_pushstring(L, "");
-		if (accepted && requestId != 0)
+		if (canYieldModalResult(L))
 		{
-			lua_pushnumber(L, static_cast<lua_Number>(requestId));
-			return 2;
+			QPointer<WorldView>          viewGuard(runtime->view());
+			LuaPendingModalStringRequest request;
+			request.guiCallable = [viewGuard, parts, def]() -> QString
+			{ return qmudShowLuaMenuDialog(viewGuard.data(), parts, def); };
+			setLuaModalResumeCallback(request, runtime, pluginIdFromLua(L));
+			return yieldModalStringResult(L, engine, std::move(request));
 		}
+		const QString result = showMenuDialog(runtime->view(), parts, def);
+		pushLuaUtf8String(L, result);
 		return 1;
 	}
-	const QString result = runOnRuntimeThread(
-	    runtime,
-	    [runtime, parts, def]() -> QString
-	    {
-		    WorldView *view = runtime ? runtime->view() : nullptr;
-		    // Legacy behavior: if there is no command-input view, return empty selection.
-		    if (!view || !view->inputEditor())
-			    return {};
-		    return showMenuDialog(view, parts, def);
-	    },
-	    QString());
-	lua_pushstring(L, result.toLocal8Bit().constData());
+	const auto showMenu = [runtime, parts, def]() -> QString
+	{
+		WorldView *view = runtime ? runtime->view() : nullptr;
+		// Legacy behavior: if there is no command-input view, return empty selection.
+		if (!view || !view->inputEditor())
+			return {};
+		return showMenuDialog(view, parts, def);
+	};
+	const QString result = runOnRuntimeThread(runtime, showMenu, QString());
+	pushLuaUtf8String(L, result);
 	return 1;
 }
 
@@ -18671,13 +19501,13 @@ static int luaMetaphone(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const int     length = static_cast<int>(luaL_optinteger(L, 2, 4));
 	const QString input  = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString result = WorldRuntime::metaphone(input, length);
-	lua_pushstring(L, result.toUtf8().constData());
+	pushLuaUtf8String(L, result);
 	return 1;
 }
 
@@ -19515,7 +20345,7 @@ static int luaPasteCommand(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QString text = QString::fromUtf8(luaL_checkstring(L, 1));
@@ -19524,7 +20354,7 @@ static int luaPasteCommand(lua_State *L)
 		WorldRuntime::CommandUiSnapshot snapshot;
 		if (!resolveCommandUiSnapshotLightForApi(engine, runtime, snapshot) || !snapshot.hasView)
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		const QString expectedInput  = snapshot.commandInputText;
@@ -19549,7 +20379,7 @@ static int luaPasteCommand(lua_State *L)
 			                                             });
 			replaceCallbackCommandSelectionSnapshot(engine, selectionStart, selectionEnd, text);
 		}
-		lua_pushstring(L, replaced.toLocal8Bit().constData());
+		pushLuaUtf8String(L, replaced);
 		return 1;
 	}
 	const QString replaced = runOnRuntimeThread(
@@ -19561,7 +20391,7 @@ static int luaPasteCommand(lua_State *L)
 		    return {};
 	    },
 	    QString());
-	lua_pushstring(L, replaced.toLocal8Bit().constData());
+	pushLuaUtf8String(L, replaced);
 	return 1;
 }
 
@@ -19597,28 +20427,21 @@ static int luaPickColour(lua_State *L)
 	}
 	const auto pickColour = [initial](MainWindow *frame) -> QColor
 	{ return QColorDialog::getColor(initial, frame, QStringLiteral("Pick Colour")); };
-	if (engine && runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
+	if (runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden() &&
+	    canYieldModalResult(L))
 	{
-		quint64    requestId = 0;
-		const bool accepted  = enqueueMainWindowAsyncResult(
-		    engine, runtime, QStringLiteral("PickColour"),
-		    [pickColour](MainWindow *frame) -> PluginAsyncDialogResult
-		    {
-			    const QColor chosen = pickColour(frame);
-			    return {true, eOK,
-			            QString::number(chosen.isValid() ? static_cast<lua_Number>(colorValue(chosen)) : -1)};
-		    },
-		    requestId);
-		lua_pushnumber(L, -1);
-		if (accepted && requestId != 0)
+		LuaPendingModalStringRequest request;
+		request.guiCallable = [pickColour]() -> QString
 		{
-			lua_pushnumber(L, static_cast<lua_Number>(requestId));
-			return 2;
-		}
-		return 1;
+			MainWindow  *frame  = resolveMainWindow();
+			const QColor chosen = frame ? pickColour(frame) : QColor();
+			return QString::number(chosen.isValid() ? colorValue(chosen) : -1);
+		};
+		setLuaModalResumeCallback(request, runtime, pluginIdFromLua(L));
+		return yieldModalStringResult(L, engine, std::move(request), luaModalNumberContinuation);
 	}
-	const QColor chosen = runOnMainWindowThreadAllowNestedEvents([&](MainWindow *frame) -> QColor
-	                                                             { return pickColour(frame); }, {});
+	const QColor chosen = runOnMainWindowThreadModalDialogSync([&](MainWindow *frame) -> QColor
+	                                                           { return pickColour(frame); }, {});
 	if (!chosen.isValid())
 	{
 		lua_pushnumber(L, -1);
@@ -19788,7 +20611,7 @@ static int luaPushCommand(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	if (activeCallbackContextConst(engine))
@@ -19796,7 +20619,7 @@ static int luaPushCommand(lua_State *L)
 		WorldRuntime::CommandUiSnapshot snapshot;
 		if (!resolveCommandUiSnapshotLightForApi(engine, runtime, snapshot) || !snapshot.hasView)
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		const QString command = snapshot.commandInputText;
@@ -19833,7 +20656,7 @@ static int luaPushCommand(lua_State *L)
 			cacheCallbackCommandHistory(engine, history);
 		}
 
-		lua_pushstring(L, command.toLocal8Bit().constData());
+		pushLuaUtf8String(L, command);
 		return 1;
 	}
 	const QString command = runOnRuntimeThread(
@@ -19845,7 +20668,7 @@ static int luaPushCommand(lua_State *L)
 		    return {};
 	    },
 	    QString());
-	lua_pushstring(L, command.toLocal8Bit().constData());
+	pushLuaUtf8String(L, command);
 	return 1;
 }
 
@@ -19916,7 +20739,7 @@ static int luaRemoveBacktracks(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QHash<QString, AppController::MapDirection> directionSnapshot =
@@ -19931,14 +20754,14 @@ static int luaRemoveBacktracks(lua_State *L)
 		walk.clear();
 	if (walk.isEmpty() || walk.startsWith(QLatin1Char('*')))
 	{
-		lua_pushstring(L, walk.toLocal8Bit().constData());
+		pushLuaUtf8String(L, walk);
 		return 1;
 	}
 
 	const QStringList items = walk.split(QRegularExpression(QStringLiteral("[\\r\\n]+")), Qt::SkipEmptyParts);
 	if (items.isEmpty())
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 
@@ -20003,7 +20826,7 @@ static int luaRemoveBacktracks(lua_State *L)
 		result += QLatin1Char(' ');
 	}
 
-	lua_pushstring(L, result.toLocal8Bit().constData());
+	pushLuaUtf8String(L, result);
 	return 1;
 }
 
@@ -20070,7 +20893,7 @@ static int luaReplace(lua_State *L)
 	const QString replaceWith = QString::fromUtf8(luaL_checkstring(L, 3));
 	const bool    multiple    = optBool(L, 4, true);
 	const QString result      = qmudReplaceString(source, searchFor, replaceWith, multiple);
-	lua_pushstring(L, result.toUtf8().constData());
+	pushLuaUtf8String(L, result);
 	return 1;
 }
 
@@ -20109,7 +20932,7 @@ static int luaStripANSI(lua_State *L)
 {
 	const QString message  = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString stripped = stripAnsiText(message);
-	lua_pushstring(L, stripped.toLocal8Bit().constData());
+	pushLuaUtf8String(L, stripped);
 	return 1;
 }
 
@@ -20117,7 +20940,7 @@ static int luaTrim(lua_State *L)
 {
 	const QString source  = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString trimmed = source.trimmed();
-	lua_pushstring(L, trimmed.toLocal8Bit().constData());
+	pushLuaUtf8String(L, trimmed);
 	return 1;
 }
 
@@ -20125,7 +20948,7 @@ static int luaTranslateGerman(lua_State *L)
 {
 	const QString source = QString::fromUtf8(luaL_checkstring(L, 1));
 	const QString result = qmudFixUpGerman(source);
-	lua_pushstring(L, result.toUtf8().constData());
+	pushLuaUtf8String(L, result);
 	return 1;
 }
 
@@ -20160,7 +20983,7 @@ static int luaReverseSpeedwalk(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QHash<QString, AppController::MapDirection> directionSnapshot =
@@ -20175,14 +20998,14 @@ static int luaReverseSpeedwalk(lua_State *L)
 		walk.clear();
 	if (walk.isEmpty() || walk.startsWith(QLatin1Char('*')))
 	{
-		lua_pushstring(L, walk.toLocal8Bit().constData());
+		pushLuaUtf8String(L, walk);
 		return 1;
 	}
 
 	const QStringList items = walk.split(QRegularExpression(QStringLiteral("[\\r\\n]+")), Qt::SkipEmptyParts);
 	if (items.isEmpty())
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 
@@ -20232,7 +21055,7 @@ static int luaReverseSpeedwalk(lua_State *L)
 			result += lastDir + QLatin1Char(' ');
 	}
 
-	lua_pushstring(L, result.toLocal8Bit().constData());
+	pushLuaUtf8String(L, result);
 	return 1;
 }
 
@@ -20242,12 +21065,12 @@ static int luaRGBColourToName(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const long    colour = luaL_checkinteger(L, 1);
 	const QString result = WorldRuntime::rgbColourToName(colour);
-	lua_pushstring(L, result.toUtf8().constData());
+	pushLuaUtf8String(L, result);
 	return 1;
 }
 
@@ -22068,7 +22891,7 @@ static int luaBase64Decode(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	lua_pushstring(L, QString::fromUtf8(decoded).toUtf8().constData());
+	pushLuaUtf8String(L, QString::fromUtf8(decoded));
 	return 1;
 }
 
@@ -22078,13 +22901,13 @@ static int luaBase64Encode(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QString input     = QString::fromUtf8(luaL_checkstring(L, 1));
 	const bool    multiLine = optBool(L, 2, false);
 	const QString encoded   = WorldRuntime::base64Encode(input, multiLine);
-	lua_pushstring(L, encoded.toUtf8().constData());
+	pushLuaUtf8String(L, encoded);
 	return 1;
 }
 
@@ -22359,7 +23182,7 @@ static int luaResolveFilePathForApi(lua_State *L)
 	QString       error;
 	if (!resolveLuaFileApiPath(engine, rawPath, &resolved, &error))
 		return luaL_error(L, "QMud file path rejected: %s", qPrintable(error));
-	lua_pushstring(L, resolved.toUtf8().constData());
+	pushLuaUtf8String(L, resolved);
 	return 1;
 }
 
@@ -22401,28 +23224,28 @@ static int luaGetInfo(lua_State *L)
 	{
 	// strings
 	case 1:
-		lua_pushstring(L, getAttr(QStringLiteral("site")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("site")));
 		return 1;
 	case 2:
-		lua_pushstring(L, getAttr(QStringLiteral("name")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("name")));
 		return 1;
 	case 3:
-		lua_pushstring(L, getAttr(QStringLiteral("player")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("player")));
 		return 1;
 	case 4:
-		lua_pushstring(L, getMulti(QStringLiteral("send_to_world_file_preamble")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getMulti(QStringLiteral("send_to_world_file_preamble")));
 		return 1;
 	case 5:
-		lua_pushstring(L, getMulti(QStringLiteral("send_to_world_file_postamble")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getMulti(QStringLiteral("send_to_world_file_postamble")));
 		return 1;
 	case 6:
-		lua_pushstring(L, getAttr(QStringLiteral("send_to_world_line_preamble")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("send_to_world_line_preamble")));
 		return 1;
 	case 7:
-		lua_pushstring(L, getAttr(QStringLiteral("send_to_world_line_postamble")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("send_to_world_line_postamble")));
 		return 1;
 	case 8:
-		lua_pushstring(L, getAttr(QStringLiteral("notes")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("notes")));
 		return 1;
 	case 9:
 		pushLuaString(
@@ -22433,123 +23256,123 @@ static int luaGetInfo(lua_State *L)
 		    L, qmudHomeRelativePathForGetInfo(engine, getAttr(QStringLiteral("script_editor")), false));
 		return 1;
 	case 11:
-		lua_pushstring(L, getMulti(QStringLiteral("log_file_preamble")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getMulti(QStringLiteral("log_file_preamble")));
 		return 1;
 	case 12:
-		lua_pushstring(L, getMulti(QStringLiteral("log_file_postamble")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getMulti(QStringLiteral("log_file_postamble")));
 		return 1;
 	case 13:
-		lua_pushstring(L, getAttr(QStringLiteral("log_line_preamble_input")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("log_line_preamble_input")));
 		return 1;
 	case 14:
-		lua_pushstring(L, getAttr(QStringLiteral("log_line_preamble_notes")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("log_line_preamble_notes")));
 		return 1;
 	case 15:
-		lua_pushstring(L, getAttr(QStringLiteral("log_line_preamble_output")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("log_line_preamble_output")));
 		return 1;
 	case 16:
-		lua_pushstring(L, getAttr(QStringLiteral("log_line_postamble_input")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("log_line_postamble_input")));
 		return 1;
 	case 17:
-		lua_pushstring(L, getAttr(QStringLiteral("log_line_postamble_notes")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("log_line_postamble_notes")));
 		return 1;
 	case 18:
-		lua_pushstring(L, getAttr(QStringLiteral("log_line_postamble_output")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("log_line_postamble_output")));
 		return 1;
 	case 19:
-		lua_pushstring(L, getAttr(QStringLiteral("speed_walk_filler")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("speed_walk_filler")));
 		return 1;
 	case 20:
-		lua_pushstring(L, getAttr(QStringLiteral("output_font_name")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("output_font_name")));
 		return 1;
 	case 21:
-		lua_pushstring(L, getAttr(QStringLiteral("speed_walk_prefix")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("speed_walk_prefix")));
 		return 1;
 	case 22:
-		lua_pushstring(L, getMulti(QStringLiteral("connect_text")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getMulti(QStringLiteral("connect_text")));
 		return 1;
 	case 23:
-		lua_pushstring(L, getAttr(QStringLiteral("input_font_name")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("input_font_name")));
 		return 1;
 	case 24:
-		lua_pushstring(L, getMulti(QStringLiteral("paste_postamble")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getMulti(QStringLiteral("paste_postamble")));
 		return 1;
 	case 25:
-		lua_pushstring(L, getMulti(QStringLiteral("paste_preamble")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getMulti(QStringLiteral("paste_preamble")));
 		return 1;
 	case 26:
-		lua_pushstring(L, getAttr(QStringLiteral("paste_line_postamble")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("paste_line_postamble")));
 		return 1;
 	case 27:
-		lua_pushstring(L, getAttr(QStringLiteral("paste_line_preamble")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("paste_line_preamble")));
 		return 1;
 	case 28:
-		lua_pushstring(L, getAttr(QStringLiteral("script_language")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("script_language")));
 		return 1;
 	case 29:
-		lua_pushstring(L, getAttr(QStringLiteral("on_world_open")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("on_world_open")));
 		return 1;
 	case 30:
-		lua_pushstring(L, getAttr(QStringLiteral("on_world_close")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("on_world_close")));
 		return 1;
 	case 31:
-		lua_pushstring(L, getAttr(QStringLiteral("on_world_connect")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("on_world_connect")));
 		return 1;
 	case 32:
-		lua_pushstring(L, getAttr(QStringLiteral("on_world_disconnect")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("on_world_disconnect")));
 		return 1;
 	case 33:
-		lua_pushstring(L, getAttr(QStringLiteral("on_world_get_focus")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("on_world_get_focus")));
 		return 1;
 	case 34:
-		lua_pushstring(L, getAttr(QStringLiteral("on_world_lose_focus")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("on_world_lose_focus")));
 		return 1;
 	case 35:
 		pushLuaString(
 		    L, qmudHomeRelativePathForGetInfo(engine, getAttr(QStringLiteral("script_filename")), false));
 		return 1;
 	case 36:
-		lua_pushstring(L, getAttr(QStringLiteral("script_prefix")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("script_prefix")));
 		return 1;
 	case 37:
-		lua_pushstring(L, getAttr(QStringLiteral("auto_say_string")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("auto_say_string")));
 		return 1;
 	case 38:
-		lua_pushstring(L, getAttr(QStringLiteral("auto_say_override")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("auto_say_override")));
 		return 1;
 	case 39:
-		lua_pushstring(L, getAttr(QStringLiteral("tab_completion_defaults")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("tab_completion_defaults")));
 		return 1;
 	case 40:
 		pushLuaString(
 		    L, qmudHomeRelativePathForGetInfo(engine, getAttr(QStringLiteral("auto_log_file_name")), false));
 		return 1;
 	case 41:
-		lua_pushstring(L, getAttr(QStringLiteral("recall_line_preamble")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("recall_line_preamble")));
 		return 1;
 	case 42:
-		lua_pushstring(L, getAttr(QStringLiteral("terminal_identification")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("terminal_identification")));
 		return 1;
 	case 43:
-		lua_pushstring(L, getAttr(QStringLiteral("mapping_failure")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("mapping_failure")));
 		return 1;
 	case 44:
-		lua_pushstring(L, getAttr(QStringLiteral("on_mxp_start")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("on_mxp_start")));
 		return 1;
 	case 45:
-		lua_pushstring(L, getAttr(QStringLiteral("on_mxp_stop")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("on_mxp_stop")));
 		return 1;
 	case 46:
-		lua_pushstring(L, getAttr(QStringLiteral("on_mxp_error")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("on_mxp_error")));
 		return 1;
 	case 47:
-		lua_pushstring(L, getAttr(QStringLiteral("on_mxp_open_tag")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("on_mxp_open_tag")));
 		return 1;
 	case 48:
-		lua_pushstring(L, getAttr(QStringLiteral("on_mxp_close_tag")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("on_mxp_close_tag")));
 		return 1;
 	case 49:
-		lua_pushstring(L, getAttr(QStringLiteral("on_mxp_set_variable")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("on_mxp_set_variable")));
 		return 1;
 	case 50:
 		pushLuaString(L,
@@ -22560,7 +23383,7 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.logFileName, false));
@@ -22571,10 +23394,10 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.lastImmediateExpression.toLocal8Bit().constData());
+		pushLuaUtf8String(L, snapshot.lastImmediateExpression);
 		return 1;
 	}
 	case 53:
@@ -22582,10 +23405,10 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.statusMessage.toLocal8Bit().constData());
+		pushLuaUtf8String(L, snapshot.statusMessage);
 		return 1;
 	}
 	case 54:
@@ -22593,7 +23416,7 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.worldFilePath, false));
@@ -22607,7 +23430,7 @@ static int luaGetInfo(lua_State *L)
 			title = snapshot.windowTitleOverride;
 		if (title.isEmpty())
 			title = getAttr(QStringLiteral("name"));
-		lua_pushstring(L, title.toLocal8Bit().constData());
+		pushLuaUtf8String(L, title);
 		return 1;
 	}
 	case 56:
@@ -22618,7 +23441,7 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.defaultWorldDirectory, true));
@@ -22629,7 +23452,7 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.defaultLogDirectory, true));
@@ -22643,7 +23466,7 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.pluginsDirectory, true));
@@ -22654,10 +23477,10 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.peerAddressString.toLocal8Bit().constData());
+		pushLuaUtf8String(L, snapshot.peerAddressString);
 		return 1;
 	}
 	case 62:
@@ -22665,14 +23488,14 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.proxyAddressString.toLocal8Bit().constData());
+		pushLuaUtf8String(L, snapshot.proxyAddressString);
 		return 1;
 	}
 	case 63:
-		lua_pushstring(L, QHostInfo::localHostName().toLocal8Bit().constData());
+		pushLuaUtf8String(L, QHostInfo::localHostName());
 		return 1;
 	case 64:
 	{
@@ -22680,7 +23503,7 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	}
 	case 65:
-		lua_pushstring(L, getAttr(QStringLiteral("on_world_save")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, getAttr(QStringLiteral("on_world_save")));
 		return 1;
 	case 66:
 	{
@@ -22701,7 +23524,7 @@ static int luaGetInfo(lua_State *L)
 			worldFilePath = snapshot.worldFilePath;
 		if (worldFilePath.isEmpty())
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		const QString worldDir = QFileInfo(QMudPluginPathUtils::normalizeSeparators(worldFilePath)).path();
@@ -22713,7 +23536,7 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.startupDirectory, true));
@@ -22724,7 +23547,7 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.translatorFile, false));
@@ -22735,10 +23558,10 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.locale.toLocal8Bit().constData());
+		pushLuaUtf8String(L, snapshot.locale);
 		return 1;
 	}
 	case 71:
@@ -22746,17 +23569,17 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.fixedPitchFont.toLocal8Bit().constData());
+		pushLuaUtf8String(L, snapshot.fixedPitchFont);
 		return 1;
 	}
 	case 72:
-		lua_pushstring(L, kVersionString);
+		pushLuaUtf8String(L, kVersionString);
 		return 1;
 	case 73:
-		lua_pushstring(L, QStringLiteral(__DATE__ " " __TIME__).toLocal8Bit().constData());
+		pushLuaUtf8String(L, QStringLiteral(__DATE__ " " __TIME__));
 		return 1;
 	case 74:
 	{
@@ -22775,10 +23598,10 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.lastTelnetSubnegotiation.toLocal8Bit().constData());
+		pushLuaUtf8String(L, snapshot.lastTelnetSubnegotiation);
 		return 1;
 	}
 	case 76:
@@ -22786,14 +23609,14 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.firstSpecialFontPath, false));
 		return 1;
 	}
 	case 77:
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	case 78:
 		pushLuaString(
@@ -22805,28 +23628,28 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	case 81:
 	case 80:
-		lua_pushstring(L, qmudPngVersionString().toLocal8Bit().constData());
+		pushLuaUtf8String(L, qmudPngVersionString());
 		return 1;
 	case 82:
 	{
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.preferencesDatabaseName, false));
 		return 1;
 	}
 	case 83:
-		lua_pushstring(L, sqliteVersionString().toLocal8Bit().constData());
+		pushLuaUtf8String(L, sqliteVersionString());
 		return 1;
 	case 84:
 	{
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.fileBrowsingDirectory, true));
@@ -22837,7 +23660,7 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		pushLuaString(L, qmudHomeRelativePathForGetInfo(engine, snapshot.stateFilesDirectory, true));
@@ -22848,10 +23671,10 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::CommandUiSnapshot snapshot;
 		if (!resolveCommandUiSnapshotForApi(engine, runtime, snapshot, true))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.selectedWord.toLocal8Bit().constData());
+		pushLuaUtf8String(L, snapshot.selectedWord);
 		return 1;
 	}
 	case 87:
@@ -22859,10 +23682,10 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.lastCommandSent.toLocal8Bit().constData());
+		pushLuaUtf8String(L, snapshot.lastCommandSent);
 		return 1;
 	}
 	case 88:
@@ -22870,10 +23693,10 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.windowTitleOverride.toLocal8Bit().constData());
+		pushLuaUtf8String(L, snapshot.windowTitleOverride);
 		return 1;
 	}
 	case 89:
@@ -22881,10 +23704,10 @@ static int luaGetInfo(lua_State *L)
 		WorldRuntime::RuntimeCountersSnapshot snapshot;
 		if (!resolveRuntimeCountersSnapshotWithStringsForApi(engine, runtime, snapshot))
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
-		lua_pushstring(L, snapshot.mainTitleOverride.toLocal8Bit().constData());
+		pushLuaUtf8String(L, snapshot.mainTitleOverride);
 		return 1;
 	}
 	case 272:
@@ -24639,39 +25462,38 @@ static int luaUtilsFontPicker(lua_State *L)
 			pickerResult.colour = initialColour;
 		return pickerResult;
 	};
-	if (engine && runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
+	if (runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden() &&
+	    canYieldModalResult(L))
 	{
-		quint64    requestId = 0;
-		const bool accepted  = enqueueMainWindowAsyncResult(
-		    engine, runtime, QStringLiteral("FontPicker"),
-		    [pickFont](MainWindow *frame) -> PluginAsyncDialogResult
-		    {
-			    const FontPickerResult result = pickFont(frame);
-			    if (!result.accepted)
-				    return {false, -1, QString()};
-			    const QString payload = encodeAsyncKeyValuePayload({
-			        {QStringLiteral("name"),      result.font.family()                               },
-			        {QStringLiteral("style"),     QFontDatabase::styleString(result.font)            },
-			        {QStringLiteral("size"),      QString::number(result.font.pointSize())           },
-			        {QStringLiteral("colour"),    QString::number(colourRefFromQColor(result.colour))},
-			        {QStringLiteral("bold"),      QString::number(result.font.bold() ? 1 : 0)        },
-			        {QStringLiteral("italic"),    QString::number(result.font.italic() ? 1 : 0)      },
-			        {QStringLiteral("underline"), QString::number(result.font.underline() ? 1 : 0)   },
-			        {QStringLiteral("strikeout"), QString::number(result.font.strikeOut() ? 1 : 0)   },
-			        {QStringLiteral("charset"),   QStringLiteral("0")                                }
-                });
-			    return {true, eOK, payload};
-		    },
-		    requestId);
-		lua_pushnil(L);
-		if (accepted && requestId != 0)
+		LuaPendingModalStringRequest request;
+		request.guiCallable = [pickFont]() -> QString
 		{
-			lua_pushnumber(L, static_cast<lua_Number>(requestId));
-			return 2;
-		}
-		return 1;
+			MainWindow *frame = resolveMainWindow();
+			if (!frame)
+				return luaModalJsonResult({
+				    {QStringLiteral("accepted"), false}
+                });
+			const FontPickerResult result = pickFont(frame);
+			if (!result.accepted)
+				return luaModalJsonResult({
+				    {QStringLiteral("accepted"), false}
+                });
+			return luaModalJsonResult({
+			    {QStringLiteral("accepted"),  true                                   },
+			    {QStringLiteral("name"),      result.font.family()                   },
+			    {QStringLiteral("style"),     QFontDatabase::styleString(result.font)},
+			    {QStringLiteral("size"),      result.font.pointSize()                },
+			    {QStringLiteral("colour"),    colourRefFromQColor(result.colour)     },
+			    {QStringLiteral("bold"),      result.font.bold()                     },
+			    {QStringLiteral("italic"),    result.font.italic()                   },
+			    {QStringLiteral("underline"), result.font.underline()                },
+			    {QStringLiteral("strikeout"), result.font.strikeOut()                }
+            });
+		};
+		setLuaModalResumeCallback(request, runtime, pluginIdFromLua(L));
+		return yieldModalStringResult(L, engine, std::move(request), luaModalFontPickerContinuation);
 	}
-	const FontPickerResult result = runOnMainWindowThreadAllowNestedEvents(
+	const FontPickerResult result = runOnMainWindowThreadModalDialogSync(
 	    [&](MainWindow *frame) -> FontPickerResult { return pickFont(frame); }, {});
 	if (!result.accepted)
 	{
@@ -24851,32 +25673,26 @@ static int luaUtilsMsgBoxInternal(lua_State *L)
 			return "other";
 		}
 	};
-	if (engine && runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
+	if (runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden() &&
+	    canYieldModalResult(L))
 	{
-		quint64    requestId = 0;
-		const bool accepted  = enqueueMainWindowAsyncResult(
-		    engine, runtime, QStringLiteral("MsgBox"),
-		    [showMessageBox, buttonName](MainWindow *frame) -> PluginAsyncDialogResult
-		    {
-			    const QMessageBox::StandardButton result = showMessageBox(frame);
-			    return {true, eOK, QString::fromLatin1(buttonName(result))};
-		    },
-		    requestId);
-		lua_pushstring(L, "other");
-		if (accepted && requestId != 0)
+		LuaPendingModalStringRequest request;
+		request.guiCallable = [showMessageBox, buttonName]() -> QString
 		{
-			lua_pushnumber(L, static_cast<lua_Number>(requestId));
-			return 2;
-		}
-		return 1;
+			MainWindow *frame  = resolveMainWindow();
+			const auto  result = frame ? showMessageBox(frame)
+			                           : static_cast<QMessageBox::StandardButton>(QMessageBox::NoButton);
+			return QString::fromLatin1(buttonName(result));
+		};
+		setLuaModalResumeCallback(request, runtime, pluginIdFromLua(L));
+		return yieldModalStringResult(L, engine, std::move(request));
 	}
-
 	const auto result =
-	    runOnMainWindowThreadAllowNestedEvents([&](MainWindow *frame) -> QMessageBox::StandardButton
-	                                           { return showMessageBox(frame); }, QMessageBox::NoButton);
+	    runOnMainWindowThreadModalDialogSync([&](MainWindow *frame) -> QMessageBox::StandardButton
+	                                         { return showMessageBox(frame); }, QMessageBox::NoButton);
 	const char *out = buttonName(result);
 
-	lua_pushstring(L, out);
+	pushLuaUtf8String(L, out);
 	return 1;
 }
 
@@ -24955,7 +25771,7 @@ static int luaUtilsFunctionList(lua_State *L)
 	lua_newtable(L);
 	for (int i = 0; kInternalFunctionMetadataTable[i].functionName[0]; ++i)
 	{
-		lua_pushstring(L, kInternalFunctionMetadataTable[i].functionName);
+		pushLuaUtf8String(L, kInternalFunctionMetadataTable[i].functionName);
 		lua_rawseti(L, -2, i + 1);
 	}
 	return 1;
@@ -24966,8 +25782,8 @@ static int luaUtilsFunctionArgs(lua_State *L)
 	lua_newtable(L);
 	for (int i = 0; kInternalFunctionMetadataTable[i].functionName[0]; ++i)
 	{
-		lua_pushstring(L, kInternalFunctionMetadataTable[i].functionName);
-		lua_pushstring(L, kInternalFunctionMetadataTable[i].argumentsSignature);
+		pushLuaUtf8String(L, kInternalFunctionMetadataTable[i].functionName);
+		pushLuaUtf8String(L, kInternalFunctionMetadataTable[i].argumentsSignature);
 		lua_rawset(L, -3);
 	}
 	return 1;
@@ -25021,11 +25837,11 @@ static int luaUtilsMetaphone(lua_State *L)
 	const QString input             = QString::fromUtf8(luaL_checkstring(L, 1));
 	const int     length            = static_cast<int>(luaL_optnumber(L, 2, 4));
 	const auto [primary, secondary] = qmudDoubleMetaphone(input, length);
-	lua_pushstring(L, primary.toUtf8().constData());
+	pushLuaUtf8String(L, primary);
 	if (secondary.isEmpty())
 		lua_pushnil(L);
 	else
-		lua_pushstring(L, secondary.toUtf8().constData());
+		pushLuaUtf8String(L, secondary);
 	return 2;
 }
 
@@ -25054,7 +25870,7 @@ static int luaUtilsHash(lua_State *L)
 	const char      *data = luaL_checklstring(L, 1, &len);
 	const QByteArray bytes(data, static_cast<int>(len));
 	const QByteArray digest = QCryptographicHash::hash(bytes, QCryptographicHash::Sha1);
-	lua_pushstring(L, digest.toHex().constData());
+	pushLuaUtf8String(L, digest.toHex());
 	return 1;
 }
 
@@ -25086,14 +25902,14 @@ static int luaUtilsReadDir(lua_State *L)
 		lua_pushlstring(L, name.constData(), name.size());
 		lua_newtable(L);
 
-		lua_pushstring(L, "size");
+		pushLuaUtf8String(L, "size");
 		lua_pushnumber(L, static_cast<lua_Number>(fi.size()));
 		lua_rawset(L, -3);
 
 		if (const qint64 createSecs = fi.birthTime().isValid() ? fi.birthTime().toSecsSinceEpoch() : -1;
 		    createSecs >= 0)
 		{
-			lua_pushstring(L, "create_time");
+			pushLuaUtf8String(L, "create_time");
 			lua_pushnumber(L, static_cast<lua_Number>(createSecs));
 			lua_rawset(L, -3);
 		}
@@ -25101,34 +25917,34 @@ static int luaUtilsReadDir(lua_State *L)
 		if (const qint64 accessSecs = fi.lastRead().isValid() ? fi.lastRead().toSecsSinceEpoch() : -1;
 		    accessSecs >= 0)
 		{
-			lua_pushstring(L, "access_time");
+			pushLuaUtf8String(L, "access_time");
 			lua_pushnumber(L, static_cast<lua_Number>(accessSecs));
 			lua_rawset(L, -3);
 		}
 
-		lua_pushstring(L, "write_time");
+		pushLuaUtf8String(L, "write_time");
 		lua_pushnumber(L, static_cast<lua_Number>(fi.lastModified().toSecsSinceEpoch()));
 		lua_rawset(L, -3);
 
 		const QFile::Permissions perms    = fi.permissions();
 		const bool               readonly = !(perms & QFileDevice::WriteOwner);
 
-		lua_pushstring(L, "archive");
+		pushLuaUtf8String(L, "archive");
 		lua_pushboolean(L, fi.isFile());
 		lua_rawset(L, -3);
-		lua_pushstring(L, "hidden");
+		pushLuaUtf8String(L, "hidden");
 		lua_pushboolean(L, fi.isHidden());
 		lua_rawset(L, -3);
-		lua_pushstring(L, "normal");
+		pushLuaUtf8String(L, "normal");
 		lua_pushboolean(L, fi.isFile() && !fi.isHidden() && !fi.isSymLink());
 		lua_rawset(L, -3);
-		lua_pushstring(L, "readonly");
+		pushLuaUtf8String(L, "readonly");
 		lua_pushboolean(L, readonly);
 		lua_rawset(L, -3);
-		lua_pushstring(L, "directory");
+		pushLuaUtf8String(L, "directory");
 		lua_pushboolean(L, fi.isDir());
 		lua_rawset(L, -3);
-		lua_pushstring(L, "system");
+		pushLuaUtf8String(L, "system");
 		lua_pushboolean(L, fi.isSymLink());
 		lua_rawset(L, -3);
 
@@ -25156,22 +25972,22 @@ static int luaUtilsInfo(lua_State *L)
 	AppController *app = AppController::instance();
 	if (const QString currentDir = slashPathWithTrailingSlash(QDir::currentPath()); !currentDir.isEmpty())
 	{
-		lua_pushstring(L, "current_directory");
-		lua_pushstring(L, qmudHomeRelativePathForGetInfo(engine, currentDir, true).toUtf8().constData());
+		pushLuaUtf8String(L, "current_directory");
+		pushLuaUtf8String(L, qmudHomeRelativePathForGetInfo(engine, currentDir, true));
 		lua_rawset(L, -3);
 	}
 
 	const QString appDir = qmudHomeRelativePathForGetInfo(engine, qmudHomeForLuaFileApi(engine), true);
-	lua_pushstring(L, "app_directory");
-	lua_pushstring(L, appDir.toUtf8().constData());
+	pushLuaUtf8String(L, "app_directory");
+	pushLuaUtf8String(L, appDir);
 	lua_rawset(L, -3);
 
 	if (app)
 	{
 		auto setString = [L](const char *key, const QString &value)
 		{
-			lua_pushstring(L, key);
-			lua_pushstring(L, value.toUtf8().constData());
+			pushLuaUtf8String(L, key);
+			pushLuaUtf8String(L, value);
 			lua_rawset(L, -3);
 		};
 
@@ -25190,7 +26006,7 @@ static int luaUtilsInfo(lua_State *L)
 		          qmudHomeRelativePathForGetInfo(engine, QFileInfo(app->iniFilePath()).absolutePath(), true));
 		setString("locale", globalString("Locale"));
 		setString("fixed_pitch_font", globalString("FixedPitchFont"));
-		lua_pushstring(L, "fixed_pitch_font_size");
+		pushLuaUtf8String(L, "fixed_pitch_font_size");
 		lua_pushinteger(L, app->getGlobalOption(QStringLiteral("FixedPitchFontSize")).toInt());
 		lua_rawset(L, -3);
 
@@ -25222,7 +26038,7 @@ static int luaUtilsInfoTypes(lua_State *L)
 	lua_newtable(L);
 	for (int i = 0; kInfoTypeMappingTable[i].infoType; ++i)
 	{
-		lua_pushstring(L, kInfoTypeMappingTable[i].description);
+		pushLuaUtf8String(L, kInfoTypeMappingTable[i].description);
 		lua_rawseti(L, -2, kInfoTypeMappingTable[i].infoType);
 	}
 	return 1;
@@ -25487,7 +26303,7 @@ static int luaUtilsShellExecute(lua_State *L)
 		if (!url.isValid())
 		{
 			lua_pushnil(L);
-			lua_pushstring(L, "Invalid URL or path.");
+			pushLuaUtf8String(L, "Invalid URL or path.");
 			return 2;
 		}
 		if (operation == QStringLiteral("explore") && url.isLocalFile())
@@ -25540,7 +26356,7 @@ static int luaUtilsShellExecute(lua_State *L)
 	if (!ok)
 	{
 		lua_pushnil(L);
-		lua_pushstring(L, error.toUtf8().constData());
+		pushLuaUtf8String(L, error);
 		return 2;
 	}
 	lua_pushboolean(L, 1);
@@ -25622,33 +26438,32 @@ static int luaUtilsSpellCheckDialog(lua_State *L)
 		dialogResult.replacement = dlg.replacement();
 		return dialogResult;
 	};
-	if (engine && runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
+	if (runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden() &&
+	    canYieldModalResult(L))
 	{
-		quint64    requestId = 0;
-		const bool accepted  = enqueueMainWindowAsyncResult(
-		    engine, runtime, QStringLiteral("SpellCheckDialog"),
-		    [showSpellCheckDialog](MainWindow *frame) -> PluginAsyncDialogResult
-		    {
-			    const SpellCheckDialogResult result = showSpellCheckDialog(frame);
-			    if (!result.accepted)
-				    return {false, -1, QString()};
-			    return {
-			        true, eOK,
-			        encodeAsyncKeyValuePayload({{QStringLiteral("action"), result.action},
-			                                    {QStringLiteral("replacement"), result.replacement}}
-                    )
-                };
-		    },
-		    requestId);
-		lua_pushnil(L);
-		if (accepted && requestId != 0)
+		LuaPendingModalStringRequest request;
+		request.guiCallable = [showSpellCheckDialog]() -> QString
 		{
-			lua_pushnumber(L, static_cast<lua_Number>(requestId));
-			return 2;
-		}
-		return 1;
+			MainWindow *frame = resolveMainWindow();
+			if (!frame)
+				return luaModalJsonResult({
+				    {QStringLiteral("accepted"), false}
+                });
+			const SpellCheckDialogResult result = showSpellCheckDialog(frame);
+			if (!result.accepted)
+				return luaModalJsonResult({
+				    {QStringLiteral("accepted"), false}
+                });
+			return luaModalJsonResult({
+			    {QStringLiteral("accepted"),    true              },
+			    {QStringLiteral("action"),      result.action     },
+			    {QStringLiteral("replacement"), result.replacement}
+            });
+		};
+		setLuaModalResumeCallback(request, runtime, pluginIdFromLua(L));
+		return yieldModalStringResult(L, engine, std::move(request), luaModalSpellCheckContinuation);
 	}
-	const SpellCheckDialogResult result = runOnMainWindowThreadAllowNestedEvents(
+	const SpellCheckDialogResult result = runOnMainWindowThreadModalDialogSync(
 	    [&](MainWindow *frame) -> SpellCheckDialogResult { return showSpellCheckDialog(frame); }, {});
 	if (!result.accepted)
 	{
@@ -25938,30 +26753,30 @@ static int luaUtilsXmlRead(lua_State *L)
 				continue;
 			XmlNodeFrame frame = stack.takeLast();
 			lua_newtable(L);
-			lua_pushstring(L, "name");
-			lua_pushstring(L, frame.name.toUtf8().constData());
+			pushLuaUtf8String(L, "name");
+			pushLuaUtf8String(L, frame.name);
 			lua_rawset(L, -3);
 			if (!frame.text.isEmpty())
 			{
-				lua_pushstring(L, "value");
-				lua_pushstring(L, frame.text.toUtf8().constData());
+				pushLuaUtf8String(L, "value");
+				pushLuaUtf8String(L, frame.text);
 				lua_rawset(L, -3);
 			}
 			if (!frame.attrs.isEmpty())
 			{
-				lua_pushstring(L, "attributes");
+				pushLuaUtf8String(L, "attributes");
 				lua_newtable(L);
 				for (const auto &[k, v] : frame.attrs)
 				{
-					lua_pushstring(L, k.toUtf8().constData());
-					lua_pushstring(L, v.toUtf8().constData());
+					pushLuaUtf8String(L, k);
+					pushLuaUtf8String(L, v);
 					lua_rawset(L, -3);
 				}
 				lua_rawset(L, -3);
 			}
 			if (frame.childrenRef != LUA_REFNIL)
 			{
-				lua_pushstring(L, "nodes");
+				pushLuaUtf8String(L, "nodes");
 				lua_rawgeti(L, LUA_REGISTRYINDEX, frame.childrenRef);
 				lua_rawset(L, -3);
 				luaL_unref(L, LUA_REGISTRYINDEX, frame.childrenRef);
@@ -25990,7 +26805,7 @@ static int luaUtilsXmlRead(lua_State *L)
 	if (xml.hasError())
 	{
 		lua_pushnil(L);
-		lua_pushstring(L, xml.errorString().toUtf8().constData());
+		pushLuaUtf8String(L, xml.errorString());
 		lua_pushnumber(L, static_cast<lua_Number>(xml.lineNumber()));
 		return 3;
 	}
@@ -25998,14 +26813,14 @@ static int luaUtilsXmlRead(lua_State *L)
 	if (rootRef == LUA_REFNIL)
 	{
 		lua_pushnil(L);
-		lua_pushstring(L, "No XML root element.");
+		pushLuaUtf8String(L, "No XML root element.");
 		lua_pushnumber(L, 0);
 		return 3;
 	}
 
 	lua_rawgeti(L, LUA_REGISTRYINDEX, rootRef);
 	luaL_unref(L, LUA_REGISTRYINDEX, rootRef);
-	lua_pushstring(L, rootName.toUtf8().constData());
+	pushLuaUtf8String(L, rootName);
 	return 2;
 }
 
@@ -26066,119 +26881,79 @@ static int luaUtilsFilePicker(lua_State *L)
 		}
 	}
 
-	if (engine && runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
+	auto pickFile = [=](MainWindow *frame) -> QString
 	{
-		const QString callbackPluginId = engine->pluginId();
-		const quint64 requestId        = callbackPluginId.isEmpty() ? 0 : nextPluginAsyncResultRequestId();
-		const bool    accepted         = enqueueRuntimeThreadDeferredMutationNoResult(
-		    engine, runtime,
-		    [title, defaultName, defaultExtension, filterString, saveDialog, initialDir, qmudHome,
-		     callbackPluginId, requestId](WorldRuntime &targetRuntime)
-		    {
-			    const QPointer<WorldRuntime> runtimeGuard(&targetRuntime);
-			    const bool                   queued = enqueueOnMainThread(
-			        [runtimeGuard, title, defaultName, defaultExtension, filterString, saveDialog, initialDir,
-			         qmudHome, callbackPluginId, requestId]()
-			        {
-				        WorldRuntime *targetRuntimeOnMain = runtimeGuard.data();
-				        if (!targetRuntimeOnMain)
-					        return;
+		QFileDialog dialog(frame, title, initialDir, filterString);
+		dialog.setAcceptMode(saveDialog ? QFileDialog::AcceptSave : QFileDialog::AcceptOpen);
+		dialog.setFileMode(saveDialog ? QFileDialog::AnyFile : QFileDialog::ExistingFile);
+		if (!defaultName.isEmpty())
+			dialog.selectFile(defaultName);
+		if (!defaultExtension.isEmpty())
+			dialog.setDefaultSuffix(defaultExtension);
+		if (dialog.exec() != QDialog::Accepted)
+			return {};
+		const QStringList files = dialog.selectedFiles();
+		return files.isEmpty() ? QString() : files.first();
+	};
+	auto encodeSelectedPath = [=](const QString &selectedPath) -> QString
+	{
+		if (selectedPath.isEmpty())
+			return luaModalAcceptedStringResult(false, QString());
 
-				        QString selectedPath;
-				        if (MainWindow *frame = resolveMainWindow())
-				        {
-					        QFileDialog dialog(frame, title, initialDir, filterString);
-					        dialog.setAcceptMode(saveDialog ? QFileDialog::AcceptSave
-					                                        : QFileDialog::AcceptOpen);
-					        dialog.setFileMode(saveDialog ? QFileDialog::AnyFile : QFileDialog::ExistingFile);
-					        if (!defaultName.isEmpty())
-						        dialog.selectFile(defaultName);
-					        if (!defaultExtension.isEmpty())
-						        dialog.setDefaultSuffix(defaultExtension);
-					        if (dialog.exec() == QDialog::Accepted)
-					        {
-						        const QStringList files = dialog.selectedFiles();
-						        if (!files.isEmpty())
-							        selectedPath = files.first();
-					        }
-				        }
+		const QString cleanedSelected =
+		    QDir::cleanPath(QMudPluginPathUtils::normalizeSeparators(selectedPath));
+		const QString selectedContainer =
+		    saveDialog ? QFileInfo(cleanedSelected).absolutePath() : cleanedSelected;
+		if (!QMudPluginPathUtils::pathIsWithinOrEqualTo(selectedContainer, qmudHome))
+			return luaModalAcceptedStringResult(false, QString());
 
-				        const bool ok = !selectedPath.isEmpty();
-				        if (!ok)
-				        {
-					        emitPluginAsyncResult(*targetRuntimeOnMain, callbackPluginId, requestId,
-					                              QStringLiteral("FilePicker"), false, eCouldNotOpenFile,
-					                              QString());
-					        return;
-				        }
-
-				        const QString cleanedSelected =
-				            QDir::cleanPath(QMudPluginPathUtils::normalizeSeparators(selectedPath));
-				        const QString selectedContainer =
-				            saveDialog ? QFileInfo(cleanedSelected).absolutePath() : cleanedSelected;
-				        if (!QMudPluginPathUtils::pathIsWithinOrEqualTo(selectedContainer, qmudHome))
-				        {
-					        emitPluginAsyncResult(*targetRuntimeOnMain, callbackPluginId, requestId,
-					                              QStringLiteral("FilePicker"), false, eCouldNotOpenFile,
-					                              QString());
-					        return;
-				        }
-
-				        const QString resolvedPath =
-				            QMudPluginPathUtils::qmudHomeRelativePath(qmudHome, cleanedSelected, false);
-				        const QString browseDir = QMudPluginPathUtils::qmudHomeRelativePath(
-				            qmudHome, QFileInfo(cleanedSelected).absolutePath(), true);
-				        const bool runtimeQueued = QMetaObject::invokeMethod(
-				            targetRuntimeOnMain,
-				            [runtimeGuard, callbackPluginId, requestId, resolvedPath, browseDir]
-				            {
-					            WorldRuntime *targetRuntimeOnRuntime = runtimeGuard.data();
-					            if (!targetRuntimeOnRuntime)
-						            return;
-					            targetRuntimeOnRuntime->setFileBrowsingDirectory(browseDir);
-					            emitPluginAsyncResult(*targetRuntimeOnRuntime, callbackPluginId, requestId,
-					                                  QStringLiteral("FilePicker"), true, eOK, resolvedPath);
-				            },
-				            Qt::QueuedConnection);
-				        if (!runtimeQueued)
-				        {
-					        emitPluginAsyncResult(*targetRuntimeOnMain, callbackPluginId, requestId,
-					                              QStringLiteral("FilePicker"), true, eOK, resolvedPath);
-				        }
-			        });
-			    if (!queued)
-			    {
-				    emitPluginAsyncResult(targetRuntime, callbackPluginId, requestId,
-				                          QStringLiteral("FilePicker"), false, eCouldNotOpenFile, QString());
-			    }
-		    });
-		if (accepted)
-			invalidateCallbackRuntimeSnapshots(engine);
-		lua_pushboolean(L, accepted ? 1 : 0);
-		if (accepted && requestId != 0)
+		const QString absolutePath = QFileInfo(selectedPath).absolutePath();
+		const QString resultPath =
+		    QMudPluginPathUtils::qmudHomeRelativePath(qmudHome, cleanedSelected, false);
+		QJsonObject object;
+		object.insert(QStringLiteral("accepted"), true);
+		object.insert(QStringLiteral("value"), resultPath);
+		object.insert(QStringLiteral("absolutePath"), absolutePath);
+		object.insert(QStringLiteral("relativeBrowsingDirectory"),
+		              QMudPluginPathUtils::qmudHomeRelativePath(qmudHome, absolutePath, true));
+		return luaModalJsonResult(object);
+	};
+	if (runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden() &&
+	    canYieldModalResult(L))
+	{
+		LuaPendingModalStringRequest request;
+		request.guiCallable = [pickFile, encodeSelectedPath]() -> QString
 		{
-			lua_pushnumber(L, static_cast<lua_Number>(requestId));
-			return 2;
-		}
-		return 1;
+			MainWindow *frame = resolveMainWindow();
+			return frame ? encodeSelectedPath(pickFile(frame))
+			             : luaModalAcceptedStringResult(false, QString());
+		};
+		request.beforeResumeCallback = [engine, runtime](const QString &result)
+		{
+			const QJsonObject object = QJsonDocument::fromJson(result.toUtf8()).object();
+			if (!object.value(QStringLiteral("accepted")).toBool(false))
+				return;
+			const QString relativeBrowsingDirectory =
+			    object.value(QStringLiteral("relativeBrowsingDirectory")).toString();
+			if (!relativeBrowsingDirectory.isEmpty())
+				setCallbackFileBrowsingDirectorySnapshot(engine, runtime, relativeBrowsingDirectory);
+		};
+		request.beforeRuntimeResumeCallback = [](WorldRuntime &targetRuntime, const QString &result)
+		{
+			const QJsonObject object = QJsonDocument::fromJson(result.toUtf8()).object();
+			if (!object.value(QStringLiteral("accepted")).toBool(false))
+				return;
+			const QString absolutePath = object.value(QStringLiteral("absolutePath")).toString();
+			if (absolutePath.isEmpty())
+				return;
+			targetRuntime.setFileBrowsingDirectory(absolutePath);
+		};
+		setLuaModalResumeCallback(request, runtime, pluginIdFromLua(L));
+		return yieldModalStringResult(L, engine, std::move(request), luaModalAcceptedStringContinuation);
 	}
 
-	const QString selectedPath = runOnMainWindowThreadAllowNestedEvents(
-	    [&](MainWindow *frame) -> QString
-	    {
-		    QFileDialog dialog(frame, title, initialDir, filterString);
-		    dialog.setAcceptMode(saveDialog ? QFileDialog::AcceptSave : QFileDialog::AcceptOpen);
-		    dialog.setFileMode(saveDialog ? QFileDialog::AnyFile : QFileDialog::ExistingFile);
-		    if (!defaultName.isEmpty())
-			    dialog.selectFile(defaultName);
-		    if (!defaultExtension.isEmpty())
-			    dialog.setDefaultSuffix(defaultExtension);
-		    if (dialog.exec() != QDialog::Accepted)
-			    return {};
-		    const QStringList files = dialog.selectedFiles();
-		    return files.isEmpty() ? QString() : files.first();
-	    },
-	    {});
+	const QString selectedPath = runOnMainWindowThreadModalDialogSync([&](MainWindow *frame) -> QString
+	                                                                  { return pickFile(frame); }, {});
 	if (selectedPath.isEmpty())
 	{
 		lua_pushnil(L);
@@ -26349,29 +27124,23 @@ static int luaUtilsTextBox(lua_State *L, const bool multiline)
 		dialogResult.text     = textResult;
 		return dialogResult;
 	};
-	if (engine && runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
+	if (runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden() &&
+	    canYieldModalResult(L))
 	{
-		quint64    requestId = 0;
-		const bool accepted  = enqueueMainWindowAsyncResult(
-		    engine, runtime, multiline ? QStringLiteral("EditBox") : QStringLiteral("InputBox"),
-		    [showTextBox](MainWindow *frame) -> PluginAsyncDialogResult
-		    {
-			    const TextBoxResult result = showTextBox(frame);
-			    if (!result.accepted)
-				    return {false, -1, QString()};
-			    return {true, eOK, result.text};
-		    },
-		    requestId);
-		lua_pushnil(L);
-		if (accepted && requestId != 0)
+		LuaPendingModalStringRequest request;
+		request.guiCallable = [showTextBox]() -> QString
 		{
-			lua_pushnumber(L, static_cast<lua_Number>(requestId));
-			return 2;
-		}
-		return 1;
+			MainWindow *frame = resolveMainWindow();
+			if (!frame)
+				return luaModalAcceptedStringResult(false, QString());
+			const TextBoxResult result = showTextBox(frame);
+			return luaModalAcceptedStringResult(result.accepted, result.text);
+		};
+		setLuaModalResumeCallback(request, runtime, pluginIdFromLua(L));
+		return yieldModalStringResult(L, engine, std::move(request), luaModalAcceptedStringContinuation);
 	}
-	const TextBoxResult result = runOnMainWindowThreadAllowNestedEvents(
-	    [&](MainWindow *frame) -> TextBoxResult { return showTextBox(frame); }, {});
+	const TextBoxResult result = runOnMainWindowThreadModalDialogSync([&](MainWindow *frame) -> TextBoxResult
+	                                                                  { return showTextBox(frame); }, {});
 	if (!result.accepted)
 	{
 		lua_pushnil(L);
@@ -26392,7 +27161,7 @@ static int luaUtilsEditBox(lua_State *L)
 	return luaUtilsTextBox(L, true);
 }
 
-static int luaUtilsListBoxInternal(lua_State *L, const QString &asyncApiName)
+static int luaUtilsListBoxInternal(lua_State *L)
 {
 	auto         *engine         = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	WorldRuntime *runtime        = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
@@ -26409,29 +27178,23 @@ static int luaUtilsListBoxInternal(lua_State *L, const QString &asyncApiName)
 	if (!lua_istable(L, tableIndex))
 		luaL_error(L, "must have table of choices as 3rd argument");
 
-	const bool haveDefault     = lua_gettop(L) >= 4 && !lua_isnil(L, 4);
-	const bool defaultIsNumber = haveDefault && lua_type(L, 4) == LUA_TNUMBER;
-	QString    defaultString;
-	lua_Number defaultNumber = 0;
+	const bool haveDefault = lua_gettop(L) >= 4 && !lua_isnil(L, 4);
 	if (haveDefault)
 	{
-		if (!lua_isstring(L, 4))
+		if (!(lua_type(L, 4) == LUA_TSTRING || lua_isnumber(L, 4)))
 			luaL_error(L, "default key must be string or number");
-		if (defaultIsNumber)
-			defaultNumber = lua_tonumber(L, 4);
-		else
-			defaultString = QString::fromUtf8(lua_tostring(L, 4));
 	}
 
 	struct Choice
 	{
-			bool       isNumber{false};
-			lua_Number numberKey{0};
-			QString    stringKey;
-			QString    value;
+			LuaChoiceKey key;
+			QString      value;
 	};
 	QVector<Choice> choices;
 	int             defaultIndex = -1;
+	LuaChoiceKey    defaultKey;
+	if (haveDefault)
+		defaultKey = luaChoiceKeyFromStack(L, 4);
 
 	for (lua_pushnil(L); lua_next(L, tableIndex) != 0; lua_pop(L, 1))
 	{
@@ -26440,20 +27203,9 @@ static int luaUtilsListBoxInternal(lua_State *L, const QString &asyncApiName)
 
 		Choice choice;
 		choice.value = QString::fromUtf8(lua_tostring(L, -1));
-
-		if (lua_type(L, -2) == LUA_TSTRING)
-		{
-			choice.stringKey = QString::fromUtf8(lua_tostring(L, -2));
-			if (haveDefault && !defaultIsNumber && choice.stringKey == defaultString)
-				defaultIndex = static_cast<int>(choices.size());
-		}
-		else
-		{
-			choice.isNumber  = true;
-			choice.numberKey = lua_tonumber(L, -2);
-			if (haveDefault && defaultIsNumber && choice.numberKey == defaultNumber)
-				defaultIndex = static_cast<int>(choices.size());
-		}
+		choice.key   = luaChoiceKeyFromStack(L, -2);
+		if (haveDefault && luaChoiceKeysEqual(choice.key, defaultKey))
+			defaultIndex = static_cast<int>(choices.size());
 
 		choices.push_back(choice);
 	}
@@ -26488,132 +27240,143 @@ static int luaUtilsListBoxInternal(lua_State *L, const QString &asyncApiName)
 			return -1;
 		return list->currentRow();
 	};
-	if (engine && runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
+	if (runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden() &&
+	    canYieldModalResult(L))
 	{
-		quint64    requestId = 0;
-		const bool accepted  = enqueueMainWindowAsyncResult(
-		    engine, runtime, asyncApiName,
-		    [showListBox, choices](MainWindow *frame) -> PluginAsyncDialogResult
-		    {
-			    const int row = showListBox(frame);
-			    if (row < 0 || row >= choices.size())
-				    return {false, -1, QString()};
-			    const Choice  &choice = choices.at(row);
-			    const QVariant payload =
-			        choice.isNumber ? QVariant(choice.numberKey) : QVariant(choice.stringKey);
-			    return {true, eOK, encodeDatabaseFieldAsyncPayload(payload)};
-		    },
-		    requestId);
-		lua_pushnil(L);
-		if (accepted && requestId != 0)
+		LuaPendingModalStringRequest request;
+		request.guiCallable = [showListBox, choices]() -> QString
 		{
-			lua_pushnumber(L, static_cast<lua_Number>(requestId));
-			return 2;
-		}
-		return 1;
+			MainWindow *frame = resolveMainWindow();
+			const int   row   = frame ? showListBox(frame) : -1;
+			if (row < 0 || row >= choices.size())
+				return luaModalJsonResult({
+				    {QStringLiteral("accepted"), false}
+                });
+			const Choice &choice = choices.at(row);
+			QJsonObject   object;
+			object.insert(QStringLiteral("accepted"), true);
+			insertLuaChoiceKey(object, choice.key);
+			return luaModalJsonResult(object);
+		};
+		setLuaModalResumeCallback(request, runtime, pluginIdFromLua(L));
+		return yieldModalStringResult(L, engine, std::move(request), luaModalListKeyContinuation);
 	}
-	const int row = runOnMainWindowThreadAllowNestedEvents([&](MainWindow *frame) -> int
-	                                                       { return showListBox(frame); }, -1);
+	const int row = runOnMainWindowThreadModalDialogSync([&](MainWindow *frame) -> int
+	                                                     { return showListBox(frame); }, -1);
 	if (row < 0 || row >= choices.size())
 	{
 		lua_pushnil(L);
 		return 1;
 	}
 
-	if (const Choice &choice = choices.at(row); choice.isNumber)
-		lua_pushnumber(L, choice.numberKey);
-	else
-	{
-		const QByteArray bytes = choice.stringKey.toUtf8();
-		lua_pushlstring(L, bytes.constData(), bytes.size());
-	}
+	pushLuaChoiceKey(L, choices.at(row).key);
 	return 1;
 }
 
 static int luaUtilsListBox(lua_State *L)
 {
-	return luaUtilsListBoxInternal(L, QStringLiteral("ListBox"));
+	return luaUtilsListBoxInternal(L);
 }
 
-static int luaUtilsMultiListBox(lua_State *L)
+struct MultiListBoxEntry
 {
-	auto         *engine     = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	WorldRuntime *runtime    = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
-	const QString title      = QString::fromUtf8(luaL_optstring(L, 1, ""));
-	constexpr int tableIndex = 2;
+		LuaChoiceKey key;
+		QString      value;
+		bool         selected{false};
+};
+
+struct MultiListBoxRequest
+{
+		QString                    messageText;
+		QString                    titleText;
+		QVector<MultiListBoxEntry> entries;
+};
+
+static MultiListBoxRequest parseUtilsMultiListBoxRequest(lua_State *L)
+{
+	size_t        messageLen   = 0;
+	size_t        titleLen     = 0;
+	const char   *message      = luaL_checklstring(L, 1, &messageLen);
+	const char   *title        = luaL_optlstring(L, 2, "QMud", &titleLen);
+	constexpr int tableIndex   = 3;
+	constexpr int defaultIndex = 4;
+	const bool    haveDefaults = lua_gettop(L) >= defaultIndex && !lua_isnil(L, defaultIndex);
 	if (!lua_istable(L, tableIndex))
-		luaL_error(L, "must have table of choices as second argument");
+		return (luaL_error(L, "must have table of choices as 3rd argument"), MultiListBoxRequest{});
+	if (haveDefaults && !lua_istable(L, defaultIndex))
+		return (luaL_error(L, "defaults must be a table, or nil"), MultiListBoxRequest{});
 
-	QSet<QString> defaultKeys;
-	if (lua_istable(L, 3))
-	{
-		for (lua_pushnil(L); lua_next(L, 3) != 0; lua_pop(L, 1))
-		{
-			if (!lua_isstring(L, -2))
-				luaL_error(L, "defaults table must have string keys");
-			const QString key = QString::fromUtf8(lua_tostring(L, -2));
-			if (!(lua_isnil(L, -1) || (lua_isboolean(L, -1) && !lua_toboolean(L, -1))))
-				defaultKeys.insert(key);
-		}
-	}
+	if (messageLen > 1000)
+		return (luaL_error(L, "message too long (max 1000 characters)"), MultiListBoxRequest{});
+	if (titleLen > 100)
+		return (luaL_error(L, "title too long (max 100 characters)"), MultiListBoxRequest{});
 
-	const bool noSort = optBool(L, 4, false);
-
-	struct Entry
-	{
-			bool       isNumber{false};
-			lua_Number numberKey{0};
-			QString    stringKey;
-			QString    value;
-	};
-	QVector<Entry> entries;
-
+	MultiListBoxRequest request;
+	request.messageText = QString::fromUtf8(message, sizeToInt(static_cast<qsizetype>(messageLen)));
+	request.titleText   = QString::fromUtf8(title, sizeToInt(static_cast<qsizetype>(titleLen)));
 	for (lua_pushnil(L); lua_next(L, tableIndex) != 0; lua_pop(L, 1))
 	{
 		if (!(lua_isstring(L, -2) || lua_isnumber(L, -2)))
-			luaL_error(L, "table must have string or number keys");
+			return (luaL_error(L, "table must have string or number keys"), MultiListBoxRequest{});
 		if (!(lua_isstring(L, -1) || lua_isnumber(L, -1)))
-			luaL_error(L, "table must have string or number values");
+			return (luaL_error(L, "table must have string or number values"), MultiListBoxRequest{});
 
-		Entry e;
+		MultiListBoxEntry e;
 		e.value = QString::fromUtf8(lua_tostring(L, -1));
-		if (lua_type(L, -2) == LUA_TSTRING)
-			e.stringKey = QString::fromUtf8(lua_tostring(L, -2));
-		else
+		e.key   = luaChoiceKeyFromStack(L, -2);
+		if (haveDefaults)
 		{
-			e.isNumber  = true;
-			e.numberKey = lua_tonumber(L, -2);
+			lua_pushvalue(L, -2);
+			lua_gettable(L, defaultIndex);
+			e.selected = !(lua_isnil(L, -1) || (lua_isboolean(L, -1) && !lua_toboolean(L, -1)));
+			lua_pop(L, 1);
 		}
-		entries.push_back(e);
+		request.entries.push_back(e);
 	}
+	return request;
+}
 
-	if (!noSort)
-	{
-		std::ranges::sort(entries, [](const Entry &a, const Entry &b)
-		                  { return a.value.compare(b.value, Qt::CaseInsensitive) < 0; });
-	}
+#ifdef QMUD_LUACALLBACKENGINE_TEST_MINIMAL_BINDINGS
+static int luaTestUtilsMultiListBox(lua_State *L)
+{
+	(void)parseUtilsMultiListBoxRequest(L);
+	lua_pushnil(L);
+	return 1;
+}
+#endif
 
+static int luaUtilsMultiListBox(lua_State *L)
+{
+	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const MultiListBoxRequest        request     = parseUtilsMultiListBoxRequest(L);
+	const QVector<MultiListBoxEntry> entries     = request.entries;
+	const QString                    messageText = request.messageText;
+	const QString                    titleText   = request.titleText;
 	struct MultiListResult
 	{
 			bool         accepted{false};
 			QVector<int> indices;
 	};
-	const auto showMultiListBox = [entries, defaultKeys, title](MainWindow *frame) -> MultiListResult
+	const auto showMultiListBox = [entries, messageText, titleText](MainWindow *frame) -> MultiListResult
 	{
 		QDialog dialog(frame);
-		dialog.setWindowTitle(title);
+		dialog.setWindowTitle(titleText);
 		auto layout = std::make_unique<QVBoxLayout>(&dialog);
+		auto label  = std::make_unique<QLabel>(messageText, &dialog);
 		auto list   = std::make_unique<QListWidget>(&dialog);
 		auto buttons =
 		    std::make_unique<QDialogButtonBox>(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+		label->setWordWrap(true);
+		layout->addWidget(label.get());
 		list->setSelectionMode(QAbstractItemView::MultiSelection);
 		for (int i = 0; i < entries.size(); ++i)
 		{
-			const Entry &e = entries.at(i);
+			const MultiListBoxEntry &e = entries.at(i);
 			list->addItem(e.value);
 			auto *item = list->item(list->count() - 1);
 			item->setData(Qt::UserRole, i);
-			if (!e.isNumber && defaultKeys.contains(e.stringKey))
+			if (e.selected)
 				item->setSelected(true);
 		}
 		layout->addWidget(list.get());
@@ -26629,38 +27392,41 @@ static int luaUtilsMultiListBox(lua_State *L)
 			result.indices.push_back(item->data(Qt::UserRole).toInt());
 		return result;
 	};
-	if (engine && runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
+	if (runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden() &&
+	    canYieldModalResult(L))
 	{
-		quint64    requestId = 0;
-		const bool accepted  = enqueueMainWindowAsyncResult(
-		    engine, runtime, QStringLiteral("MultiListBox"),
-		    [showMultiListBox, entries](MainWindow *frame) -> PluginAsyncDialogResult
-		    {
-			    const MultiListResult result = showMultiListBox(frame);
-			    if (!result.accepted)
-				    return {false, -1, QString()};
-			    QStringList payloadRows;
-			    for (const int index : result.indices)
-			    {
-				    if (index < 0 || index >= entries.size())
-					    continue;
-				    const Entry   &entry = entries.at(index);
-				    const QVariant payload =
-				        entry.isNumber ? QVariant(entry.numberKey) : QVariant(entry.stringKey);
-				    payloadRows.push_back(encodeDatabaseFieldAsyncPayload(payload));
-			    }
-			    return {true, eOK, payloadRows.join(QLatin1Char('\n'))};
-		    },
-		    requestId);
-		lua_pushnil(L);
-		if (accepted && requestId != 0)
+		LuaPendingModalStringRequest modalRequest;
+		modalRequest.guiCallable = [showMultiListBox, entries]() -> QString
 		{
-			lua_pushnumber(L, static_cast<lua_Number>(requestId));
-			return 2;
-		}
-		return 1;
+			MainWindow *frame = resolveMainWindow();
+			if (!frame)
+				return luaModalJsonResult({
+				    {QStringLiteral("accepted"), false}
+                });
+			const MultiListResult result = showMultiListBox(frame);
+			if (!result.accepted)
+				return luaModalJsonResult({
+				    {QStringLiteral("accepted"), false}
+                });
+			QJsonArray items;
+			for (const int index : result.indices)
+			{
+				if (index < 0 || index >= entries.size())
+					continue;
+				const MultiListBoxEntry &entry = entries.at(index);
+				QJsonObject              item;
+				insertLuaChoiceKey(item, entry.key);
+				items.push_back(item);
+			}
+			return luaModalJsonResult({
+			    {QStringLiteral("accepted"), true },
+                {QStringLiteral("items"),    items}
+            });
+		};
+		setLuaModalResumeCallback(modalRequest, runtime, pluginIdFromLua(L));
+		return yieldModalStringResult(L, engine, std::move(modalRequest), luaModalMultiListContinuation);
 	}
-	const MultiListResult dialogResult = runOnMainWindowThreadAllowNestedEvents(
+	const MultiListResult dialogResult = runOnMainWindowThreadModalDialogSync(
 	    [&](MainWindow *frame) -> MultiListResult { return showMultiListBox(frame); }, {});
 	if (!dialogResult.accepted)
 	{
@@ -26673,10 +27439,7 @@ static int luaUtilsMultiListBox(lua_State *L)
 	{
 		if (index < 0 || index >= entries.size())
 			continue;
-		if (const Entry &e = entries.at(index); e.isNumber)
-			lua_pushnumber(L, e.numberKey);
-		else
-			lua_pushstring(L, e.stringKey.toUtf8().constData());
+		pushLuaChoiceKey(L, entries.at(index).key);
 		lua_pushboolean(L, 1);
 		lua_rawset(L, -3);
 	}
@@ -26888,7 +27651,7 @@ static int luaUtilsCallbacksList(lua_State *L)
 	int index = 1;
 	for (int i = 0; kCallbacks[i] != nullptr; ++i)
 	{
-		lua_pushstring(L, kCallbacks[i]);
+		pushLuaUtf8String(L, kCallbacks[i]);
 		lua_rawseti(L, -2, index++);
 	}
 	return 1;
@@ -26896,7 +27659,7 @@ static int luaUtilsCallbacksList(lua_State *L)
 
 static int luaUtilsChoose(lua_State *L)
 {
-	return luaUtilsListBoxInternal(L, QStringLiteral("Choose"));
+	return luaUtilsListBoxInternal(L);
 }
 
 static int luaUtilsDirectoryPicker(lua_State *L)
@@ -26908,29 +27671,21 @@ static int luaUtilsDirectoryPicker(lua_State *L)
 	const QString initial       = defaultDir.isEmpty() ? QDir::currentPath() : defaultDir;
 	const auto    pickDirectory = [title, initial](MainWindow *frame) -> QString
 	{ return QFileDialog::getExistingDirectory(frame, title, initial); };
-	if (engine && runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
+	if (runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden() &&
+	    canYieldModalResult(L))
 	{
-		quint64    requestId = 0;
-		const bool accepted  = enqueueMainWindowAsyncResult(
-		    engine, runtime, QStringLiteral("DirectoryPicker"),
-		    [pickDirectory](MainWindow *frame) -> PluginAsyncDialogResult
-		    {
-			    const QString chosen = pickDirectory(frame);
-			    if (chosen.isEmpty())
-				    return {false, -1, QString()};
-			    return {true, eOK, chosen};
-		    },
-		    requestId);
-		lua_pushnil(L);
-		if (accepted && requestId != 0)
+		LuaPendingModalStringRequest request;
+		request.guiCallable = [pickDirectory]() -> QString
 		{
-			lua_pushnumber(L, static_cast<lua_Number>(requestId));
-			return 2;
-		}
-		return 1;
+			MainWindow   *frame = resolveMainWindow();
+			const QString path  = frame ? pickDirectory(frame) : QString();
+			return luaModalAcceptedStringResult(!path.isEmpty(), path);
+		};
+		setLuaModalResumeCallback(request, runtime, pluginIdFromLua(L));
+		return yieldModalStringResult(L, engine, std::move(request), luaModalAcceptedStringContinuation);
 	}
-	const QString chosen = runOnMainWindowThreadAllowNestedEvents([&](MainWindow *frame) -> QString
-	                                                              { return pickDirectory(frame); }, {});
+	const QString chosen = runOnMainWindowThreadModalDialogSync([&](MainWindow *frame) -> QString
+	                                                            { return pickDirectory(frame); }, {});
 	if (chosen.isEmpty())
 	{
 		lua_pushnil(L);
@@ -26963,10 +27718,8 @@ static int luaUtilsFilterPicker(lua_State *L)
 
 	struct Choice
 	{
-			bool       isNumber{false};
-			lua_Number numberKey{0};
-			QString    stringKey;
-			QString    value;
+			LuaChoiceKey key;
+			QString      value;
 	};
 	QVector<Choice> choices;
 	for (lua_pushnil(L); lua_next(L, 1) != 0; lua_pop(L, 1))
@@ -26975,13 +27728,7 @@ static int luaUtilsFilterPicker(lua_State *L)
 			luaL_error(L, "table must have string or number values");
 		Choice choice;
 		choice.value = QString::fromUtf8(lua_tostring(L, -1));
-		if (lua_type(L, -2) == LUA_TSTRING)
-			choice.stringKey = QString::fromUtf8(lua_tostring(L, -2));
-		else
-		{
-			choice.isNumber  = true;
-			choice.numberKey = lua_tonumber(L, -2);
-		}
+		choice.key   = luaChoiceKeyFromStack(L, -2);
 		choices.push_back(choice);
 	}
 
@@ -27028,44 +27775,35 @@ static int luaUtilsFilterPicker(lua_State *L)
 			return -1;
 		return list->currentItem()->data(Qt::UserRole).toInt();
 	};
-	if (engine && runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
+	if (runtime && activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden() &&
+	    canYieldModalResult(L))
 	{
-		quint64    requestId = 0;
-		const bool accepted  = enqueueMainWindowAsyncResult(
-		    engine, runtime, QStringLiteral("FilterPicker"),
-		    [showFilterPicker, choices](MainWindow *frame) -> PluginAsyncDialogResult
-		    {
-			    const int idx = showFilterPicker(frame);
-			    if (idx < 0 || idx >= choices.size())
-				    return {false, -1, QString()};
-			    const Choice  &choice = choices.at(idx);
-			    const QVariant payload =
-			        choice.isNumber ? QVariant(choice.numberKey) : QVariant(choice.stringKey);
-			    return {true, eOK, encodeDatabaseFieldAsyncPayload(payload)};
-		    },
-		    requestId);
-		lua_pushnil(L);
-		if (accepted && requestId != 0)
+		LuaPendingModalStringRequest request;
+		request.guiCallable = [showFilterPicker, choices]() -> QString
 		{
-			lua_pushnumber(L, static_cast<lua_Number>(requestId));
-			return 2;
-		}
-		return 1;
+			MainWindow *frame = resolveMainWindow();
+			const int   idx   = frame ? showFilterPicker(frame) : -1;
+			if (idx < 0 || idx >= choices.size())
+				return luaModalJsonResult({
+				    {QStringLiteral("accepted"), false}
+                });
+			const Choice &choice = choices.at(idx);
+			QJsonObject   object;
+			object.insert(QStringLiteral("accepted"), true);
+			insertLuaChoiceKey(object, choice.key);
+			return luaModalJsonResult(object);
+		};
+		setLuaModalResumeCallback(request, runtime, pluginIdFromLua(L));
+		return yieldModalStringResult(L, engine, std::move(request), luaModalListKeyContinuation);
 	}
-	const int idx = runOnMainWindowThreadAllowNestedEvents([&](MainWindow *frame) -> int
-	                                                       { return showFilterPicker(frame); }, -1);
+	const int idx = runOnMainWindowThreadModalDialogSync([&](MainWindow *frame) -> int
+	                                                     { return showFilterPicker(frame); }, -1);
 	if (idx < 0 || idx >= choices.size())
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-	if (const Choice &choice = choices.at(idx); choice.isNumber)
-		lua_pushnumber(L, choice.numberKey);
-	else
-	{
-		const QByteArray bytes = choice.stringKey.toUtf8();
-		lua_pushlstring(L, bytes.constData(), bytes.size());
-	}
+	pushLuaChoiceKey(L, choices.at(idx).key);
 	return 1;
 }
 
@@ -27252,7 +27990,7 @@ namespace
 		{
 			const QString captured = m.captured(i);
 			if (m.capturedStart(i) >= 0)
-				lua_pushstring(L, captured.toUtf8().constData());
+				pushLuaUtf8String(L, captured);
 			else
 				lua_pushboolean(L, 0);
 			lua_rawseti(L, -2, i);
@@ -27264,9 +28002,9 @@ namespace
 			const QString &name = names.at(i);
 			if (name.isEmpty())
 				continue;
-			lua_pushstring(L, name.toUtf8().constData());
+			pushLuaUtf8String(L, name);
 			if (m.capturedStart(i) >= 0)
-				lua_pushstring(L, m.captured(i).toUtf8().constData());
+				pushLuaUtf8String(L, m.captured(i));
 			else
 				lua_pushboolean(L, 0);
 			lua_rawset(L, -3);
@@ -27303,7 +28041,7 @@ namespace
 static int luaRexVersion(lua_State *L)
 {
 	Q_UNUSED(L);
-	lua_pushstring(L, "QRegularExpression (PCRE2)");
+	pushLuaUtf8String(L, "QRegularExpression (PCRE2)");
 	return 1;
 }
 
@@ -27342,7 +28080,7 @@ static int luaRexFlags(lua_State *L)
 	lua_newtable(L);
 	for (const RexFlagPair *p = kPcreFlags; p->key != nullptr; ++p)
 	{
-		lua_pushstring(L, p->key);
+		pushLuaUtf8String(L, p->key);
 		lua_pushinteger(L, p->val);
 		lua_rawset(L, -3);
 	}
@@ -27352,16 +28090,16 @@ static int luaRexFlags(lua_State *L)
 static int luaRexFlagsPosix(lua_State *L)
 {
 	lua_newtable(L);
-	lua_pushstring(L, "EXTENDED");
+	pushLuaUtf8String(L, "EXTENDED");
 	lua_pushinteger(L, kRegexExtended);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "ICASE");
+	pushLuaUtf8String(L, "ICASE");
 	lua_pushinteger(L, kRegexIgnoreCase);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "NOSUB");
+	pushLuaUtf8String(L, "NOSUB");
 	lua_pushinteger(L, kRegexNoSub);
 	lua_rawset(L, -3);
-	lua_pushstring(L, "NEWLINE");
+	pushLuaUtf8String(L, "NEWLINE");
 	lua_pushinteger(L, kRegexNewline);
 	lua_rawset(L, -3);
 	return 1;
@@ -27553,7 +28291,7 @@ static int luaRexGmatch(lua_State *L)
 		++nmatch;
 
 		lua_pushvalue(L, 3); // callback
-		lua_pushstring(L, m.captured(0).toUtf8().constData());
+		pushLuaUtf8String(L, m.captured(0));
 		rexPushSubstrings(L, m);
 		if (QMudLuaSupport::callLuaProtected(L, 2, 1, 0) != 0)
 			return lua_error(L);
@@ -28152,7 +28890,7 @@ static bool requireModuleNoThrow(lua_State *L, const char *moduleName)
 		lua_settop(L, stackTop);
 		return false;
 	}
-	lua_pushstring(L, moduleName);
+	pushLuaUtf8String(L, moduleName);
 	if (QMudLuaSupport::callLuaProtected(L, 1, 1, 0) != 0)
 	{
 		lua_settop(L, stackTop);
@@ -28185,7 +28923,7 @@ static void registerSqliteLibrary(lua_State *L)
 	lua_getglobal(L, "require");
 	if (lua_isfunction(L, -1))
 	{
-		lua_pushstring(L, "sqlite3");
+		pushLuaUtf8String(L, "sqlite3");
 		if (QMudLuaSupport::callLuaProtected(L, 1, 1, 0) == 0)
 		{
 			lua_pushvalue(L, -1);
@@ -28214,7 +28952,7 @@ static void registerBcLibrary(lua_State *L)
 	lua_getglobal(L, "require");
 	if (lua_isfunction(L, -1))
 	{
-		lua_pushstring(L, "bc");
+		pushLuaUtf8String(L, "bc");
 		if (QMudLuaSupport::callLuaProtected(L, 1, 1, 0) == 0)
 		{
 			lua_setglobal(L, "bc");
@@ -28242,7 +28980,7 @@ static void registerLpegLibrary(lua_State *L)
 	lua_getglobal(L, "require");
 	if (lua_isfunction(L, -1))
 	{
-		lua_pushstring(L, "lpeg");
+		pushLuaUtf8String(L, "lpeg");
 		if (QMudLuaSupport::callLuaProtected(L, 1, 1, 0) == 0)
 		{
 			if (lua_istable(L, -1))
@@ -28385,7 +29123,7 @@ static int luaProgressGc(lua_State *L)
 static int luaProgressToString(lua_State *L)
 {
 	Q_UNUSED(L);
-	lua_pushstring(L, "progress_dialog");
+	pushLuaUtf8String(L, "progress_dialog");
 	return 1;
 }
 
@@ -30207,26 +30945,26 @@ static int luaGetRecentLines(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const int count = static_cast<int>(luaL_checkinteger(L, 1));
 	if (count <= 0)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	QStringList out;
 	static_cast<void>(resolveRecentLinesForApi(engine, runtime, count, out));
 	// Legacy behavior: GetRecentLines joins with '\n'.
 	const QString joined = out.join(QStringLiteral("\n"));
-	lua_pushstring(L, joined.toLocal8Bit().constData());
+	pushLuaUtf8String(L, joined);
 	return 1;
 }
 
@@ -30236,7 +30974,7 @@ template <typename Option> static int pushOptionNameList(lua_State *L, const Opt
 	int index = 1;
 	for (int i = 0; options[i].name; ++i)
 	{
-		lua_pushstring(L, options[i].name);
+		pushLuaUtf8String(L, options[i].name);
 		lua_rawseti(L, -2, index++);
 	}
 	return 1;
@@ -30510,17 +31248,17 @@ static int luaGetWorldID(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QString value = resolveWorldAttributeValueForApi(engine, runtime, QStringLiteral("id"));
-	lua_pushstring(L, value.toLocal8Bit().constData());
+	pushLuaUtf8String(L, value);
 	return 1;
 }
 
@@ -30529,17 +31267,17 @@ static int luaWorldName(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QString value = resolveWorldAttributeValueForApi(engine, runtime, QStringLiteral("name"));
-	lua_pushstring(L, value.toLocal8Bit().constData());
+	pushLuaUtf8String(L, value);
 	return 1;
 }
 
@@ -30548,17 +31286,17 @@ static int luaWorldAddress(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QString value = resolveWorldAttributeValueForApi(engine, runtime, QStringLiteral("site"));
-	lua_pushstring(L, value.toLocal8Bit().constData());
+	pushLuaUtf8String(L, value);
 	return 1;
 }
 
@@ -30585,7 +31323,7 @@ static int luaWorldPort(lua_State *L)
 static int luaCreateGUID(lua_State *L)
 {
 	const QString guid = QUuid::createUuid().toString(QUuid::WithoutBraces).toUpper();
-	lua_pushstring(L, guid.toLocal8Bit().constData());
+	pushLuaUtf8String(L, guid);
 	return 1;
 }
 
@@ -30594,7 +31332,7 @@ static int luaGetUniqueID(lua_State *L)
 	const QString    guid   = QUuid::createUuid().toString(QUuid::WithoutBraces).toUpper().remove('-');
 	const QByteArray digest = QCryptographicHash::hash(guid.toUtf8(), QCryptographicHash::Sha1);
 	const QByteArray hex    = digest.toHex().left(24);
-	lua_pushstring(L, hex.constData());
+	pushLuaUtf8String(L, hex);
 	return 1;
 }
 
@@ -30618,7 +31356,7 @@ static int luaGetMappingCount(lua_State *L)
 static int luaVersion(lua_State *L)
 {
 	const QString version = WorldRuntime::clientVersionString();
-	lua_pushstring(L, version.toUtf8().constData());
+	pushLuaUtf8String(L, version);
 	return 1;
 }
 
@@ -30779,8 +31517,8 @@ static int luaWorldProxyIndex(lua_State *L)
 
 	lua_pushlightuserdata(L, engine);
 	lua_pushlightuserdata(L, target);
-	lua_pushstring(L, worldId);
-	lua_pushstring(L, key);
+	pushLuaUtf8String(L, worldId);
+	pushLuaUtf8String(L, key);
 	lua_pushcclosure(L, luaWorldProxyCall, 4);
 	return 1;
 }
@@ -30797,7 +31535,7 @@ static void pushWorldProxy(lua_State *L, LuaCallbackEngine *engine, WorldRuntime
 {
 	static constexpr char kWorldProxyMeta[] = "QMud.WorldProxy";
 	lua_newtable(L);
-	lua_pushstring(L, worldId.toUtf8().constData());
+	pushLuaUtf8String(L, worldId);
 	lua_setfield(L, -2, "__worldId");
 	lua_pushlightuserdata(L, runtime);
 	lua_setfield(L, -2, "__worldPtr");
@@ -34102,8 +34840,8 @@ static int luaGetTrigger(lua_State *L)
 		return 8;
 	}
 	lua_pushnumber(L, eOK);
-	lua_pushstring(L, trigger.attributes.value(QStringLiteral("match")).toLocal8Bit().constData());
-	lua_pushstring(L, trigger.children.value(QStringLiteral("send")).toLocal8Bit().constData());
+	pushLuaUtf8String(L, trigger.attributes.value(QStringLiteral("match")));
+	pushLuaUtf8String(L, trigger.children.value(QStringLiteral("send")));
 
 	int flags = 0;
 	if (isEnabledValue(trigger.attributes.value(QStringLiteral("ignore_case"))))
@@ -34127,8 +34865,8 @@ static int luaGetTrigger(lua_State *L)
 	lua_pushnumber(
 	    L, triggerColourFromCustom(trigger.attributes.value(QStringLiteral("custom_colour")).toInt()));
 	lua_pushnumber(L, trigger.attributes.value(QStringLiteral("clipboard_arg")).toInt());
-	lua_pushstring(L, trigger.attributes.value(QStringLiteral("sound")).toLocal8Bit().constData());
-	lua_pushstring(L, trigger.attributes.value(QStringLiteral("script")).toLocal8Bit().constData());
+	pushLuaUtf8String(L, trigger.attributes.value(QStringLiteral("sound")));
+	pushLuaUtf8String(L, trigger.attributes.value(QStringLiteral("script")));
 	return 8;
 }
 
@@ -34155,8 +34893,8 @@ static int luaGetAlias(lua_State *L)
 		return 5;
 	}
 	lua_pushnumber(L, eOK);
-	lua_pushstring(L, alias.attributes.value(QStringLiteral("match")).toLocal8Bit().constData());
-	lua_pushstring(L, alias.children.value(QStringLiteral("send")).toLocal8Bit().constData());
+	pushLuaUtf8String(L, alias.attributes.value(QStringLiteral("match")));
+	pushLuaUtf8String(L, alias.children.value(QStringLiteral("send")));
 
 	int flags = 0;
 	if (isEnabledValue(alias.attributes.value(QStringLiteral("enabled"))))
@@ -34184,7 +34922,7 @@ static int luaGetAlias(lua_State *L)
 		flags |= eAliasOneShot;
 
 	lua_pushnumber(L, flags);
-	lua_pushstring(L, alias.attributes.value(QStringLiteral("script")).toLocal8Bit().constData());
+	pushLuaUtf8String(L, alias.attributes.value(QStringLiteral("script")));
 	return 5;
 }
 
@@ -34214,7 +34952,7 @@ static int luaGetTimer(lua_State *L)
 	lua_pushnumber(L, timer.attributes.value(QStringLiteral("hour")).toInt());
 	lua_pushnumber(L, timer.attributes.value(QStringLiteral("minute")).toInt());
 	lua_pushnumber(L, timer.attributes.value(QStringLiteral("second")).toDouble());
-	lua_pushstring(L, timer.children.value(QStringLiteral("send")).toLocal8Bit().constData());
+	pushLuaUtf8String(L, timer.children.value(QStringLiteral("send")));
 
 	int flags = 0;
 	if (isEnabledValue(timer.attributes.value(QStringLiteral("enabled"))))
@@ -34229,7 +34967,7 @@ static int luaGetTimer(lua_State *L)
 	if (isEnabledValue(timer.attributes.value(QStringLiteral("active_closed"))))
 		flags |= eActiveWhenClosed;
 	lua_pushnumber(L, flags);
-	lua_pushstring(L, timer.attributes.value(QStringLiteral("script")).toLocal8Bit().constData());
+	pushLuaUtf8String(L, timer.attributes.value(QStringLiteral("script")));
 	return 7;
 }
 
@@ -34247,7 +34985,7 @@ template <typename Item> static int pushNamedAttributeList(lua_State *L, const Q
 	{
 		const auto    attrIt = item.attributes.constFind(kNameAttribute);
 		const QString name   = attrIt != item.attributes.cend() ? attrIt.value() : QString{};
-		lua_pushstring(L, name.toLocal8Bit().constData());
+		pushLuaUtf8String(L, name);
 		lua_rawseti(L, -2, index++);
 	}
 	return 1;
@@ -34798,12 +35536,12 @@ static int luaGetTriggerOption(lua_State *L)
 	    optName == QStringLiteral("script") || optName == QStringLiteral("sound") ||
 	    optName == QStringLiteral("variable"))
 	{
-		lua_pushstring(L, trigger.attributes.value(optName).toLocal8Bit().constData());
+		pushLuaUtf8String(L, trigger.attributes.value(optName));
 		return 1;
 	}
 	if (optName == QStringLiteral("send"))
 	{
-		lua_pushstring(L, trigger.children.value(QStringLiteral("send")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, trigger.children.value(QStringLiteral("send")));
 		return 1;
 	}
 	if (optName == QStringLiteral("match_style"))
@@ -35153,12 +35891,12 @@ static int luaGetAliasOption(lua_State *L)
 	if (optName == QStringLiteral("group") || optName == QStringLiteral("match") ||
 	    optName == QStringLiteral("script") || optName == QStringLiteral("variable"))
 	{
-		lua_pushstring(L, alias.attributes.value(optName).toLocal8Bit().constData());
+		pushLuaUtf8String(L, alias.attributes.value(optName));
 		return 1;
 	}
 	if (optName == QStringLiteral("send"))
 	{
-		lua_pushstring(L, alias.children.value(QStringLiteral("send")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, alias.children.value(QStringLiteral("send")));
 		return 1;
 	}
 
@@ -35403,12 +36141,12 @@ static int luaGetTimerOption(lua_State *L)
 	if (optName == QStringLiteral("group") || optName == QStringLiteral("script") ||
 	    optName == QStringLiteral("variable"))
 	{
-		lua_pushstring(L, timer.attributes.value(optName).toLocal8Bit().constData());
+		pushLuaUtf8String(L, timer.attributes.value(optName));
 		return 1;
 	}
 	if (optName == QStringLiteral("send"))
 	{
-		lua_pushstring(L, timer.children.value(QStringLiteral("send")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, timer.children.value(QStringLiteral("send")));
 		return 1;
 	}
 
@@ -35661,15 +36399,15 @@ static int luaGetTriggerWildcard(lua_State *L)
 	if (handledByContext)
 	{
 		if (foundInContext)
-			lua_pushstring(L, value.toLocal8Bit().constData());
+			pushLuaUtf8String(L, value);
 		else
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 		return 1;
 	}
 	if (tryResolveCallbackStoredWildcard(engine, CallbackWildcardDomain::Trigger, engine->pluginId(), name,
 	                                     wildcardName, value))
 	{
-		lua_pushstring(L, value.toLocal8Bit().constData());
+		pushLuaUtf8String(L, value);
 		return 1;
 	}
 	const auto resolveWildcard = [&]() -> bool
@@ -35681,7 +36419,7 @@ static int luaGetTriggerWildcard(lua_State *L)
 	const bool inCallback = activeCallbackContextConst(engine) != nullptr;
 	if (callbackNoFlushRuntimeReadBridgeForbidden(engine, inCallback))
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const bool ok = inCallback ? runOnRuntimeThreadNoDeferredFlush(runtime, resolveWildcard, false)
@@ -35689,10 +36427,10 @@ static int luaGetTriggerWildcard(lua_State *L)
 	if (!ok)
 	{
 		// MUSHclient parity: missing wildcard lookup returns empty string for Lua callers.
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
-	lua_pushstring(L, value.toLocal8Bit().constData());
+	pushLuaUtf8String(L, value);
 	return 1;
 }
 
@@ -35720,15 +36458,15 @@ static int luaGetAliasWildcard(lua_State *L)
 	if (handledByContext)
 	{
 		if (foundInContext)
-			lua_pushstring(L, value.toLocal8Bit().constData());
+			pushLuaUtf8String(L, value);
 		else
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 		return 1;
 	}
 	if (tryResolveCallbackStoredWildcard(engine, CallbackWildcardDomain::Alias, engine->pluginId(), name,
 	                                     wildcardName, value))
 	{
-		lua_pushstring(L, value.toLocal8Bit().constData());
+		pushLuaUtf8String(L, value);
 		return 1;
 	}
 	const auto resolveWildcard = [&]() -> bool
@@ -35740,7 +36478,7 @@ static int luaGetAliasWildcard(lua_State *L)
 	const bool inCallback = activeCallbackContextConst(engine) != nullptr;
 	if (callbackNoFlushRuntimeReadBridgeForbidden(engine, inCallback))
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const bool ok = inCallback ? runOnRuntimeThreadNoDeferredFlush(runtime, resolveWildcard, false)
@@ -35748,10 +36486,10 @@ static int luaGetAliasWildcard(lua_State *L)
 	if (!ok)
 	{
 		// MUSHclient parity: missing wildcard lookup returns empty string for Lua callers.
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
-	lua_pushstring(L, value.toLocal8Bit().constData());
+	pushLuaUtf8String(L, value);
 	return 1;
 }
 
@@ -36292,12 +37030,12 @@ static int luaGetPluginTriggerOption(lua_State *L)
 	    optName == QStringLiteral("script") || optName == QStringLiteral("sound") ||
 	    optName == QStringLiteral("variable"))
 	{
-		lua_pushstring(L, trigger.attributes.value(optName).toLocal8Bit().constData());
+		pushLuaUtf8String(L, trigger.attributes.value(optName));
 		return 1;
 	}
 	if (optName == QStringLiteral("send"))
 	{
-		lua_pushstring(L, trigger.children.value(QStringLiteral("send")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, trigger.children.value(QStringLiteral("send")));
 		return 1;
 	}
 	if (optName == QStringLiteral("match_style"))
@@ -36355,12 +37093,12 @@ static int luaGetPluginAliasOption(lua_State *L)
 	if (optName == QStringLiteral("group") || optName == QStringLiteral("match") ||
 	    optName == QStringLiteral("script") || optName == QStringLiteral("variable"))
 	{
-		lua_pushstring(L, alias.attributes.value(optName).toLocal8Bit().constData());
+		pushLuaUtf8String(L, alias.attributes.value(optName));
 		return 1;
 	}
 	if (optName == QStringLiteral("send"))
 	{
-		lua_pushstring(L, alias.children.value(QStringLiteral("send")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, alias.children.value(QStringLiteral("send")));
 		return 1;
 	}
 	if (optName == QStringLiteral("enabled") || optName == QStringLiteral("expand_variables") ||
@@ -36405,12 +37143,12 @@ static int luaGetPluginTimerOption(lua_State *L)
 	if (optName == QStringLiteral("group") || optName == QStringLiteral("script") ||
 	    optName == QStringLiteral("variable"))
 	{
-		lua_pushstring(L, timer.attributes.value(optName).toLocal8Bit().constData());
+		pushLuaUtf8String(L, timer.attributes.value(optName));
 		return 1;
 	}
 	if (optName == QStringLiteral("send"))
 	{
-		lua_pushstring(L, timer.children.value(QStringLiteral("send")).toLocal8Bit().constData());
+		pushLuaUtf8String(L, timer.children.value(QStringLiteral("send")));
 		return 1;
 	}
 	if (optName == QStringLiteral("enabled") || optName == QStringLiteral("at_time") ||
@@ -36462,7 +37200,7 @@ static int luaGetVariable(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	lua_pushstring(L, value.toLocal8Bit().constData());
+	pushLuaUtf8String(L, value);
 	return 1;
 }
 
@@ -36553,8 +37291,8 @@ static int luaGetVariableList(lua_State *L)
 		lua_newtable(L);
 		for (auto it = cachedValues->constBegin(); it != cachedValues->constEnd(); ++it)
 		{
-			lua_pushstring(L, it.key().toLocal8Bit().constData());
-			lua_pushstring(L, it.value().toLocal8Bit().constData());
+			pushLuaUtf8String(L, it.key());
+			pushLuaUtf8String(L, it.value());
 			lua_rawset(L, -3);
 		}
 		return 1;
@@ -36576,8 +37314,8 @@ static int luaGetVariableList(lua_State *L)
 	lua_newtable(L);
 	for (auto it = values.constBegin(); it != values.constEnd(); ++it)
 	{
-		lua_pushstring(L, it.key().toLocal8Bit().constData());
-		lua_pushstring(L, it.value().toLocal8Bit().constData());
+		pushLuaUtf8String(L, it.key());
+		pushLuaUtf8String(L, it.value());
 		lua_rawset(L, -3);
 	}
 	return 1;
@@ -36860,7 +37598,7 @@ static int luaArrayGet(lua_State *L)
 			lua_pushnil(L);
 			return 1;
 		}
-		lua_pushstring(L, values.value(key).toLocal8Bit().constData());
+		pushLuaUtf8String(L, values.value(key));
 		return 1;
 	}
 	QString    value;
@@ -36871,7 +37609,7 @@ static int luaArrayGet(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	lua_pushstring(L, value.toLocal8Bit().constData());
+	pushLuaUtf8String(L, value);
 	return 1;
 }
 
@@ -36994,7 +37732,7 @@ static int luaArrayGetFirstKey(lua_State *L)
 			lua_pushnil(L);
 			return 1;
 		}
-		lua_pushstring(L, values.firstKey().toLocal8Bit().constData());
+		pushLuaUtf8String(L, values.firstKey());
 		return 1;
 	}
 	QString key;
@@ -37003,7 +37741,7 @@ static int luaArrayGetFirstKey(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	lua_pushstring(L, key.toLocal8Bit().constData());
+	pushLuaUtf8String(L, key);
 	return 1;
 }
 
@@ -37031,7 +37769,7 @@ static int luaArrayGetLastKey(lua_State *L)
 			lua_pushnil(L);
 			return 1;
 		}
-		lua_pushstring(L, values.lastKey().toLocal8Bit().constData());
+		pushLuaUtf8String(L, values.lastKey());
 		return 1;
 	}
 	QString key;
@@ -37040,7 +37778,7 @@ static int luaArrayGetLastKey(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	lua_pushstring(L, key.toLocal8Bit().constData());
+	pushLuaUtf8String(L, key);
 	return 1;
 }
 
@@ -37092,7 +37830,7 @@ static int luaArrayExport(lua_State *L)
 		}
 		if (values.isEmpty())
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		QChar delimiter;
@@ -37115,7 +37853,7 @@ static int luaArrayExport(lua_State *L)
 			parts.append(safeKey);
 			parts.append(safeValue);
 		}
-		lua_pushstring(L, parts.join(delimStr).toLocal8Bit().constData());
+		pushLuaUtf8String(L, parts.join(delimStr));
 		return 1;
 	}
 
@@ -37145,7 +37883,7 @@ static int luaArrayExport(lua_State *L)
 	}
 	if (keys.isEmpty())
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 
@@ -37171,7 +37909,7 @@ static int luaArrayExport(lua_State *L)
 		parts.append(safeKey);
 		parts.append(safeValue);
 	}
-	lua_pushstring(L, parts.join(delimStr).toLocal8Bit().constData());
+	pushLuaUtf8String(L, parts.join(delimStr));
 	return 1;
 }
 
@@ -37207,7 +37945,7 @@ static int luaArrayExportKeys(lua_State *L)
 		}
 		if (values.isEmpty())
 		{
-			lua_pushstring(L, "");
+			pushLuaUtf8String(L, "");
 			return 1;
 		}
 		QChar delimiter;
@@ -37226,7 +37964,7 @@ static int luaArrayExportKeys(lua_State *L)
 			safeKey.replace(delimStr, QStringLiteral("\\") + delimStr);
 			safeKeys.append(safeKey);
 		}
-		lua_pushstring(L, safeKeys.join(delimStr).toLocal8Bit().constData());
+		pushLuaUtf8String(L, safeKeys.join(delimStr));
 		return 1;
 	}
 	QStringList keys;
@@ -37247,7 +37985,7 @@ static int luaArrayExportKeys(lua_State *L)
 	}
 	if (keys.isEmpty())
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	QChar delimiter;
@@ -37266,7 +38004,7 @@ static int luaArrayExportKeys(lua_State *L)
 		safeKey.replace(delimStr, QStringLiteral("\\") + delimStr);
 		safeKeys.append(safeKey);
 	}
-	lua_pushstring(L, safeKeys.join(delimStr).toLocal8Bit().constData());
+	pushLuaUtf8String(L, safeKeys.join(delimStr));
 	return 1;
 }
 
@@ -37574,8 +38312,8 @@ static int luaArrayList(lua_State *L)
 		lua_newtable(L);
 		for (auto it = values.constBegin(); it != values.constEnd(); ++it)
 		{
-			lua_pushstring(L, it.key().toLocal8Bit().constData());
-			lua_pushstring(L, it.value().toLocal8Bit().constData());
+			pushLuaUtf8String(L, it.key());
+			pushLuaUtf8String(L, it.value());
 			lua_rawset(L, -3);
 		}
 		return 1;
@@ -37606,8 +38344,8 @@ static int luaArrayList(lua_State *L)
 	{
 		const QString &key   = keys.at(i);
 		const QString &value = values.at(i);
-		lua_pushstring(L, key.toLocal8Bit().constData());
-		lua_pushstring(L, value.toLocal8Bit().constData());
+		pushLuaUtf8String(L, key);
+		pushLuaUtf8String(L, value);
 		lua_rawset(L, -3);
 	}
 	return 1;
@@ -38607,20 +39345,20 @@ static int luaDatabaseError(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 	{
-		lua_pushstring(L, "database id not found");
+		pushLuaUtf8String(L, "database id not found");
 		return 1;
 	}
 	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
-		lua_pushstring(L, "database id not found");
+		pushLuaUtf8String(L, "database id not found");
 		return 1;
 	}
 	const QString name = QString::fromUtf8(luaL_checkstring(L, 1));
 	QString       text = {};
 	if (!resolveDatabaseErrorForApi(engine, runtime, name, text))
 		text.clear();
-	lua_pushstring(L, text.toLocal8Bit().constData());
+	pushLuaUtf8String(L, text);
 	return 1;
 }
 
@@ -38642,7 +39380,7 @@ static int luaDatabaseColumnName(lua_State *L)
 	const int     column = static_cast<int>(luaL_checknumber(L, 2));
 	QString       result;
 	if (resolveDatabaseColumnNameForApi(engine, runtime, name, column, result))
-		lua_pushstring(L, result.toLocal8Bit().constData());
+		pushLuaUtf8String(L, result);
 	else
 		lua_pushnil(L);
 	return 1;
@@ -38666,7 +39404,7 @@ static int luaDatabaseColumnText(lua_State *L)
 	const int     column = static_cast<int>(luaL_checknumber(L, 2));
 	QString       value;
 	if (resolveDatabaseColumnTextForApi(engine, runtime, name, column, value))
-		lua_pushstring(L, value.toLocal8Bit().constData());
+		pushLuaUtf8String(L, value);
 	else
 		lua_pushnil(L);
 	return 1;
@@ -38689,7 +39427,7 @@ static void pushDatabaseColumnValue(lua_State *L, const QVariant &value)
 		lua_pushnumber(L, value.toDouble());
 		break;
 	default:
-		lua_pushstring(L, value.toString().toLocal8Bit().constData());
+		pushLuaUtf8String(L, value.toString());
 		break;
 	}
 }
@@ -38793,20 +39531,20 @@ static int luaDatabaseLastInsertRowid(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
 	if (!runtime)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QString name = QString::fromUtf8(luaL_checkstring(L, 1));
 	QString       rowid;
 	if (!resolveDatabaseLastInsertRowidForApi(engine, runtime, name, rowid))
 		rowid.clear();
-	lua_pushstring(L, rowid.toLocal8Bit().constData());
+	pushLuaUtf8String(L, rowid);
 	return 1;
 }
 
@@ -39056,7 +39794,7 @@ static int luaGetPluginVariable(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	lua_pushstring(L, value.toLocal8Bit().constData());
+	pushLuaUtf8String(L, value);
 	return 1;
 }
 
@@ -39085,8 +39823,8 @@ static int luaGetPluginVariableList(lua_State *L)
 		lua_newtable(L);
 		for (auto it = cachedValues->constBegin(); it != cachedValues->constEnd(); ++it)
 		{
-			lua_pushstring(L, it.key().toLocal8Bit().constData());
-			lua_pushstring(L, it.value().toLocal8Bit().constData());
+			pushLuaUtf8String(L, it.key());
+			pushLuaUtf8String(L, it.value());
 			lua_rawset(L, -3);
 		}
 		return 1;
@@ -39105,8 +39843,8 @@ static int luaGetPluginVariableList(lua_State *L)
 	lua_newtable(L);
 	for (auto it = values.constBegin(); it != values.constEnd(); ++it)
 	{
-		lua_pushstring(L, it.key().toLocal8Bit().constData());
-		lua_pushstring(L, it.value().toLocal8Bit().constData());
+		pushLuaUtf8String(L, it.key());
+		pushLuaUtf8String(L, it.value());
 		lua_rawset(L, -3);
 	}
 	return 1;
@@ -39210,7 +39948,7 @@ static int luaGetPluginID(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QByteArray id = engine->pluginId().toLocal8Bit();
@@ -39223,7 +39961,7 @@ static int luaGetPluginName(lua_State *L)
 	auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
 	if (!engine)
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	const QByteArray name = engine->pluginName().toLocal8Bit();
@@ -39586,19 +40324,17 @@ static int luaCallPlugin(lua_State *L)
 	{
 		lua_pushnumber(L, eErrorCallingPluginRoutine);
 		const QString reason = qmudLuaBridgeLastError().trimmed();
-		lua_pushstring(L,
-		               (reason.isEmpty()
-		                    ? QStringLiteral("Failed to flush deferred runtime mutations before CallPlugin")
-		                    : reason)
-		                   .toLocal8Bit()
-		                   .constData());
+		pushLuaUtf8String(L,
+		                  reason.isEmpty()
+		                      ? QStringLiteral("Failed to flush deferred runtime mutations before CallPlugin")
+		                      : reason);
 		return 2;
 	}
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	const auto pushCodeAndMessage = [L](const int code, const QString &message)
 	{
 		lua_pushnumber(L, code);
-		lua_pushstring(L, message.toLocal8Bit().constData());
+		pushLuaUtf8String(L, message);
 		return 2;
 	};
 	const CallbackDispatchSnapshot callPluginSnapshot = buildActiveCallbackDispatchSnapshot(engine, runtime);
@@ -39645,7 +40381,7 @@ static int luaCallPlugin(lua_State *L)
 			const QString error        = QStringLiteral("Cannot pass argument #%1 (%2 type) to CallPlugin")
 			                                 .arg(displayIndex)
 			                                 .arg(QString::fromLatin1(marshalling.typeName));
-			lua_pushstring(L, error.toLocal8Bit().constData());
+			pushLuaUtf8String(L, error);
 			return 2;
 		}
 		case CallPluginLuaMarshallingError::RuntimeError:
@@ -39653,8 +40389,8 @@ static int luaCallPlugin(lua_State *L)
 			lua_pushnumber(L, eErrorCallingPluginRoutine);
 			const QString error = QStringLiteral("Runtime error in function '%1', plugin '%2' (%3)")
 			                          .arg(routine, targetPluginName, targetPluginId);
-			lua_pushstring(L, error.toLocal8Bit().constData());
-			lua_pushstring(L, marshalling.runtimeError.toLocal8Bit().constData());
+			pushLuaUtf8String(L, error);
+			pushLuaUtf8String(L, marshalling.runtimeError);
 			return 3;
 		}
 		case CallPluginLuaMarshallingError::UnsupportedReturnType:
@@ -39666,7 +40402,7 @@ static int luaCallPlugin(lua_State *L)
 			        .arg(marshalling.index)
 			        .arg(QString::fromLatin1(marshalling.typeName))
 			        .arg(routine, targetPluginName, targetPluginId);
-			lua_pushstring(L, error.toLocal8Bit().constData());
+			pushLuaUtf8String(L, error);
 			return 2;
 		}
 		case CallPluginLuaMarshallingError::None:
@@ -40000,7 +40736,7 @@ static int luaGetAlphaOption(lua_State *L)
 	const bool    isMultiline   = (option->flags & kOptMultiline) != 0;
 	const QString value =
 	    resolveWorldAttributeValueMaybeMultilineForApi(engine, runtime, canonical, isMultiline);
-	lua_pushstring(L, value.toLocal8Bit().constData());
+	pushLuaUtf8String(L, value);
 	return 1;
 }
 
@@ -42878,7 +43614,7 @@ static int luaWindowMenu(lua_State *L)
 	const QString pluginId  = pluginIdFromLua(L);
 	auto          pushEmpty = [L]() -> int
 	{
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	};
 	if (activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
@@ -42901,28 +43637,27 @@ static int luaWindowMenu(lua_State *L)
 			return pushEmpty();
 		}
 
-		const QString callbackPluginId = engine ? engine->pluginId() : QString();
-		const quint64 requestId        = callbackPluginId.isEmpty() ? 0 : nextPluginAsyncResultRequestId();
-		const bool    accepted         = enqueueRuntimeThreadDeferredMutationNoResult(
-		    engine, runtime,
-		    [name, left, top, items, pluginId, callbackPluginId, requestId](WorldRuntime &targetRuntime)
-		    {
-			    const QString result = targetRuntime.windowMenu(name, left, top, items, pluginId);
-			    emitPluginAsyncResult(targetRuntime, callbackPluginId, requestId,
-			                          QStringLiteral("WindowMenu"), true, eOK, result);
-		    });
-		lua_pushstring(L, "");
-		if (accepted && requestId != 0)
+		QPointer<WorldView> viewGuard(runtime->view());
+		MiniWindow          windowCopy = *window;
+		if (canYieldModalResult(L))
 		{
-			lua_pushnumber(L, static_cast<lua_Number>(requestId));
-			return 2;
+			LuaPendingModalStringRequest request;
+			request.guiCallable = [viewGuard, windowCopy, left, top, items]() mutable -> QString
+			{ return qmudShowLuaMiniWindowMenuDialog(viewGuard.data(), &windowCopy, left, top, items); };
+			setLuaModalResumeCallback(request, runtime, pluginId);
+			return yieldModalStringResult(L, engine, std::move(request));
 		}
+		const QString result = qmudRunGuiModalDialogSync(
+		    [viewGuard, windowCopy, left, top, items]() mutable -> QString
+		    { return qmudShowLuaMiniWindowMenuDialog(viewGuard.data(), &windowCopy, left, top, items); },
+		    QString());
+		pushLuaUtf8String(L, result);
 		return 1;
 	}
 	const QString result = runOnRuntimeThreadAllowNestedEventsFlushingDeferred(
 	    L, runtime, [&]() -> QString { return runtime->windowMenu(name, left, top, items, pluginId); },
 	    QString());
-	lua_pushstring(L, result.toLocal8Bit().constData());
+	pushLuaUtf8String(L, result);
 	return 1;
 }
 #endif
@@ -43318,7 +44053,7 @@ static int luaTestGetInfo(lua_State *L)
 			lua_pushlstring(L, bytes.constData(), bytes.size());
 			return 1;
 		}
-		lua_pushstring(L, "");
+		pushLuaUtf8String(L, "");
 		return 1;
 	}
 	if (infoType >= 290 && infoType <= 293)
@@ -43632,20 +44367,22 @@ void LuaCallbackEngine::registerWorldBindings()
 		lua_setglobal(m_state, name);
 	};
 	static const LuaBindingEntry kMinimalWorldBindings[] = {
-	    {"ColourNote",        luaColourNote           },
-	    {"ColourTell",        luaColourTell           },
-	    {"GetInfo",           luaTestGetInfo          },
-	    {"Note",              luaNote                 },
-	    {"SaveState",         luaTestSaveState        },
-	    {"Tell",              luaTell                 },
-	    {"WindowAddHotspot",  luaTestWindowAddHotspot },
-	    {"WindowCreate",      luaTestWindowCreate     },
-	    {"WindowHotspotList", luaTestWindowHotspotList},
-	    {"WindowInfo",        luaTestWindowInfo       },
-	    {"WindowList",        luaTestWindowList       },
-	    {"WindowPosition",    luaTestWindowPosition   },
-	    {"WindowResize",      luaTestWindowResize     },
-	    {nullptr,             nullptr                 },
+	    {"ColourNote",           luaColourNote           },
+	    {"ColourTell",           luaColourTell           },
+	    {"GetInfo",              luaTestGetInfo          },
+	    {"Note",	             luaNote                 },
+	    {"SaveState",            luaTestSaveState        },
+	    {"Tell",	             luaTell                 },
+	    {"TestYieldModalNumber", luaTestYieldModalNumber },
+	    {"TestYieldModalString", luaTestYieldModalString },
+	    {"WindowAddHotspot",     luaTestWindowAddHotspot },
+	    {"WindowCreate",         luaTestWindowCreate     },
+	    {"WindowHotspotList",    luaTestWindowHotspotList},
+	    {"WindowInfo",           luaTestWindowInfo       },
+	    {"WindowList",           luaTestWindowList       },
+	    {"WindowPosition",       luaTestWindowPosition   },
+	    {"WindowResize",         luaTestWindowResize     },
+	    {nullptr,                nullptr                 },
 	};
 	for (const LuaBindingEntry *entry = kMinimalWorldBindings; entry->name != nullptr; ++entry)
 		registerWorldFn(entry->name, entry->function);
@@ -43653,6 +44390,9 @@ void LuaCallbackEngine::registerWorldBindings()
 	lua_pushlightuserdata(m_state, this);
 	lua_pushcclosure(m_state, luaUtilsInfo, 1);
 	lua_setfield(m_state, -2, "info");
+	lua_pushlightuserdata(m_state, this);
+	lua_pushcclosure(m_state, luaTestUtilsMultiListBox, 1);
+	lua_setfield(m_state, -2, "multilistbox");
 	lua_pushlightuserdata(m_state, this);
 	lua_pushcclosure(m_state, luaUtilsReadDir, 1);
 	lua_setfield(m_state, -2, "readdir");
@@ -44256,9 +44996,17 @@ void LuaCallbackEngine::registerWorldBindings()
 }
 
 bool LuaCallbackEngine::callMxpError(const QString &functionName, int level, long messageNumber,
-                                     int lineNumber, const QString &message)
+                                     int lineNumber, const QString &message, bool *suspended,
+                                     quint64                      *modalResumeId,
+                                     LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return false;
 	if (!ensureState())
@@ -44272,97 +45020,99 @@ bool LuaCallbackEngine::callMxpError(const QString &functionName, int level, lon
 	lua_pushinteger(m_state, lineNumber);
 	const QByteArray msgBytes = message.toUtf8();
 	lua_pushlstring(m_state, msgBytes.constData(), msgBytes.size());
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
-
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 4, 1, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		qWarning() << "Lua MXP error callback failed:" << (err ? err : "unknown");
-		lua_pop(m_state, 1);
-		return false;
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
-
-	bool suppress = true;
-	if (lua_gettop(m_state) > 0)
-	{
-		if (lua_isboolean(m_state, -1))
-			suppress = lua_toboolean(m_state, -1) != 0;
-		else
-			suppress = lua_tonumber(m_state, -1) != 0.0;
-	}
-	lua_pop(m_state, 1);
-	return suppress;
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
+	return callPreparedYieldableCallback(functionName, 4, 1, true, suspended, modalResumeId,
+	                                     pendingModalStringRequest);
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(level);
 	Q_UNUSED(messageNumber);
 	Q_UNUSED(lineNumber);
 	Q_UNUSED(message);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return false;
 #endif
 }
 
-void LuaCallbackEngine::callMxpStartUp(const QString &functionName)
+void LuaCallbackEngine::callMxpStartUp(const QString &functionName, bool *suspended, quint64 *modalResumeId,
+                                       LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return;
 	if (!ensureState())
 		return;
 	if (!pushLuaFunctionByName(m_state, functionName))
 		return;
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 0, 0, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		qWarning() << "Lua MXP startup callback failed:" << (err ? err : "unknown");
-		lua_pop(m_state, 1);
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
+	static_cast<void>(callPreparedYieldableCallback(functionName, 0, 0, true, suspended, modalResumeId,
+	                                                pendingModalStringRequest,
+	                                                LuaPreparedCallbackResultMode::NoResult));
 #else
 	Q_UNUSED(functionName);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 #endif
 }
 
-void LuaCallbackEngine::callMxpShutDown(const QString &functionName)
+void LuaCallbackEngine::callMxpShutDown(const QString &functionName, bool *suspended, quint64 *modalResumeId,
+                                        LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return;
 	if (!ensureState())
 		return;
 	if (!pushLuaFunctionByName(m_state, functionName))
 		return;
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 0, 0, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		qWarning() << "Lua MXP shutdown callback failed:" << (err ? err : "unknown");
-		lua_pop(m_state, 1);
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
+	static_cast<void>(callPreparedYieldableCallback(functionName, 0, 0, true, suspended, modalResumeId,
+	                                                pendingModalStringRequest,
+	                                                LuaPreparedCallbackResultMode::NoResult));
 #else
 	Q_UNUSED(functionName);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 #endif
 }
 
 bool LuaCallbackEngine::callMxpStartTag(const QString &functionName, const QString &name, const QString &args,
-                                        const QMap<QString, QString> &table)
+                                        const QMap<QString, QString> &table, bool *suspended,
+                                        quint64                      *modalResumeId,
+                                        LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return false;
 	if (!ensureState())
@@ -44386,43 +45136,35 @@ bool LuaCallbackEngine::callMxpStartTag(const QString &functionName, const QStri
 		lua_pushlstring(m_state, valueBytes.constData(), valueBytes.size());
 		lua_settable(m_state, -3);
 	}
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
-
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 3, 1, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		qWarning() << "Lua MXP start tag callback failed:" << (err ? err : "unknown");
-		lua_pop(m_state, 1);
-		return false;
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
-
-	bool suppress = true;
-	if (lua_gettop(m_state) > 0)
-	{
-		if (lua_isboolean(m_state, -1))
-			suppress = lua_toboolean(m_state, -1) != 0;
-		else
-			suppress = lua_tonumber(m_state, -1) != 0.0;
-	}
-	lua_pop(m_state, 1);
-	return suppress;
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
+	return callPreparedYieldableCallback(functionName, 3, 1, true, suspended, modalResumeId,
+	                                     pendingModalStringRequest);
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(name);
 	Q_UNUSED(args);
 	Q_UNUSED(table);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return false;
 #endif
 }
 
-void LuaCallbackEngine::callMxpEndTag(const QString &functionName, const QString &name, const QString &text)
+void LuaCallbackEngine::callMxpEndTag(const QString &functionName, const QString &name, const QString &text,
+                                      bool *suspended, quint64 *modalResumeId,
+                                      LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return;
 	if (!ensureState())
@@ -44435,30 +45177,34 @@ void LuaCallbackEngine::callMxpEndTag(const QString &functionName, const QString
 	lua_pushlstring(m_state, nameBytes.constData(), nameBytes.size());
 	const QByteArray textBytes = text.toUtf8();
 	lua_pushlstring(m_state, textBytes.constData(), textBytes.size());
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
-
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 2, 0, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		qWarning() << "Lua MXP end tag callback failed:" << (err ? err : "unknown");
-		lua_pop(m_state, 1);
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
+	static_cast<void>(callPreparedYieldableCallback(functionName, 2, 0, true, suspended, modalResumeId,
+	                                                pendingModalStringRequest,
+	                                                LuaPreparedCallbackResultMode::NoResult));
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(name);
 	Q_UNUSED(text);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 #endif
 }
 
 void LuaCallbackEngine::callMxpSetVariable(const QString &functionName, const QString &name,
-                                           const QString &contents)
+                                           const QString &contents, bool *suspended, quint64 *modalResumeId,
+                                           LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return;
 	if (!ensureState())
@@ -44471,32 +45217,36 @@ void LuaCallbackEngine::callMxpSetVariable(const QString &functionName, const QS
 	lua_pushlstring(m_state, nameBytes.constData(), nameBytes.size());
 	const QByteArray valueBytes = contents.toUtf8();
 	lua_pushlstring(m_state, valueBytes.constData(), valueBytes.size());
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
-
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 2, 0, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		reportLuaError(*this, QStringLiteral("Lua MXP set variable callback failed: %1")
-		                          .arg(QString::fromUtf8(err ? err : "unknown")));
-		lua_pop(m_state, 1);
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
+	static_cast<void>(callPreparedYieldableCallback(functionName, 2, 0, true, suspended, modalResumeId,
+	                                                pendingModalStringRequest,
+	                                                LuaPreparedCallbackResultMode::NoResult));
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(name);
 	Q_UNUSED(contents);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 #endif
 }
 
-bool LuaCallbackEngine::callFunctionNoArgs(const QString &functionName, bool *hasFunction, bool defaultResult)
+bool LuaCallbackEngine::callFunctionNoArgs(const QString &functionName, bool *hasFunction, bool defaultResult,
+                                           bool *suspended, quint64 *modalResumeId,
+                                           LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	if (hasFunction)
 		*hasFunction = false;
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return defaultResult;
 	if (!ensureState())
@@ -44506,46 +45256,37 @@ bool LuaCallbackEngine::callFunctionNoArgs(const QString &functionName, bool *ha
 		return defaultResult;
 	if (hasFunction)
 		*hasFunction = true;
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
-
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 0, 1, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		reportLuaError(
-		    *this, QStringLiteral("Lua callback failed: %1").arg(QString::fromUtf8(err ? err : "unknown")));
-		lua_pop(m_state, 1);
-		return false;
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
-
-	bool result = defaultResult;
-	if (lua_gettop(m_state) > 0)
-	{
-		if (lua_isboolean(m_state, -1))
-			result = lua_toboolean(m_state, -1) != 0;
-		else if (lua_isnumber(m_state, -1))
-			result = lua_tonumber(m_state, -1) != 0.0;
-	}
-	lua_pop(m_state, 1);
-	return result;
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
+	return callPreparedYieldableCallback(functionName, 0, 1, defaultResult, suspended, modalResumeId,
+	                                     pendingModalStringRequest);
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(hasFunction);
 	Q_UNUSED(defaultResult);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return defaultResult;
 #endif
 }
 
 bool LuaCallbackEngine::callFunctionWithString(const QString &functionName, const QString &arg,
-                                               bool *hasFunction, bool defaultResult)
+                                               bool *hasFunction, bool defaultResult, bool *suspended,
+                                               quint64                      *modalResumeId,
+                                               LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	if (hasFunction)
 		*hasFunction = false;
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return defaultResult;
 	if (!ensureState())
@@ -44555,80 +45296,65 @@ bool LuaCallbackEngine::callFunctionWithString(const QString &functionName, cons
 		return defaultResult;
 	if (hasFunction)
 		*hasFunction = true;
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
 
 	const QByteArray argBytes = arg.toUtf8();
 	lua_pushlstring(m_state, argBytes.constData(), argBytes.size());
-
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 1, 1, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		reportLuaError(
-		    *this, QStringLiteral("Lua callback failed: %1").arg(QString::fromUtf8(err ? err : "unknown")));
-		lua_pop(m_state, 1);
-		return defaultResult;
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
-
-	bool result = defaultResult;
-	if (lua_gettop(m_state) > 0)
-	{
-		if (lua_isboolean(m_state, -1))
-			result = lua_toboolean(m_state, -1) != 0;
-		else if (lua_isnumber(m_state, -1))
-			result = lua_tonumber(m_state, -1) != 0.0;
-	}
-	lua_pop(m_state, 1);
-	return result;
+	return callPreparedYieldableCallback(functionName, 1, 1, defaultResult, suspended, modalResumeId,
+	                                     pendingModalStringRequest);
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(arg);
 	Q_UNUSED(hasFunction);
 	Q_UNUSED(defaultResult);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return defaultResult;
 #endif
 }
 
 bool LuaCallbackEngine::callProcedureWithString(const QString &functionName, const QString &arg,
-                                                bool *hasFunction)
+                                                bool *hasFunction, bool *suspended, quint64 *modalResumeId,
+                                                LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	if (hasFunction)
 		*hasFunction = false;
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return false;
 	if (!ensureState())
 		return false;
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
 
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	QString                   error;
-	bool                      callbackPresent = false;
-	const bool                ok =
-	    QMudLuaSupport::callLuaNamedProcedureWithString(m_state, functionName, arg, &callbackPresent, &error);
-	if (hasFunction)
-		*hasFunction = callbackPresent;
-	if (!ok && callbackPresent)
-	{
-		reportLuaError(*this,
-		               QStringLiteral("Lua callback failed: %1").arg(error.isEmpty() ? "unknown" : error));
-		addScriptTimeForEngine(*this, timer.nsecsElapsed());
+	if (!pushLuaFunctionByName(m_state, functionName))
 		return false;
-	}
-	if (callbackPresent)
-		addScriptTimeForEngine(*this, timer.nsecsElapsed());
-	return ok;
+	if (hasFunction)
+		*hasFunction = true;
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
+
+	const QByteArray argBytes = arg.toUtf8();
+	lua_pushlstring(m_state, argBytes.constData(), argBytes.size());
+	return callPreparedYieldableCallback(functionName, 1, 0, true, suspended, modalResumeId,
+	                                     pendingModalStringRequest, LuaPreparedCallbackResultMode::NoResult);
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(arg);
 	Q_UNUSED(hasFunction);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return false;
 #endif
 }
@@ -44682,11 +45408,19 @@ CallPluginLuaMarshallingResult LuaCallbackEngine::callPluginLuaWithMarshalling(
 }
 
 bool LuaCallbackEngine::callFunctionWithBytes(const QString &functionName, const QByteArray &arg,
-                                              bool *hasFunction, bool defaultResult)
+                                              bool *hasFunction, bool defaultResult, bool *suspended,
+                                              quint64                      *modalResumeId,
+                                              LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	if (hasFunction)
 		*hasFunction = false;
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return defaultResult;
 	if (!ensureState())
@@ -44696,49 +45430,39 @@ bool LuaCallbackEngine::callFunctionWithBytes(const QString &functionName, const
 		return defaultResult;
 	if (hasFunction)
 		*hasFunction = true;
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
 
 	lua_pushlstring(m_state, arg.constData(), arg.size());
-
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 1, 1, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		reportLuaError(
-		    *this, QStringLiteral("Lua callback failed: %1").arg(QString::fromUtf8(err ? err : "unknown")));
-		lua_pop(m_state, 1);
-		return defaultResult;
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
-
-	bool result = defaultResult;
-	if (lua_gettop(m_state) > 0)
-	{
-		if (lua_isboolean(m_state, -1))
-			result = lua_toboolean(m_state, -1) != 0;
-		else if (lua_isnumber(m_state, -1))
-			result = lua_tonumber(m_state, -1) != 0.0;
-	}
-	lua_pop(m_state, 1);
-	return result;
+	return callPreparedYieldableCallback(functionName, 1, 1, defaultResult, suspended, modalResumeId,
+	                                     pendingModalStringRequest);
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(arg);
 	Q_UNUSED(hasFunction);
 	Q_UNUSED(defaultResult);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return defaultResult;
 #endif
 }
 
 bool LuaCallbackEngine::callFunctionWithBytesInOut(const QString &functionName, QByteArray &arg,
-                                                   bool *hasFunction)
+                                                   bool *hasFunction, bool *suspended, quint64 *modalResumeId,
+                                                   LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	if (hasFunction)
 		*hasFunction = false;
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return true;
 	if (!ensureState())
@@ -44748,48 +45472,40 @@ bool LuaCallbackEngine::callFunctionWithBytesInOut(const QString &functionName, 
 		return true;
 	if (hasFunction)
 		*hasFunction = true;
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
 
 	lua_pushlstring(m_state, arg.constData(), arg.size());
-
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 1, 1, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		reportLuaError(
-		    *this, QStringLiteral("Lua callback failed: %1").arg(QString::fromUtf8(err ? err : "unknown")));
-		lua_pop(m_state, 1);
-		return false;
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
-
-	if (lua_isstring(m_state, -1))
-	{
-		size_t outLen = 0;
-		if (const char *out = lua_tolstring(m_state, -1, &outLen); out)
-			arg = QByteArray(out, static_cast<int>(outLen));
-		else
-			arg.clear();
-	}
-	lua_pop(m_state, 1);
-	return true;
+	return callPreparedYieldableCallback(functionName, 1, 1, true, suspended, modalResumeId,
+	                                     pendingModalStringRequest, LuaPreparedCallbackResultMode::Bytes,
+	                                     &arg, nullptr);
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(arg);
 	Q_UNUSED(hasFunction);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return true;
 #endif
 }
 
 bool LuaCallbackEngine::callFunctionWithStringInOut(const QString &functionName, QString &arg,
-                                                    bool *hasFunction)
+                                                    bool *hasFunction, bool *suspended,
+                                                    quint64                      *modalResumeId,
+                                                    LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	if (hasFunction)
 		*hasFunction = false;
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return true;
 	if (!ensureState())
@@ -44799,45 +45515,41 @@ bool LuaCallbackEngine::callFunctionWithStringInOut(const QString &functionName,
 		return true;
 	if (hasFunction)
 		*hasFunction = true;
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
 
 	const QByteArray in = arg.toUtf8();
 	lua_pushlstring(m_state, in.constData(), in.size());
-
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 1, 1, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		reportLuaError(
-		    *this, QStringLiteral("Lua callback failed: %1").arg(QString::fromUtf8(err ? err : "unknown")));
-		lua_pop(m_state, 1);
-		return false;
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
-
-	if (lua_isstring(m_state, -1))
-		arg = QString::fromUtf8(lua_tostring(m_state, -1));
-
-	lua_pop(m_state, 1);
-	return true;
+	return callPreparedYieldableCallback(functionName, 1, 1, true, suspended, modalResumeId,
+	                                     pendingModalStringRequest, LuaPreparedCallbackResultMode::String,
+	                                     nullptr, &arg);
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(arg);
 	Q_UNUSED(hasFunction);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return true;
 #endif
 }
 
-bool LuaCallbackEngine::callFunctionWithNumberAndString(const QString &functionName, long arg1,
-                                                        const QString &arg, bool *hasFunction,
-                                                        bool defaultResult)
+bool LuaCallbackEngine::callFunctionWithNumberAndString(
+    const QString &functionName, long arg1, const QString &arg, bool *hasFunction, bool defaultResult,
+    const int actionSourceOverride, bool *didSuspend, quint64 *modalResumeId,
+    LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	if (hasFunction)
 		*hasFunction = false;
+	if (didSuspend)
+		*didSuspend = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return defaultResult;
 	if (!ensureState())
@@ -44847,42 +45559,29 @@ bool LuaCallbackEngine::callFunctionWithNumberAndString(const QString &functionN
 		return defaultResult;
 	if (hasFunction)
 		*hasFunction = true;
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
+	LuaCallbackExecutionContext context;
+	context.wildcardDomain          = CallbackWildcardDomain::None;
+	context.actionSourceOverride    = actionSourceOverride;
+	context.hasActionSourceOverride = actionSourceOverride >= 0;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
 
 	lua_pushinteger(m_state, arg1);
 	const QByteArray argBytes = arg.toUtf8();
 	lua_pushlstring(m_state, argBytes.constData(), argBytes.size());
-
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 2, 1, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		reportLuaError(
-		    *this, QStringLiteral("Lua callback failed: %1").arg(QString::fromUtf8(err ? err : "unknown")));
-		lua_pop(m_state, 1);
-		return defaultResult;
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
-
-	bool result = defaultResult;
-	if (lua_gettop(m_state) > 0)
-	{
-		if (lua_isboolean(m_state, -1))
-			result = lua_toboolean(m_state, -1) != 0;
-		else if (lua_isnumber(m_state, -1))
-			result = lua_tonumber(m_state, -1) != 0.0;
-	}
-	lua_pop(m_state, 1);
-	return result;
+	return callPreparedYieldableCallback(functionName, 2, 1, defaultResult, didSuspend, modalResumeId,
+	                                     pendingModalStringRequest, LuaPreparedCallbackResultMode::Bool);
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(arg1);
 	Q_UNUSED(arg);
 	Q_UNUSED(hasFunction);
 	Q_UNUSED(defaultResult);
+	Q_UNUSED(actionSourceOverride);
+	Q_UNUSED(didSuspend);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return defaultResult;
 #endif
 }
@@ -44911,15 +45610,20 @@ bool LuaCallbackEngine::callFunctionWithNumberAndStrings(const QString &function
 #endif
 }
 
-bool LuaCallbackEngine::callFunctionWithNumberAndUtf8Strings(const QString &functionName, long arg1,
-                                                             const QByteArray &arg2Utf8,
-                                                             const QByteArray &arg3Utf8,
-                                                             const QByteArray &arg4Utf8, bool *hasFunction,
-                                                             bool defaultResult)
+bool LuaCallbackEngine::callFunctionWithNumberAndUtf8Strings(
+    const QString &functionName, long arg1, const QByteArray &arg2Utf8, const QByteArray &arg3Utf8,
+    const QByteArray &arg4Utf8, bool *hasFunction, bool defaultResult, bool *suspended,
+    quint64 *modalResumeId, LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	if (hasFunction)
 		*hasFunction = false;
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return defaultResult;
 	if (!ensureState())
@@ -44929,37 +45633,17 @@ bool LuaCallbackEngine::callFunctionWithNumberAndUtf8Strings(const QString &func
 		return defaultResult;
 	if (hasFunction)
 		*hasFunction = true;
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
 
 	lua_pushinteger(m_state, arg1);
 	lua_pushlstring(m_state, arg2Utf8.constData(), arg2Utf8.size());
 	lua_pushlstring(m_state, arg3Utf8.constData(), arg3Utf8.size());
 	lua_pushlstring(m_state, arg4Utf8.constData(), arg4Utf8.size());
-
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 4, 1, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		reportLuaError(
-		    *this, QStringLiteral("Lua callback failed: %1").arg(QString::fromUtf8(err ? err : "unknown")));
-		lua_pop(m_state, 1);
-		return defaultResult;
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
-
-	bool result = defaultResult;
-	if (lua_gettop(m_state) > 0)
-	{
-		if (lua_isboolean(m_state, -1))
-			result = lua_toboolean(m_state, -1) != 0;
-		else if (lua_isnumber(m_state, -1))
-			result = lua_tonumber(m_state, -1) != 0.0;
-	}
-	lua_pop(m_state, 1);
-	return result;
+	return callPreparedYieldableCallback(functionName, 4, 1, defaultResult, suspended, modalResumeId,
+	                                     pendingModalStringRequest);
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(arg1);
@@ -44968,17 +45652,27 @@ bool LuaCallbackEngine::callFunctionWithNumberAndUtf8Strings(const QString &func
 	Q_UNUSED(arg4Utf8);
 	Q_UNUSED(hasFunction);
 	Q_UNUSED(defaultResult);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return defaultResult;
 #endif
 }
 
-bool LuaCallbackEngine::callFunctionWithTwoNumbersAndString(const QString &functionName, long arg1, long arg2,
-                                                            const QString &arg, bool *hasFunction,
-                                                            bool defaultResult)
+bool LuaCallbackEngine::callFunctionWithTwoNumbersAndString(
+    const QString &functionName, long arg1, long arg2, const QString &arg, bool *hasFunction,
+    bool defaultResult, bool *suspended, quint64 *modalResumeId,
+    LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	if (hasFunction)
 		*hasFunction = false;
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return defaultResult;
 	if (!ensureState())
@@ -44988,37 +45682,17 @@ bool LuaCallbackEngine::callFunctionWithTwoNumbersAndString(const QString &funct
 		return defaultResult;
 	if (hasFunction)
 		*hasFunction = true;
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
 
 	lua_pushinteger(m_state, arg1);
 	lua_pushinteger(m_state, arg2);
 	const QByteArray argBytes = arg.toUtf8();
 	lua_pushlstring(m_state, argBytes.constData(), argBytes.size());
-
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 3, 1, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		reportLuaError(
-		    *this, QStringLiteral("Lua callback failed: %1").arg(QString::fromUtf8(err ? err : "unknown")));
-		lua_pop(m_state, 1);
-		return defaultResult;
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
-
-	bool result = defaultResult;
-	if (lua_gettop(m_state) > 0)
-	{
-		if (lua_isboolean(m_state, -1))
-			result = lua_toboolean(m_state, -1) != 0;
-		else if (lua_isnumber(m_state, -1))
-			result = lua_tonumber(m_state, -1) != 0.0;
-	}
-	lua_pop(m_state, 1);
-	return result;
+	return callPreparedYieldableCallback(functionName, 3, 1, defaultResult, suspended, modalResumeId,
+	                                     pendingModalStringRequest);
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(arg1);
@@ -45026,17 +45700,26 @@ bool LuaCallbackEngine::callFunctionWithTwoNumbersAndString(const QString &funct
 	Q_UNUSED(arg);
 	Q_UNUSED(hasFunction);
 	Q_UNUSED(defaultResult);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return defaultResult;
 #endif
 }
 
-bool LuaCallbackEngine::callFunctionWithNumberAndBytes(const QString &functionName, long arg1,
-                                                       const QByteArray &arg, bool *hasFunction,
-                                                       bool defaultResult)
+bool LuaCallbackEngine::callFunctionWithNumberAndBytes(
+    const QString &functionName, long arg1, const QByteArray &arg, bool *hasFunction, bool defaultResult,
+    bool *suspended, quint64 *modalResumeId, LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	if (hasFunction)
 		*hasFunction = false;
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return defaultResult;
 	if (!ensureState())
@@ -45046,41 +45729,24 @@ bool LuaCallbackEngine::callFunctionWithNumberAndBytes(const QString &functionNa
 		return defaultResult;
 	if (hasFunction)
 		*hasFunction = true;
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, CallbackWildcardDomain::None, QString(), QStringList(), QMap<QString, QString>());
+	LuaCallbackExecutionContext context;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
 
 	lua_pushinteger(m_state, arg1);
 	lua_pushlstring(m_state, arg.constData(), arg.size());
-
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 2, 1, 0) != 0)
-	{
-		const char *err = lua_tostring(m_state, -1);
-		reportLuaError(
-		    *this, QStringLiteral("Lua callback failed: %1").arg(QString::fromUtf8(err ? err : "unknown")));
-		lua_pop(m_state, 1);
-		return defaultResult;
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
-
-	bool result = defaultResult;
-	if (lua_gettop(m_state) > 0)
-	{
-		if (lua_isboolean(m_state, -1))
-			result = lua_toboolean(m_state, -1) != 0;
-		else if (lua_isnumber(m_state, -1))
-			result = lua_tonumber(m_state, -1) != 0.0;
-	}
-	lua_pop(m_state, 1);
-	return result;
+	return callPreparedYieldableCallback(functionName, 2, 1, defaultResult, suspended, modalResumeId,
+	                                     pendingModalStringRequest);
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(arg1);
 	Q_UNUSED(arg);
 	Q_UNUSED(hasFunction);
 	Q_UNUSED(defaultResult);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return defaultResult;
 #endif
 }
@@ -45090,11 +45756,18 @@ bool LuaCallbackEngine::callFunctionWithStringsAndWildcards(
     const QMap<QString, QString> &namedWildcards, const QVector<LuaStyleRun> *styleRuns,
     const LuaCallbackMiniWindowSnapshot *miniWindowSnapshot, bool *hasFunction,
     const int actionSourceOverride, const bool triggerOutputReplacesMatchedLine,
-    const int triggerMatchedLineBufferIndex, const qint64 triggerMatchedLineAbsoluteNumber)
+    const int triggerMatchedLineBufferIndex, const qint64 triggerMatchedLineAbsoluteNumber, bool *suspended,
+    quint64 *modalResumeId, LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	if (hasFunction)
 		*hasFunction = false;
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (functionName.isEmpty())
 		return false;
 	if (!ensureState())
@@ -45106,14 +45779,18 @@ bool LuaCallbackEngine::callFunctionWithStringsAndWildcards(
 		*hasFunction = true;
 	const CallbackWildcardDomain wildcardDomain =
 	    inferCallbackWildcardDomain(args, styleRuns, wildcards, namedWildcards);
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(
-	    this, wildcardDomain, args.isEmpty() ? QString() : args.first(), wildcards, namedWildcards,
-	    actionSourceOverride, triggerOutputReplacesMatchedLine);
+	LuaCallbackExecutionContext context;
+	context.wildcardDomain          = wildcardDomain;
+	context.callbackLabelKey        = normalizeCallbackLabel(args.isEmpty() ? QString() : args.first());
+	context.wildcards               = wildcards;
+	context.namedWildcards          = namedWildcards;
+	context.actionSourceOverride    = actionSourceOverride;
+	context.hasActionSourceOverride = actionSourceOverride >= 0;
+	context.triggerOutputReplacesMatchedLine = triggerOutputReplacesMatchedLine;
+	pushActiveCallbackContext(this, std::move(context));
 	seedCallbackMiniWindowSnapshot(this, miniWindowSnapshot);
 	seedCallbackLineSnapshotFromArgs(this, worldRuntimeForBridgedCall(), wildcardDomain, args, styleRuns,
 	                                 triggerMatchedLineBufferIndex, triggerMatchedLineAbsoluteNumber);
-	const auto flushDeferredCallbackRuntimeMutations = [this]() -> bool
-	{ return flushDeferredRuntimeMutations(this, nullptr); };
 
 	int paramCount = 0;
 	for (const QString &arg : args)
@@ -45171,31 +45848,8 @@ bool LuaCallbackEngine::callFunctionWithStringsAndWildcards(
 		++paramCount;
 	}
 
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, paramCount, 0, 0) != 0)
-	{
-		if (!flushDeferredCallbackRuntimeMutations())
-		{
-			qWarning().noquote() << QStringLiteral(
-			    "[QMud][LuaBridge] callback teardown failed to flush deferred runtime mutations");
-		}
-		const char *err = lua_tostring(m_state, -1);
-		reportLuaError(
-		    *this, QStringLiteral("Lua callback failed: %1").arg(QString::fromUtf8(err ? err : "unknown")));
-		lua_pop(m_state, 1);
-		return false;
-	}
-	if (!flushDeferredCallbackRuntimeMutations())
-	{
-		qWarning().noquote() << QStringLiteral(
-		    "[QMud][LuaBridge] callback completion failed to flush deferred runtime mutations");
-		return false;
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
-
-	return true;
+	return callPreparedYieldableCallback(functionName, paramCount, 0, true, suspended, modalResumeId,
+	                                     pendingModalStringRequest);
 #else
 	Q_UNUSED(functionName);
 	Q_UNUSED(args);
@@ -45208,6 +45862,9 @@ bool LuaCallbackEngine::callFunctionWithStringsAndWildcards(
 	Q_UNUSED(triggerOutputReplacesMatchedLine);
 	Q_UNUSED(triggerMatchedLineBufferIndex);
 	Q_UNUSED(triggerMatchedLineAbsoluteNumber);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return false;
 #endif
 }
@@ -45216,9 +45873,17 @@ bool LuaCallbackEngine::executeScript(const QString &code, const QString &descri
                                       const QVector<LuaStyleRun> *styleRuns, const bool hasTriggerContext,
                                       const bool   triggerOutputReplacesMatchedLine,
                                       const int    triggerMatchedLineBufferIndex,
-                                      const qint64 triggerMatchedLineAbsoluteNumber)
+                                      const qint64 triggerMatchedLineAbsoluteNumber, bool *suspended,
+                                      quint64                      *modalResumeId,
+                                      LuaPendingModalStringRequest *pendingModalStringRequest)
 {
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
+	if (suspended)
+		*suspended = false;
+	if (modalResumeId)
+		*modalResumeId = 0;
+	if (pendingModalStringRequest)
+		*pendingModalStringRequest = {};
 	if (code.trimmed().isEmpty())
 		return true;
 	if (!ensureState())
@@ -45234,18 +45899,19 @@ bool LuaCallbackEngine::executeScript(const QString &code, const QString &descri
 			triggerLine += text;
 		}
 	}
-	const CallbackWildcardDomain            wildcardDomain = hasTriggerContext && !triggerLine.isEmpty()
-	                                                             ? CallbackWildcardDomain::Trigger
-	                                                             : CallbackWildcardDomain::None;
-	const ScopedLuaCallbackExecutionContext callbackContextGuard(this, wildcardDomain, QString(),
-	                                                             QStringList(), QMap<QString, QString>(), -1,
-	                                                             triggerOutputReplacesMatchedLine);
+	const CallbackWildcardDomain wildcardDomain = hasTriggerContext && !triggerLine.isEmpty()
+	                                                  ? CallbackWildcardDomain::Trigger
+	                                                  : CallbackWildcardDomain::None;
+	LuaCallbackExecutionContext  context;
+	context.wildcardDomain                   = wildcardDomain;
+	context.triggerOutputReplacesMatchedLine = triggerOutputReplacesMatchedLine;
+	pushActiveCallbackContext(this, std::move(context));
+	if (const auto *snapshot = currentDispatchMiniWindowSnapshot(); snapshot)
+		seedCallbackMiniWindowSnapshot(this, snapshot);
 	if (wildcardDomain == CallbackWildcardDomain::Trigger)
 		seedCallbackLineSnapshotFromArgs(this, worldRuntimeForBridgedCall(), wildcardDomain,
 		                                 {QString(), triggerLine}, styleRuns, triggerMatchedLineBufferIndex,
 		                                 triggerMatchedLineAbsoluteNumber);
-	const auto flushDeferredScriptRuntimeMutations = [this]() -> bool
-	{ return flushDeferredRuntimeMutations(this, nullptr); };
 	if (styleRuns)
 	{
 		lua_newtable(m_state);
@@ -45275,36 +45941,16 @@ bool LuaCallbackEngine::executeScript(const QString &code, const QString &descri
 	}
 	if (const QByteArray codeBytes = code.toUtf8(); luaL_loadstring(m_state, codeBytes.constData()) != 0)
 	{
+		LuaCallbackExecutionContext failedContext = takeActiveCallbackContext(this);
+		static_cast<void>(teardownCallbackContext(this, failedContext));
 		const char *err = lua_tostring(m_state, -1);
 		reportLuaError(*this, QStringLiteral("Lua script load error: %1 %2")
 		                          .arg(description, QString::fromUtf8(err ? err : "unknown")));
 		lua_pop(m_state, 1);
 		return false;
 	}
-	QElapsedTimer timer;
-	timer.start();
-	ScriptExecutionDepthGuard depthGuard(this);
-	if (QMudLuaSupport::callLuaProtected(m_state, 0, 0, 0) != 0)
-	{
-		if (!flushDeferredScriptRuntimeMutations())
-		{
-			qWarning().noquote() << QStringLiteral(
-			    "[QMud][LuaBridge] script teardown failed to flush deferred runtime mutations");
-		}
-		const char *err = lua_tostring(m_state, -1);
-		reportLuaError(*this, QStringLiteral("Lua script run error: %1 %2")
-		                          .arg(description, QString::fromUtf8(err ? err : "unknown")));
-		lua_pop(m_state, 1);
-		return false;
-	}
-	if (!flushDeferredScriptRuntimeMutations())
-	{
-		qWarning().noquote() << QStringLiteral(
-		    "[QMud][LuaBridge] script completion failed to flush deferred runtime mutations");
-		return false;
-	}
-	addScriptTimeForEngine(*this, timer.nsecsElapsed());
-	return true;
+	return callPreparedYieldableCallback(description, 0, 0, true, suspended, modalResumeId,
+	                                     pendingModalStringRequest, LuaPreparedCallbackResultMode::NoResult);
 #else
 	Q_UNUSED(code);
 	Q_UNUSED(description);
@@ -45313,6 +45959,9 @@ bool LuaCallbackEngine::executeScript(const QString &code, const QString &descri
 	Q_UNUSED(triggerOutputReplacesMatchedLine);
 	Q_UNUSED(triggerMatchedLineBufferIndex);
 	Q_UNUSED(triggerMatchedLineAbsoluteNumber);
+	Q_UNUSED(suspended);
+	Q_UNUSED(modalResumeId);
+	Q_UNUSED(pendingModalStringRequest);
 	return false;
 #endif
 }

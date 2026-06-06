@@ -75,6 +75,9 @@ namespace
 	QString                             g_lastWorldHotspotFunction;
 	QString                             g_lastWorldHotspotId;
 	long                                g_lastWorldHotspotFlags{0};
+	bool                                g_lastWorldHotspotQueueWhenBusy{false};
+	QVector<QString>                    g_worldHotspotCallbackFunctions;
+	QVector<bool>                       g_worldHotspotCallbackQueueWhenBusy;
 	QPoint                              g_lastResizeHotspotPressOffset;
 	QSize                               g_expectedReleaseResizeSize;
 	QPoint                              g_expectedReleaseMousePosition;
@@ -231,7 +234,10 @@ namespace
 		g_worldHotspotCallbackCount = 0;
 		g_lastWorldHotspotFunction.clear();
 		g_lastWorldHotspotId.clear();
-		g_lastWorldHotspotFlags           = 0;
+		g_lastWorldHotspotFlags         = 0;
+		g_lastWorldHotspotQueueWhenBusy = false;
+		g_worldHotspotCallbackFunctions.clear();
+		g_worldHotspotCallbackQueueWhenBusy.clear();
 		g_lastResizeHotspotPressOffset    = {};
 		g_expectedReleaseResizeSize       = {};
 		g_expectedReleaseMousePosition    = {};
@@ -1012,17 +1018,22 @@ bool WorldRuntime::isNawsNegotiated() const
 	return g_nawsNegotiated;
 }
 
-bool WorldRuntime::callPluginHotspotFunction(const QString &, const QString &, long, const QString &)
+bool WorldRuntime::callPluginHotspotFunction(const QString &, const QString &, long, const QString &,
+                                             const QString &, bool)
 {
 	return false;
 }
 
-bool WorldRuntime::callWorldHotspotFunction(const QString &functionName, long flags, const QString &hotspotId)
+bool WorldRuntime::callWorldHotspotFunction(const QString &functionName, long flags, const QString &hotspotId,
+                                            const QString &, const bool queueWhenCallbackLaneBusy)
 {
 	++g_worldHotspotCallbackCount;
-	g_lastWorldHotspotFunction = functionName;
-	g_lastWorldHotspotFlags    = flags;
-	g_lastWorldHotspotId       = hotspotId;
+	g_lastWorldHotspotFunction      = functionName;
+	g_lastWorldHotspotFlags         = flags;
+	g_lastWorldHotspotId            = hotspotId;
+	g_lastWorldHotspotQueueWhenBusy = queueWhenCallbackLaneBusy;
+	g_worldHotspotCallbackFunctions.push_back(functionName);
+	g_worldHotspotCallbackQueueWhenBusy.push_back(queueWhenCallbackLaneBusy);
 	if (functionName == QStringLiteral("drag_test_resize_down"))
 	{
 		for (const MiniWindow &window : g_testMiniWindows)
@@ -7153,6 +7164,7 @@ class tst_WorldView_Basic : public QObject
 			MiniWindowHotspot hotspot;
 			hotspot.rect      = QRect(0, 0, windowRect.width(), windowRect.height());
 			hotspot.mouseDown = QStringLiteral("on_hotspot_down");
+			hotspot.mouseUp   = QStringLiteral("on_hotspot_up");
 			window.hotspots.insert(QStringLiteral("hotspot_main"), hotspot);
 
 			const QPoint clickInStack    = windowRect.center();
@@ -7163,9 +7175,67 @@ class tst_WorldView_Basic : public QObject
 			QTest::mouseClick(viewport, Qt::LeftButton, Qt::NoModifier, clickInViewport);
 			QCoreApplication::processEvents();
 
-			QTRY_VERIFY(g_worldHotspotCallbackCount >= baseline + 1);
-			QCOMPARE(g_lastWorldHotspotFunction, QStringLiteral("on_hotspot_down"));
+			QTRY_VERIFY(g_worldHotspotCallbackCount >= baseline + 2);
+			QCOMPARE(g_worldHotspotCallbackFunctions.at(baseline), QStringLiteral("on_hotspot_down"));
+			QCOMPARE(g_worldHotspotCallbackFunctions.at(baseline + 1), QStringLiteral("on_hotspot_up"));
+			QVERIFY(!g_worldHotspotCallbackQueueWhenBusy.at(baseline));
+			QVERIFY(!g_worldHotspotCallbackQueueWhenBusy.at(baseline + 1));
+			QCOMPARE(g_lastWorldHotspotFunction, QStringLiteral("on_hotspot_up"));
 			QCOMPARE(g_lastWorldHotspotId, QStringLiteral("hotspot_main"));
+			QVERIFY(!g_lastWorldHotspotQueueWhenBusy);
+			resetTestState();
+		}
+
+		void nativeOutputRendererRightButtonMouseUpQueuesHotspotWhenLaneBusy()
+		{
+			resetTestState();
+
+			WorldView view;
+			view.setRuntimeObserver(fakeRuntimePointer());
+			view.resize(760, 460);
+			view.show();
+			QCoreApplication::processEvents();
+
+			QSplitter *outputSplitter = findOutputSplitter(view);
+			QVERIFY(outputSplitter);
+			QWidget *outputStack = outputSplitter->parentWidget();
+			QVERIFY(outputStack);
+			QTextBrowser *browser = findVisibleOutputBrowser(view);
+			QVERIFY(browser);
+			QWidget *viewport = browser->viewport();
+			QVERIFY(viewport);
+
+			const QRect viewportInStack(viewport->mapTo(outputStack, QPoint(0, 0)), viewport->size());
+			QVERIFY(viewportInStack.width() > 80);
+			QVERIFY(viewportInStack.height() > 40);
+
+			const QRect windowRect(viewportInStack.left() + 20, viewportInStack.top() + 20, 80, 40);
+			QVERIFY(viewportInStack.contains(windowRect.adjusted(0, 0, -1, -1)));
+
+			MiniWindow &window = appendTestMiniWindow(QStringLiteral("native-right-hotspot"), windowRect, 0,
+			                                          QColor(0, 160, 0));
+			MiniWindowHotspot hotspot;
+			hotspot.rect      = QRect(0, 0, windowRect.width(), windowRect.height());
+			hotspot.mouseDown = QStringLiteral("on_right_hotspot_down");
+			hotspot.mouseUp   = QStringLiteral("on_right_hotspot_up");
+			window.hotspots.insert(QStringLiteral("hotspot_context"), hotspot);
+
+			const QPoint clickInStack    = windowRect.center();
+			const QPoint clickInViewport = viewport->mapFrom(outputStack, clickInStack);
+			QVERIFY(viewport->rect().contains(clickInViewport));
+
+			const int baseline = g_worldHotspotCallbackCount;
+			QTest::mouseClick(viewport, Qt::RightButton, Qt::NoModifier, clickInViewport);
+			QCoreApplication::processEvents();
+
+			QTRY_VERIFY(g_worldHotspotCallbackCount >= baseline + 2);
+			QCOMPARE(g_worldHotspotCallbackFunctions.at(baseline), QStringLiteral("on_right_hotspot_down"));
+			QCOMPARE(g_worldHotspotCallbackFunctions.at(baseline + 1), QStringLiteral("on_right_hotspot_up"));
+			QVERIFY(!g_worldHotspotCallbackQueueWhenBusy.at(baseline));
+			QVERIFY(g_worldHotspotCallbackQueueWhenBusy.at(baseline + 1));
+			QCOMPARE(g_lastWorldHotspotFunction, QStringLiteral("on_right_hotspot_up"));
+			QCOMPARE(g_lastWorldHotspotId, QStringLiteral("hotspot_context"));
+			QVERIFY(g_lastWorldHotspotQueueWhenBusy);
 			resetTestState();
 		}
 
@@ -7449,6 +7519,7 @@ class tst_WorldView_Basic : public QObject
 			const QPoint pressInStack    = QPoint(startRect.right() - 2, startRect.bottom() - 2);
 			const QPoint pressInViewport = viewport->mapFrom(outputStack, pressInStack);
 			QVERIFY(viewport->rect().contains(pressInViewport));
+			const int callbackBaseline = g_worldHotspotCallbackCount;
 			QTest::mousePress(viewport, Qt::LeftButton, Qt::NoModifier, pressInViewport);
 			QCoreApplication::processEvents();
 			QTRY_VERIFY(view.isMiniWindowCaptureActive());
@@ -7469,6 +7540,9 @@ class tst_WorldView_Basic : public QObject
 
 			QCOMPARE(g_resizeMoveCallbackCount, 1);
 			QVERIFY(g_releaseCallbackSawFlushedResize);
+			QTRY_VERIFY(g_worldHotspotCallbackCount >= callbackBaseline + 3);
+			QCOMPARE(g_worldHotspotCallbackFunctions.at(callbackBaseline + 2),
+			         QStringLiteral("drag_test_release_after_resize"));
 			QTRY_VERIFY(!view.isMiniWindowCaptureActive());
 			resetTestState();
 		}

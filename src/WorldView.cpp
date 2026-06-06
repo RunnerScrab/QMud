@@ -10392,20 +10392,20 @@ MiniWindow *WorldView::hitTestMiniWindow(const QPoint &localPos, QString &hotspo
 }
 
 void WorldView::callHotspotCallback(MiniWindow *window, const QString &hotspotId, const QString &callbackName,
-                                    int flags) const
+                                    int flags, const bool queueWhenCallbackLaneBusy) const
 {
 	if (!window || callbackName.isEmpty() || hotspotId.isEmpty())
 		return;
 	if (!m_runtime)
 		return;
 	m_runtime->setWordUnderMenu(QString(), true);
-	window->executingScript = true;
-	bool ok                 = false;
+	bool ok = false;
 	if (window->callbackPlugin.isEmpty())
-		ok = m_runtime->callWorldHotspotFunction(callbackName, flags, hotspotId);
+		ok = m_runtime->callWorldHotspotFunction(callbackName, flags, hotspotId, window->name,
+		                                         queueWhenCallbackLaneBusy);
 	else
-		ok = m_runtime->callPluginHotspotFunction(window->callbackPlugin, callbackName, flags, hotspotId);
-	window->executingScript = false;
+		ok = m_runtime->callPluginHotspotFunction(window->callbackPlugin, callbackName, flags, hotspotId,
+		                                          window->name, queueWhenCallbackLaneBusy);
 	if (miniWindowMouseDebugEnabled())
 	{
 		miniWindowMouseDebug(
@@ -10899,7 +10899,8 @@ bool WorldView::handleMiniWindowMouseRelease(const QMouseEvent *event, const QWi
 				{
 					const QString mouseUpCallback = it->mouseUp;
 					if (!mouseUpCallback.isEmpty())
-						callHotspotCallback(pressedWindow, previousDownHotspot, mouseUpCallback, flags);
+						callHotspotCallback(pressedWindow, previousDownHotspot, mouseUpCallback, flags,
+						                    (flags & kMiniMouseRight) != 0);
 				}
 				else
 				{

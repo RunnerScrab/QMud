@@ -498,12 +498,20 @@ namespace
 			void directCallbackShapesRoundTrip();
 			void wildcardAndStyleCallbackReceivesContextTables();
 			void mxpCallbacksMarshalArguments();
+			void modalYieldResumePreservesNumberAndStringCallback();
+			void modalYieldResumePreservesStringInOutCallback();
+			void modalYieldResumePreservesNoArgsCallback();
+			void modalYieldResumePreservesBytesInOutCallback();
+			void modalYieldResumeSupportsStackedModalCalls();
+			void workerModalResumeDefersPostModalRuntimeMutations();
+			void modalYieldCancelPreventsCallbackContinuation();
 			void callbackCatalogObserverTracksFunctionPresence();
 			void packageRestrictionsAreAppliedToExistingState();
 			void worldLuaFileApisAcceptMixedSeparators();
 			void worldLuaFileApisUseRuntimeHomeAcrossThreadAffinity();
 			void worldLuaFileApisIgnoreProcessQmudHome();
 			void luaVisiblePathApisReturnRelativePosix();
+			void utilsMultiListBoxAcceptsMushclientArgumentOrder();
 			void deferredRuntimeMutationBatchesPreserveOrderAndOwnership();
 			void directExecutorDispatchesRealEngines();
 			void callPluginMarshallingUsesTargetEngineState();
@@ -514,6 +522,7 @@ namespace
 			void colourTellIgnoresTrailingLuaGsubReturnAndKeepsFollowingNote();
 			void executeScriptNoteUsesRuntimeNoteColour();
 			void triggerAnchoredColourOutputKeepsNativePromptText();
+			void stringsAndWildcardsDispatchSuppliesSnapshotForCallbackReads();
 			void callbackSnapshotSuppliesGetInfoAndMiniWindowReads();
 			void miniWindowDragReleaseSeesResizedCallbackState();
 			void deferredRuntimeMutationSkipsDestroyedRuntime();
@@ -810,6 +819,383 @@ assert(mxp_seen.end_tag == "send:Look")
 assert(mxp_seen.variable == "room:Dock")
 )lua"),
 	                             QStringLiteral("verify mxp callbacks")));
+}
+
+void tst_LuaCallbackEngine::modalYieldResumePreservesNumberAndStringCallback()
+{
+	WorldRuntime runtime;
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QStringLiteral(R"lua(
+colour_seen = false
+function OnHotspot(flags, hotspot)
+  SaveState()
+  local colour = TestYieldModalNumber()
+  colour_seen = flags == 2 and hotspot == "tab" and colour == 255
+  SaveState()
+  return colour_seen
+end
+)lua"));
+
+	LuaExecutorDirect       executor;
+	LuaBatchDispatchRequest request;
+	request.engines       = {engine};
+	request.kind          = LuaBatchDispatchKind::NumberAndStringStopOnTrue;
+	request.functionName  = QStringLiteral("OnHotspot");
+	request.numberArg1    = 2;
+	request.stringArg2    = QStringLiteral("tab");
+	request.defaultResult = false;
+
+	LuaBatchDispatchResult initialResult = executor.dispatchBatch(request);
+	QVERIFY(initialResult.suspended);
+	QVERIFY(initialResult.modalResumeId != 0);
+	QCOMPARE(initialResult.suspendedEngineIndex, 0);
+	QVERIFY(initialResult.hasPendingModalStringRequest);
+	QVERIFY(initialResult.pendingModalStringRequest.guiCallable);
+	QVERIFY(initialResult.pendingModalStringRequest.resultCallback);
+	executeDeferredMutations(initialResult);
+	QCOMPARE(runtimeStubState(&runtime).savePluginStateCalls, 1);
+	QVERIFY(!luaGlobalBoolean(engine->luaState(), "colour_seen"));
+
+	LuaBatchDispatchRequest resumeRequest;
+	resumeRequest.engines       = {engine};
+	resumeRequest.kind          = LuaBatchDispatchKind::ResumeSuspendedModalString;
+	resumeRequest.modalResumeId = initialResult.modalResumeId;
+	resumeRequest.stringArg     = QStringLiteral("255");
+
+	LuaBatchDispatchResult resumedResult = executor.dispatchBatch(resumeRequest);
+	QVERIFY(!resumedResult.suspended);
+	QVERIFY(resumedResult.boolResultValid);
+	QVERIFY(resumedResult.boolResult);
+	QVERIFY(resumedResult.hasFunctionValid);
+	QVERIFY(resumedResult.hasFunction);
+	executeDeferredMutations(resumedResult);
+	QCOMPARE(runtimeStubState(&runtime).savePluginStateCalls, 2);
+	QVERIFY(luaGlobalBoolean(engine->luaState(), "colour_seen"));
+}
+
+void tst_LuaCallbackEngine::modalYieldResumePreservesStringInOutCallback()
+{
+	WorldRuntime runtime;
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QStringLiteral(R"lua(
+string_seen = ""
+function Transform(value)
+  local choice = TestYieldModalString()
+  string_seen = value .. ":" .. choice
+  return string_seen
+end
+)lua"));
+
+	LuaExecutorDirect       executor;
+	LuaBatchDispatchRequest request;
+	request.engines      = {engine};
+	request.kind         = LuaBatchDispatchKind::StringInOut;
+	request.functionName = QStringLiteral("Transform");
+	request.stringArg    = QStringLiteral("before");
+
+	LuaBatchDispatchResult initialResult = executor.dispatchBatch(request);
+	QVERIFY(initialResult.suspended);
+	QVERIFY(initialResult.modalResumeId != 0);
+	QCOMPARE(initialResult.suspendedEngineIndex, 0);
+	QVERIFY(initialResult.hasPendingModalStringRequest);
+	QCOMPARE(initialResult.stringResult, QStringLiteral("before"));
+	QCOMPARE(luaGlobalString(engine->luaState(), "string_seen"), QString());
+
+	LuaBatchDispatchRequest resumeRequest;
+	resumeRequest.engines       = {engine};
+	resumeRequest.kind          = LuaBatchDispatchKind::ResumeSuspendedModalString;
+	resumeRequest.modalResumeId = initialResult.modalResumeId;
+	resumeRequest.stringArg     = QStringLiteral("after");
+
+	LuaBatchDispatchResult resumedResult = executor.dispatchBatch(resumeRequest);
+	QVERIFY(!resumedResult.suspended);
+	QVERIFY(resumedResult.boolResultValid);
+	QVERIFY(resumedResult.boolResult);
+	QVERIFY(resumedResult.hasFunctionValid);
+	QVERIFY(resumedResult.hasFunction);
+	QCOMPARE(resumedResult.stringResult, QStringLiteral("before:after"));
+	QCOMPARE(luaGlobalString(engine->luaState(), "string_seen"), QStringLiteral("before:after"));
+}
+
+void tst_LuaCallbackEngine::modalYieldResumePreservesNoArgsCallback()
+{
+	WorldRuntime runtime;
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QStringLiteral(R"lua(
+noargs_seen = false
+function OnPluginEnable()
+  SaveState()
+  local choice = TestYieldModalString()
+  noargs_seen = choice == "accepted"
+  SaveState()
+  return noargs_seen
+end
+)lua"));
+
+	LuaExecutorDirect       executor;
+	LuaBatchDispatchRequest request;
+	request.engines       = {engine};
+	request.kind          = LuaBatchDispatchKind::NoArgs;
+	request.functionName  = QStringLiteral("OnPluginEnable");
+	request.defaultResult = false;
+
+	LuaBatchDispatchResult initialResult = executor.dispatchBatch(request);
+	QVERIFY(initialResult.suspended);
+	QVERIFY(initialResult.modalResumeId != 0);
+	QCOMPARE(initialResult.suspendedEngineIndex, 0);
+	QVERIFY(initialResult.hasPendingModalStringRequest);
+	QVERIFY(!initialResult.boolResultValid);
+	QVERIFY(!initialResult.hasFunctionValid);
+	executeDeferredMutations(initialResult);
+	QCOMPARE(runtimeStubState(&runtime).savePluginStateCalls, 1);
+	QVERIFY(!luaGlobalBoolean(engine->luaState(), "noargs_seen"));
+
+	LuaBatchDispatchRequest resumeRequest;
+	resumeRequest.engines       = {engine};
+	resumeRequest.kind          = LuaBatchDispatchKind::ResumeSuspendedModalString;
+	resumeRequest.modalResumeId = initialResult.modalResumeId;
+	resumeRequest.stringArg     = QStringLiteral("accepted");
+
+	LuaBatchDispatchResult resumedResult = executor.dispatchBatch(resumeRequest);
+	QVERIFY(!resumedResult.suspended);
+	QVERIFY(resumedResult.boolResultValid);
+	QVERIFY(resumedResult.boolResult);
+	QVERIFY(resumedResult.hasFunctionValid);
+	QVERIFY(resumedResult.hasFunction);
+	executeDeferredMutations(resumedResult);
+	QCOMPARE(runtimeStubState(&runtime).savePluginStateCalls, 2);
+	QVERIFY(luaGlobalBoolean(engine->luaState(), "noargs_seen"));
+}
+
+void tst_LuaCallbackEngine::modalYieldResumePreservesBytesInOutCallback()
+{
+	WorldRuntime runtime;
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QStringLiteral(R"lua(
+bytes_seen = false
+function TransformBytes(value)
+  SaveState()
+  local suffix = TestYieldModalString()
+  bytes_seen = value == "payload" and suffix == "done"
+  SaveState()
+  return value .. ":" .. suffix
+end
+)lua"));
+
+	LuaExecutorDirect       executor;
+	LuaBatchDispatchRequest request;
+	request.engines      = {engine};
+	request.kind         = LuaBatchDispatchKind::BytesInOut;
+	request.functionName = QStringLiteral("TransformBytes");
+	request.bytesArg     = QByteArray("payload");
+
+	LuaBatchDispatchResult initialResult = executor.dispatchBatch(request);
+	QVERIFY(initialResult.suspended);
+	QVERIFY(initialResult.modalResumeId != 0);
+	QCOMPARE(initialResult.suspendedEngineIndex, 0);
+	QVERIFY(initialResult.hasPendingModalStringRequest);
+	QCOMPARE(initialResult.bytesResult, QByteArray("payload"));
+	executeDeferredMutations(initialResult);
+	QCOMPARE(runtimeStubState(&runtime).savePluginStateCalls, 1);
+	QVERIFY(!luaGlobalBoolean(engine->luaState(), "bytes_seen"));
+
+	LuaBatchDispatchRequest resumeRequest;
+	resumeRequest.engines       = {engine};
+	resumeRequest.kind          = LuaBatchDispatchKind::ResumeSuspendedModalString;
+	resumeRequest.modalResumeId = initialResult.modalResumeId;
+	resumeRequest.stringArg     = QStringLiteral("done");
+
+	LuaBatchDispatchResult resumedResult = executor.dispatchBatch(resumeRequest);
+	QVERIFY(!resumedResult.suspended);
+	QVERIFY(resumedResult.boolResultValid);
+	QVERIFY(resumedResult.boolResult);
+	QVERIFY(resumedResult.hasFunctionValid);
+	QVERIFY(resumedResult.hasFunction);
+	QCOMPARE(resumedResult.bytesResult, QByteArray("payload:done"));
+	executeDeferredMutations(resumedResult);
+	QCOMPARE(runtimeStubState(&runtime).savePluginStateCalls, 2);
+	QVERIFY(luaGlobalBoolean(engine->luaState(), "bytes_seen"));
+}
+
+void tst_LuaCallbackEngine::modalYieldResumeSupportsStackedModalCalls()
+{
+	WorldRuntime runtime;
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QStringLiteral(R"lua(
+stacked_seen = false
+function OnHotspot(flags, hotspot)
+  SaveState()
+  local first = TestYieldModalNumber()
+  SaveState()
+  local second = TestYieldModalNumber()
+  SaveState()
+  stacked_seen = flags == 4 and hotspot == "stacked" and first == 10 and second == 20
+  return stacked_seen
+end
+)lua"));
+
+	LuaExecutorDirect       executor;
+	LuaBatchDispatchRequest request;
+	request.engines       = {engine};
+	request.kind          = LuaBatchDispatchKind::NumberAndStringStopOnTrue;
+	request.functionName  = QStringLiteral("OnHotspot");
+	request.numberArg1    = 4;
+	request.stringArg2    = QStringLiteral("stacked");
+	request.defaultResult = false;
+
+	LuaBatchDispatchResult firstSuspend = executor.dispatchBatch(request);
+	QVERIFY(firstSuspend.suspended);
+	QVERIFY(firstSuspend.modalResumeId != 0);
+	QVERIFY(firstSuspend.hasPendingModalStringRequest);
+	executeDeferredMutations(firstSuspend);
+	QCOMPARE(runtimeStubState(&runtime).savePluginStateCalls, 1);
+
+	LuaBatchDispatchRequest firstResume;
+	firstResume.engines       = {engine};
+	firstResume.kind          = LuaBatchDispatchKind::ResumeSuspendedModalString;
+	firstResume.modalResumeId = firstSuspend.modalResumeId;
+	firstResume.stringArg     = QStringLiteral("10");
+
+	LuaBatchDispatchResult secondSuspend = executor.dispatchBatch(firstResume);
+	QVERIFY(secondSuspend.suspended);
+	QVERIFY(secondSuspend.modalResumeId != 0);
+	QVERIFY(secondSuspend.modalResumeId != firstSuspend.modalResumeId);
+	QCOMPARE(secondSuspend.suspendedEngineIndex, 0);
+	QVERIFY(secondSuspend.hasPendingModalStringRequest);
+	executeDeferredMutations(secondSuspend);
+	QCOMPARE(runtimeStubState(&runtime).savePluginStateCalls, 2);
+	QVERIFY(!luaGlobalBoolean(engine->luaState(), "stacked_seen"));
+
+	LuaBatchDispatchRequest secondResume;
+	secondResume.engines       = {engine};
+	secondResume.kind          = LuaBatchDispatchKind::ResumeSuspendedModalString;
+	secondResume.modalResumeId = secondSuspend.modalResumeId;
+	secondResume.stringArg     = QStringLiteral("20");
+
+	LuaBatchDispatchResult completed = executor.dispatchBatch(secondResume);
+	QVERIFY(!completed.suspended);
+	QVERIFY(completed.boolResultValid);
+	QVERIFY(completed.boolResult);
+	executeDeferredMutations(completed);
+	QCOMPARE(runtimeStubState(&runtime).savePluginStateCalls, 3);
+	QVERIFY(luaGlobalBoolean(engine->luaState(), "stacked_seen"));
+}
+
+void tst_LuaCallbackEngine::workerModalResumeDefersPostModalRuntimeMutations()
+{
+	WorldRuntime      runtime;
+	LuaExecutorWorker executor;
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
+worker_resume_seen = false
+function OnPluginEnable()
+  SaveState()
+  local choice = TestYieldModalString()
+  worker_resume_seen = choice == "accepted"
+  SaveState()
+  return worker_resume_seen
+end
+function worker_status(value)
+  if worker_resume_seen then
+    return "yes"
+  end
+  return "no"
+end
+)lua"),
+	                       &runtime);
+
+	LuaBatchDispatchRequest request;
+	request.engines       = {engine};
+	request.kind          = LuaBatchDispatchKind::NoArgs;
+	request.functionName  = QStringLiteral("OnPluginEnable");
+	request.defaultResult = false;
+
+	LuaBatchDispatchResult initialResult;
+	dispatchWorkerAndWait(executor, request, initialResult);
+	QVERIFY(initialResult.suspended);
+	QVERIFY(initialResult.modalResumeId != 0);
+	QVERIFY(!initialResult.deferredRuntimeMutationBatches.isEmpty());
+	QCOMPARE(runtimeStubState(&runtime).savePluginStateCalls, 0);
+	executeDeferredMutations(initialResult);
+	QCOMPARE(runtimeStubState(&runtime).savePluginStateCalls, 1);
+
+	LuaBatchDispatchRequest resumeRequest;
+	resumeRequest.engines       = {engine};
+	resumeRequest.kind          = LuaBatchDispatchKind::ResumeSuspendedModalString;
+	resumeRequest.modalResumeId = initialResult.modalResumeId;
+	resumeRequest.stringArg     = QStringLiteral("accepted");
+
+	LuaBatchDispatchResult resumedResult;
+	dispatchWorkerAndWait(executor, resumeRequest, resumedResult);
+	QVERIFY(!resumedResult.suspended);
+	QVERIFY(resumedResult.boolResultValid);
+	QVERIFY(resumedResult.boolResult);
+	QVERIFY(!resumedResult.deferredRuntimeMutationBatches.isEmpty());
+	QCOMPARE(runtimeStubState(&runtime).savePluginStateCalls, 1);
+	executeDeferredMutations(resumedResult);
+	QCOMPARE(runtimeStubState(&runtime).savePluginStateCalls, 2);
+
+	LuaBatchDispatchRequest statusRequest;
+	statusRequest.engines      = {engine};
+	statusRequest.kind         = LuaBatchDispatchKind::StringInOut;
+	statusRequest.functionName = QStringLiteral("worker_status");
+	statusRequest.stringArg    = QStringLiteral("ignored");
+	LuaBatchDispatchResult statusResult;
+	dispatchWorkerAndWait(executor, statusRequest, statusResult);
+	QCOMPARE(statusResult.stringResult, QStringLiteral("yes"));
+
+	teardownWorkerEngine(executor, engine);
+}
+
+void tst_LuaCallbackEngine::modalYieldCancelPreventsCallbackContinuation()
+{
+	WorldRuntime runtime;
+	auto         engine = QSharedPointer<LuaCallbackEngine>::create();
+	engine->setWorldRuntime(&runtime);
+	setEngineScript(*engine, QStringLiteral(R"lua(
+cancel_seen = false
+function OnHotspot(flags, hotspot)
+  local colour = TestYieldModalNumber()
+  cancel_seen = true
+  return colour == 42
+end
+)lua"));
+
+	LuaExecutorDirect       executor;
+	LuaBatchDispatchRequest request;
+	request.engines       = {engine};
+	request.kind          = LuaBatchDispatchKind::NumberAndStringStopOnTrue;
+	request.functionName  = QStringLiteral("OnHotspot");
+	request.numberArg1    = 8;
+	request.stringArg2    = QStringLiteral("cancel");
+	request.defaultResult = false;
+
+	LuaBatchDispatchResult initialResult = executor.dispatchBatch(request);
+	QVERIFY(initialResult.suspended);
+	QVERIFY(initialResult.modalResumeId != 0);
+	QVERIFY(initialResult.hasPendingModalStringRequest);
+
+	LuaBatchDispatchRequest cancelRequest;
+	cancelRequest.engines       = {engine};
+	cancelRequest.kind          = LuaBatchDispatchKind::CancelSuspendedModalString;
+	cancelRequest.modalResumeId = initialResult.modalResumeId;
+	static_cast<void>(executor.dispatchBatch(cancelRequest));
+
+	LuaBatchDispatchRequest resumeRequest;
+	resumeRequest.engines                      = {engine};
+	resumeRequest.kind                         = LuaBatchDispatchKind::ResumeSuspendedModalString;
+	resumeRequest.modalResumeId                = initialResult.modalResumeId;
+	resumeRequest.stringArg                    = QStringLiteral("42");
+	const LuaBatchDispatchResult resumedResult = executor.dispatchBatch(resumeRequest);
+	QVERIFY(!resumedResult.suspended);
+	QVERIFY(!resumedResult.boolResultValid);
+	QVERIFY(!resumedResult.hasFunctionValid);
+	QVERIFY(!luaGlobalBoolean(engine->luaState(), "cancel_seen"));
 }
 
 void tst_LuaCallbackEngine::callbackCatalogObserverTracksFunctionPresence()
@@ -1150,6 +1536,23 @@ utils_info_ok = utils_info_summary == "./|./"
 	QVERIFY(luaGlobalBoolean(engine.luaState(), "utils_info_ok"));
 	QVERIFY(QDir::setCurrent(previousCurrentPath));
 	QVERIFY(root.removeRecursively());
+}
+
+void tst_LuaCallbackEngine::utilsMultiListBoxAcceptsMushclientArgumentOrder()
+{
+	LuaCallbackEngine engine;
+	setEngineScript(engine, QStringLiteral(R"lua(
+local ok, result = pcall(function()
+  return utils.multilistbox("Choose channels", "New Tab", { tell = "tell", shout = "shout" }, { tell = true })
+end)
+multilistbox_signature_ok = ok
+multilistbox_error = tostring(result)
+multilistbox_no_host_returns_nil = result == nil
+)lua"));
+
+	const QByteArray multilistboxError = luaGlobalString(engine.luaState(), "multilistbox_error").toUtf8();
+	QVERIFY2(luaGlobalBoolean(engine.luaState(), "multilistbox_signature_ok"), multilistboxError.constData());
+	QVERIFY(luaGlobalBoolean(engine.luaState(), "multilistbox_no_host_returns_nil"));
 }
 
 void tst_LuaCallbackEngine::deferredRuntimeMutationBatchesPreserveOrderAndOwnership()
@@ -1562,6 +1965,56 @@ end
 
 	const QStringList logicalLines = logicalOutputLinesFromEntries(state.lineEntries);
 	QCOMPARE(logicalLines, QStringList({QStringLiteral("[435, 1226]"), prompt}));
+	teardownWorkerEngine(executor, engine);
+}
+
+void tst_LuaCallbackEngine::stringsAndWildcardsDispatchSuppliesSnapshotForCallbackReads()
+{
+	WorldRuntime      runtime;
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
+	snapshot_seen = ""
+	function timer_cb(name)
+	  snapshot_seen = string.format("%dx%d|%d",
+	    WindowInfo("map", 3) or -1,
+	    WindowInfo("map", 4) or -1,
+	    GetInfo(290))
+	end
+	function snapshot_status(value)
+	  return snapshot_seen
+	end
+	)lua"),
+	                       &runtime);
+
+	auto snapshot                   = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+	snapshot->hasCommandUiSnapshot  = true;
+	snapshot->commandUiHasFrameData = true;
+	snapshot->commandUiValues[QStringLiteral("outputTextRectLeft")] = 19;
+	snapshot->windowNames                                           = {QStringLiteral("map")};
+	LuaCallbackMiniWindowSnapshot::WindowInfoSnapshot windowInfo;
+	windowInfo.width                                    = 120;
+	windowInfo.height                                   = 80;
+	snapshot->windowInfoByWindow[QStringLiteral("map")] = windowInfo;
+	snapshot->rebuildMiniWindowLookupCaches();
+
+	LuaBatchDispatchRequest request;
+	request.engines               = {engine};
+	request.kind                  = LuaBatchDispatchKind::StringsAndWildcards;
+	request.functionName          = QStringLiteral("timer_cb");
+	request.stringListArg         = {QStringLiteral("wait_timer")};
+	request.miniWindowSnapshotArg = snapshot;
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	QVERIFY(result.hasFunctionValid);
+	QVERIFY(result.hasFunction);
+
+	request.kind         = LuaBatchDispatchKind::StringInOut;
+	request.functionName = QStringLiteral("snapshot_status");
+	request.stringArg    = QStringLiteral("ignored");
+	dispatchWorkerAndWait(executor, request, result);
+	QCOMPARE(result.stringResult, QStringLiteral("120x80|19"));
+
 	teardownWorkerEngine(executor, engine);
 }
 

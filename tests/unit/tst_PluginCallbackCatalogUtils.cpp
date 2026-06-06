@@ -7,6 +7,7 @@
  */
 
 #include "PluginCallbackCatalogUtils.h"
+#include "PluginCallbackDispatchUtils.h"
 
 #include <QtTest/QTest>
 
@@ -163,6 +164,44 @@ class tst_PluginCallbackCatalogUtils : public QObject
 			const QVector<int> recipients{0};
 			QVERIFY(!qmudShouldSkipSelfOnlyPluginBroadcast(recipients, 1, QStringLiteral("plugin-a"),
 			                                               std::function<QString(int)>()));
+		}
+
+		/**
+		 * @brief Provides callback-lane contention combinations for hotspot queue policy coverage.
+		 */
+		static void contendedHotspotCallbackQueuePolicy_data()
+		{
+			QTest::addColumn<bool>("queueWhenBusy");
+			QTest::addColumn<bool>("dispatchActive");
+			QTest::addColumn<bool>("workerInFlight");
+			QTest::addColumn<bool>("hasQueuedDispatches");
+			QTest::addColumn<bool>("drainQueued");
+			QTest::addColumn<bool>("expected");
+
+			QTest::newRow("not opted in idle") << false << false << false << false << false << false;
+			QTest::newRow("not opted in active") << false << true << true << true << true << false;
+			QTest::newRow("opted in idle") << true << false << false << false << false << false;
+			QTest::newRow("active") << true << true << false << false << false << true;
+			QTest::newRow("worker in flight") << true << false << true << false << false << true;
+			QTest::newRow("queued dispatch") << true << false << false << true << false << true;
+			QTest::newRow("drain queued") << true << false << false << false << true << true;
+		}
+
+		/**
+		 * @brief Verifies only opted-in hotspot callbacks queue when the callback lane is contended.
+		 */
+		static void contendedHotspotCallbackQueuePolicy()
+		{
+			QFETCH(bool, queueWhenBusy);
+			QFETCH(bool, dispatchActive);
+			QFETCH(bool, workerInFlight);
+			QFETCH(bool, hasQueuedDispatches);
+			QFETCH(bool, drainQueued);
+			QFETCH(bool, expected);
+
+			QCOMPARE(qmudShouldQueueContendedHotspotCallback(queueWhenBusy, dispatchActive, workerInFlight,
+			                                                 hasQueuedDispatches, drainQueued),
+			         expected);
 		}
 };
 

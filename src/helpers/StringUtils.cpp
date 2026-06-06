@@ -54,6 +54,7 @@ namespace
 		}();
 		return tables;
 	}
+
 } // namespace
 
 QString qmudCommandIdToString(const int id)
@@ -162,6 +163,14 @@ QString qmudReplaceString(const QString &source, const QString &target, const QS
 	if (index >= 0)
 		result.replace(index, target.size(), replacement);
 	return result;
+}
+
+QStringList qmudSplitLegacyMenuItems(const QString &items)
+{
+	QStringList parts = items.split(QLatin1Char('|'), Qt::KeepEmptyParts);
+	for (QString &part : parts)
+		part = part.trimmed();
+	return parts;
 }
 
 int qmudEditDistance(const QStringView source, const QStringView target)

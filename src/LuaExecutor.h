@@ -333,7 +333,9 @@ enum class LuaBatchDispatchKind
 	MxpShutDown,
 	MxpStartTag,
 	MxpEndTag,
-	MxpSetVariable
+	MxpSetVariable,
+	CancelSuspendedModalString,
+	ResumeSuspendedModalString
 };
 
 /**
@@ -614,6 +616,7 @@ struct LuaBatchDispatchRequest
 		QString                                    functionName;
 		QString                                    stringArg;
 		QString                                    stringArg2;
+		QString                                    miniWindowExecutionName;
 		QSharedPointer<const QVector<LuaEngineObservedInitializationRequest>> initRequestsArg;
 		QSet<QString>                                                         observedCallbackNamesArg;
 		QStringList                                                           stringListArg;
@@ -644,6 +647,8 @@ struct LuaBatchDispatchRequest
 		bool    triggerOutputReplacesMatchedLine{false};
 		bool    applyCallingPluginContext{false};
 		QString callingPluginId;
+		quint64 modalResumeId{0};
+		quint64 runtimeModalResumeId{0};
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 		lua_State *luaStateArg{nullptr};
 #endif
@@ -660,6 +665,17 @@ struct LuaDeferredRuntimeMutationBatch
 {
 		WorldRuntime                  *runtime{nullptr};
 		QVector<std::function<void()>> mutations;
+};
+
+/**
+ * @brief Pending string-result modal request produced by a yielded Lua callback.
+ */
+struct LuaPendingModalStringRequest
+{
+		std::function<QString()>                             guiCallable;
+		std::function<void(WorldRuntime &, const QString &)> beforeRuntimeResumeCallback;
+		std::function<void(const QString &)>                 beforeResumeCallback;
+		std::function<void(quint64, QString)>                resultCallback;
 };
 
 /**
@@ -682,6 +698,11 @@ struct LuaBatchDispatchResult
 		QString                                  marshallingRuntimeError;
 		int                                      marshallingReturnCount{0};
 		bool                                     marshallingSameState{false};
+		bool                                     suspended{false};
+		quint64                                  modalResumeId{0};
+		int                                      suspendedEngineIndex{-1};
+		bool                                     hasPendingModalStringRequest{false};
+		LuaPendingModalStringRequest             pendingModalStringRequest;
 		QVector<LuaDeferredRuntimeMutationBatch> deferredRuntimeMutationBatches;
 };
 

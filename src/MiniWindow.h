@@ -99,6 +99,7 @@ struct MiniWindow
 		QRect                            rect;
 		bool                             temporarilyHide{false};
 		int                              zOrder{0};
+		int                              executingScriptDepth{0};
 		bool                             executingScript{false};
 		QString                          creatingPlugin;
 		QString                          callbackPlugin;

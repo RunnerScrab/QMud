@@ -186,6 +186,7 @@ set(QMUD_SOURCES
         helpers/NoteColourUtils.cpp
         helpers/WorldCommandProcessorUtils.cpp
         helpers/LuaExecutionUtils.cpp
+        helpers/LuaModalDialogUtils.cpp
         helpers/AccessibleTextUtils.cpp
         helpers/PluginPathUtils.cpp
         helpers/OutputWrapUtils.cpp
@@ -257,6 +258,7 @@ set(QMUD_HEADERS
         helpers/MainFrameActionUtils.h
         helpers/MainFrameMdiUtils.h
         helpers/LuaExecutionUtils.h
+        helpers/LuaModalDialogUtils.h
         helpers/AccessibleTextUtils.h
         helpers/PluginPathUtils.h
         helpers/OutputWrapUtils.h
@@ -268,6 +270,7 @@ set(QMUD_HEADERS
         helpers/WorldSessionRestoreFlowUtils.h
         helpers/WorldSessionStateUtils.h
         helpers/PluginCallbackCatalogUtils.h
+        helpers/PluginCallbackDispatchUtils.h
         Accelerators.h
         helpers/AcceleratorUtils.h
         helpers/AliasMatchUtils.h
