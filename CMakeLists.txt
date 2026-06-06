@@ -204,6 +204,7 @@ set(QMUD_SOURCES
         ActivityWindow.cpp
         dialogs/ImportXmlDialog.cpp
         WorldDocument.cpp
+        NativePluginRegistry.cpp
         WorldRuntime.cpp
         WorldCommandProcessor.cpp
         SpeedwalkParser.cpp
@@ -293,6 +294,7 @@ set(QMUD_HEADERS
         ActivityWindow.h
         dialogs/ImportXmlDialog.h
         WorldDocument.h
+        NativePluginRegistry.h
         WorldRuntime.h
         helpers/WorldRuntimeAttributeUtils.h
         MiniWindow.h
@@ -398,6 +400,9 @@ endif ()
 target_link_libraries(QMud PRIVATE Qt6::Widgets Qt6::Network Qt6::Sql Qt6::PrintSupport ${QMUD_ZLIB_TARGET} ${QMUD_QT_MULTIMEDIA_TARGET} ${QMUD_QT_TEXTTOSPEECH_TARGET})
 if (APPLE)
     target_link_libraries(QMud PRIVATE "-framework CoreServices")
+endif ()
+if (WIN32)
+    target_link_libraries(QMud PRIVATE ole32 oleaut32)
 endif ()
 target_compile_definitions(QMud PRIVATE QMUD_ENABLE_SOUND=${QMUD_ENABLE_SOUND_VALUE}
         QMUD_ENABLE_TEXT_TO_SPEECH=${QMUD_ENABLE_TEXT_TO_SPEECH_VALUE}
@@ -1504,6 +1509,8 @@ if (UNIX AND NOT APPLE)
                 "Lua prefix inside WinDocker image")
         set(QMUD_WINDOCKER_LUA_MODULES_PREFIX "/opt/qmud/windows-deps/lua-modules" CACHE PATH
                 "Lua module prefix inside WinDocker image")
+        set(QMUD_WINDOCKER_NVDA_CONTROLLER_URL "" CACHE STRING
+                "Optional explicit NVDA controllerClient zip URL for WinDocker staging")
         option(QMUD_WINDOCKER_DISABLE_SELINUX
                 "Disable SELinux labeling for WinDocker container runs (--security-opt label=disable)" ON)
         option(QMUD_WINDOCKER_RUN_AS_HOST_USER
@@ -1586,6 +1593,7 @@ if (UNIX AND NOT APPLE)
                     -e QMUD_WINDOCKER_MINGW_TRIPLET=${QMUD_WINDOCKER_MINGW_TRIPLET}
                     -e QMUD_WINDOCKER_LUA_PREFIX=${QMUD_WINDOCKER_LUA_PREFIX}
                     -e QMUD_WINDOCKER_LUA_MODULES_PREFIX=${QMUD_WINDOCKER_LUA_MODULES_PREFIX}
+                    -e QMUD_WINDOCKER_NVDA_CONTROLLER_URL=${QMUD_WINDOCKER_NVDA_CONTROLLER_URL}
                     -v "${CMAKE_SOURCE_DIR}:/home/user/project:ro"
                     -v "${QMUD_WINDOCKER_BUILD_DIR}:/home/user/build:rw"
                     "${QMUD_WINDOCKER_IMAGE}"

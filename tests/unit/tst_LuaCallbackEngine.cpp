@@ -11,10 +11,12 @@
 #include "LuaExecutor.h"
 #include "LuaExecutorWorker.h"
 #include "LuaSupport.h"
+#include "NativePluginRegistry.h"
 #include "TelnetProcessor.h"
 #include "WorldRuntime.h"
 #include "WorldView.h"
 #include "helpers/LuaExecutionUtils.h"
+#include "scripting/ScriptingErrors.h"
 
 // ReSharper disable once CppUnusedIncludeDirective
 #include <QDir>
@@ -96,6 +98,9 @@ namespace
 			QString                              fileBrowsingDirectory;
 			QString                              stateFilesDirectory;
 			QList<WorldRuntime::Plugin>          plugins;
+			int                nextAcceleratorCommand = WorldRuntime::kAcceleratorFirstCommand;
+			QHash<qint64, int> acceleratorKeyToCommand;
+			QHash<int, WorldRuntime::AcceleratorEntry> acceleratorEntries;
 	};
 
 	QHash<const WorldRuntime *, RuntimeStubState> &runtimeStubStates()
@@ -510,8 +515,45 @@ QStringList WorldRuntime::pluginIdList() const
 {
 	QStringList ids;
 	for (const Plugin &plugin : runtimeStubState(this).plugins)
-		ids.push_back(plugin.attributes.value(QStringLiteral("id")));
+	{
+		const QString id = plugin.attributes.value(QStringLiteral("id"));
+		if (!id.isEmpty() && !QMudNativePluginRegistry::isBlacklistedId(id))
+			ids.push_back(id);
+	}
+	for (const QString &shimId : {QMudNativePluginRegistry::mushReaderPluginId()})
+	{
+		if (!ids.contains(shimId, Qt::CaseInsensitive))
+			ids.push_back(shimId);
+	}
 	return ids;
+}
+
+int WorldRuntime::allocateAcceleratorCommand()
+{
+	RuntimeStubState &state = runtimeStubState(this);
+	return state.nextAcceleratorCommand++;
+}
+
+void WorldRuntime::registerAccelerator(const qint64 key, const int commandId, const AcceleratorEntry &entry)
+{
+	RuntimeStubState &state = runtimeStubState(this);
+	state.acceleratorKeyToCommand.insert(key, commandId);
+	state.acceleratorEntries.insert(commandId, entry);
+}
+
+void WorldRuntime::removeAccelerator(const qint64 key)
+{
+	RuntimeStubState &state = runtimeStubState(this);
+	const auto        it    = state.acceleratorKeyToCommand.constFind(key);
+	if (it == state.acceleratorKeyToCommand.constEnd())
+		return;
+	state.acceleratorEntries.remove(it.value());
+	state.acceleratorKeyToCommand.remove(key);
+}
+
+int WorldRuntime::acceleratorCommandForKey(const qint64 key) const
+{
+	return runtimeStubState(this).acceleratorKeyToCommand.value(key, -1);
 }
 
 QVariant WorldRuntime::windowHotspotInfo(const QString &name, const QString &hotspotId, int infoType) const
@@ -574,6 +616,8 @@ namespace
 			void colourTellIgnoresTrailingLuaGsubReturnAndKeepsFollowingNote();
 			void executeScriptNoteUsesRuntimeNoteColour();
 			void selfPluginInfoMetadataFallsThroughToRuntime();
+			void nativeShimDiscoveryIsAvailableWithoutShadowPlugin();
+			void blacklistedPluginsAreHiddenFromPluginApis();
 			void triggerAnchoredColourOutputKeepsNativePromptText();
 			void stringsAndWildcardsDispatchSuppliesSnapshotForCallbackReads();
 			void callbackSnapshotSuppliesGetInfoAndMiniWindowReads();
@@ -2044,6 +2088,88 @@ void tst_LuaCallbackEngine::selfPluginInfoMetadataFallsThroughToRuntime()
 	QCOMPARE(result.stringResult,
 	         QStringLiteral("Plugin Name|Runtime Author|Runtime Description|Runtime Script|lua|"
 	                        "worlds/plugins/runtime_plugin.xml|Plugin.Id|Runtime Purpose|/tmp/plugin/"));
+	teardownWorkerEngine(executor, engine);
+}
+
+void tst_LuaCallbackEngine::nativeShimDiscoveryIsAvailableWithoutShadowPlugin()
+{
+	WorldRuntime      runtime;
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	const QString     shimId = QMudNativePluginRegistry::mushReaderPluginId();
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
+	function OnPluginEnable()
+	  local id = "925cdd0331023d9f0b8f05a7"
+	  shim_info = GetPluginInfo(id, 1) or ""
+	end
+	function shim_info_status(value)
+	  return shim_info
+	end
+	)lua"),
+	                       &runtime);
+
+	LuaBatchDispatchRequest request;
+	request.engines      = {engine};
+	request.kind         = LuaBatchDispatchKind::NoArgs;
+	request.functionName = QStringLiteral("OnPluginEnable");
+	dispatchWorkerAndWait(executor, request);
+
+	request.kind         = LuaBatchDispatchKind::StringInOut;
+	request.functionName = QStringLiteral("shim_info_status");
+	request.stringArg    = QStringLiteral("ignored");
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	QCOMPARE(result.stringResult, QStringLiteral("MushReader"));
+	QVERIFY(runtime.pluginIdList().contains(shimId, Qt::CaseInsensitive));
+	QCOMPARE(QMudNativePluginRegistry::pluginSupports(shimId, QStringLiteral("say")), eOK);
+	QCOMPARE(QMudNativePluginRegistry::pluginSupports(shimId, QStringLiteral("interrupt")), eOK);
+	QCOMPARE(QMudNativePluginRegistry::pluginSupports(shimId, QStringLiteral("stop")), eOK);
+	QCOMPARE(QMudNativePluginRegistry::pluginSupports(shimId, QStringLiteral("missing")), eNoSuchRoutine);
+	teardownWorkerEngine(executor, engine);
+}
+
+void tst_LuaCallbackEngine::blacklistedPluginsAreHiddenFromPluginApis()
+{
+	WorldRuntime      runtime;
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	const QString     blacklistedId = QStringLiteral("bb6a05ed7534b5db1ed40511");
+	const QStringList blacklistedIds{blacklistedId, QStringLiteral("b8e6dac1ee7fe8e3de931fb7"),
+	                                 QStringLiteral("8238deec7c06bade8ebc3819")};
+	for (const QString &id : blacklistedIds)
+		QVERIFY(QMudNativePluginRegistry::isBlacklistedId(id));
+
+	WorldRuntime::Plugin plugin;
+	plugin.attributes.insert(QStringLiteral("id"), blacklistedId);
+	plugin.attributes.insert(QStringLiteral("name"), QStringLiteral("Automatic Backup"));
+	plugin.enabled = true;
+	runtimeStubState(&runtime).plugins.push_back(plugin);
+
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
+	function OnPluginEnable()
+	  local id = "bb6a05ed7534b5db1ed40511"
+	  blacklist_status = tostring(GetPluginInfo(id, 1) == nil)
+	end
+	function blacklist_status_value(value)
+	  return blacklist_status
+	end
+	)lua"),
+	                       &runtime);
+
+	LuaBatchDispatchRequest request;
+	request.engines      = {engine};
+	request.kind         = LuaBatchDispatchKind::NoArgs;
+	request.functionName = QStringLiteral("OnPluginEnable");
+	dispatchWorkerAndWait(executor, request);
+
+	request.kind         = LuaBatchDispatchKind::StringInOut;
+	request.functionName = QStringLiteral("blacklist_status_value");
+	request.stringArg    = QStringLiteral("ignored");
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	QCOMPARE(result.stringResult, QStringLiteral("true"));
+	QVERIFY(!runtime.pluginIdList().contains(blacklistedId, Qt::CaseInsensitive));
+	QCOMPARE(QMudNativePluginRegistry::pluginSupports(blacklistedId, QStringLiteral("say")), eNoSuchPlugin);
 	teardownWorkerEngine(executor, engine);
 }
 

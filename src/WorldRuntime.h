@@ -292,6 +292,8 @@ class WorldRuntime : public QObject
 				bool                                  saveState{false};
 				bool                                  savingStateNow{false};
 				bool                                  installPending{false};
+				bool                                  nativeShim{false};
+				QString                               nativeShimMarker;
 				int                                   sequence{5000};
 				double                                version{0.0};
 				double                                requiredVersion{0.0};

@@ -15,6 +15,7 @@
 #include "HyperlinkActionUtils.h"
 #include "MainWindowHost.h"
 #include "MainWindowHostResolver.h"
+#include "NativePluginRegistry.h"
 #include "SpeedwalkParser.h"
 #include "TimerSchedulingUtils.h"
 #include "TraceDispatchUtils.h"
@@ -2166,6 +2167,9 @@ bool WorldCommandProcessor::evaluateCommand(const QString &input)
 
 	if (matchedAliases.isEmpty())
 	{
+		if (QMudNativePluginRegistry::handleCommand(m_runtime, line))
+			return false;
+
 		auto quitMacroText = QStringLiteral("quit");
 		for (const auto &[attributes, children] : m_runtime->macros())
 		{

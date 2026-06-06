@@ -175,6 +175,24 @@ target_compile_definitions(tst_TtsEngine
         PRIVATE
         QMUD_ENABLE_TEXT_TO_SPEECH=${QMUD_ENABLE_TEXT_TO_SPEECH_VALUE})
 
+qmud_add_qtest(tst_NativePluginRegistry
+        SOURCES
+        unit/tst_NativePluginRegistry.cpp
+        "${CMAKE_SOURCE_DIR}/src/WorldRuntime.h"
+        "${CMAKE_SOURCE_DIR}/src/NativePluginRegistry.cpp"
+        "${CMAKE_SOURCE_DIR}/src/TtsEngine.cpp"
+        "${CMAKE_SOURCE_DIR}/src/WorldDocument.cpp"
+        "${CMAKE_SOURCE_DIR}/src/helpers/AcceleratorUtils.cpp"
+        LIBRARIES
+        ${QMUD_QT_TEXTTOSPEECH_TARGET}
+        Qt6::Sql
+        LABELS
+        unit)
+target_compile_definitions(tst_NativePluginRegistry
+        PRIVATE
+        QMUD_NATIVEPLUGINREGISTRY_TEST_HOOKS
+        QMUD_ENABLE_TEXT_TO_SPEECH=${QMUD_ENABLE_TEXT_TO_SPEECH_VALUE})
+
 if (QMUD_ENABLE_LUA_SCRIPTING)
     qmud_add_qtest(tst_LuaExecution
             SOURCES
@@ -208,9 +226,11 @@ if (QMUD_ENABLE_LUA_SCRIPTING)
             "${CMAKE_SOURCE_DIR}/src/LuaExecutorWorker.cpp"
             "${CMAKE_SOURCE_DIR}/src/LuaSupport.cpp"
             "${CMAKE_SOURCE_DIR}/src/LuaLuacomShim.cpp"
+            "${CMAKE_SOURCE_DIR}/src/NativePluginRegistry.cpp"
             "${CMAKE_SOURCE_DIR}/src/TtsEngine.cpp"
             "${CMAKE_SOURCE_DIR}/src/Sqlite3Lua.cpp"
             "${CMAKE_SOURCE_DIR}/src/Environment.cpp"
+            "${CMAKE_SOURCE_DIR}/src/helpers/AcceleratorUtils.cpp"
             "${CMAKE_SOURCE_DIR}/src/helpers/LuaExecutionUtils.cpp"
             "${CMAKE_SOURCE_DIR}/src/helpers/PluginPathUtils.cpp"
             LIBRARIES

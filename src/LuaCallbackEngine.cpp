@@ -25,6 +25,7 @@
 #include "MainFrame.h"
 #include "MainWindowHost.h"
 #include "MainWindowHostResolver.h"
+#include "NativePluginRegistry.h"
 #include "SpeedwalkParser.h"
 #include "SqliteCompat.h"
 #include "StringUtils.h"
@@ -32564,6 +32565,10 @@ static int queryPluginSupportsForCallback(const LuaCallbackEngine *engine, World
 {
 	if (!runtime || pluginId.trimmed().isEmpty() || scriptName.trimmed().isEmpty())
 		return fallbackCode;
+	if (QMudNativePluginRegistry::isBlacklistedId(pluginId))
+		return eNoSuchPlugin;
+	if (const QString shimId = QMudNativePluginRegistry::resolveShimIdOrName(pluginId); !shimId.isEmpty())
+		return QMudNativePluginRegistry::pluginSupports(shimId, scriptName);
 	int cachedStatus = fallbackCode;
 	if (tryResolveCallbackPluginSupportStatusFromCache(engine, pluginId, scriptName, cachedStatus))
 		return cachedStatus;
@@ -32614,6 +32619,8 @@ static void cacheCallbackPluginIdListAfterUnload(const LuaCallbackEngine *engine
 {
 	QStringList ids = resolvePluginIdListForApi(engine, runtime);
 	ids.removeIf([&pluginId](const QString &id) { return id.compare(pluginId, Qt::CaseInsensitive) == 0; });
+	if (QMudNativePluginRegistry::isShimId(pluginId) && !ids.contains(pluginId, Qt::CaseInsensitive))
+		ids.push_back(pluginId.trimmed().toLower());
 	cacheCallbackPluginIdList(engine, ids);
 }
 
@@ -32622,6 +32629,22 @@ static QVariant resolvePluginInfoValueForApi(const LuaCallbackEngine *engine, Wo
 {
 	if (!engine || !runtime || pluginId.trimmed().isEmpty())
 		return {};
+	if (QMudNativePluginRegistry::isBlacklistedId(pluginId))
+		return {};
+	if (const QString shimId = QMudNativePluginRegistry::resolveShimIdOrName(pluginId); !shimId.isEmpty())
+	{
+		int               visibleIndex = 0;
+		const QStringList ids          = resolvePluginIdListForApi(engine, runtime);
+		for (int i = 0; i < ids.size(); ++i)
+		{
+			if (ids.at(i).compare(shimId, Qt::CaseInsensitive) == 0)
+			{
+				visibleIndex = i + 1;
+				break;
+			}
+		}
+		return QMudNativePluginRegistry::pluginInfo(shimId, infoType, visibleIndex);
+	}
 	const QString selfPluginId = engine->pluginId().trimmed();
 	const bool    targetsSelfPlugin =
 	    !selfPluginId.isEmpty() && pluginId.trimmed().compare(selfPluginId, Qt::CaseInsensitive) == 0;
@@ -32684,6 +32707,10 @@ static bool resolvePluginInstalledForApi(const LuaCallbackEngine *engine, WorldR
 {
 	if (!engine || !runtime || pluginId.trimmed().isEmpty())
 		return false;
+	if (QMudNativePluginRegistry::isBlacklistedId(pluginId))
+		return false;
+	if (!QMudNativePluginRegistry::resolveShimIdOrName(pluginId).isEmpty())
+		return true;
 	const bool inCallback          = activeCallbackContextConst(engine) != nullptr;
 	const bool syncBridgeForbidden = callbackScopeSyncBridgeForbidden();
 	const bool needsThreadBridge   = runtime->thread() && QThread::currentThread() != runtime->thread();
@@ -32726,6 +32753,8 @@ static QString resolvePluginIdOrNameForLifecycleApi(const LuaCallbackEngine *eng
 		return {};
 	const QString key = pluginIdOrName.trimmed();
 	if (key.isEmpty())
+		return {};
+	if (QMudNativePluginRegistry::isBlacklistedId(key))
 		return {};
 	const bool inCallback          = activeCallbackContextConst(engine) != nullptr;
 	const bool syncBridgeForbidden = callbackScopeSyncBridgeForbidden();
@@ -40172,7 +40201,8 @@ static int luaUnloadPlugin(lua_State *L)
 			lua_pushnumber(L, eBadParameter);
 			return 1;
 		}
-		cacheCallbackPluginInstalled(engine, resolvedPluginId, false);
+		cacheCallbackPluginInstalled(engine, resolvedPluginId,
+		                             QMudNativePluginRegistry::isShimId(resolvedPluginId));
 		cacheCallbackPluginIdListAfterUnload(engine, runtime, resolvedPluginId);
 		QList<WorldRuntime::Trigger> emptyTriggers;
 		QList<WorldRuntime::Alias>   emptyAliases;
@@ -40328,6 +40358,8 @@ static int luaCallPlugin(lua_State *L)
 		                      : reason);
 		return 2;
 	}
+	if (const QString shimId = QMudNativePluginRegistry::resolveShimIdOrName(pluginId); !shimId.isEmpty())
+		return runtime->callPluginLua(shimId, routine, L, 1, engine->pluginId());
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	const auto pushCodeAndMessage = [L](const int code, const QString &message)
 	{
