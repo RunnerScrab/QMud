@@ -1475,6 +1475,21 @@ class WorldView : public QWidget
 		 */
 		void        dispatchPendingCapturedMiniWindowDragMove();
 		/**
+		 * @brief Starts logical miniwindow mouse capture without requesting a platform mouse grab.
+		 */
+		void        startMiniWindowMouseCapture();
+		/**
+		 * @brief Ends logical miniwindow mouse capture and removes temporary event routing.
+		 */
+		void        stopMiniWindowMouseCapture();
+		/**
+		 * @brief Routes captured miniwindow mouse events from any widget in this view window.
+		 * @param watched Object receiving the original event.
+		 * @param event Mouse event payload.
+		 * @return `true` when the captured event was consumed.
+		 */
+		bool        handleCapturedMiniWindowMouseEvent(QObject *watched, const QMouseEvent *event);
+		/**
 		 * @brief Returns hyperlink currently under global cursor, if any.
 		 * @return Hyperlink href under cursor, or empty when none.
 		 */
@@ -1919,6 +1934,7 @@ class WorldView : public QWidget
 		NativeOutputSelectionState              m_nativeOutputSelection;
 		mutable int                             m_nativeSelectionPendingHeadTrimLines{0};
 		bool                                    m_mouseCaptured{false};
+		bool                                    m_miniWindowCaptureEventFilterInstalled{false};
 		bool                                    m_hasCapturedMiniWindowPressLocal{false};
 		bool                                    m_hasPendingCapturedMiniWindowDragMove{false};
 		bool                                    m_capturedMiniWindowDragMoveDrainQueued{false};

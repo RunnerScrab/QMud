@@ -7345,6 +7345,69 @@ class tst_WorldView_Basic : public QObject
 			resetTestState();
 		}
 
+		void nativeOutputRendererMiniWindowCaptureRoutesEventsFromSiblingWidget()
+		{
+			resetTestState();
+
+			WorldView view;
+			view.setRuntimeObserver(fakeRuntimePointer());
+			view.resize(760, 460);
+			view.show();
+			QCoreApplication::processEvents();
+
+			QSplitter *outputSplitter = findOutputSplitter(view);
+			QVERIFY(outputSplitter);
+			QWidget *outputStack = outputSplitter->parentWidget();
+			QVERIFY(outputStack);
+			QTextBrowser *browser = findVisibleOutputBrowser(view);
+			QVERIFY(browser);
+			QWidget *viewport = browser->viewport();
+			QVERIFY(viewport);
+			QPlainTextEdit *input = view.inputEditor();
+			QVERIFY(input);
+
+			const QRect viewportInStack(viewport->mapTo(outputStack, QPoint(0, 0)), viewport->size());
+			QVERIFY(viewportInStack.width() > 260);
+			QVERIFY(viewportInStack.height() > 160);
+
+			constexpr QColor overlayColour(30, 170, 60, 255);
+			const QRect      startRect(viewportInStack.left() + 24, viewportInStack.top() + 24, 100, 56);
+			MiniWindow &window = appendTestMiniWindow(QStringLiteral("native-sibling-routed-drag"), startRect,
+			                                          0, overlayColour);
+			MiniWindowHotspot hotspot;
+			hotspot.rect         = QRect(0, 0, startRect.width(), startRect.height());
+			hotspot.moveCallback = QStringLiteral("drag_test_move");
+			window.hotspots.insert(QStringLiteral("drag"), hotspot);
+			view.onMiniWindowsChanged();
+			QCoreApplication::processEvents();
+
+			const QPoint pressInStack    = startRect.center();
+			const QPoint pressInViewport = viewport->mapFrom(outputStack, pressInStack);
+			QVERIFY(viewport->rect().contains(pressInViewport));
+			QTest::mousePress(viewport, Qt::LeftButton, Qt::NoModifier, pressInViewport);
+			QCoreApplication::processEvents();
+			QTRY_VERIFY(view.isMiniWindowCaptureActive());
+
+			const QPoint moveInStack = QPoint(viewportInStack.left() + 220, viewportInStack.top() + 90);
+			const QPoint moveGlobal  = outputStack->mapToGlobal(moveInStack);
+			const QPoint moveInInput = input->mapFromGlobal(moveGlobal);
+			QMouseEvent  moveEvent(QEvent::MouseMove, QPointF(moveInInput), QPointF(moveInInput),
+			                       QPointF(moveGlobal), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+			QCoreApplication::sendEvent(input, &moveEvent);
+			QCoreApplication::processEvents();
+
+			QCOMPARE(g_testMiniWindows.constFirst().clientMousePosition, moveInStack);
+			QTRY_VERIFY(widgetRectMostlyMatchesColor(outputStack, g_testMiniWindows.constFirst().rect,
+			                                         overlayColour, 80));
+
+			QMouseEvent releaseEvent(QEvent::MouseButtonRelease, QPointF(moveInInput), QPointF(moveInInput),
+			                         QPointF(moveGlobal), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+			QCoreApplication::sendEvent(input, &releaseEvent);
+			QCoreApplication::processEvents();
+			QTRY_VERIFY(!view.isMiniWindowCaptureActive());
+			resetTestState();
+		}
+
 		void nativeOutputRendererMiniWindowResizeHotspotUsesPressOrigin()
 		{
 			resetTestState();

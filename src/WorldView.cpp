@@ -1900,6 +1900,7 @@ WorldView::WorldView(QWidget *parent) : QWidget(parent)
 
 WorldView::~WorldView()
 {
+	stopMiniWindowMouseCapture();
 	m_destroying = true;
 }
 
@@ -10505,6 +10506,49 @@ void WorldView::dispatchPendingCapturedMiniWindowDragMove()
 		                    withMiniWindowModifierFlags(captured->flagsOnMouseDown));
 }
 
+void WorldView::startMiniWindowMouseCapture()
+{
+	m_mouseCaptured = true;
+	if (!m_miniWindowCaptureEventFilterInstalled && qApp)
+	{
+		qApp->installEventFilter(this);
+		m_miniWindowCaptureEventFilterInstalled = true;
+	}
+}
+
+void WorldView::stopMiniWindowMouseCapture()
+{
+	if (m_miniWindowCaptureEventFilterInstalled && qApp)
+	{
+		qApp->removeEventFilter(this);
+		m_miniWindowCaptureEventFilterInstalled = false;
+	}
+	m_mouseCaptured = false;
+}
+
+bool WorldView::handleCapturedMiniWindowMouseEvent(QObject *watched, const QMouseEvent *event)
+{
+	if (!m_mouseCaptured || !event)
+		return false;
+	auto *watchedWidget = qobject_cast<QWidget *>(watched);
+	if (!watchedWidget)
+		return false;
+
+	const QWidget *const ownerWindow = window();
+	if (ownerWindow && watchedWidget->window() != ownerWindow)
+		return false;
+
+	switch (event->type())
+	{
+	case QEvent::MouseMove:
+		return handleMiniWindowMouseMove(event, watchedWidget);
+	case QEvent::MouseButtonRelease:
+		return handleMiniWindowMouseRelease(event, watchedWidget);
+	default:
+		return false;
+	}
+}
+
 void WorldView::applyOutputCursor(const QCursor *cursor)
 {
 	if (cursor)
@@ -10810,14 +10854,7 @@ bool WorldView::handleMiniWindowMousePress(const QMouseEvent *event, bool double
 	m_hasCapturedMiniWindowPressLocal       = true;
 	m_hasPendingCapturedMiniWindowDragMove  = false;
 	m_capturedMiniWindowDragMoveDrainQueued = false;
-	if (!m_mouseCaptured)
-	{
-		if (m_outputStack)
-			m_outputStack->grabMouse();
-		else
-			grabMouse();
-		m_mouseCaptured = true;
-	}
+	startMiniWindowMouseCapture();
 
 	const auto it = window->hotspots.find(hotspotId);
 	if (it != window->hotspots.end())
@@ -10874,11 +10911,7 @@ bool WorldView::handleMiniWindowMouseRelease(const QMouseEvent *event, const QWi
 		pressedWindow->mouseDownHotspot.clear();
 	}
 
-	if (m_outputStack)
-		m_outputStack->releaseMouse();
-	else
-		releaseMouse();
-	m_mouseCaptured = false;
+	stopMiniWindowMouseCapture();
 	m_capturedWindowName.clear();
 	m_hasCapturedMiniWindowPressLocal      = false;
 	m_hasPendingCapturedMiniWindowDragMove = false;
@@ -11871,6 +11904,17 @@ bool WorldView::eventFilter(QObject *watched, QEvent *event)
 	                            watched == m_outputSplitter || watched == m_outputScrollBar ||
 	                            watched == m_output || watched == m_liveOutput || watched == outputViewport ||
 	                            watched == liveOutputViewport;
+
+	if (m_mouseCaptured &&
+	    (event->type() == QEvent::MouseMove || event->type() == QEvent::MouseButtonRelease))
+	{
+		if (auto *mouseEvent = dynamic_cast<QMouseEvent *>(event);
+		    mouseEvent && handleCapturedMiniWindowMouseEvent(watched, mouseEvent))
+		{
+			event->accept();
+			return true;
+		}
+	}
 
 	if ((watched == m_outputContainer || watched == m_outputStack || watched == m_outputSplitter) &&
 	    event->type() == QEvent::Resize)
