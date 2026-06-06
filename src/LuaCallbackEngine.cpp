@@ -32629,8 +32629,6 @@ static QVariant resolvePluginInfoValueForApi(const LuaCallbackEngine *engine, Wo
 	{
 		if (infoType == 1)
 			return engine->pluginName();
-		if (infoType == 2 || infoType == 3 || infoType == 4 || infoType == 6 || infoType == 8)
-			return QString();
 		if (infoType == 5)
 			return QStringLiteral("lua");
 		if (infoType == 7)
@@ -44370,6 +44368,9 @@ void LuaCallbackEngine::registerWorldBindings()
 	    {"ColourNote",           luaColourNote           },
 	    {"ColourTell",           luaColourTell           },
 	    {"GetInfo",              luaTestGetInfo          },
+	    {"GetPluginID",          luaGetPluginID          },
+	    {"GetPluginInfo",        luaGetPluginInfo        },
+	    {"GetPluginName",        luaGetPluginName        },
 	    {"Note",	             luaNote                 },
 	    {"SaveState",            luaTestSaveState        },
 	    {"Tell",	             luaTell                 },

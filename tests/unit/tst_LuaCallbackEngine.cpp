@@ -95,6 +95,7 @@ namespace
 			QString                              preferencesDatabaseName;
 			QString                              fileBrowsingDirectory;
 			QString                              stateFilesDirectory;
+			QList<WorldRuntime::Plugin>          plugins;
 	};
 
 	QHash<const WorldRuntime *, RuntimeStubState> &runtimeStubStates()
@@ -462,6 +463,57 @@ QStringList WorldRuntime::windowHotspotList(const QString &name) const
 	return runtimeStubState(this).hotspotIds.value(name);
 }
 
+const QList<WorldRuntime::Plugin> &WorldRuntime::plugins() const
+{
+	return runtimeStubState(this).plugins;
+}
+
+QList<WorldRuntime::Plugin> &WorldRuntime::pluginsMutable()
+{
+	return runtimeStubState(this).plugins;
+}
+
+QVariant WorldRuntime::pluginInfo(const QString &pluginId, const int infoType) const
+{
+	for (const Plugin &plugin : runtimeStubState(this).plugins)
+	{
+		if (plugin.attributes.value(QStringLiteral("id")).compare(pluginId, Qt::CaseInsensitive) != 0)
+			continue;
+		switch (infoType)
+		{
+		case 1:
+			return plugin.attributes.value(QStringLiteral("name"));
+		case 2:
+			return plugin.attributes.value(QStringLiteral("author"));
+		case 3:
+			return plugin.description;
+		case 4:
+			return plugin.script;
+		case 5:
+			return plugin.attributes.value(QStringLiteral("language"));
+		case 6:
+			return plugin.source;
+		case 7:
+			return plugin.attributes.value(QStringLiteral("id"));
+		case 8:
+			return plugin.attributes.value(QStringLiteral("purpose"));
+		case 20:
+			return plugin.directory;
+		default:
+			return {};
+		}
+	}
+	return {};
+}
+
+QStringList WorldRuntime::pluginIdList() const
+{
+	QStringList ids;
+	for (const Plugin &plugin : runtimeStubState(this).plugins)
+		ids.push_back(plugin.attributes.value(QStringLiteral("id")));
+	return ids;
+}
+
 QVariant WorldRuntime::windowHotspotInfo(const QString &name, const QString &hotspotId, int infoType) const
 {
 	Q_UNUSED(name);
@@ -521,6 +573,7 @@ namespace
 			void workerColourOutputMatchesMushclientGroupingAndNewlineSemantics();
 			void colourTellIgnoresTrailingLuaGsubReturnAndKeepsFollowingNote();
 			void executeScriptNoteUsesRuntimeNoteColour();
+			void selfPluginInfoMetadataFallsThroughToRuntime();
 			void triggerAnchoredColourOutputKeepsNativePromptText();
 			void stringsAndWildcardsDispatchSuppliesSnapshotForCallbackReads();
 			void callbackSnapshotSuppliesGetInfoAndMiniWindowReads();
@@ -1916,6 +1969,82 @@ void tst_LuaCallbackEngine::executeScriptNoteUsesRuntimeNoteColour()
 	QVERIFY(!entry.spans.isEmpty());
 	QCOMPARE(entry.spans.constFirst().fore, QColor(0, 255, 255));
 	QCOMPARE(entry.spans.constFirst().back, QColor(Qt::black));
+}
+
+void tst_LuaCallbackEngine::selfPluginInfoMetadataFallsThroughToRuntime()
+{
+	WorldRuntime         runtime;
+	auto                &state = runtimeStubState(&runtime);
+
+	WorldRuntime::Plugin plugin;
+	plugin.attributes.insert(QStringLiteral("id"), QStringLiteral("Plugin.Id"));
+	plugin.attributes.insert(QStringLiteral("name"), QStringLiteral("Runtime Plugin Name"));
+	plugin.attributes.insert(QStringLiteral("author"), QStringLiteral("Runtime Author"));
+	plugin.attributes.insert(QStringLiteral("language"), QStringLiteral("lua"));
+	plugin.attributes.insert(QStringLiteral("purpose"), QStringLiteral("Runtime Purpose"));
+	plugin.description = QStringLiteral("Runtime Description");
+	plugin.script      = QStringLiteral("Runtime Script");
+	plugin.source      = QStringLiteral("worlds/plugins/runtime_plugin.xml");
+	plugin.directory   = QStringLiteral("worlds/plugins/");
+	state.plugins.push_back(plugin);
+
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
+	function OnPluginEnable()
+	  local plugin_id = "Plugin.Id"
+	  self_info = table.concat({
+	    GetPluginInfo(plugin_id, 1) or "",
+	    GetPluginInfo(plugin_id, 2) or "",
+	    GetPluginInfo(plugin_id, 3) or "",
+	    GetPluginInfo(plugin_id, 4) or "",
+	    GetPluginInfo(plugin_id, 5) or "",
+	    GetPluginInfo(plugin_id, 6) or "",
+	    GetPluginInfo(plugin_id, 7) or "",
+	    GetPluginInfo(plugin_id, 8) or "",
+	    GetPluginInfo(plugin_id, 20) or ""
+	  }, "|")
+	end
+	function self_info_status(value)
+	  return self_info
+	end
+	)lua"),
+	                       &runtime);
+
+	const QString pluginKey = QStringLiteral("plugin.id");
+	auto          snapshot  = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+	snapshot->pluginIdsSnapshot.push_back(pluginKey);
+	snapshot->pluginNamesById.insert(pluginKey, QStringLiteral("Runtime Plugin Name"));
+	snapshot->pluginEnabledById.insert(pluginKey, true);
+	snapshot->pluginDirectoriesById.insert(pluginKey, QStringLiteral("worlds/plugins/"));
+	auto &pluginInfo = snapshot->pluginInfoValuesById[pluginKey];
+	pluginInfo.insert(1, QStringLiteral("Runtime Plugin Name"));
+	pluginInfo.insert(2, QStringLiteral("Runtime Author"));
+	pluginInfo.insert(3, QStringLiteral("Runtime Description"));
+	pluginInfo.insert(4, QStringLiteral("Runtime Script"));
+	pluginInfo.insert(5, QStringLiteral("lua"));
+	pluginInfo.insert(6, QStringLiteral("worlds/plugins/runtime_plugin.xml"));
+	pluginInfo.insert(7, QStringLiteral("Plugin.Id"));
+	pluginInfo.insert(8, QStringLiteral("Runtime Purpose"));
+	pluginInfo.insert(20, QStringLiteral("worlds/plugins/"));
+
+	LuaBatchDispatchRequest request;
+	request.engines               = {engine};
+	request.kind                  = LuaBatchDispatchKind::NoArgs;
+	request.functionName          = QStringLiteral("OnPluginEnable");
+	request.miniWindowSnapshotArg = snapshot;
+	dispatchWorkerAndWait(executor, request);
+
+	request.kind                  = LuaBatchDispatchKind::StringInOut;
+	request.functionName          = QStringLiteral("self_info_status");
+	request.stringArg             = QStringLiteral("ignored");
+	request.miniWindowSnapshotArg = {};
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	QCOMPARE(result.stringResult,
+	         QStringLiteral("Plugin Name|Runtime Author|Runtime Description|Runtime Script|lua|"
+	                        "worlds/plugins/runtime_plugin.xml|Plugin.Id|Runtime Purpose|/tmp/plugin/"));
+	teardownWorkerEngine(executor, engine);
 }
 
 void tst_LuaCallbackEngine::triggerAnchoredColourOutputKeepsNativePromptText()
