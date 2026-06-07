@@ -286,7 +286,7 @@ void QMudOutputWrapUtils::wrapPlainLineForColumn(QString &text, const int wrapCo
 			lineHasVisibleChar = true;
 
 		column += graphemeColumnWidthForWrap(grapheme);
-		if (column < wrapColumn)
+		if (column <= wrapColumn)
 			continue;
 
 		if (!lineHasVisibleChar)
@@ -417,7 +417,7 @@ void QMudOutputWrapUtils::wrapStyledLineForColumn(QString &text, QVector<WorldRu
 			lineHasVisibleChar = true;
 
 		column += graphemeColumnWidthForWrap(grapheme);
-		if (column < wrapColumn)
+		if (column <= wrapColumn)
 			continue;
 
 		if (!lineHasVisibleChar)

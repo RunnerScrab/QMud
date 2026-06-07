@@ -413,6 +413,11 @@ if (QMUD_ENABLE_LUA_SCRIPTING)
                 "/usr/lib64/lua/${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}"
                 "/usr/local/lib/lua/${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}"
                 "/usr/local/lib64/lua/${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}")
+        if (CMAKE_LIBRARY_ARCHITECTURE)
+            list(PREPEND QMUD_LUA_MODULE_SEARCH_PATHS
+                    "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/lua/${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}"
+                    "/usr/local/lib/${CMAKE_LIBRARY_ARCHITECTURE}/lua/${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}")
+        endif ()
         list(REMOVE_DUPLICATES QMUD_LUA_MODULE_SEARCH_PATHS)
     endif ()
     target_compile_definitions(QMud PRIVATE QMUD_ENABLE_LUA_SCRIPTING)
@@ -852,7 +857,13 @@ if (NOT QMUD_SYSTEM_SSL_CORE_SO)
 endif ()
 if (LUA_VERSION_MAJOR AND LUA_VERSION_MINOR)
     set(QMUD_LUA_VERDIR "${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}")
-    foreach (_qmud_libdir /usr/lib64 /usr/lib /usr/local/lib64 /usr/local/lib)
+    set(_qmud_libdirs /usr/lib64 /usr/lib /usr/local/lib64 /usr/local/lib)
+    if (CMAKE_LIBRARY_ARCHITECTURE)
+        list(PREPEND _qmud_libdirs
+                "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}"
+                "/usr/local/lib/${CMAKE_LIBRARY_ARCHITECTURE}")
+    endif ()
+    foreach (_qmud_libdir ${_qmud_libdirs})
         if (NOT QMUD_SYSTEM_SSL_CORE_SO AND EXISTS "${_qmud_libdir}/lua/${QMUD_LUA_VERDIR}/ssl/core.so")
             set(QMUD_SYSTEM_SSL_CORE_SO "${_qmud_libdir}/lua/${QMUD_LUA_VERDIR}/ssl/core.so" CACHE FILEPATH
                     "Optional explicit path to system LuaSec C module (ssl/core.so or ssl.so)" FORCE)
