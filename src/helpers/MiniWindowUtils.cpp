@@ -27,9 +27,9 @@
 #include <QMutexLocker>
 #include <QPainter>
 #include <QPainterPath>
-#include <QPixmap>
 #include <QRandomGenerator>
 #include <QScreen>
+#include <QTextBoundaryFinder>
 #include <QTransform>
 #include <QtGlobal>
 #include <QtMath>
@@ -1043,6 +1043,38 @@ namespace
 		return Qt::RoundJoin;
 	}
 
+	template <typename Visitor> void forEachTextCluster(const QString &text, Visitor &&visitor)
+	{
+		QTextBoundaryFinder finder(QTextBoundaryFinder::Grapheme, text);
+		finder.toStart();
+		int start = 0;
+		while (true)
+		{
+			const int end = finder.toNextBoundary();
+			if (end < 0)
+				break;
+			if (end > start)
+				visitor(text.mid(start, end - start));
+			start = end;
+		}
+		if (start < text.size())
+			visitor(text.mid(start));
+	}
+
+	int measuredTextWidthForMiniWindow(const MiniWindow &window, const MiniWindowFont &fontEntry,
+	                                   const QString &text)
+	{
+		if (text.isEmpty())
+			return 0;
+		const QImage       &surface = window.backingSurface();
+		const QPaintDevice *device  = surface.isNull() ? nullptr : &surface;
+		const QFontMetrics  metrics(fontEntry.font, device);
+		int                 width = 0;
+		forEachTextCluster(text, [&metrics, &width](const QString &cluster)
+		                   { width += qMax(0, metrics.horizontalAdvance(cluster)); });
+		return width;
+	}
+
 } // namespace
 
 namespace MiniWindowUtils::Internal
@@ -1210,7 +1242,15 @@ namespace MiniWindowUtils
 		const QRect rect = rectFromCoords(window, left, top, right, bottom);
 		if (rect.width() <= 0 || rect.height() <= 0)
 			return eOK;
-		return qMin(qMax(0, it.value().metrics.horizontalAdvance(text)), rect.width());
+		return qMin(textWidth(window, fontId, text), rect.width());
+	}
+
+	int textWidth(const MiniWindow &window, const QString &fontId, const QString &text)
+	{
+		const auto it = window.fonts.constFind(fontId);
+		if (it == window.fonts.constEnd())
+			return -2;
+		return measuredTextWidthForMiniWindow(window, it.value(), text);
 	}
 
 	QVariant fontInfo(const MiniWindow &window, const QString &fontId, const int infoType)
@@ -1919,12 +1959,22 @@ namespace MiniWindowUtils
 		const QRect rect = rectFromCoords(window, left, top, right, bottom);
 		if (rect.width() <= 0 || rect.height() <= 0)
 			return eOK;
-		QPainter painter(&Internal::mutableBackingSurface(window));
+		QImage  &surface = Internal::mutableBackingSurface(window);
+		QPainter painter(&surface);
 		painter.setFont(it.value().font);
 		painter.setPen(colorFromRef(colour));
 		painter.setClipRect(rect);
-		painter.drawText(rect, Qt::AlignLeft | Qt::AlignTop, text);
-		return qMin(qMax(0, it.value().metrics.horizontalAdvance(text)), rect.width());
+		const QFontMetrics metrics(it.value().font, &surface);
+		const int          baseline = rect.top() + metrics.ascent();
+		int                x        = rect.left();
+		forEachTextCluster(text,
+		                   [&metrics, &painter, &rect, &x, baseline](const QString &cluster)
+		                   {
+			                   if (x < rect.right() + 1)
+				                   painter.drawText(QPoint(x, baseline), cluster);
+			                   x += qMax(0, metrics.horizontalAdvance(cluster));
+		                   });
+		return qMin(qMax(0, x - rect.left()), rect.width());
 	}
 
 	void createImage(MiniWindow &window, const QString &imageId, const long row1, const long row2,
@@ -2181,7 +2231,9 @@ namespace MiniWindowUtils
 		}
 		QPainter painter(&Internal::mutableBackingSurface(window));
 		painter.setPen(penStyle == 5 ? Qt::NoPen : makePen(penColour, penStyle, penWidth));
-		painter.setBrush(QBrush(QPixmap::fromImage(pattern)));
+		QBrush brush;
+		brush.setTextureImage(pattern);
+		painter.setBrush(brush);
 		const QRect rect = rectFromCoords(window, left, top, right, bottom);
 		switch (action)
 		{

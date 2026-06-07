@@ -724,7 +724,8 @@ namespace QMudNativePluginRegistry
 		return eNoSuchRoutine;
 	}
 
-	QVariant pluginInfo(const QString &pluginId, const int infoType, const int visibleIndex)
+	QVariant pluginInfo(const QString &pluginId, const int infoType, const int visibleIndex,
+	                    const bool enabled)
 	{
 		NativePluginMetadata metadata;
 		if (!metadataForShim(pluginId, metadata))
@@ -760,7 +761,7 @@ namespace QMudNativePluginRegistry
 		case 16:
 			return false;
 		case 17:
-			return true;
+			return enabled;
 		case 18:
 			return metadata.requiredVersion;
 		case 19:
@@ -849,6 +850,7 @@ namespace QMudNativePluginRegistry
 		{
 			MushReaderState &state     = stateFor(runtime);
 			state.passiveSpeechEnabled = !state.passiveSpeechEnabled;
+			runtime->notifyNativePluginStateChanged();
 			stopSpeech(runtime);
 			speak(runtime,
 			      state.passiveSpeechEnabled ? QStringLiteral("speech on") : QStringLiteral("speech off"),
@@ -904,6 +906,15 @@ namespace QMudNativePluginRegistry
 		state.passiveSpeechEnabled = enable;
 		if (!enable)
 			stopSpeech(runtime);
+	}
+
+	bool isPassiveSpeechEnabled(const WorldRuntime *runtime)
+	{
+		if (!runtime)
+			return false;
+		QMutexLocker locker(&stateMutex());
+		const auto   it = states().find(runtime);
+		return it != states().end() && it->second && it->second->passiveSpeechEnabled;
 	}
 
 	void ensureRuntimeSetup(WorldRuntime *runtime)

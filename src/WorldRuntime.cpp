@@ -10001,6 +10001,9 @@ QSharedPointer<const LuaCallbackMiniWindowSnapshot> WorldRuntime::captureLuaCall
 		QMudNativePluginRegistry::NativePluginMetadata metadata;
 		if (!QMudNativePluginRegistry::metadataForShim(shimId, metadata))
 			continue;
+		const int  shadowIndex = findPluginIndex(m_plugins, shimId);
+		const bool enabled     = QMudNativePluginRegistry::isPassiveSpeechEnabled(this) ||
+		                         (shadowIndex >= 0 && m_plugins.at(shadowIndex).enabled);
 		if (!snapshot->pluginIdsSnapshot.contains(shimId, Qt::CaseInsensitive))
 			snapshot->pluginIdsSnapshot.push_back(shimId);
 		int visibleIndex = 0;
@@ -10016,14 +10019,15 @@ QSharedPointer<const LuaCallbackMiniWindowSnapshot> WorldRuntime::captureLuaCall
 		snapshot->pluginIdsByLookupKey.insert(metadata.name.trimmed().toLower(), shimId);
 		snapshot->pluginNamesById.insert(shimId, metadata.name);
 		snapshot->pluginDirectoriesById.insert(shimId, metadata.directory);
-		snapshot->pluginEnabledById.insert(shimId, true);
+		snapshot->pluginEnabledById.insert(shimId, enabled);
 		QSet<QString> functions;
 		for (const QString &routine : QMudNativePluginRegistry::supportedRoutines(shimId))
 			functions.insert(routine);
 		snapshot->pluginLuaFunctionsById.insert(shimId, functions);
 		auto &pluginInfo = snapshot->pluginInfoValuesById[shimId];
 		for (int infoType = 1; infoType <= 25; ++infoType)
-			pluginInfo.insert(infoType, QMudNativePluginRegistry::pluginInfo(shimId, infoType, visibleIndex));
+			pluginInfo.insert(infoType,
+			                  QMudNativePluginRegistry::pluginInfo(shimId, infoType, visibleIndex, enabled));
 	}
 	for (const Plugin &plugin : m_plugins)
 	{
@@ -16187,7 +16191,7 @@ WorldRuntime::CommandUiSnapshot WorldRuntime::commandUiSnapshot(const bool inclu
 		snapshot.outputClientWidth          = m_view->outputClientWidth();
 		snapshot.viewHeight                 = m_view->height();
 		snapshot.viewWidth                  = m_view->width();
-		const QRect outputRect              = m_view->outputTextRectangle();
+		const QRect outputRect              = m_view->outputTextViewportRectangle();
 		snapshot.outputTextRectLeft         = outputRect.left();
 		snapshot.outputTextRectTop          = outputRect.top();
 		snapshot.outputTextRectRight        = outputRect.left() + outputRect.width();
@@ -16633,6 +16637,19 @@ void WorldRuntime::firePluginTick()
 void WorldRuntime::firePluginSent(const QString &text)
 {
 	callPluginCallbacks(QStringLiteral("OnPluginSent"), text, true);
+}
+
+void WorldRuntime::notifyNativePluginStateChanged()
+{
+	if (QThread::currentThread() != thread())
+	{
+		QMetaObject::invokeMethod(this, [this] { notifyNativePluginStateChanged(); }, Qt::QueuedConnection);
+		return;
+	}
+
+	qmudAssertObjectThreadAffinity(this, "WorldRuntime::notifyNativePluginStateChanged");
+	invalidatePluginCallbackPresenceCache();
+	invalidateLuaCallbackDispatchSnapshot();
 }
 
 void WorldRuntime::firePluginPartialLine(const QString &text)
@@ -17161,6 +17178,7 @@ void WorldRuntime::applyFromDocument(const WorldDocument &doc)
 	m_pluginCallbackRecipientIndices.clear();
 	m_pluginCallbackPresencePluginCount = -1;
 	invalidatePluginCallbackPresenceCache();
+	QMudNativePluginRegistry::setPassiveSpeechEnabled(this, false);
 	QVector<LuaEngineObservedInitializationRequest> pluginLuaInitRequests;
 	pluginLuaInitRequests.reserve(safeQSizeToInt(doc.plugins().size()));
 	for (const auto &p : doc.plugins())
@@ -17183,6 +17201,22 @@ void WorldRuntime::applyFromDocument(const WorldDocument &doc)
 		const QString enabledFlag = rp.attributes.value(QStringLiteral("enabled"));
 		const bool    requestedEnabled = enabledFlag.isEmpty() ? true : isEnabledFlag(enabledFlag);
 		rp.enabled                     = requestedEnabled;
+		if (QMudNativePluginRegistry::isBlacklistedId(pluginId))
+			continue;
+		if (QMudNativePluginRegistry::isShimId(pluginId))
+		{
+			QMudNativePluginRegistry::NativePluginMetadata metadata;
+			if (!QMudNativePluginRegistry::metadataForShim(pluginId, metadata))
+				continue;
+			Plugin shadow  = makeNativeShimShadowPlugin(metadata, rp.global);
+			shadow.enabled = requestedEnabled;
+			shadow.attributes.insert(QStringLiteral("enabled"),
+			                         requestedEnabled ? QStringLiteral("1") : QStringLiteral("0"));
+			if (findPluginIndex(m_plugins, metadata.id) < 0)
+				m_plugins.push_back(shadow);
+			QMudNativePluginRegistry::setPassiveSpeechEnabled(this, requestedEnabled);
+			continue;
+		}
 		for (const auto &t : p.triggers)
 		{
 			Trigger rt;
@@ -21242,6 +21276,9 @@ QVariant WorldRuntime::pluginInfo(const QString &pluginId, int infoType) const
 	{
 		int               visibleIndex = 0;
 		const QStringList ids          = pluginIdList();
+		const int         shadowIndex  = findPluginIndex(m_plugins, shimId);
+		const bool        enabled      = QMudNativePluginRegistry::isPassiveSpeechEnabled(this) ||
+		                                 (shadowIndex >= 0 && m_plugins.at(shadowIndex).enabled);
 		for (int i = 0; i < ids.size(); ++i)
 		{
 			if (ids.at(i).compare(shimId, Qt::CaseInsensitive) == 0)
@@ -21250,7 +21287,7 @@ QVariant WorldRuntime::pluginInfo(const QString &pluginId, int infoType) const
 				break;
 			}
 		}
-		return QMudNativePluginRegistry::pluginInfo(shimId, infoType, visibleIndex);
+		return QMudNativePluginRegistry::pluginInfo(shimId, infoType, visibleIndex, enabled);
 	}
 	const int index = findPluginIndex(m_plugins, pluginId);
 	if (index < 0)
@@ -24090,7 +24127,7 @@ int WorldRuntime::windowTextWidth(const QString &name, const QString &fontId, co
 	const auto it = window->fonts.find(fontId);
 	if (it == window->fonts.end())
 		return -2;
-	return it.value().metrics.horizontalAdvance(text);
+	return MiniWindowUtils::textWidth(*window, fontId, text);
 }
 
 int WorldRuntime::windowSetPixel(const QString &name, int x, int y, long colour)

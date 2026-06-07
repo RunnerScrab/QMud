@@ -16,6 +16,47 @@
 #include <QXmlStreamReader>
 #include <algorithm>
 
+static constexpr auto kNativePluginIncludePrefix = "qmud:native/";
+static constexpr auto kMushReaderNativePlugin    = "MushReader";
+static constexpr auto kMushReaderNativePluginId  = "925cdd0331023d9f0b8f05a7";
+
+static QString        normalizeVirtualNativePluginInclude(QString name)
+{
+	name.replace(QLatin1Char('\\'), QLatin1Char('/'));
+	name = QDir::cleanPath(name.trimmed());
+	while (name.startsWith(QStringLiteral("./")))
+		name.remove(0, 2);
+	return name;
+}
+
+static bool makeVirtualNativePlugin(const QString &rawName, WorldDocument::Plugin &plugin)
+{
+	const QString name = normalizeVirtualNativePluginInclude(rawName);
+	if (!name.startsWith(QLatin1String(kNativePluginIncludePrefix), Qt::CaseInsensitive))
+		return false;
+
+	const QString nativeName = name.mid(QString::fromLatin1(kNativePluginIncludePrefix).size());
+	if (nativeName.compare(QLatin1String(kMushReaderNativePlugin), Qt::CaseInsensitive) != 0)
+		return false;
+
+	plugin.attributes.insert(QStringLiteral("id"), QString::fromLatin1(kMushReaderNativePluginId));
+	plugin.attributes.insert(QStringLiteral("name"), QString::fromLatin1(kMushReaderNativePlugin));
+	plugin.attributes.insert(QStringLiteral("author"), QStringLiteral("QMud native compatibility layer"));
+	plugin.attributes.insert(QStringLiteral("purpose"),
+	                         QStringLiteral("Native screen-reader compatibility shim"));
+	plugin.attributes.insert(QStringLiteral("language"), QStringLiteral("native"));
+	plugin.attributes.insert(QStringLiteral("source"), QStringLiteral("qmud:native/MushReader"));
+	plugin.attributes.insert(QStringLiteral("directory"), QStringLiteral("qmud:native/"));
+	plugin.description = QStringLiteral("QMud native compatibility shim - Legacy XML ignored.");
+	return true;
+}
+
+static bool isVirtualNativePluginInclude(const QString &rawName)
+{
+	return normalizeVirtualNativePluginInclude(rawName).startsWith(QLatin1String(kNativePluginIncludePrefix),
+	                                                               Qt::CaseInsensitive);
+}
+
 static bool isPortableRootSegment(const QString &segment)
 {
 	return segment.compare(QStringLiteral("worlds"), Qt::CaseInsensitive) == 0 ||
@@ -449,7 +490,7 @@ bool WorldDocument::loadFromFileWithPolicy(const QString &fileName, PluginPolicy
 				}
 
 				// General attributes are on the <world> element.
-				// Multi-line alpha options are child elements (eg. <notes>...</notes>).
+				// Multi-line alpha options are child elements (e.g. <notes>...</notes>).
 				while (!reader.atEnd())
 				{
 					reader.readNext();
@@ -606,7 +647,7 @@ bool WorldDocument::loadFromFileWithPolicy(const QString &fileName, PluginPolicy
 			else if (name == QLatin1String("colours"))
 			{
 				sawContent = true;
-				// Collect colour elements by group.
+				// Collect color elements by group.
 				while (!reader.atEnd())
 				{
 					reader.readNext();
@@ -1141,6 +1182,34 @@ bool WorldDocument::expandIncludesPass(const QString &worldFilePath, const QStri
                                pluginFlag == QStringLiteral("true"));
 		if (isPlugin != wantPlugins)
 			continue;
+		if (isPlugin)
+		{
+			if (isVirtualNativePluginInclude(rawName))
+			{
+				Plugin nativePlugin;
+				if (!makeVirtualNativePlugin(rawName, nativePlugin))
+				{
+					m_errorString = QStringLiteral("Unknown native plugin include \"%1\"").arg(rawName);
+					return false;
+				}
+				const QString includeEnabled = include.attributes.value(QStringLiteral("enabled")).trimmed();
+				if (!includeEnabled.isEmpty())
+					nativePlugin.attributes.insert(QStringLiteral("enabled"), includeEnabled);
+				const QString newPluginId =
+				    nativePlugin.attributes.value(QStringLiteral("id")).trimmed().toLower();
+				const QString newPluginName = nativePlugin.attributes.value(QStringLiteral("name")).trimmed();
+				if (!newPluginId.isEmpty() && m_loadedPluginIds.contains(newPluginId))
+				{
+					const QString existingName = m_loadedPluginIds.value(newPluginId);
+					m_errorString = QStringLiteral("The plugin '%1' is already loaded.").arg(existingName);
+					return false;
+				}
+				m_plugins.push_back(nativePlugin);
+				if (!newPluginId.isEmpty())
+					m_loadedPluginIds.insert(newPluginId, newPluginName);
+				continue;
+			}
+		}
 
 		const QString resolved =
 		    resolveIncludePath(rawName, worldFilePath, pluginsDir, programDir, currentPluginDir, wantPlugins);
@@ -1353,7 +1422,7 @@ QString WorldDocument::resolveIncludePath(const QString &rawName, const QString 
 		nativeName = nativeName.mid(1);
 	}
 
-	// Repair legacy malformed absolute-like portable paths (eg. "/worlds/...").
+	// Repair legacy malformed absolute-like portable paths (e.g. "/worlds/...").
 	if (nativeName.startsWith(QLatin1Char('/')))
 	{
 		QString candidate = nativeName;
@@ -1368,7 +1437,7 @@ QString WorldDocument::resolveIncludePath(const QString &rawName, const QString 
 	}
 
 	// Convert legacy absolute Windows paths that point into portable roots
-	// (eg. "C:/Games/.../worlds/foo.xml") to portable-root paths.
+	// (e.g. "C:/Games/.../worlds/foo.xml") to portable-root paths.
 	if (const bool isDrivePath =
 	        nativeName.size() >= 2 && nativeName.at(1) == QLatin1Char(':') && nativeName.at(0).isLetter();
 	    isDrivePath)

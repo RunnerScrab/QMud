@@ -6127,19 +6127,18 @@ namespace
 		const auto it = window->fonts.constFind(fontId);
 		if (it == window->fonts.constEnd())
 			return false;
-		width = qMax(0, it.value().metrics.horizontalAdvance(text));
+		width = MiniWindowUtils::textWidth(*window, fontId, text);
 		return true;
 	}
 
-	int drawCallbackMiniWindowShadowTextForApi(const LuaCallbackEngine *engine, const QString &windowName,
-	                                           const QString &fontId, const QString &text, const int left,
-	                                           const int top, const int right, const int bottom,
-	                                           const long colour)
+	int previewCallbackMiniWindowShadowTextForApi(const LuaCallbackEngine *engine, const QString &windowName,
+	                                              const QString &fontId, const QString &text, const int left,
+	                                              const int top, const int right, const int bottom)
 	{
 		MiniWindow *window = callbackMiniWindowShadow(engine, windowName);
 		if (!window)
 			return eNoSuchWindow;
-		const int width = MiniWindowUtils::text(*window, fontId, text, left, top, right, bottom, colour);
+		const int width = MiniWindowUtils::textPreviewWidth(*window, fontId, text, left, top, right, bottom);
 		if (width >= 0)
 			cacheCallbackMiniWindowTextWidth(engine, windowName, fontId, text, width);
 		return width;
@@ -32631,7 +32630,9 @@ static QVariant resolvePluginInfoValueForApi(const LuaCallbackEngine *engine, Wo
 		return {};
 	if (QMudNativePluginRegistry::isBlacklistedId(pluginId))
 		return {};
-	if (const QString shimId = QMudNativePluginRegistry::resolveShimIdOrName(pluginId); !shimId.isEmpty())
+	const QString shimId            = QMudNativePluginRegistry::resolveShimIdOrName(pluginId);
+	const QString effectivePluginId = shimId.isEmpty() ? pluginId : shimId;
+	if (!shimId.isEmpty() && infoType != 17)
 	{
 		int               visibleIndex = 0;
 		const QStringList ids          = resolvePluginIdListForApi(engine, runtime);
@@ -32645,9 +32646,9 @@ static QVariant resolvePluginInfoValueForApi(const LuaCallbackEngine *engine, Wo
 		}
 		return QMudNativePluginRegistry::pluginInfo(shimId, infoType, visibleIndex);
 	}
-	const QString selfPluginId = engine->pluginId().trimmed();
-	const bool    targetsSelfPlugin =
-	    !selfPluginId.isEmpty() && pluginId.trimmed().compare(selfPluginId, Qt::CaseInsensitive) == 0;
+	const QString selfPluginId      = engine->pluginId().trimmed();
+	const bool    targetsSelfPlugin = !selfPluginId.isEmpty() && effectivePluginId.trimmed().compare(
+	                                                                 selfPluginId, Qt::CaseInsensitive) == 0;
 	if (targetsSelfPlugin)
 	{
 		if (infoType == 1)
@@ -32664,11 +32665,11 @@ static QVariant resolvePluginInfoValueForApi(const LuaCallbackEngine *engine, Wo
 	const bool needsThreadBridge   = runtime->thread() && QThread::currentThread() != runtime->thread();
 	// Keep CallPlugin caller context local to the target Lua engine thread.
 	// This avoids runtime-thread state mutation for infoType=23 in threaded mode.
-	if (infoType == 23 && pluginId.compare(engine->pluginId(), Qt::CaseInsensitive) == 0)
+	if (infoType == 23 && effectivePluginId.compare(engine->pluginId(), Qt::CaseInsensitive) == 0)
 		return engine->currentCallingPluginId();
 	QVariant value;
 	bool     cacheHit = false;
-	if (tryResolveCallbackPluginInfoValueFromCache(engine, pluginId, infoType, value, cacheHit))
+	if (tryResolveCallbackPluginInfoValueFromCache(engine, effectivePluginId, infoType, value, cacheHit))
 		return value;
 	if (cacheHit)
 		return {};
@@ -32676,7 +32677,8 @@ static QVariant resolvePluginInfoValueForApi(const LuaCallbackEngine *engine, Wo
 	    (callbackNoFlushRuntimeReadBridgeForbidden(engine, inCallback) || syncBridgeForbidden))
 	{
 		bool hasValue = false;
-		if (tryBackfillCallbackPluginInfoValueFromDispatch(engine, pluginId, infoType, value, hasValue))
+		if (tryBackfillCallbackPluginInfoValueFromDispatch(engine, effectivePluginId, infoType, value,
+		                                                   hasValue))
 			return hasValue ? value : QVariant{};
 		return {};
 	}
@@ -32684,7 +32686,7 @@ static QVariant resolvePluginInfoValueForApi(const LuaCallbackEngine *engine, Wo
 	                                       runtime,
 	                                       [&]() -> bool
 	                                       {
-		                                       value = runtime->pluginInfo(pluginId, infoType);
+		                                       value = runtime->pluginInfo(effectivePluginId, infoType);
 		                                       return true;
 	                                       },
 	                                       false)
@@ -32692,13 +32694,13 @@ static QVariant resolvePluginInfoValueForApi(const LuaCallbackEngine *engine, Wo
 	                                       runtime,
 	                                       [&]() -> bool
 	                                       {
-		                                       value = runtime->pluginInfo(pluginId, infoType);
+		                                       value = runtime->pluginInfo(effectivePluginId, infoType);
 		                                       return true;
 	                                       },
 	                                       false);
 	if (!resolved)
 		return {};
-	cacheCallbackPluginInfoValue(engine, pluginId, infoType, value, value.isValid());
+	cacheCallbackPluginInfoValue(engine, effectivePluginId, infoType, value, value.isValid());
 	return value;
 }
 
@@ -41858,8 +41860,8 @@ static int luaWindowText(lua_State *L)
 			return 1;
 		}
 
-		const int result = drawCallbackMiniWindowShadowTextForApi(engine, name, fontId, text, left, top,
-		                                                          right, bottom, colour);
+		const int result =
+		    previewCallbackMiniWindowShadowTextForApi(engine, name, fontId, text, left, top, right, bottom);
 		if (result < 0)
 		{
 			lua_pushnumber(L, result);

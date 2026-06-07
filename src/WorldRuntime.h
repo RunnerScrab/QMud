@@ -1243,6 +1243,10 @@ class WorldRuntime : public QObject
 		 */
 		[[nodiscard]] QVariant    pluginInfo(const QString &pluginId, int infoType) const;
 		/**
+		 * @brief Invalidates plugin metadata caches after native shim runtime state changes.
+		 */
+		void                      notifyNativePluginStateChanged();
+		/**
 		 * @brief Lists installed plugin ids in current order.
 		 * @return Plugin id list.
 		 */

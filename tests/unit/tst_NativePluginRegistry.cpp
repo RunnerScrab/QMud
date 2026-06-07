@@ -92,6 +92,10 @@ void WorldRuntime::outputText(const QString &text, bool, bool)
 	stateFor(this).outputLines.push_back(text);
 }
 
+void WorldRuntime::notifyNativePluginStateChanged()
+{
+}
+
 int WorldRuntime::allocateAcceleratorCommand()
 {
 	return stateFor(this).nextAcceleratorCommand++;
@@ -159,7 +163,8 @@ class tst_NativePluginRegistry : public QObject
 			QCOMPARE(metadata.name, QStringLiteral("MushReader"));
 			QCOMPARE(QMudNativePluginRegistry::pluginInfo(shimId, 1).toString(),
 			         QStringLiteral("MushReader"));
-			QCOMPARE(QMudNativePluginRegistry::pluginInfo(shimId, 17).toBool(), true);
+			QCOMPARE(QMudNativePluginRegistry::pluginInfo(shimId, 17).toBool(), false);
+			QCOMPARE(QMudNativePluginRegistry::pluginInfo(shimId, 17, 0, true).toBool(), true);
 			QCOMPARE(QMudNativePluginRegistry::pluginInfo(shimId, 21, 7).toInt(), 7);
 
 			QCOMPARE(QMudNativePluginRegistry::pluginSupports(shimId, QStringLiteral("say")), eOK);
@@ -320,6 +325,20 @@ class tst_NativePluginRegistry : public QObject
 				}
 			}
 			QVERIFY(found);
+		}
+
+		void passiveSpeechEnabledStateTracksTtsToggle()
+		{
+			WorldRuntime runtime;
+			QMudNativePluginRegistry::setTestSpeechSink(
+			    [](const QMudNativePluginRegistry::TestSpeechEvent &) {});
+			QVERIFY(!QMudNativePluginRegistry::isPassiveSpeechEnabled(&runtime));
+
+			QVERIFY(QMudNativePluginRegistry::handleCommand(&runtime, QStringLiteral("tts")));
+			QVERIFY(QMudNativePluginRegistry::isPassiveSpeechEnabled(&runtime));
+
+			QVERIFY(QMudNativePluginRegistry::handleCommand(&runtime, QStringLiteral("tts")));
+			QVERIFY(!QMudNativePluginRegistry::isPassiveSpeechEnabled(&runtime));
 		}
 
 		void blacklistAndProtectedPluginXmlClassification()

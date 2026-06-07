@@ -171,6 +171,10 @@ WorldRuntime::~WorldRuntime()
 	runtimeStubStates().remove(this);
 }
 
+void WorldRuntime::notifyNativePluginStateChanged()
+{
+}
+
 void WorldRuntime::addScriptTime(qint64 nanos)
 {
 	Q_UNUSED(nanos);
@@ -480,6 +484,21 @@ QList<WorldRuntime::Plugin> &WorldRuntime::pluginsMutable()
 
 QVariant WorldRuntime::pluginInfo(const QString &pluginId, const int infoType) const
 {
+	if (const QString shimId = QMudNativePluginRegistry::resolveShimIdOrName(pluginId); !shimId.isEmpty())
+	{
+		int               visibleIndex = 0;
+		const QStringList ids          = pluginIdList();
+		for (int i = 0; i < ids.size(); ++i)
+		{
+			if (ids.at(i).compare(shimId, Qt::CaseInsensitive) == 0)
+			{
+				visibleIndex = i + 1;
+				break;
+			}
+		}
+		return QMudNativePluginRegistry::pluginInfo(shimId, infoType, visibleIndex,
+		                                            QMudNativePluginRegistry::isPassiveSpeechEnabled(this));
+	}
 	for (const Plugin &plugin : runtimeStubState(this).plugins)
 	{
 		if (plugin.attributes.value(QStringLiteral("id")).compare(pluginId, Qt::CaseInsensitive) != 0)
@@ -2100,7 +2119,10 @@ void tst_LuaCallbackEngine::nativeShimDiscoveryIsAvailableWithoutShadowPlugin()
 	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
 	function OnPluginEnable()
 	  local id = "925cdd0331023d9f0b8f05a7"
-	  shim_info = GetPluginInfo(id, 1) or ""
+	  shim_info = table.concat({
+	    GetPluginInfo(id, 1) or "",
+	    tostring(GetPluginInfo(id, 17) or false)
+	  }, "|")
 	end
 	function shim_info_status(value)
 	  return shim_info
@@ -2119,7 +2141,7 @@ void tst_LuaCallbackEngine::nativeShimDiscoveryIsAvailableWithoutShadowPlugin()
 	request.stringArg    = QStringLiteral("ignored");
 	LuaBatchDispatchResult result;
 	dispatchWorkerAndWait(executor, request, result);
-	QCOMPARE(result.stringResult, QStringLiteral("MushReader"));
+	QCOMPARE(result.stringResult, QStringLiteral("MushReader|false"));
 	QVERIFY(runtime.pluginIdList().contains(shimId, Qt::CaseInsensitive));
 	QCOMPARE(QMudNativePluginRegistry::pluginSupports(shimId, QStringLiteral("say")), eOK);
 	QCOMPARE(QMudNativePluginRegistry::pluginSupports(shimId, QStringLiteral("interrupt")), eOK);

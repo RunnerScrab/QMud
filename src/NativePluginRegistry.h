@@ -112,9 +112,11 @@ namespace QMudNativePluginRegistry
 	 * @param pluginId Shim id.
 	 * @param infoType Legacy info selector.
 	 * @param visibleIndex One-based list index when a shadow row exists, otherwise zero.
+	 * @param enabled Runtime-visible enabled state for info selector 17.
 	 * @return Requested value, or invalid QVariant when unsupported.
 	 */
-	[[nodiscard]] QVariant    pluginInfo(const QString &pluginId, int infoType, int visibleIndex = 0);
+	[[nodiscard]] QVariant    pluginInfo(const QString &pluginId, int infoType, int visibleIndex = 0,
+	                                     bool enabled = false);
 	/**
 	 * @brief Calls a native shim routine from legacy CallPlugin APIs.
 	 * @param runtime Owning runtime.
@@ -153,15 +155,21 @@ namespace QMudNativePluginRegistry
 	 */
 	void             setPassiveSpeechEnabled(const WorldRuntime *runtime, bool enable);
 	/**
+	 * @brief Returns whether passive native MushReader screen/tab speech is active.
+	 * @param runtime Owning runtime.
+	 * @return `true` when passive speech is enabled for the runtime.
+	 */
+	[[nodiscard]] bool isPassiveSpeechEnabled(const WorldRuntime *runtime);
+	/**
 	 * @brief Installs runtime-level native behavior that must exist even without a shadow row.
 	 * @param runtime Owning runtime.
 	 */
-	void             ensureRuntimeSetup(WorldRuntime *runtime);
+	void               ensureRuntimeSetup(WorldRuntime *runtime);
 	/**
 	 * @brief Releases per-runtime native shim state.
 	 * @param runtime Runtime being destroyed.
 	 */
-	void             discardRuntimeState(const WorldRuntime *runtime);
+	void               discardRuntimeState(const WorldRuntime *runtime);
 
 #ifdef QMUD_NATIVEPLUGINREGISTRY_TEST_HOOKS
 	/**
