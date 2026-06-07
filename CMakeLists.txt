@@ -407,6 +407,19 @@ if (QMUD_ENABLE_LUA_SCRIPTING)
     set(QMUD_RESOLVED_LUASOCKET_PROVIDER "${QMUD_LUASOCKET_PROVIDER}")
 
     find_package(Lua 5.4 REQUIRED)
+    if (LUA_VERSION_MAJOR AND LUA_VERSION_MINOR)
+        list(PREPEND QMUD_LUA_MODULE_SEARCH_PATHS
+                "/usr/lib/lua/${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}"
+                "/usr/lib64/lua/${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}"
+                "/usr/local/lib/lua/${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}"
+                "/usr/local/lib64/lua/${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}")
+        if (CMAKE_LIBRARY_ARCHITECTURE)
+            list(PREPEND QMUD_LUA_MODULE_SEARCH_PATHS
+                    "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/lua/${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}"
+                    "/usr/local/lib/${CMAKE_LIBRARY_ARCHITECTURE}/lua/${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}")
+        endif ()
+        list(REMOVE_DUPLICATES QMUD_LUA_MODULE_SEARCH_PATHS)
+    endif ()
     target_compile_definitions(QMud PRIVATE QMUD_ENABLE_LUA_SCRIPTING)
     if (TARGET Lua::Lua)
         target_link_libraries(QMud PRIVATE Lua::Lua)
@@ -500,7 +513,7 @@ if (QMUD_ENABLE_LUA_SCRIPTING)
             find_file(QMUD_SYSTEM_LPEG_SO
                     NAMES lpeg.so
                     PATHS ${QMUD_LUA_MODULE_SEARCH_PATHS}
-                    PATH_SUFFIXES lua/5.4 lua/5.3 lua/5.2 lua/5.1
+                    PATH_SUFFIXES "" lua/5.4 lua/5.3 lua/5.2 lua/5.1
             )
             if (QMUD_SYSTEM_LPEG_SO)
                 set(QMUD_HAS_SYSTEM_LPEG ON)
@@ -670,6 +683,11 @@ set(QMUD_SYSTEM_LUA_SEARCH_PATHS
         /usr/local/share/lua/5.2
         /usr/local/share/lua/5.1
 )
+if (LUA_VERSION_MAJOR AND LUA_VERSION_MINOR)
+    list(PREPEND QMUD_SYSTEM_LUA_SEARCH_PATHS
+            "/usr/share/lua/${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}"
+            "/usr/local/share/lua/${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}")
+endif ()
 if (QMUD_SYSTEM_LUA_MODULES_PREFIX)
     list(PREPEND QMUD_SYSTEM_LUA_SEARCH_PATHS "${QMUD_SYSTEM_LUA_MODULES_PREFIX}")
 endif ()
@@ -837,21 +855,38 @@ if (NOT QMUD_SYSTEM_SSL_CORE_SO)
             NO_CMAKE_FIND_ROOT_PATH
     )
 endif ()
-if (NOT QMUD_SYSTEM_SSL_CORE_SO AND EXISTS "/usr/lib64/lua/5.4/ssl.so")
-    set(QMUD_SYSTEM_SSL_CORE_SO "/usr/lib64/lua/5.4/ssl.so" CACHE FILEPATH
-            "Optional explicit path to system LuaSec C module (ssl/core.so or ssl.so)" FORCE)
-endif ()
-if (NOT QMUD_SYSTEM_SSL_LUA_FILE AND EXISTS "/usr/share/lua/5.4/ssl.lua")
-    set(QMUD_SYSTEM_SSL_LUA_FILE "/usr/share/lua/5.4/ssl.lua" CACHE FILEPATH
-            "Optional explicit path to system LuaSec top-level Lua file (ssl.lua)" FORCE)
-endif ()
-if (NOT QMUD_SYSTEM_SSL_LUA_DIR AND EXISTS "/usr/share/lua/5.4/ssl")
-    set(QMUD_SYSTEM_SSL_LUA_DIR "/usr/share/lua/5.4/ssl" CACHE PATH
-            "Optional explicit path to system LuaSec Lua directory (ssl/*.lua)" FORCE)
-endif ()
-if (NOT QMUD_SYSTEM_SOCKET_CMODULE_DIR AND EXISTS "/usr/lib64/lua/5.4/socket")
-    set(QMUD_SYSTEM_SOCKET_CMODULE_DIR "/usr/lib64/lua/5.4/socket" CACHE PATH
-            "Optional explicit path to system LuaSocket C modules directory (socket/*.so)" FORCE)
+if (LUA_VERSION_MAJOR AND LUA_VERSION_MINOR)
+    set(QMUD_LUA_VERDIR "${LUA_VERSION_MAJOR}.${LUA_VERSION_MINOR}")
+    set(_qmud_libdirs /usr/lib64 /usr/lib /usr/local/lib64 /usr/local/lib)
+    if (CMAKE_LIBRARY_ARCHITECTURE)
+        list(PREPEND _qmud_libdirs
+                "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}"
+                "/usr/local/lib/${CMAKE_LIBRARY_ARCHITECTURE}")
+    endif ()
+    foreach (_qmud_libdir ${_qmud_libdirs})
+        if (NOT QMUD_SYSTEM_SSL_CORE_SO AND EXISTS "${_qmud_libdir}/lua/${QMUD_LUA_VERDIR}/ssl/core.so")
+            set(QMUD_SYSTEM_SSL_CORE_SO "${_qmud_libdir}/lua/${QMUD_LUA_VERDIR}/ssl/core.so" CACHE FILEPATH
+                    "Optional explicit path to system LuaSec C module (ssl/core.so or ssl.so)" FORCE)
+        endif ()
+        if (NOT QMUD_SYSTEM_SSL_CORE_SO AND EXISTS "${_qmud_libdir}/lua/${QMUD_LUA_VERDIR}/ssl.so")
+            set(QMUD_SYSTEM_SSL_CORE_SO "${_qmud_libdir}/lua/${QMUD_LUA_VERDIR}/ssl.so" CACHE FILEPATH
+                    "Optional explicit path to system LuaSec C module (ssl/core.so or ssl.so)" FORCE)
+        endif ()
+        if (NOT QMUD_SYSTEM_SOCKET_CMODULE_DIR AND EXISTS "${_qmud_libdir}/lua/${QMUD_LUA_VERDIR}/socket")
+            set(QMUD_SYSTEM_SOCKET_CMODULE_DIR "${_qmud_libdir}/lua/${QMUD_LUA_VERDIR}/socket" CACHE PATH
+                    "Optional explicit path to system LuaSocket C modules directory (socket/*.so)" FORCE)
+        endif ()
+    endforeach ()
+    foreach (_qmud_sharedir /usr/share/lua /usr/local/share/lua)
+        if (NOT QMUD_SYSTEM_SSL_LUA_FILE AND EXISTS "${_qmud_sharedir}/${QMUD_LUA_VERDIR}/ssl.lua")
+            set(QMUD_SYSTEM_SSL_LUA_FILE "${_qmud_sharedir}/${QMUD_LUA_VERDIR}/ssl.lua" CACHE FILEPATH
+                    "Optional explicit path to system LuaSec top-level Lua file (ssl.lua)" FORCE)
+        endif ()
+        if (NOT QMUD_SYSTEM_SSL_LUA_DIR AND EXISTS "${_qmud_sharedir}/${QMUD_LUA_VERDIR}/ssl")
+            set(QMUD_SYSTEM_SSL_LUA_DIR "${_qmud_sharedir}/${QMUD_LUA_VERDIR}/ssl" CACHE PATH
+                    "Optional explicit path to system LuaSec Lua directory (ssl/*.lua)" FORCE)
+        endif ()
+    endforeach ()
 endif ()
 if (EXISTS "${SKELETON_SRC}")
     file(GLOB_RECURSE SKELETON_FILES CONFIGURE_DEPENDS
@@ -927,7 +962,7 @@ if (EXISTS "${SKELETON_SRC}")
                 "${QMUD_SYSTEM_JSON_LUA_DIR}/*.lua")
     else ()
         set(QMUD_SYSTEM_JSON_LUA_FILES)
-        if (QMUD_ENABLE_LUA_SCRIPTING)
+        if (QMUD_ENABLE_LUA_SCRIPTING AND NOT QMUD_SYSTEM_JSON_TOP_LUA_FILE)
             message(FATAL_ERROR "System Lua JSON module directory not found.")
         endif ()
     endif ()
