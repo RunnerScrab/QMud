@@ -1801,6 +1801,23 @@ if (UNIX AND NOT APPLE)
         endif ()
         get_filename_component(QMUD_APPIMAGE_QT_RUNTIME_ROOT "${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}" DIRECTORY)
 
+        set(QMUD_APPIMAGE_QT_PLUGIN_DIR "")
+        foreach (_qmud_qt_plugin_candidate
+                "${QMUD_APPIMAGE_QT_RUNTIME_ROOT}/plugins"
+                "${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}/qt6/plugins"
+                "${QMUD_APPIMAGE_QT_RUNTIME_ROOT}/lib/qt6/plugins"
+                "${QMUD_APPIMAGE_QT_RUNTIME_ROOT}/lib64/qt6/plugins")
+            if (EXISTS "${_qmud_qt_plugin_candidate}/platforms")
+                set(QMUD_APPIMAGE_QT_PLUGIN_DIR "${_qmud_qt_plugin_candidate}")
+                break()
+            endif ()
+        endforeach ()
+        if (NOT QMUD_APPIMAGE_QT_PLUGIN_DIR)
+            message(WARNING "Could not locate Qt plugins directory; AppImage platform plugins will not be bundled.")
+            set(QMUD_APPIMAGE_QT_PLUGIN_DIR "${QMUD_APPIMAGE_QT_RUNTIME_ROOT}/plugins")
+        endif ()
+        message(STATUS "AppImage Qt plugin dir: ${QMUD_APPIMAGE_QT_PLUGIN_DIR}")
+
         set(QMUD_APPIMAGE_LPEG_SO "${QMUD_SYSTEM_LPEG_SO}")
         if (NOT QMUD_APPIMAGE_LPEG_SO)
             find_file(QMUD_APPIMAGE_LPEG_SO
@@ -2077,7 +2094,7 @@ if (UNIX AND NOT APPLE)
                     COMMAND ${CMAKE_COMMAND} -E env
                     QMUD_APPIMAGE_BUNDLE_GLIBC=1
                     "QMUD_QT_LIB_DIR=$<SHELL_PATH:${QMUD_APPIMAGE_QT_RUNTIME_LIB_DIR}>"
-                    "QMUD_QT_PLUGIN_DIR=$<SHELL_PATH:${QMUD_APPIMAGE_QT_RUNTIME_ROOT}/plugins>"
+                    "QMUD_QT_PLUGIN_DIR=$<SHELL_PATH:${QMUD_APPIMAGE_QT_PLUGIN_DIR}>"
                     /bin/sh
                     "$<SHELL_PATH:${QMUD_APPIMAGE_COLLECT_RUNTIME_SCRIPT}>"
                     "$<SHELL_PATH:${QMUD_APPIMAGE_APPDIR}>"
