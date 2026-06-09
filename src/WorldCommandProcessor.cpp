@@ -2167,7 +2167,9 @@ bool WorldCommandProcessor::evaluateCommand(const QString &input)
 
 	if (matchedAliases.isEmpty())
 	{
-		if (QMudNativePluginRegistry::handleCommand(m_runtime, line))
+		if (QMudNativePluginRegistry::handleMushReaderCommand(m_runtime, line))
+			return false;
+		if (QMudNativePluginRegistry::handleLuaAudioCommand(m_runtime, line))
 			return false;
 
 		auto quitMacroText = QStringLiteral("quit");

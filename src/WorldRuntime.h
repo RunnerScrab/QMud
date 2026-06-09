@@ -3391,6 +3391,21 @@ class WorldRuntime : public QObject
 		 */
 		int playSound(int buffer, const QString &fileName, bool loop, double volume, double pan);
 		/**
+		 * @brief Plays sound file in a buffer slot without firing plugin sound callbacks.
+		 *
+		 * Only native compatibility shims that implement `OnPluginPlaySound` replacement behavior should
+		 * use this API. Normal MUSHclient `Sound` behavior must use `playSound()` so plugins can intercept it.
+		 *
+		 * @param buffer Sound buffer slot index.
+		 * @param fileName Sound file path.
+		 * @param loop Loop playback when `true`.
+		 * @param volume Playback volume.
+		 * @param pan Stereo pan value.
+		 * @return API status code.
+		 */
+		int playSoundBypassingPluginCallbacks(int buffer, const QString &fileName, bool loop, double volume,
+		                                      double pan);
+		/**
 		 * @brief Plays sound from memory bytes.
 		 * @param buffer Sound buffer slot index.
 		 * @param data Encoded audio bytes.
@@ -3406,6 +3421,17 @@ class WorldRuntime : public QObject
 		 * @return API status code.
 		 */
 		int stopSound(int buffer);
+		/**
+		 * @brief Stops playback in a buffer slot without firing plugin sound callbacks.
+		 *
+		 * Only native compatibility shims that implement `OnPluginPlaySound` replacement behavior should
+		 * use this API. Normal MUSHclient `StopSound` behavior must use `stopSound()` so plugins can
+		 * intercept stop-all requests.
+		 *
+		 * @param buffer Sound buffer slot index.
+		 * @return API status code.
+		 */
+		int stopSoundBypassingPluginCallbacks(int buffer);
 		/**
 		 * @brief Returns playback status for buffer slot.
 		 * @param buffer Sound buffer slot index.

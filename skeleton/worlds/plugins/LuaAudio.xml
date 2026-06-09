@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE muclient>
+
+<muclient>
+    <plugin
+            name="LuaAudio"
+            author="Panagiotis Kalogiratos (Nodens)"
+            id="aedf0cb0be5bf045860d54b7"
+            language="Lua"
+            purpose="Native legacy audio compatibility shim"
+            date_written="2026-06-07 00:00:00"
+            requires="11.00"
+            version="11.00"
+    >
+        <description trim="y">
+            <![CDATA[
+QMud native compatibility shim - Legacy XML ignored.
+
+Loading this plugin activates QMud's native LuaAudio compatibility shim. The original LuaAudio Lua and audio.dll code are not loaded or executed; QMud provides the supported LuaAudio APIs natively.
+]]>
+        </description>
+    </plugin>
+</muclient>

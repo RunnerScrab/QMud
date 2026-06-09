@@ -25,13 +25,22 @@ namespace
 {
 	struct RuntimeStubState
 	{
-			QString             startupDirectory;
-			QStringList         outputLines;
-			int                 nextAcceleratorCommand{WorldRuntime::kAcceleratorFirstCommand};
-			QHash<qint64, int>  acceleratorKeyToCommand;
-			QHash<int, QString> acceleratorTextByCommand;
-			QHash<int, int>     acceleratorSendToByCommand;
-			QHash<int, QString> acceleratorPluginByCommand;
+			QString                     startupDirectory;
+			QStringList                 outputLines;
+			QList<WorldRuntime::Plugin> plugins;
+			QHash<int, int>             soundStatusByBuffer;
+			int                         publicPlaySoundCalls{0};
+			int                         directPlaySoundCalls{0};
+			int                         publicStopSoundCalls{0};
+			int                         directStopSoundCalls{0};
+			int                         nextAcceleratorCommand{WorldRuntime::kAcceleratorFirstCommand};
+			QHash<qint64, int>          acceleratorKeyToCommand;
+			QHash<int, QString>         acceleratorTextByCommand;
+			QHash<int, int>             acceleratorSendToByCommand;
+			QHash<int, QString>         acceleratorPluginByCommand;
+			bool                        directPlayRequiresLuaAudioState{false};
+			bool                        directPlayReleasesLuaAudioState{false};
+			bool                        sawLuaAudioStateDuringDirectPlay{false};
 	};
 
 	QHash<const WorldRuntime *, RuntimeStubState> &runtimeStates()
@@ -129,6 +138,113 @@ QString WorldRuntime::acceleratorPluginId(const int commandId) const
 {
 	return stateFor(this).acceleratorPluginByCommand.value(commandId);
 }
+
+int WorldRuntime::playSound(const int buffer, const QString &fileName, const bool loop, double, double)
+{
+	++stateFor(this).publicPlaySoundCalls;
+	return playSoundBypassingPluginCallbacks(buffer, fileName, loop, 0.0, 0.0);
+}
+
+int WorldRuntime::playSoundBypassingPluginCallbacks(const int buffer, const QString &fileName,
+                                                    const bool loop, double, double)
+{
+	++stateFor(this).directPlaySoundCalls;
+	if (fileName.isEmpty())
+	{
+		if (!stateFor(this).soundStatusByBuffer.contains(buffer))
+			return eBadParameter;
+		stateFor(this).soundStatusByBuffer.insert(buffer, loop ? 2 : 1);
+		return eOK;
+	}
+	const int                                            targetBuffer = buffer > 0 ? buffer : 1;
+	QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+	const bool                                           hasLuaAudioState =
+	    QMudNativePluginRegistry::luaAudioRuntimeBufferState(this, targetBuffer, bufferState);
+	if (stateFor(this).directPlayRequiresLuaAudioState)
+		stateFor(this).sawLuaAudioStateDuringDirectPlay = hasLuaAudioState;
+	if (hasLuaAudioState && stateFor(this).directPlayReleasesLuaAudioState)
+		QMudNativePluginRegistry::luaAudioReleaseRuntimeBufferIfGeneration(this, targetBuffer,
+		                                                                   bufferState.generation);
+	stateFor(this).soundStatusByBuffer.insert(targetBuffer, loop ? 2 : 1);
+	return eOK;
+}
+
+int WorldRuntime::stopSound(const int buffer)
+{
+	++stateFor(this).publicStopSoundCalls;
+	return stopSoundBypassingPluginCallbacks(buffer);
+}
+
+int WorldRuntime::stopSoundBypassingPluginCallbacks(const int buffer)
+{
+	++stateFor(this).directStopSoundCalls;
+	RuntimeStubState &state = stateFor(this);
+	if (buffer == 0)
+		state.soundStatusByBuffer.clear();
+	else
+		state.soundStatusByBuffer.remove(buffer);
+	return eOK;
+}
+
+int WorldRuntime::soundStatus(const int buffer) const
+{
+	if (buffer < 1 || buffer > WorldRuntime::kMaxSoundBuffers)
+		return -1;
+	return stateFor(this).soundStatusByBuffer.value(buffer, -2);
+}
+
+const QList<WorldRuntime::Plugin> &WorldRuntime::plugins() const
+{
+	return stateFor(this).plugins;
+}
+
+QList<WorldRuntime::Plugin> &WorldRuntime::pluginsMutable()
+{
+	return stateFor(this).plugins;
+}
+
+bool WorldRuntime::enablePlugin(const QString &pluginId, const bool enable)
+{
+	const QString shimId = QMudNativePluginRegistry::resolveShimIdOrName(pluginId);
+	const QString id     = shimId.isEmpty() ? pluginId.trimmed().toLower() : shimId;
+	for (Plugin &plugin : stateFor(this).plugins)
+	{
+		if (plugin.attributes.value(QStringLiteral("id")).compare(id, Qt::CaseInsensitive) != 0)
+			continue;
+		if (plugin.nativeShim && id == QMudNativePluginRegistry::mushReaderPluginId())
+			QMudNativePluginRegistry::setMushReaderPassiveSpeechEnabled(this, enable);
+		if (plugin.nativeShim && id == QMudNativePluginRegistry::luaAudioPluginId() && !enable)
+			QMudNativePluginRegistry::luaAudioStopRuntime(this);
+		plugin.enabled = enable;
+		plugin.attributes.insert(QStringLiteral("enabled"),
+		                         enable ? QStringLiteral("1") : QStringLiteral("0"));
+		return true;
+	}
+	return QMudNativePluginRegistry::isShimId(id);
+}
+
+bool WorldRuntime::unloadPlugin(const QString &pluginId, QString *error)
+{
+	const QString     shimId = QMudNativePluginRegistry::resolveShimIdOrName(pluginId);
+	const QString     id     = shimId.isEmpty() ? pluginId.trimmed().toLower() : shimId;
+	RuntimeStubState &state  = stateFor(this);
+	for (int i = 0; i < state.plugins.size(); ++i)
+	{
+		if (state.plugins.at(i).attributes.value(QStringLiteral("id")).compare(id, Qt::CaseInsensitive) != 0)
+			continue;
+		if (state.plugins.at(i).nativeShim && id == QMudNativePluginRegistry::mushReaderPluginId())
+			QMudNativePluginRegistry::setMushReaderPassiveSpeechEnabled(this, false);
+		if (state.plugins.at(i).nativeShim && id == QMudNativePluginRegistry::luaAudioPluginId())
+			QMudNativePluginRegistry::luaAudioStopRuntime(this);
+		state.plugins.removeAt(i);
+		return true;
+	}
+	if (QMudNativePluginRegistry::isShimId(id))
+		return true;
+	if (error)
+		*error = QStringLiteral("Plugin not found");
+	return false;
+}
 // NOLINTEND(readability-convert-member-functions-to-static,readability-make-member-function-const)
 
 /**
@@ -152,10 +268,14 @@ class tst_NativePluginRegistry : public QObject
 
 		void shimMetadataAndRoutineSurface()
 		{
-			const QString shimId = QMudNativePluginRegistry::mushReaderPluginId();
+			const QString shimId      = QMudNativePluginRegistry::mushReaderPluginId();
+			const QString audioShimId = QMudNativePluginRegistry::luaAudioPluginId();
 			QVERIFY(QMudNativePluginRegistry::isShimId(shimId));
+			QVERIFY(QMudNativePluginRegistry::isShimId(audioShimId));
 			QVERIFY(QMudNativePluginRegistry::isProtectedId(shimId));
+			QVERIFY(QMudNativePluginRegistry::isProtectedId(audioShimId));
 			QCOMPARE(QMudNativePluginRegistry::resolveShimIdOrName(QStringLiteral("MushReader")), shimId);
+			QCOMPARE(QMudNativePluginRegistry::resolveShimIdOrName(QStringLiteral("LuaAudio")), audioShimId);
 
 			QMudNativePluginRegistry::NativePluginMetadata metadata;
 			QVERIFY(QMudNativePluginRegistry::metadataForShim(shimId, metadata));
@@ -174,6 +294,18 @@ class tst_NativePluginRegistry : public QObject
 			         eOK);
 			QCOMPARE(QMudNativePluginRegistry::pluginSupports(shimId, QStringLiteral("missing")),
 			         eNoSuchRoutine);
+
+			QVERIFY(QMudNativePluginRegistry::metadataForShim(audioShimId, metadata));
+			QCOMPARE(metadata.id, audioShimId);
+			QCOMPARE(metadata.name, QStringLiteral("LuaAudio"));
+			QCOMPARE(metadata.source, QStringLiteral("qmud:native/LuaAudio"));
+			QCOMPARE(QMudNativePluginRegistry::pluginInfo(audioShimId, 1).toString(),
+			         QStringLiteral("LuaAudio"));
+			QCOMPARE(QMudNativePluginRegistry::pluginSupports(audioShimId, QStringLiteral("play")), eOK);
+			QCOMPARE(QMudNativePluginRegistry::pluginSupports(audioShimId, QStringLiteral("setVol")), eOK);
+			QCOMPARE(
+			    QMudNativePluginRegistry::pluginSupports(audioShimId, QStringLiteral("plugin_update_url")),
+			    eOK);
 		}
 
 		void callPluginRoutesToNativeSpeech()
@@ -201,6 +333,29 @@ class tst_NativePluginRegistry : public QObject
 			QCOMPARE(update.errorCode, eOK);
 			QCOMPARE(update.returnValues.size(), 1);
 			QCOMPARE(update.returnValues.constFirst().toString(), QStringLiteral("qmud:native/MushReader"));
+			const QMudNativePluginRegistry::NativeCallResult audioUpdate =
+			    QMudNativePluginRegistry::callRoutine(&runtime, QMudNativePluginRegistry::luaAudioPluginId(),
+			                                          QStringLiteral("plugin_update_url"), {});
+			QCOMPARE(audioUpdate.errorCode, eOK);
+			QCOMPARE(audioUpdate.returnValues.size(), 1);
+			QCOMPARE(audioUpdate.returnValues.constFirst().toString(),
+			         QStringLiteral("qmud:native/LuaAudio"));
+			QTemporaryDir soundRoot;
+			QVERIFY(soundRoot.isValid());
+			QVERIFY(QDir(soundRoot.path()).mkpath(QStringLiteral("sounds")));
+			QFile soundFile(QDir(soundRoot.path()).filePath(QStringLiteral("sounds/coin.wav")));
+			QVERIFY(soundFile.open(QIODevice::WriteOnly));
+			soundFile.write("RIFF");
+			soundFile.close();
+			stateFor(&runtime).startupDirectory = soundRoot.path();
+			const QMudNativePluginRegistry::NativeCallResult audioPlay =
+			    QMudNativePluginRegistry::callRoutine(&runtime, QMudNativePluginRegistry::luaAudioPluginId(),
+			                                          QStringLiteral("play"),
+			                                          {QStringLiteral("coin.wav"), false, 0.0, 100.0});
+			QCOMPARE(audioPlay.errorCode, eOK);
+			QCOMPARE(audioPlay.returnValues.size(), 1);
+			QCOMPARE(audioPlay.returnValues.constFirst().typeId(), QMetaType::Int);
+			QCOMPARE(audioPlay.returnValues.constFirst().toInt(), 1);
 
 			QCOMPARE(events.size(), 3);
 			QCOMPARE(events.at(0).text, QStringLiteral("       line"));
@@ -211,6 +366,240 @@ class tst_NativePluginRegistry : public QObject
 			QCOMPARE(QMudNativePluginRegistry::callRoutine(&runtime, shimId, QStringLiteral("missing"), {})
 			             .errorCode,
 			         eNoSuchRoutine);
+		}
+
+		void luaAudioRuntimeStateIsSharedAndMutable()
+		{
+			WorldRuntime  runtime;
+			QTemporaryDir soundRoot;
+			QVERIFY(soundRoot.isValid());
+			QVERIFY(QDir(soundRoot.path()).mkpath(QStringLiteral("sounds")));
+			QFile soundFile(QDir(soundRoot.path()).filePath(QStringLiteral("sounds/coin.wav")));
+			QVERIFY(soundFile.open(QIODevice::WriteOnly));
+			soundFile.write("RIFF");
+			soundFile.close();
+			stateFor(&runtime).startupDirectory = soundRoot.path();
+
+			const QString audioId = QMudNativePluginRegistry::luaAudioPluginId();
+			const QMudNativePluginRegistry::NativeCallResult delayedPlay =
+			    QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("playDelay"),
+			                                          {QStringLiteral("coin.wav"), 10.0, 0.0, 100.0});
+			QCOMPARE(delayedPlay.errorCode, eOK);
+			QCOMPARE(delayedPlay.returnValues.size(), 1);
+			QCOMPARE(delayedPlay.returnValues.constFirst().toInt(), 1);
+			QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).size(), 1);
+
+			QCOMPARE(
+			    QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("setVol"), {25.0, 1})
+			        .errorCode,
+			    eOK);
+			QCOMPARE(
+			    QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("setPan"), {3.0, 1})
+			        .errorCode,
+			    eOK);
+			QCOMPARE(
+			    QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("setPitch"), {7.0, 1})
+			        .errorCode,
+			    eOK);
+
+			QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+			QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeBufferState(&runtime, 1, bufferState));
+			QCOMPARE(bufferState.volume, 25.0);
+			QCOMPARE(bufferState.pan, 3.0);
+			QCOMPARE(bufferState.pitch, 7.0);
+
+			const QMudNativePluginRegistry::NativeCallResult volume =
+			    QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("getVolume"), {1});
+			QCOMPARE(volume.errorCode, eOK);
+			QCOMPARE(volume.returnValues.size(), 1);
+			QCOMPARE(volume.returnValues.constFirst().toDouble(), 25.0);
+
+			const int reserved = QMudNativePluginRegistry::luaAudioReserveRuntimeBuffer(
+			    &runtime, [](const int) { return -2; });
+			QCOMPARE(reserved, 2);
+			QMudNativePluginRegistry::luaAudioReleaseRuntimeBuffer(&runtime, reserved);
+
+			QCOMPARE(QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("stop"), {1})
+			             .errorCode,
+			         eOK);
+			QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+
+			QCOMPARE(
+			    QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("setVol"), {33.0})
+			        .errorCode,
+			    eOK);
+			const QMudNativePluginRegistry::NativeCallResult resetPlay =
+			    QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("playDelay"),
+			                                          {QStringLiteral("coin.wav"), 10.0, 0.0, 33.0});
+			QCOMPARE(resetPlay.errorCode, eOK);
+			QCOMPARE(resetPlay.returnValues.constFirst().toInt(), 1);
+			QVERIFY(!QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+			QCOMPARE(QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("slideVol"),
+			                                               {10.0, 1, 0.02})
+			             .errorCode,
+			         eOK);
+			QCOMPARE(
+			    QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("fadeout"), {1, 0.02})
+			        .errorCode,
+			    eOK);
+			QMudNativePluginRegistry::luaAudioResetRuntime(&runtime);
+			QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+			QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeMasterState(&runtime).volume, 100.0);
+			const QMudNativePluginRegistry::NativeCallResult postResetPlay =
+			    QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("play"),
+			                                          {QStringLiteral("coin.wav"), false, 0.0, 33.0});
+			QCOMPARE(postResetPlay.errorCode, eOK);
+			QCOMPARE(postResetPlay.returnValues.constFirst().toInt(), 1);
+			QTest::qWait(60);
+			QMudNativePluginRegistry::LuaAudioRuntimeBufferState postResetState;
+			QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeBufferState(&runtime, 1, postResetState));
+			QCOMPARE(postResetState.volume, 33.0);
+			QCOMPARE(stateFor(&runtime).soundStatusByBuffer.value(1), 1);
+
+			stateFor(&runtime).soundStatusByBuffer.insert(1, 0);
+			const QMudNativePluginRegistry::NativeCallResult transientStoppedPlay =
+			    QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("play"),
+			                                          {QStringLiteral("coin.wav"), false, 0.0, 44.0});
+			QCOMPARE(transientStoppedPlay.errorCode, eOK);
+			QCOMPARE(transientStoppedPlay.returnValues.constFirst().toInt(), 2);
+			QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).size(), 2);
+			QMudNativePluginRegistry::luaAudioReleaseRuntimeBuffer(&runtime, 2);
+			static_cast<void>(runtime.stopSoundBypassingPluginCallbacks(2));
+
+			QVERIFY(QMudNativePluginRegistry::luaAudioReleaseRuntimeBufferIfGeneration(
+			    &runtime, 1, postResetState.generation));
+			const QMudNativePluginRegistry::NativeCallResult reclaimedPlay =
+			    QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("play"),
+			                                          {QStringLiteral("coin.wav"), false, 0.0, 55.0});
+			QCOMPARE(reclaimedPlay.errorCode, eOK);
+			QCOMPARE(reclaimedPlay.returnValues.constFirst().toInt(), 1);
+			QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).size(), 1);
+			QMudNativePluginRegistry::LuaAudioRuntimeBufferState reclaimedState;
+			QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeBufferState(&runtime, 1, reclaimedState));
+			QCOMPARE(reclaimedState.volume, 55.0);
+			QCOMPARE(stateFor(&runtime).soundStatusByBuffer.value(1), 1);
+
+			QMudNativePluginRegistry::luaAudioReleaseRuntimeBuffer(&runtime, 1);
+			static_cast<void>(runtime.stopSoundBypassingPluginCallbacks(1));
+			stateFor(&runtime).directPlayRequiresLuaAudioState = true;
+			stateFor(&runtime).directPlayReleasesLuaAudioState = true;
+			const QMudNativePluginRegistry::NativeCallResult immediateReleasePlay =
+			    QMudNativePluginRegistry::callRoutine(&runtime, audioId, QStringLiteral("play"),
+			                                          {QStringLiteral("coin.wav"), false, 0.0, 65.0});
+			QCOMPARE(immediateReleasePlay.errorCode, eOK);
+			QCOMPARE(immediateReleasePlay.returnValues.constFirst().toInt(), 1);
+			QVERIFY(stateFor(&runtime).sawLuaAudioStateDuringDirectPlay);
+			QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+		}
+
+		void luaAudioCommandsAndPlaySoundCallbackMirrorLegacyPlugin()
+		{
+			WorldRuntime  runtime;
+			QTemporaryDir soundRoot;
+			QVERIFY(soundRoot.isValid());
+			QVERIFY(QDir(soundRoot.path()).mkpath(QStringLiteral("sounds")));
+			QFile soundFile(QDir(soundRoot.path()).filePath(QStringLiteral("sounds/coin.wav")));
+			QVERIFY(soundFile.open(QIODevice::WriteOnly));
+			soundFile.write("RIFF");
+			soundFile.close();
+			stateFor(&runtime).startupDirectory = soundRoot.path();
+
+			QVERIFY(
+			    !QMudNativePluginRegistry::handleLuaAudioCommand(&runtime, QStringLiteral("LuaAudio help")));
+			QVERIFY(!QMudNativePluginRegistry::handleLuaAudioPlaySound(&runtime, QStringLiteral("pan=15")));
+			QVERIFY(stateFor(&runtime).outputLines.isEmpty());
+			QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeMasterState(&runtime).pan, 0.0);
+
+			WorldRuntime::Plugin audioPlugin;
+			audioPlugin.enabled    = false;
+			audioPlugin.nativeShim = true;
+			audioPlugin.attributes.insert(QStringLiteral("id"), QMudNativePluginRegistry::luaAudioPluginId());
+			stateFor(&runtime).plugins.push_back(audioPlugin);
+			QVERIFY(!QMudNativePluginRegistry::handleLuaAudioCommand(&runtime, QStringLiteral("LuaAudio")));
+
+			stateFor(&runtime).plugins.back().enabled = true;
+
+			QVERIFY(
+			    QMudNativePluginRegistry::handleLuaAudioCommand(&runtime, QStringLiteral("LuaAudio help")));
+			QVERIFY(stateFor(&runtime).outputLines.constLast().contains(QStringLiteral("LuaAudio")));
+
+			QVERIFY(QMudNativePluginRegistry::handleLuaAudioCommand(&runtime, QStringLiteral("volume_down")));
+			QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeMasterState(&runtime).volume, 95.0);
+			QVERIFY(
+			    QMudNativePluginRegistry::handleLuaAudioCommand(&runtime, QStringLiteral("sound_toggle")));
+			QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeMasterState(&runtime).volume, 0.0);
+			QVERIFY(
+			    QMudNativePluginRegistry::handleLuaAudioCommand(&runtime, QStringLiteral("sound_toggle")));
+			QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeMasterState(&runtime).volume, 95.0);
+
+			QVERIFY(QMudNativePluginRegistry::handleLuaAudioPlaySound(&runtime, QStringLiteral("pan=15")));
+			QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeMasterState(&runtime).pan, 15.0);
+			QVERIFY(QMudNativePluginRegistry::handleLuaAudioPlaySound(&runtime, QStringLiteral("volume=45")));
+			QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeMasterState(&runtime).volume, 45.0);
+			QVERIFY(QMudNativePluginRegistry::handleLuaAudioPlaySound(&runtime, QStringLiteral("freq=3")));
+			QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeMasterState(&runtime).pitch, 3.0);
+
+			QVERIFY(QMudNativePluginRegistry::handleLuaAudioPlaySound(&runtime, QStringLiteral("coin.wav")));
+			QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).size(), 1);
+			QCOMPARE(runtime.soundStatus(1), 1);
+			QCOMPARE(stateFor(&runtime).publicPlaySoundCalls, 0);
+			QCOMPARE(stateFor(&runtime).directPlaySoundCalls, 1);
+			QVERIFY(QMudNativePluginRegistry::handleLuaAudioPlaySound(&runtime, QString()));
+			QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+			QCOMPARE(runtime.soundStatus(1), -2);
+			QCOMPARE(stateFor(&runtime).publicStopSoundCalls, 0);
+			QCOMPARE(stateFor(&runtime).directStopSoundCalls, 1);
+
+			stateFor(&runtime).directPlayRequiresLuaAudioState  = true;
+			stateFor(&runtime).directPlayReleasesLuaAudioState  = true;
+			stateFor(&runtime).sawLuaAudioStateDuringDirectPlay = false;
+			QVERIFY(
+			    QMudNativePluginRegistry::handleLuaAudioPlaySound(&runtime, QStringLiteral("loop=coin.wav")));
+			QVERIFY(stateFor(&runtime).sawLuaAudioStateDuringDirectPlay);
+			QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+			QVERIFY(
+			    QMudNativePluginRegistry::handleLuaAudioPlaySound(&runtime, QStringLiteral("stop=coin.wav")));
+			QCOMPARE(stateFor(&runtime).directStopSoundCalls, 1);
+			stateFor(&runtime).directPlayRequiresLuaAudioState = false;
+			stateFor(&runtime).directPlayReleasesLuaAudioState = false;
+			stateFor(&runtime).soundStatusByBuffer.remove(1);
+
+			QVERIFY(
+			    QMudNativePluginRegistry::handleLuaAudioPlaySound(&runtime, QStringLiteral("loop=coin.wav")));
+			QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).size(), 1);
+			QCOMPARE(runtime.soundStatus(1), 2);
+			QVERIFY(
+			    QMudNativePluginRegistry::handleLuaAudioPlaySound(&runtime, QStringLiteral("stop=coin.wav")));
+			QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+			QCOMPARE(runtime.soundStatus(1), -2);
+			QCOMPARE(stateFor(&runtime).publicStopSoundCalls, 0);
+			QCOMPARE(stateFor(&runtime).directStopSoundCalls, 2);
+
+			QVERIFY(
+			    QMudNativePluginRegistry::handleLuaAudioPlaySound(&runtime, QStringLiteral("loop=coin.wav")));
+			QVERIFY(!QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+			QVERIFY(runtime.enablePlugin(QMudNativePluginRegistry::luaAudioPluginId(), false));
+			QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+			QCOMPARE(runtime.soundStatus(1), -2);
+			QCOMPARE(stateFor(&runtime).publicStopSoundCalls, 0);
+			QCOMPARE(stateFor(&runtime).directStopSoundCalls, 3);
+			QVERIFY(
+			    !QMudNativePluginRegistry::handleLuaAudioCommand(&runtime, QStringLiteral("LuaAudio help")));
+
+			QVERIFY(runtime.enablePlugin(QMudNativePluginRegistry::luaAudioPluginId(), true));
+			QVERIFY(
+			    QMudNativePluginRegistry::handleLuaAudioPlaySound(&runtime, QStringLiteral("loop=coin.wav")));
+			QVERIFY(!QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+			QString unloadError;
+			QVERIFY(runtime.unloadPlugin(QMudNativePluginRegistry::luaAudioPluginId(), &unloadError));
+			QVERIFY(unloadError.isEmpty());
+			QVERIFY(stateFor(&runtime).plugins.isEmpty());
+			QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+			QCOMPARE(runtime.soundStatus(1), -2);
+			QCOMPARE(stateFor(&runtime).publicStopSoundCalls, 0);
+			QCOMPARE(stateFor(&runtime).directStopSoundCalls, 4);
+			QVERIFY(
+			    !QMudNativePluginRegistry::handleLuaAudioCommand(&runtime, QStringLiteral("LuaAudio help")));
 		}
 
 		void commandFallbackAndSubstitutionBehavior()
@@ -225,11 +614,14 @@ class tst_NativePluginRegistry : public QObject
 			    [&events](const QMudNativePluginRegistry::TestSpeechEvent &event)
 			    { events.push_back(event); });
 
-			QVERIFY(QMudNativePluginRegistry::handleCommand(&runtime, QStringLiteral("tts_note hello")));
-			QVERIFY(QMudNativePluginRegistry::handleCommand(&runtime, QStringLiteral("tts_interrupt now")));
-			QVERIFY(QMudNativePluginRegistry::handleCommand(&runtime, QStringLiteral("tts_stop")));
-			QVERIFY(QMudNativePluginRegistry::handleCommand(&runtime, QStringLiteral("MushReader help")));
-			QVERIFY(QMudNativePluginRegistry::handleCommand(
+			QVERIFY(QMudNativePluginRegistry::handleMushReaderCommand(&runtime,
+			                                                          QStringLiteral("tts_note hello")));
+			QVERIFY(QMudNativePluginRegistry::handleMushReaderCommand(&runtime,
+			                                                          QStringLiteral("tts_interrupt now")));
+			QVERIFY(QMudNativePluginRegistry::handleMushReaderCommand(&runtime, QStringLiteral("tts_stop")));
+			QVERIFY(QMudNativePluginRegistry::handleMushReaderCommand(&runtime,
+			                                                          QStringLiteral("MushReader help")));
+			QVERIFY(QMudNativePluginRegistry::handleMushReaderCommand(
 			    &runtime, QStringLiteral("subst add source line==replacement line")));
 
 			QCOMPARE(events.size(), 3);
@@ -242,27 +634,30 @@ class tst_NativePluginRegistry : public QObject
 			QVERIFY(QFileInfo::exists(dir.filePath(QStringLiteral("substitutions.mush"))));
 
 			events.clear();
-			QMudNativePluginRegistry::handleScreenDraw(&runtime, 1, 0, QStringLiteral("source line"));
+			QMudNativePluginRegistry::handleMushReaderScreenDraw(&runtime, 1, 0,
+			                                                     QStringLiteral("source line"));
 			QVERIFY(events.isEmpty());
-			QVERIFY(QMudNativePluginRegistry::handleCommand(&runtime, QStringLiteral("tts")));
+			QVERIFY(QMudNativePluginRegistry::handleMushReaderCommand(&runtime, QStringLiteral("tts")));
 			QVERIFY(events.size() >= 2);
 			QVERIFY(events.at(events.size() - 2).stop);
 			QCOMPARE(events.constLast().text, QStringLiteral("speech on"));
 
 			events.clear();
-			QMudNativePluginRegistry::handleScreenDraw(&runtime, 1, 0, QStringLiteral("source line"));
+			QMudNativePluginRegistry::handleMushReaderScreenDraw(&runtime, 1, 0,
+			                                                     QStringLiteral("source line"));
 			QCOMPARE(events.size(), 1);
 			QCOMPARE(events.constFirst().text, QStringLiteral("replacement line"));
 
-			QVERIFY(
-			    QMudNativePluginRegistry::handleCommand(&runtime, QStringLiteral("subst add muted==!skip")));
+			QVERIFY(QMudNativePluginRegistry::handleMushReaderCommand(
+			    &runtime, QStringLiteral("subst add muted==!skip")));
 			events.clear();
-			QMudNativePluginRegistry::handleScreenDraw(&runtime, 1, 0, QStringLiteral("muted"));
+			QMudNativePluginRegistry::handleMushReaderScreenDraw(&runtime, 1, 0, QStringLiteral("muted"));
 			QVERIFY(events.isEmpty());
 
-			QVERIFY(QMudNativePluginRegistry::handleCommand(&runtime, QStringLiteral("subst off")));
+			QVERIFY(QMudNativePluginRegistry::handleMushReaderCommand(&runtime, QStringLiteral("subst off")));
 			events.clear();
-			QMudNativePluginRegistry::handleScreenDraw(&runtime, 1, 0, QStringLiteral("source line"));
+			QMudNativePluginRegistry::handleMushReaderScreenDraw(&runtime, 1, 0,
+			                                                     QStringLiteral("source line"));
 			QVERIFY(events.isEmpty());
 		}
 
@@ -274,42 +669,42 @@ class tst_NativePluginRegistry : public QObject
 			    [&events](const QMudNativePluginRegistry::TestSpeechEvent &event)
 			    { events.push_back(event); });
 
-			QMudNativePluginRegistry::handleScreenDraw(&runtime, 2, 0, QStringLiteral("ignored"));
+			QMudNativePluginRegistry::handleMushReaderScreenDraw(&runtime, 2, 0, QStringLiteral("ignored"));
 			QVERIFY(events.isEmpty());
-			QMudNativePluginRegistry::handleScreenDraw(&runtime, 1, 0, QStringLiteral("spoken"));
-			QVERIFY(events.isEmpty());
-
-			QMudNativePluginRegistry::handleTabComplete(&runtime, QStringLiteral("north"));
+			QMudNativePluginRegistry::handleMushReaderScreenDraw(&runtime, 1, 0, QStringLiteral("spoken"));
 			QVERIFY(events.isEmpty());
 
-			QVERIFY(QMudNativePluginRegistry::handleCommand(&runtime, QStringLiteral("tts")));
+			QMudNativePluginRegistry::handleMushReaderTabComplete(&runtime, QStringLiteral("north"));
+			QVERIFY(events.isEmpty());
+
+			QVERIFY(QMudNativePluginRegistry::handleMushReaderCommand(&runtime, QStringLiteral("tts")));
 			QCOMPARE(events.size(), 2);
 			QVERIFY(events.at(0).stop);
 			QCOMPARE(events.at(1).text, QStringLiteral("speech on"));
 			QVERIFY(events.at(1).interrupt);
 
-			QMudNativePluginRegistry::handleScreenDraw(&runtime, 1, 0, QStringLiteral("spoken"));
+			QMudNativePluginRegistry::handleMushReaderScreenDraw(&runtime, 1, 0, QStringLiteral("spoken"));
 			QCOMPARE(events.size(), 3);
 			QCOMPARE(events.at(2).text, QStringLiteral("spoken"));
 
-			QMudNativePluginRegistry::handleTabComplete(&runtime, QStringLiteral("north"));
+			QMudNativePluginRegistry::handleMushReaderTabComplete(&runtime, QStringLiteral("north"));
 			QCOMPARE(events.size(), 4);
 			QCOMPARE(events.at(3).text, QStringLiteral("north"));
 
-			QVERIFY(QMudNativePluginRegistry::handleCommand(&runtime, QStringLiteral("tts")));
+			QVERIFY(QMudNativePluginRegistry::handleMushReaderCommand(&runtime, QStringLiteral("tts")));
 			QCOMPARE(events.size(), 6);
 			QVERIFY(events.at(4).stop);
 			QCOMPARE(events.at(5).text, QStringLiteral("speech off"));
 			QVERIFY(events.at(5).interrupt);
 
-			QMudNativePluginRegistry::handleScreenDraw(&runtime, 1, 0, QStringLiteral("muted"));
+			QMudNativePluginRegistry::handleMushReaderScreenDraw(&runtime, 1, 0, QStringLiteral("muted"));
 			QCOMPARE(events.size(), 6);
 		}
 
 		void runtimeSetupRegistersNativeAccelerator()
 		{
 			WorldRuntime runtime;
-			QMudNativePluginRegistry::ensureRuntimeSetup(&runtime);
+			QMudNativePluginRegistry::ensureMushReaderRuntimeSetup(&runtime);
 
 			bool found = false;
 			for (auto it = stateFor(&runtime).acceleratorKeyToCommand.constBegin();
@@ -332,13 +727,32 @@ class tst_NativePluginRegistry : public QObject
 			WorldRuntime runtime;
 			QMudNativePluginRegistry::setTestSpeechSink(
 			    [](const QMudNativePluginRegistry::TestSpeechEvent &) {});
-			QVERIFY(!QMudNativePluginRegistry::isPassiveSpeechEnabled(&runtime));
+			QVERIFY(!QMudNativePluginRegistry::isMushReaderPassiveSpeechEnabled(&runtime));
 
-			QVERIFY(QMudNativePluginRegistry::handleCommand(&runtime, QStringLiteral("tts")));
-			QVERIFY(QMudNativePluginRegistry::isPassiveSpeechEnabled(&runtime));
+			QVERIFY(QMudNativePluginRegistry::handleMushReaderCommand(&runtime, QStringLiteral("tts")));
+			QVERIFY(QMudNativePluginRegistry::isMushReaderPassiveSpeechEnabled(&runtime));
 
-			QVERIFY(QMudNativePluginRegistry::handleCommand(&runtime, QStringLiteral("tts")));
-			QVERIFY(!QMudNativePluginRegistry::isPassiveSpeechEnabled(&runtime));
+			QVERIFY(QMudNativePluginRegistry::handleMushReaderCommand(&runtime, QStringLiteral("tts")));
+			QVERIFY(!QMudNativePluginRegistry::isMushReaderPassiveSpeechEnabled(&runtime));
+
+			WorldRuntime::Plugin mushReaderPlugin;
+			mushReaderPlugin.nativeShim = true;
+			mushReaderPlugin.enabled    = true;
+			mushReaderPlugin.attributes.insert(QStringLiteral("id"),
+			                                   QMudNativePluginRegistry::mushReaderPluginId());
+			stateFor(&runtime).plugins.push_back(mushReaderPlugin);
+
+			QVERIFY(runtime.enablePlugin(QMudNativePluginRegistry::mushReaderPluginId(), true));
+			QVERIFY(QMudNativePluginRegistry::isMushReaderPassiveSpeechEnabled(&runtime));
+			QVERIFY(runtime.enablePlugin(QMudNativePluginRegistry::mushReaderPluginId(), false));
+			QVERIFY(!QMudNativePluginRegistry::isMushReaderPassiveSpeechEnabled(&runtime));
+			QVERIFY(runtime.enablePlugin(QMudNativePluginRegistry::mushReaderPluginId(), true));
+			QVERIFY(QMudNativePluginRegistry::isMushReaderPassiveSpeechEnabled(&runtime));
+
+			QString unloadError;
+			QVERIFY(runtime.unloadPlugin(QMudNativePluginRegistry::mushReaderPluginId(), &unloadError));
+			QVERIFY(unloadError.isEmpty());
+			QVERIFY(!QMudNativePluginRegistry::isMushReaderPassiveSpeechEnabled(&runtime));
 		}
 
 		void blacklistAndProtectedPluginXmlClassification()
@@ -358,7 +772,8 @@ class tst_NativePluginRegistry : public QObject
 			QTemporaryDir dir;
 			QVERIFY(dir.isValid());
 			for (const QString &id :
-			     blacklistIds + QStringList{QMudNativePluginRegistry::mushReaderPluginId()})
+			     blacklistIds + QStringList{QMudNativePluginRegistry::mushReaderPluginId(),
+			                                QMudNativePluginRegistry::luaAudioPluginId()})
 			{
 				const QString path = writePluginXml(dir, id, QStringLiteral("package.loadlib('x','y')"));
 				QVERIFY(!path.isEmpty());

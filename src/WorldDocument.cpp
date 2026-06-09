@@ -8,6 +8,7 @@
 
 #include "WorldDocument.h"
 
+#include "NativePluginRegistry.h"
 #include "Version.h"
 
 #include <QDir>
@@ -17,8 +18,6 @@
 #include <algorithm>
 
 static constexpr auto kNativePluginIncludePrefix = "qmud:native/";
-static constexpr auto kMushReaderNativePlugin    = "MushReader";
-static constexpr auto kMushReaderNativePluginId  = "925cdd0331023d9f0b8f05a7";
 
 static QString        normalizeVirtualNativePluginInclude(QString name)
 {
@@ -36,18 +35,18 @@ static bool makeVirtualNativePlugin(const QString &rawName, WorldDocument::Plugi
 		return false;
 
 	const QString nativeName = name.mid(QString::fromLatin1(kNativePluginIncludePrefix).size());
-	if (nativeName.compare(QLatin1String(kMushReaderNativePlugin), Qt::CaseInsensitive) != 0)
+	QMudNativePluginRegistry::NativePluginMetadata metadata;
+	if (!QMudNativePluginRegistry::metadataForNativeName(nativeName, metadata))
 		return false;
 
-	plugin.attributes.insert(QStringLiteral("id"), QString::fromLatin1(kMushReaderNativePluginId));
-	plugin.attributes.insert(QStringLiteral("name"), QString::fromLatin1(kMushReaderNativePlugin));
-	plugin.attributes.insert(QStringLiteral("author"), QStringLiteral("QMud native compatibility layer"));
-	plugin.attributes.insert(QStringLiteral("purpose"),
-	                         QStringLiteral("Native screen-reader compatibility shim"));
-	plugin.attributes.insert(QStringLiteral("language"), QStringLiteral("native"));
-	plugin.attributes.insert(QStringLiteral("source"), QStringLiteral("qmud:native/MushReader"));
-	plugin.attributes.insert(QStringLiteral("directory"), QStringLiteral("qmud:native/"));
-	plugin.description = QStringLiteral("QMud native compatibility shim - Legacy XML ignored.");
+	plugin.attributes.insert(QStringLiteral("id"), metadata.id);
+	plugin.attributes.insert(QStringLiteral("name"), metadata.name);
+	plugin.attributes.insert(QStringLiteral("author"), metadata.author);
+	plugin.attributes.insert(QStringLiteral("purpose"), metadata.purpose);
+	plugin.attributes.insert(QStringLiteral("language"), metadata.language);
+	plugin.attributes.insert(QStringLiteral("source"), metadata.source);
+	plugin.attributes.insert(QStringLiteral("directory"), metadata.directory);
+	plugin.description = QMudNativePluginRegistry::nativeShimMarkerText();
 	return true;
 }
 
@@ -1179,7 +1178,7 @@ bool WorldDocument::expandIncludesPass(const QString &worldFilePath, const QStri
 
 		const QString pluginFlag = include.attributes.value(QStringLiteral("plugin")).toLower();
 		const bool    isPlugin   = (pluginFlag == QStringLiteral("y") || pluginFlag == QStringLiteral("1") ||
-                               pluginFlag == QStringLiteral("true"));
+		                            pluginFlag == QStringLiteral("true"));
 		if (isPlugin != wantPlugins)
 			continue;
 		if (isPlugin)
@@ -1482,15 +1481,15 @@ QString WorldDocument::resolveIncludePath(const QString &rawName, const QString 
 
 	const QString explicitRelativeLower      = explicitRelativeWithoutCurrentDir.toLower();
 	const bool    explicitStartsPortableRoot = explicitRelativeLower == QStringLiteral("worlds") ||
-	                                        explicitRelativeLower.startsWith(QStringLiteral("worlds/")) ||
-	                                        explicitRelativeLower == QStringLiteral("logs") ||
-	                                        explicitRelativeLower.startsWith(QStringLiteral("logs/"));
+	                                           explicitRelativeLower.startsWith(QStringLiteral("worlds/")) ||
+	                                           explicitRelativeLower == QStringLiteral("logs") ||
+	                                           explicitRelativeLower.startsWith(QStringLiteral("logs/"));
 
 	const QString normalizedLower    = nativeName.toLower();
 	const bool    startsPortableRoot = normalizedLower == QStringLiteral("worlds") ||
-	                                normalizedLower.startsWith(QStringLiteral("worlds/")) ||
-	                                normalizedLower == QStringLiteral("logs") ||
-	                                normalizedLower.startsWith(QStringLiteral("logs/"));
+	                                   normalizedLower.startsWith(QStringLiteral("worlds/")) ||
+	                                   normalizedLower == QStringLiteral("logs") ||
+	                                   normalizedLower.startsWith(QStringLiteral("logs/"));
 
 	if (isExplicitRelative)
 	{
