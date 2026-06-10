@@ -3579,7 +3579,7 @@ class tst_WorldView_Basic : public QObject
 
 			appendFakeRuntimeOutputText(view,
 			                            QStringLiteral("one two three four five six seven eight nine ten "
-			                                           "eleven twelve thirteen fourteen"),
+			                                           "eleven twelve thirteen fourteen!"),
 			                            {}, true, true);
 			QCoreApplication::processEvents();
 			nativeCanvas->update();
