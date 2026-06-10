@@ -327,7 +327,11 @@ void WorldChildWindow::bindRuntime(WorldRuntime *worldRuntime, const RuntimeBind
 		        [this]
 		        {
 			        if (MainWindowHost *main = resolveMainWindowHost(window()))
+			        {
+				        main->setConnectedState(false);
+				        main->refreshTitleBar();
 				        main->updateActivityToolbarButtons();
+			        }
 		        });
 		connect(
 		    worldRuntime, &WorldRuntime::socketError, this,
@@ -517,11 +521,6 @@ void WorldChildWindow::bindRuntime(WorldRuntime *worldRuntime, const RuntimeBind
 				    const QString msg = QStringLiteral("The \"%1\" server has closed the connection")
 				                            .arg(disconnectedWorldName);
 				    main->showStatusMessage(msg, 5000);
-			    }
-			    if (MainWindowHost *main = resolveMainWindowHost(window()))
-			    {
-				    main->setConnectedState(false);
-				    main->refreshTitleBar();
 			    }
 			    if (m_commandProcessor)
 				    m_commandProcessor->handleWorldDisconnected();
