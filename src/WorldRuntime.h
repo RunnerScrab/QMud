@@ -5307,7 +5307,8 @@ class WorldRuntime : public QObject
 		 * @param error Optional output error message.
 		 * @return API status code.
 		 */
-		int  savePluginStateForPlugin(Plugin &plugin, bool scripted, QString *error);
+		int  savePluginStateForPlugin(Plugin &plugin, bool scripted, QString *error,
+		                              bool skipLuaDispatch = false);
 		/**
 		 * @brief Sorts plugins by sequence ordering.
 		 */

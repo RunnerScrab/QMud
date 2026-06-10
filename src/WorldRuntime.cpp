@@ -4267,8 +4267,24 @@ WorldRuntime::~WorldRuntime()
 	for (auto &plugin : m_plugins)
 	{
 		if (plugin.lua && hasValidPluginId(plugin))
-			dispatchSingleEngineNoArgCallback(plugin.lua, QStringLiteral("OnPluginClose"), true);
-		savePluginStateForPlugin(plugin, false, nullptr);
+		{
+			// Bypass queuePluginCallbackDispatch: snapshot capture/destruction during teardown
+			// crashes (commandUiValues dtor; pthread_cond_timedwait on partially-torn-down state)
+			const auto dispatchTeardownCallback = [&](const QString &fn)
+			{
+				LuaBatchDispatchRequest req;
+				req.kind          = LuaBatchDispatchKind::NoArgs;
+				req.lane          = LuaBatchDispatchLane::Callback;
+				req.engines       = {plugin.lua};
+				req.defaultResult = true;
+				req.functionName  = fn;
+				static_cast<void>(dispatchLuaBatch(req));
+			};
+			dispatchTeardownCallback(QStringLiteral("OnPluginClose"));
+			if (plugin.saveState)
+				dispatchTeardownCallback(QStringLiteral("OnPluginSaveState"));
+		}
+		savePluginStateForPlugin(plugin, false, nullptr, /*skipLuaDispatch=*/true);
 	}
 	m_pluginCallbackDispatchShuttingDown = true;
 
@@ -21520,7 +21536,8 @@ int WorldRuntime::savePluginState(const QString &pluginId, bool scripted, QStrin
 	return savePluginStateForPlugin(m_plugins[index], scripted, error);
 }
 
-int WorldRuntime::savePluginStateForPlugin(Plugin &plugin, bool scripted, QString *error)
+int WorldRuntime::savePluginStateForPlugin(Plugin &plugin, bool scripted, QString *error,
+                                           bool skipLuaDispatch)
 {
 	if (!scripted && !plugin.saveState)
 		return eOK;
@@ -21543,7 +21560,7 @@ int WorldRuntime::savePluginStateForPlugin(Plugin &plugin, bool scripted, QStrin
 		return scripted ? ePluginCouldNotSaveState : eOK;
 
 	plugin.savingStateNow = true;
-	if (plugin.lua)
+	if (plugin.lua && !skipLuaDispatch)
 		dispatchSingleEngineNoArgCallback(plugin.lua, QStringLiteral("OnPluginSaveState"), true);
 	plugin.savingStateNow = false;
 
