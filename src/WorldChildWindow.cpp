@@ -300,9 +300,7 @@ void WorldChildWindow::bindRuntime(WorldRuntime *worldRuntime, const RuntimeBind
 			                      flag.compare(QStringLiteral("y"), Qt::CaseInsensitive) == 0 ||
 			                      flag == QStringLiteral("1") ||
 			                      flag.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
-			    if (!show && !suppressConnectNote)
-				    return;
-			    if (!suppressConnectNote)
+			    if (show && !suppressConnectNote)
 			    {
 				    const QString when =
 				        QDateTime::currentDateTime().toString(QStringLiteral("dddd, MMMM dd, yyyy, h:mm AP"));
