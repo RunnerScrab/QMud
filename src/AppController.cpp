@@ -5549,7 +5549,6 @@ void AppController::emitStartupBanner(WorldRuntime *runtime)
 
 	constexpr QRgb bannerFore = qRgb(0, 170, 255);
 	constexpr QRgb bannerBack = qRgb(0, 0, 0);
-	constexpr QRgb linkFore   = qRgb(0, 255, 255);
 
 	auto           emitStyledNote = [runtime](const QString &text, const bool newLine)
 	{
@@ -5563,20 +5562,6 @@ void AppController::emitStartupBanner(WorldRuntime *runtime)
 		span.fore    = QColor::fromRgb(bannerFore);
 		span.back    = QColor::fromRgb(bannerBack);
 		span.changed = true;
-		runtime->outputStyledText(text, {span}, true, newLine);
-	};
-
-	auto emitStyledLink = [runtime](const QString &url, const QString &text, const bool newLine)
-	{
-		WorldRuntime::StyleSpan span;
-		span.length     = static_cast<int>(text.size());
-		span.fore       = QColor::fromRgb(linkFore);
-		span.back       = QColor::fromRgb(bannerBack);
-		span.underline  = true;
-		span.changed    = true;
-		span.actionType = WorldRuntime::ActionHyperlink;
-		span.action     = url;
-		span.hint       = text;
 		runtime->outputStyledText(text, {span}, true, newLine);
 	};
 
@@ -5596,11 +5581,6 @@ void AppController::emitStartupBanner(WorldRuntime *runtime)
 	                   .arg(QStringLiteral(LUA_RELEASE), QStringLiteral(QT_VERSION_STR),
 	                        QString::fromLatin1(zlibVersion())),
 	               true);
-	emitStyledNote(QString(), true);
-	emitStyledNote(QStringLiteral("For information and assistance about QMud visit the CthulhuMUD Discord: "),
-	               false);
-	emitStyledLink(QStringLiteral("https://discord.gg/secxwnTJCq"),
-	               QStringLiteral("https://discord.gg/secxwnTJCq"), true);
 	emitStyledNote(QString(), true);
 }
 
@@ -13672,11 +13652,6 @@ void AppController::handleAppAbout()
 	QLabel copyright(QStringLiteral("Copyright (C) 2026 Panagiotis Kalogiratos\n"), &dialog);
 	textLayout->addWidget(&copyright);
 
-	QLabel support(QStringLiteral("Support (CthulhuMUD Discord): <a href=\"%1\">%1</a>")
-	                   .arg(QStringLiteral("https://discord.gg/secxwnTJCq")),
-	               &dialog);
-	support.setOpenExternalLinks(true);
-	textLayout->addWidget(&support);
 	QLabel disclaimer(
 	    QStringLiteral(
 	        "See License Agreement and GPL v3 for limitation of liability for use of this program."),
