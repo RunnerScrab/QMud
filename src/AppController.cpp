@@ -5210,6 +5210,7 @@ bool AppController::openWorldDocument(const QString &path)
 		applyConfiguredWorldDefaults(runtime);
 		if (auto *view = window->view())
 			view->applyRuntimeSettings();
+		m_mainWindow->refreshActionState();
 		const auto worldName = runtime->worldAttributes().value(QStringLiteral("name")).trimmed();
 		if (!worldName.isEmpty())
 		{
