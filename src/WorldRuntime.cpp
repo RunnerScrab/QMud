@@ -4264,14 +4264,6 @@ WorldRuntime::~WorldRuntime()
 	}
 	m_view = nullptr;
 
-	for (auto &plugin : m_plugins)
-	{
-		if (plugin.lua && hasValidPluginId(plugin))
-			dispatchSingleEngineNoArgCallback(plugin.lua, QStringLiteral("OnPluginClose"), true);
-		savePluginStateForPlugin(plugin, false, nullptr);
-	}
-	m_pluginCallbackDispatchShuttingDown = true;
-
 	QVector<QSharedPointer<LuaCallbackEngine>> enginesToTeardown;
 	enginesToTeardown.reserve((m_luaCallbacks ? 1 : 0) + m_plugins.size());
 	for (auto &plugin : m_plugins)
@@ -4283,6 +4275,30 @@ WorldRuntime::~WorldRuntime()
 	if (m_luaCallbacks)
 		enginesToTeardown.push_back(makeNonOwningLuaEngineRef(m_luaCallbacks));
 	cancelSuspendedPluginCallbackDispatchesForEngines(enginesToTeardown);
+
+	const auto dispatchTeardownCallback = [this](const QSharedPointer<LuaCallbackEngine> &lua,
+	                                             const QString                            &fn)
+	{
+		LuaBatchDispatchRequest req;
+		req.kind          = LuaBatchDispatchKind::NoArgs;
+		req.lane          = LuaBatchDispatchLane::Callback;
+		req.engines       = {lua};
+		req.defaultResult = true;
+		req.functionName  = fn;
+		static_cast<void>(dispatchLuaBatch(req));
+	};
+
+	for (auto &plugin : m_plugins)
+	{
+		if (plugin.lua && hasValidPluginId(plugin))
+		{
+			dispatchTeardownCallback(plugin.lua, QStringLiteral("OnPluginClose"));
+			if (plugin.saveState)
+				dispatchTeardownCallback(plugin.lua, QStringLiteral("OnPluginSaveState"));
+		}
+		savePluginStateForPlugin(plugin, false, nullptr, true);
+	}
+	m_pluginCallbackDispatchShuttingDown = true;
 	for (auto &plugin : m_plugins)
 		plugin.lua.clear();
 	dispatchTeardownLuaEngines(enginesToTeardown, true);
@@ -21520,7 +21536,8 @@ int WorldRuntime::savePluginState(const QString &pluginId, bool scripted, QStrin
 	return savePluginStateForPlugin(m_plugins[index], scripted, error);
 }
 
-int WorldRuntime::savePluginStateForPlugin(Plugin &plugin, bool scripted, QString *error)
+int WorldRuntime::savePluginStateForPlugin(Plugin &plugin, bool scripted, QString *error,
+                                           bool skipLuaDispatch)
 {
 	if (!scripted && !plugin.saveState)
 		return eOK;
@@ -21543,7 +21560,7 @@ int WorldRuntime::savePluginStateForPlugin(Plugin &plugin, bool scripted, QStrin
 		return scripted ? ePluginCouldNotSaveState : eOK;
 
 	plugin.savingStateNow = true;
-	if (plugin.lua)
+	if (plugin.lua && !skipLuaDispatch)
 		dispatchSingleEngineNoArgCallback(plugin.lua, QStringLiteral("OnPluginSaveState"), true);
 	plugin.savingStateNow = false;
 
