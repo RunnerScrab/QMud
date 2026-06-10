@@ -4296,6 +4296,20 @@ WorldRuntime::~WorldRuntime()
 	}
 	m_view = nullptr;
 
+	// Cancel suspended modal coroutines before OnPluginClose: resuming a yielded coroutine
+	// during teardown corrupts the heap via stale pointers in lua_resume
+	QVector<QSharedPointer<LuaCallbackEngine>> enginesToTeardown;
+	enginesToTeardown.reserve((m_luaCallbacks ? 1 : 0) + m_plugins.size());
+	for (auto &plugin : m_plugins)
+	{
+		if (!plugin.lua)
+			continue;
+		enginesToTeardown.push_back(plugin.lua);
+	}
+	if (m_luaCallbacks)
+		enginesToTeardown.push_back(makeNonOwningLuaEngineRef(m_luaCallbacks));
+	cancelSuspendedPluginCallbackDispatchesForEngines(enginesToTeardown);
+
 	for (auto &plugin : m_plugins)
 	{
 		if (plugin.lua && hasValidPluginId(plugin))
@@ -4319,18 +4333,6 @@ WorldRuntime::~WorldRuntime()
 		savePluginStateForPlugin(plugin, false, nullptr, /*skipLuaDispatch=*/true);
 	}
 	m_pluginCallbackDispatchShuttingDown = true;
-
-	QVector<QSharedPointer<LuaCallbackEngine>> enginesToTeardown;
-	enginesToTeardown.reserve((m_luaCallbacks ? 1 : 0) + m_plugins.size());
-	for (auto &plugin : m_plugins)
-	{
-		if (!plugin.lua)
-			continue;
-		enginesToTeardown.push_back(plugin.lua);
-	}
-	if (m_luaCallbacks)
-		enginesToTeardown.push_back(makeNonOwningLuaEngineRef(m_luaCallbacks));
-	cancelSuspendedPluginCallbackDispatchesForEngines(enginesToTeardown);
 	for (auto &plugin : m_plugins)
 		plugin.lua.clear();
 	dispatchTeardownLuaEngines(enginesToTeardown, true);
