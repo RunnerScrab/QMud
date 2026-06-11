@@ -23762,6 +23762,17 @@ static QString qmudHomeRelativePathForGetInfo(const LuaCallbackEngine *engine, c
 	return QMudPluginPathUtils::qmudHomeRelativePath(qmudHomeForLuaFileApi(engine), path, trailingSlash);
 }
 
+static QString qmudHomeDirectoryForGetInfo56(const LuaCallbackEngine *engine)
+{
+	QString root = qmudHomeForLuaFileApi(engine);
+	if (root.trimmed().isEmpty())
+		root = QCoreApplication::applicationDirPath();
+	root = QMudPluginPathUtils::normalizeSeparators(root);
+	if (!root.endsWith(QLatin1Char('/')))
+		root += QLatin1Char('/');
+	return root;
+}
+
 static void pushLuaString(lua_State *L, const QString &value)
 {
 	const QByteArray bytes = value.toLocal8Bit();
@@ -24004,7 +24015,7 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	}
 	case 56:
-		pushLuaString(L, QMudPluginPathUtils::normalizeSeparators(QCoreApplication::applicationFilePath()));
+		pushLuaString(L, qmudHomeDirectoryForGetInfo56(engine));
 		return 1;
 	case 57:
 	{
@@ -25743,8 +25754,7 @@ static void reportLuaError(const LuaCallbackEngine &engine, const QString &messa
 				if (bool parsedKeyword = false; parseBooleanKeywordValue(flag, parsedKeyword))
 					toOutput = parsedKeyword;
 			}
-			if ((toOutput || targetRuntime.forceScriptErrorOutputToWorld()) &&
-			    !targetRuntime.suppressScriptErrorOutputToWorld())
+			if (toOutput && !targetRuntime.suppressScriptErrorOutputToWorld())
 			{
 				targetRuntime.outputText(message, true, true);
 				return true;
@@ -25770,94 +25780,6 @@ static void reportLuaError(const LuaCallbackEngine &engine, const QString &messa
 			return;
 	}
 	qWarning() << message;
-}
-
-static int luaReportRequireFailure(lua_State *L)
-{
-	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	if (!engine)
-		return 0;
-
-	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
-	if (!runtime)
-		return 0;
-
-	const QString module  = QString::fromUtf8(luaL_optstring(L, 1, ""));
-	const QString details = QString::fromUtf8(luaL_optstring(L, 2, ""));
-	if (activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
-	{
-		enqueueRuntimeThreadDeferredMutationNoResult(
-		    engine, runtime,
-		    [module, details](WorldRuntime &targetRuntime)
-		    {
-			    if (!targetRuntime.forceScriptErrorOutputToWorld())
-				    return;
-			    const QString message =
-			        module.isEmpty()
-			            ? QStringLiteral("Lua require failed: %1")
-			                  .arg(details.isEmpty() ? QStringLiteral("unknown") : details)
-			            : QStringLiteral("Lua require failed for module '%1': %2")
-			                  .arg(module, details.isEmpty() ? QStringLiteral("unknown") : details);
-
-			    const QString logFlag =
-			        targetRuntime.worldAttributeValue(QStringLiteral("log_script_errors"));
-			    bool logErrors = isEnabledValue(logFlag);
-			    if (!logErrors)
-			    {
-				    if (bool parsedKeyword = false; parseBooleanKeywordValue(logFlag, parsedKeyword))
-					    logErrors = parsedKeyword;
-			    }
-			    if (logErrors)
-			    {
-				    QString       logDir     = targetRuntime.defaultLogDirectory();
-				    const QString startupDir = targetRuntime.startupDirectory();
-				    if (logDir.isEmpty())
-					    logDir = startupDir;
-				    else if (QDir::isRelativePath(logDir) && !startupDir.isEmpty())
-					    logDir = QDir(startupDir).filePath(logDir);
-
-				    QDir dir(logDir.isEmpty() ? QDir::currentPath() : logDir);
-				    if (!dir.exists())
-					    dir.mkpath(QStringLiteral("."));
-				    QFile file(dir.filePath(QStringLiteral("script_error_log.txt")));
-				    if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
-				    {
-					    QTextStream out(&file);
-					    out << "\n--- Scripting error on "
-					        << QDateTime::currentDateTime().toString(
-					               QStringLiteral("dddd, MMMM d, yyyy, h:mm AP"))
-					        << " ---\n";
-					    out << message << "\n";
-				    }
-			    }
-
-			    const QString flag =
-			        targetRuntime.worldAttributeValue(QStringLiteral("script_errors_to_output_window"));
-			    bool toOutput = isEnabledValue(flag);
-			    if (!toOutput)
-			    {
-				    if (bool parsedKeyword = false; parseBooleanKeywordValue(flag, parsedKeyword))
-					    toOutput = parsedKeyword;
-			    }
-			    if ((toOutput || targetRuntime.forceScriptErrorOutputToWorld()) &&
-			        !targetRuntime.suppressScriptErrorOutputToWorld())
-			    {
-				    targetRuntime.outputText(message, true, true);
-			    }
-		    });
-		return 0;
-	}
-	if (!runOnRuntimeThread(
-	        runtime, [&]() -> bool { return runtime->forceScriptErrorOutputToWorld(); }, false))
-		return 0;
-
-	const QString message = module.isEmpty()
-	                            ? QStringLiteral("Lua require failed: %1")
-	                                  .arg(details.isEmpty() ? QStringLiteral("unknown") : details)
-	                            : QStringLiteral("Lua require failed for module '%1': %2")
-	                                  .arg(module, details.isEmpty() ? QStringLiteral("unknown") : details);
-	reportLuaError(*engine, message);
-	return 0;
 }
 
 static bool optBool(lua_State *L, const int index, const bool defaultValue)
@@ -40385,12 +40307,7 @@ static int luaGetPluginVariable(lua_State *L)
 		return 1;
 	}
 	const QString pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
-	if (pluginId.isEmpty())
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const QString name = QString::fromUtf8(luaL_checkstring(L, 2));
+	const QString name     = QString::fromUtf8(luaL_checkstring(L, 2));
 	QString       value;
 	bool          pluginAvailable = false;
 	if (!resolveVariableValueForApi(engine, runtime, pluginId, name, value, pluginAvailable))
@@ -44641,7 +44558,7 @@ static int luaTestGetInfo(lua_State *L)
 	const int     infoType = static_cast<int>(luaL_checkinteger(L, 1));
 	if (infoType == 56)
 	{
-		pushLuaString(L, QMudPluginPathUtils::normalizeSeparators(QCoreApplication::applicationFilePath()));
+		pushLuaString(L, qmudHomeDirectoryForGetInfo56(engine));
 		return 1;
 	}
 	if (!runtime)
@@ -44974,25 +44891,27 @@ void LuaCallbackEngine::registerWorldBindings()
 		lua_setglobal(m_state, name);
 	};
 	static const LuaBindingEntry kMinimalWorldBindings[] = {
-	    {"ColourNote",           luaColourNote           },
-	    {"ColourTell",           luaColourTell           },
-	    {"GetInfo",              luaTestGetInfo          },
-	    {"GetPluginID",          luaGetPluginID          },
-	    {"GetPluginInfo",        luaGetPluginInfo        },
-	    {"GetPluginName",        luaGetPluginName        },
-	    {"Note",	             luaNote                 },
-	    {"SaveState",            luaTestSaveState        },
-	    {"Tell",	             luaTell                 },
-	    {"TestYieldModalNumber", luaTestYieldModalNumber },
-	    {"TestYieldModalString", luaTestYieldModalString },
-	    {"WindowAddHotspot",     luaTestWindowAddHotspot },
-	    {"WindowCreate",         luaTestWindowCreate     },
-	    {"WindowHotspotList",    luaTestWindowHotspotList},
-	    {"WindowInfo",           luaTestWindowInfo       },
-	    {"WindowList",           luaTestWindowList       },
-	    {"WindowPosition",       luaTestWindowPosition   },
-	    {"WindowResize",         luaTestWindowResize     },
-	    {nullptr,                nullptr                 },
+	    {"ColourNote",            luaColourNote           },
+	    {"ColourTell",            luaColourTell           },
+	    {"GetInfo",               luaTestGetInfo          },
+	    {"GetPluginID",           luaGetPluginID          },
+	    {"GetPluginInfo",         luaGetPluginInfo        },
+	    {"GetPluginName",         luaGetPluginName        },
+	    {"GetPluginVariable",     luaGetPluginVariable    },
+	    {"GetPluginVariableList", luaGetPluginVariableList},
+	    {"Note",	              luaNote                 },
+	    {"SaveState",             luaTestSaveState        },
+	    {"Tell",	              luaTell                 },
+	    {"TestYieldModalNumber",  luaTestYieldModalNumber },
+	    {"TestYieldModalString",  luaTestYieldModalString },
+	    {"WindowAddHotspot",      luaTestWindowAddHotspot },
+	    {"WindowCreate",          luaTestWindowCreate     },
+	    {"WindowHotspotList",     luaTestWindowHotspotList},
+	    {"WindowInfo",            luaTestWindowInfo       },
+	    {"WindowList",            luaTestWindowList       },
+	    {"WindowPosition",        luaTestWindowPosition   },
+	    {"WindowResize",          luaTestWindowResize     },
+	    {nullptr,                 nullptr                 },
 	};
 	for (const LuaBindingEntry *entry = kMinimalWorldBindings; entry->name != nullptr; ++entry)
 		registerWorldFn(entry->name, entry->function);
@@ -45485,10 +45404,6 @@ void LuaCallbackEngine::registerWorldBindings()
 	};
 	for (const auto &[name, function] : kWorldBindings)
 		registerWorldFn(name, function);
-
-	lua_pushlightuserdata(m_state, this);
-	lua_pushcclosure(m_state, luaReportRequireFailure, 1);
-	lua_setglobal(m_state, "__qmud_report_require_failure");
 
 	for (const char *name : kWorldLibNames)
 	{

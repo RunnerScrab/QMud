@@ -89,7 +89,7 @@
     {"tls_disable_certificate_validation", false, 0, 0, OPT_PLUGIN_CANNOT_WRITE},
     {"re_evaluate_auto_say", false, 0, 0, 0}, {"save_deleted_command", false, 0, 0, 0},
     {"autosave_minutes", 60, 0, 100000, 0}, {"save_world_automatically", false, 0, 0, 0},
-    {"script_reload_option", eReloadConfirm, 0, 2, 0}, {"script_errors_to_output_window", false, 0, 0, 0},
+    {"script_reload_option", eReloadConfirm, 0, 2, 0}, {"script_errors_to_output_window", true, 0, 0, 0},
     {"send_echo", false, 0, 0, 0}, {"send_file_commented_softcode", false, 0, 0, 0},
     {"send_file_delay", 0, 0, 100000, 0}, {"send_file_delay_per_lines", 1, 1, 100000, 0},
     {"send_keep_alives", 0, 0, 0, 0}, {"send_mxp_afk_response", true, 0, 0, 0},

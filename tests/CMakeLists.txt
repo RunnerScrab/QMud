@@ -156,13 +156,6 @@ qmud_add_qtest(tst_TraceDispatchUtils
         LABELS
         unit)
 
-qmud_add_qtest(tst_ScriptErrorRoutingUtils
-        SOURCES
-        unit/tst_ScriptErrorRoutingUtils.cpp
-        "${CMAKE_SOURCE_DIR}/src/helpers/WorldCommandProcessorUtils.cpp"
-        LABELS
-        unit)
-
 qmud_add_qtest(tst_TtsEngine
         SOURCES
         unit/tst_TtsEngine.cpp
@@ -660,6 +653,17 @@ qmud_add_qtest(tst_WorldCommandProcessor_SendTargets
         integration
         TIMEOUT
         20)
+
+qmud_add_qtest(tst_WorldCommandProcessor_Trigger
+        GUI
+        SOURCES
+        integration/tst_WorldCommandProcessor_Trigger.cpp
+        LIBRARIES
+        qmud_app_core
+        LABELS
+        integration
+        TIMEOUT
+        120)
 
 qmud_add_qtest(tst_WorldCommandProcessor_Queueing
         SOURCES

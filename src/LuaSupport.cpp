@@ -634,10 +634,6 @@ if require and not rawget(_G, "__qmud_require_compat_wrapped") then
   function require(name)
     local ok, mod_or_err = pcall(_require, name)
     if not ok then
-      local hook = rawget(_G, "__qmud_report_require_failure")
-      if type(hook) == "function" then
-        pcall(hook, tostring(name), tostring(mod_or_err))
-      end
       error(mod_or_err, 2)
     end
     local mod = mod_or_err

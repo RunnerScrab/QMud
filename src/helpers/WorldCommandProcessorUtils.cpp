@@ -302,11 +302,3 @@ namespace QMudTriggerSound
 		return worldTriggerSoundsEnabled;
 	}
 } // namespace QMudTriggerSound
-
-namespace QMudScriptErrorRouting
-{
-	bool shouldForceWorldErrorOutput(const bool hasRuntime, const bool hasPluginScript)
-	{
-		return hasRuntime && !hasPluginScript;
-	}
-} // namespace QMudScriptErrorRouting

@@ -12786,6 +12786,7 @@ int WorldRuntime::deleteVariable(const QString &name)
 			m_variables.removeAt(i);
 			m_variableCount    = safeQSizeToInt(m_variables.size());
 			m_variablesChanged = true;
+			invalidateLuaCallbackDispatchSnapshot();
 			return eOK;
 		}
 	}
@@ -16873,22 +16874,6 @@ int WorldRuntime::outputWindowRedrawCount() const
 bool WorldRuntime::suppressScriptErrorOutputToWorld() const
 {
 	return m_inDrawOutputWindowCallback || m_inScreendrawCallback;
-}
-
-bool WorldRuntime::forceScriptErrorOutputToWorld() const
-{
-	return m_forceScriptErrorOutputDepth > 0;
-}
-
-void WorldRuntime::pushForceScriptErrorOutputToWorld()
-{
-	++m_forceScriptErrorOutputDepth;
-}
-
-void WorldRuntime::popForceScriptErrorOutputToWorld()
-{
-	if (m_forceScriptErrorOutputDepth > 0)
-		--m_forceScriptErrorOutputDepth;
 }
 
 void WorldRuntime::notifyOutputSelectionChanged()
@@ -24967,9 +24952,8 @@ void WorldRuntime::continuePendingPluginInstallAsync(QVector<QString> pendingPlu
 			continue;
 
 		QSharedPointer<LuaCallbackEngine> installEngine = plugin.lua;
-		pushForceScriptErrorOutputToWorld();
 
-		LuaBatchDispatchRequest installRequest;
+		LuaBatchDispatchRequest           installRequest;
 		installRequest.kind          = LuaBatchDispatchKind::NoArgs;
 		installRequest.engines       = {installEngine};
 		installRequest.functionName  = QStringLiteral("OnPluginInstall");
@@ -24983,7 +24967,6 @@ void WorldRuntime::continuePendingPluginInstallAsync(QVector<QString> pendingPlu
 			    const int currentIndex = findPluginIndex(m_plugins, pluginId);
 			    if (currentIndex < 0)
 			    {
-				    popForceScriptErrorOutputToWorld();
 				    continuePendingPluginInstallAsync(std::move(pendingPluginIds), true);
 				    return;
 			    }
@@ -25005,14 +24988,12 @@ void WorldRuntime::continuePendingPluginInstallAsync(QVector<QString> pendingPlu
 				    invalidateLuaCallbackDispatchSnapshot();
 				    if (!m_loadingDocument)
 					    m_worldFileModified = true;
-				    popForceScriptErrorOutputToWorld();
 				    continuePendingPluginInstallAsync(std::move(pendingPluginIds), true);
 				    return;
 			    }
 			    if (!currentPlugin.disableAfterInstall)
 			    {
 				    clearInstallPending();
-				    popForceScriptErrorOutputToWorld();
 				    continuePendingPluginInstallAsync(std::move(pendingPluginIds), true);
 				    return;
 			    }
@@ -25022,7 +25003,6 @@ void WorldRuntime::continuePendingPluginInstallAsync(QVector<QString> pendingPlu
 				    currentPlugin.attributes.insert(QStringLiteral("enabled"), QStringLiteral("0"));
 				    currentPlugin.disableAfterInstall = false;
 				    clearInstallPending();
-				    popForceScriptErrorOutputToWorld();
 				    continuePendingPluginInstallAsync(std::move(pendingPluginIds), true);
 				    return;
 			    }
@@ -25048,7 +25028,6 @@ void WorldRuntime::continuePendingPluginInstallAsync(QVector<QString> pendingPlu
 					        m_plugins[disabledIndex].installPending = false;
 					        invalidatePluginCallbackPresenceCache();
 				        }
-				        popForceScriptErrorOutputToWorld();
 				        continuePendingPluginInstallAsync(std::move(pendingPluginIds), true);
 			        });
 		    });

@@ -4437,19 +4437,6 @@ class WorldRuntime : public QObject
 		 */
 		[[nodiscard]] bool    suppressScriptErrorOutputToWorld() const;
 		/**
-		 * @brief Returns whether startup/install callbacks force script errors to world output.
-		 * @return `true` when startup/install callbacks should always show script errors in world output.
-		 */
-		[[nodiscard]] bool    forceScriptErrorOutputToWorld() const;
-		/**
-		 * @brief Increments forced script-error output depth.
-		 */
-		void                  pushForceScriptErrorOutputToWorld();
-		/**
-		 * @brief Decrements forced script-error output depth.
-		 */
-		void                  popForceScriptErrorOutputToWorld();
-		/**
 		 * @brief Returns draw-output notification count.
 		 * @return Output-window redraw count.
 		 */
@@ -5687,7 +5674,6 @@ class WorldRuntime : public QObject
 		bool                                            m_inCancelSoundPluginCallback{false};
 		bool                                            m_inScreendrawCallback{false};
 		bool                                            m_inDrawOutputWindowCallback{false};
-		int                                             m_forceScriptErrorOutputDepth{0};
 		int                                             m_suppressWorldOutputResizedCallbacks{0};
 		bool                                            m_pluginInstallDeferred{false};
 		bool                                            m_pluginInstallInProgress{false};

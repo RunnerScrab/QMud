@@ -66,45 +66,6 @@ class tst_WorldCommandProcessor_SendTargets : public QObject
 		{
 			QCOMPARE(QMudCommandText::fixupEscapeSequences(QStringLiteral("abc\\")), QStringLiteral("abc"));
 		}
-
-		void triggerMatchTargetPreservesTrailingWhitespaceForRegexp()
-		{
-			const QString line = QStringLiteral("<274hp 930sp 448st> ");
-			QCOMPARE(QMudCommandText::normalizeTriggerMatchLine(line, true), line);
-		}
-
-		void triggerMatchTargetTrimsTrailingWhitespaceForWildcard()
-		{
-			const QString line = QStringLiteral("<274hp 930sp 448st> \t");
-			QCOMPARE(QMudCommandText::normalizeTriggerMatchLine(line, false),
-			         QStringLiteral("<274hp 930sp 448st>"));
-		}
-
-		void triggerMultilineTargetPreservesTrailingWhitespaceForRegexp()
-		{
-			const QStringList lines = {QStringLiteral("line 1 "), QStringLiteral("line 2\t")};
-			QCOMPARE(QMudCommandText::buildTriggerMultilineTarget(lines, true),
-			         QStringLiteral("line 1 \nline 2\t\n"));
-		}
-
-		void triggerMultilineTargetTrimsTrailingWhitespaceForWildcard()
-		{
-			const QStringList lines = {QStringLiteral("line 1 "), QStringLiteral("line 2\t")};
-			QCOMPARE(QMudCommandText::buildTriggerMultilineTarget(lines, false),
-			         QStringLiteral("line 1\nline 2\n"));
-		}
-
-		void pluginTriggerSoundBypassesWorldToggle()
-		{
-			QVERIFY(QMudTriggerSound::shouldPlayTriggerSound(true, false));
-			QVERIFY(QMudTriggerSound::shouldPlayTriggerSound(true, true));
-		}
-
-		void worldTriggerSoundFollowsWorldToggle()
-		{
-			QVERIFY(!QMudTriggerSound::shouldPlayTriggerSound(false, false));
-			QVERIFY(QMudTriggerSound::shouldPlayTriggerSound(false, true));
-		}
 		// NOLINTEND(readability-convert-member-functions-to-static)
 };
 

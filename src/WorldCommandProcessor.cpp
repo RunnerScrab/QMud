@@ -3699,16 +3699,14 @@ void WorldCommandProcessor::dispatchScriptSend(
 		return;
 
 	QSharedPointer<LuaCallbackEngine> luaRef;
-	LuaCallbackEngine                *lua         = nullptr;
-	bool                              pluginScope = false;
+	LuaCallbackEngine                *lua = nullptr;
 	if (!pluginId.isEmpty())
 	{
 		if (const WorldRuntime::Plugin *plugin = m_runtime->pluginForId(pluginId);
 		    plugin && pluginHasValidId(*plugin) && plugin->enabled && !plugin->installPending)
 		{
-			luaRef      = plugin->lua;
-			lua         = luaRef.data();
-			pluginScope = true;
+			luaRef = plugin->lua;
+			lua    = luaRef.data();
 		}
 	}
 	else
@@ -3751,28 +3749,17 @@ void WorldCommandProcessor::dispatchScriptSend(
 	QPointer<WorldRuntime> executionRuntime = m_runtime;
 	if (!executionRuntime)
 		return;
-	const bool forceWorldErrorOutput =
-	    QMudScriptErrorRouting::shouldForceWorldErrorOutput(executionRuntime != nullptr, pluginScope);
-	if (forceWorldErrorOutput)
-		executionRuntime->pushForceScriptErrorOutputToWorld();
 	if (hasTriggerContext)
 	{
 		static_cast<void>(executionRuntime->dispatchLuaExecuteScript(
 		    luaRef, text, description, styleRuns, hasTriggerContext, replaceMatchedLineOutput,
 		    triggerMatchedLineBufferIndex, triggerMatchedLineAbsoluteNumber));
-		if (forceWorldErrorOutput && executionRuntime)
-			executionRuntime->popForceScriptErrorOutputToWorld();
 		return;
 	}
 
-	executionRuntime->dispatchLuaExecuteScriptAsync(
-	    luaRef, text, description, styleRuns, hasTriggerContext, replaceMatchedLineOutput,
-	    triggerMatchedLineBufferIndex, triggerMatchedLineAbsoluteNumber,
-	    [executionRuntime, forceWorldErrorOutput](bool)
-	    {
-		    if (forceWorldErrorOutput && executionRuntime)
-			    executionRuntime->popForceScriptErrorOutputToWorld();
-	    });
+	executionRuntime->dispatchLuaExecuteScriptAsync(luaRef, text, description, styleRuns, hasTriggerContext,
+	                                                replaceMatchedLineOutput, triggerMatchedLineBufferIndex,
+	                                                triggerMatchedLineAbsoluteNumber);
 }
 
 void WorldCommandProcessor::sendMsg(const QString &text, const bool echo, const bool queueIt, bool logIt)

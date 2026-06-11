@@ -92,6 +92,7 @@ else ()
 endif ()
 
 function(qmud_apply_release_optimizations target_name)
+    get_target_property(QMUD_RELEASE_OPTIMIZATION_TARGET_TYPE ${target_name} TYPE)
     if (MSVC)
         target_compile_options(${target_name} PRIVATE
                 $<$<CONFIG:Release>:/O2>
@@ -99,11 +100,13 @@ function(qmud_apply_release_optimizations target_name)
                 $<$<CONFIG:Release>:/Gy>
                 $<$<CONFIG:Release>:/GL>
         )
-        target_link_options(${target_name} PRIVATE
-                $<$<CONFIG:Release>:/OPT:REF>
-                $<$<CONFIG:Release>:/OPT:ICF>
-                $<$<CONFIG:Release>:/LTCG>
-        )
+        if (NOT QMUD_RELEASE_OPTIMIZATION_TARGET_TYPE STREQUAL "STATIC_LIBRARY")
+            target_link_options(${target_name} PRIVATE
+                    $<$<CONFIG:Release>:/OPT:REF>
+                    $<$<CONFIG:Release>:/OPT:ICF>
+                    $<$<CONFIG:Release>:/LTCG>
+            )
+        endif ()
         if (QMUD_RELEASE_NATIVE_OPTIMIZATIONS)
             target_compile_options(${target_name} PRIVATE
                     $<$<CONFIG:Release>:/arch:AVX2>
@@ -115,9 +118,11 @@ function(qmud_apply_release_optimizations target_name)
                 $<$<CONFIG:Release>:-fomit-frame-pointer>
         )
         if (NOT APPLE)
-            target_link_options(${target_name} PRIVATE
-                    $<$<CONFIG:Release>:-Wl,-O1>
-            )
+            if (NOT QMUD_RELEASE_OPTIMIZATION_TARGET_TYPE STREQUAL "STATIC_LIBRARY")
+                target_link_options(${target_name} PRIVATE
+                        $<$<CONFIG:Release>:-Wl,-O1>
+                )
+            endif ()
         endif ()
         if (QMUD_RELEASE_NATIVE_OPTIMIZATIONS)
             target_compile_options(${target_name} PRIVATE
@@ -365,19 +370,33 @@ if (QMUD_MISSING_HEADER_FILES)
             "Build will continue; verify file renames/casing if unexpected.")
 endif ()
 
-add_executable(QMud ${QMUD_SOURCE_FILES_ABS} ${QMUD_HEADER_FILES_ABS})
+set(QMUD_APP_SOURCE_FILES_ABS ${QMUD_SOURCE_FILES_ABS})
+list(REMOVE_ITEM QMUD_APP_SOURCE_FILES_ABS "${QMUD_SRC_DIR}/Main.cpp")
+
+add_library(qmud_app_core STATIC ${QMUD_APP_SOURCE_FILES_ABS} ${QMUD_HEADER_FILES_ABS})
+add_executable(QMud "${QMUD_SRC_DIR}/Main.cpp")
 if (WIN32)
     set_target_properties(QMud PROPERTIES WIN32_EXECUTABLE TRUE)
 endif ()
 
 
 # Ensure Qt auto tools are ON (redundant with qt_standard_project_setup, kept as fallback)
+set_target_properties(qmud_app_core PROPERTIES
+        CXX_STANDARD 20
+        AUTOMOC ON
+        AUTOUIC ON
+        AUTORCC ON
+)
 set_target_properties(QMud PROPERTIES
         CXX_STANDARD 20
         AUTOMOC ON
         AUTOUIC ON
         AUTORCC ON
 )
+target_include_directories(qmud_app_core
+        PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/helpers")
 
 set(QMUD_QT_MULTIMEDIA_TARGET "")
 set(QMUD_ENABLE_SOUND_VALUE 0)
@@ -397,14 +416,15 @@ else ()
     message(WARNING "Qt6 TextToSpeech module not found; building with QMUD_ENABLE_TEXT_TO_SPEECH=0")
 endif ()
 
-target_link_libraries(QMud PRIVATE Qt6::Widgets Qt6::Network Qt6::Sql Qt6::PrintSupport ${QMUD_ZLIB_TARGET} ${QMUD_QT_MULTIMEDIA_TARGET} ${QMUD_QT_TEXTTOSPEECH_TARGET})
+target_link_libraries(qmud_app_core PUBLIC Qt6::Widgets Qt6::Network Qt6::Sql Qt6::PrintSupport ${QMUD_ZLIB_TARGET} ${QMUD_QT_MULTIMEDIA_TARGET} ${QMUD_QT_TEXTTOSPEECH_TARGET})
+target_link_libraries(QMud PRIVATE qmud_app_core)
 if (APPLE)
-    target_link_libraries(QMud PRIVATE "-framework CoreServices")
+    target_link_libraries(qmud_app_core PUBLIC "-framework CoreServices")
 endif ()
 if (WIN32)
-    target_link_libraries(QMud PRIVATE ole32 oleaut32)
+    target_link_libraries(qmud_app_core PUBLIC ole32 oleaut32)
 endif ()
-target_compile_definitions(QMud PRIVATE QMUD_ENABLE_SOUND=${QMUD_ENABLE_SOUND_VALUE}
+target_compile_definitions(qmud_app_core PUBLIC QMUD_ENABLE_SOUND=${QMUD_ENABLE_SOUND_VALUE}
         QMUD_ENABLE_TEXT_TO_SPEECH=${QMUD_ENABLE_TEXT_TO_SPEECH_VALUE}
         QMUD_ENABLE_EXPERIMENTAL_THREADED_LUA_EXECUTOR=$<IF:$<BOOL:${QMUD_ENABLE_EXPERIMENTAL_THREADED_LUA_EXECUTOR}>,1,0>)
 
@@ -415,9 +435,9 @@ if (QMUD_ENABLE_LUA_SCRIPTING)
     set(QMUD_RESOLVED_LUASOCKET_PROVIDER "${QMUD_LUASOCKET_PROVIDER}")
 
     find_package(Lua 5.4 REQUIRED)
-    target_compile_definitions(QMud PRIVATE QMUD_ENABLE_LUA_SCRIPTING)
+    target_compile_definitions(qmud_app_core PUBLIC QMUD_ENABLE_LUA_SCRIPTING)
     if (TARGET Lua::Lua)
-        target_link_libraries(QMud PRIVATE Lua::Lua)
+        target_link_libraries(qmud_app_core PUBLIC Lua::Lua)
         set(QMUD_IMPORTED_LUA_LIBRARY "")
         get_target_property(QMUD_IMPORTED_LUA_LIBRARY Lua::Lua IMPORTED_LOCATION)
         if (NOT QMUD_IMPORTED_LUA_LIBRARY)
@@ -434,7 +454,7 @@ if (QMUD_ENABLE_LUA_SCRIPTING)
             endif ()
         endif ()
     else ()
-        target_link_libraries(QMud PRIVATE ${LUA_LIBRARIES})
+        target_link_libraries(qmud_app_core PUBLIC ${LUA_LIBRARIES})
     endif ()
     foreach (QMUD_LUA_LIB_CANDIDATE IN LISTS LUA_LIBRARIES)
         if (IS_ABSOLUTE "${QMUD_LUA_LIB_CANDIDATE}" AND EXISTS "${QMUD_LUA_LIB_CANDIDATE}")
@@ -476,11 +496,11 @@ if (QMUD_ENABLE_LUA_SCRIPTING)
     list(FILTER QMUD_LUA_LIBRARY_FILES INCLUDE REGEX ".*/liblua[^/]*\\.so(\\..*)?$")
     list(REMOVE_DUPLICATES QMUD_LUA_LIBRARY_FILES)
     if (DEFINED LUA_INCLUDE_DIR)
-        target_include_directories(QMud SYSTEM BEFORE PRIVATE ${LUA_INCLUDE_DIR})
+        target_include_directories(qmud_app_core SYSTEM BEFORE PUBLIC ${LUA_INCLUDE_DIR})
     elseif (DEFINED LUA_INCLUDE_DIRS)
-        target_include_directories(QMud SYSTEM BEFORE PRIVATE ${LUA_INCLUDE_DIRS})
+        target_include_directories(qmud_app_core SYSTEM BEFORE PUBLIC ${LUA_INCLUDE_DIRS})
     endif ()
-    target_sources(QMud PRIVATE src/Sqlite3Lua.cpp)
+    target_sources(qmud_app_core PRIVATE src/Sqlite3Lua.cpp)
     set(QMUD_HAS_SYSTEM_LPEG OFF)
     set(QMUD_LUA_INTERPRETER "")
     if (DEFINED LUA_EXECUTABLE AND EXISTS "${LUA_EXECUTABLE}")
@@ -519,7 +539,7 @@ if (QMUD_ENABLE_LUA_SCRIPTING)
     if (QMUD_HAS_SYSTEM_LPEG)
         set(QMUD_RESOLVED_LPEG_PROVIDER "SYSTEM")
         message(STATUS "Using system LPeg module (lua-lpeg)")
-        target_compile_definitions(QMud PRIVATE QMUD_HAS_SYSTEM_LPEG=1)
+        target_compile_definitions(qmud_app_core PUBLIC QMUD_HAS_SYSTEM_LPEG=1)
     else ()
         message(FATAL_ERROR
                 "System LPeg module (lpeg.so) not found. Install lua-lpeg or set "
@@ -556,13 +576,13 @@ if (QMUD_ENABLE_LUA_SCRIPTING)
     if (QMUD_HAS_SYSTEM_BC)
         set(QMUD_RESOLVED_BC_PROVIDER "SYSTEM")
         message(STATUS "Using system Lua bc module")
-        target_compile_definitions(QMud PRIVATE QMUD_HAS_SYSTEM_BC=1)
+        target_compile_definitions(qmud_app_core PUBLIC QMUD_HAS_SYSTEM_BC=1)
     else ()
         set(QMUD_RESOLVED_BC_PROVIDER "BUNDLED")
         message(STATUS "System bc not found, building bundled bc fallback")
-        target_sources(QMud PRIVATE src/scripting/Number.cpp)
-        target_sources(QMud PRIVATE src/scripting/Lbc.cpp)
-        target_compile_definitions(QMud PRIVATE QMUD_BUNDLED_BC=1)
+        target_sources(qmud_app_core PRIVATE src/scripting/Number.cpp)
+        target_sources(qmud_app_core PRIVATE src/scripting/Lbc.cpp)
+        target_compile_definitions(qmud_app_core PUBLIC QMUD_BUNDLED_BC=1)
     endif ()
 
     set(QMUD_HAS_SYSTEM_LUASOCKET OFF)
@@ -623,7 +643,7 @@ endforeach ()
 # Link common known targets if the subprojects provided them
 foreach (tgt lsqlite png lua luacom)
     if (TARGET ${tgt})
-        target_link_libraries(QMud PRIVATE ${tgt})
+        target_link_libraries(qmud_app_core PUBLIC ${tgt})
     endif ()
 endforeach ()
 
@@ -1088,23 +1108,26 @@ add_custom_target(ApiExport
 # They are safe on Linux and useful to avoid common Windows macros bleeding into code.
 string(TIMESTAMP QMUD_BUILD_DATE_UTC "%Y-%m-%d" UTC)
 string(TIMESTAMP QMUD_BUILD_TIME_UTC "%H:%M:%S" UTC)
-target_compile_definitions(QMud PRIVATE
+target_compile_definitions(qmud_app_core PUBLIC
         NOMINMAX
         _CRT_SECURE_NO_WARNINGS
         QMUD_BUILD_DATE_UTC="${QMUD_BUILD_DATE_UTC}"
         QMUD_BUILD_TIME_UTC="${QMUD_BUILD_TIME_UTC}"
 )
 if (QMUD_CI_BUILD)
-    target_compile_definitions(QMud PRIVATE CI_BUILD)
+    target_compile_definitions(qmud_app_core PUBLIC CI_BUILD)
 endif ()
 
 # Recommended: enable warnings and reasonable flags (adjust per taste)
 if (MSVC)
+    target_compile_options(qmud_app_core PRIVATE /W4 /permissive-)
     target_compile_options(QMud PRIVATE /W4 /permissive-)
 else ()
+    target_compile_options(qmud_app_core PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(QMud PRIVATE -Wall -Wextra -Wpedantic)
 endif ()
 
+qmud_apply_release_optimizations(qmud_app_core)
 qmud_apply_release_optimizations(QMud)
 if (APPLE AND CMAKE_CROSSCOMPILING)
     # Suppress noisy osxcross/tbd linker warnings (e.g. libz/libcups out-of-sync stubs).

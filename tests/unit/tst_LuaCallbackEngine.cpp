@@ -16,6 +16,7 @@
 #include "WorldRuntime.h"
 #include "WorldView.h"
 #include "helpers/LuaExecutionUtils.h"
+#include "helpers/PluginPathUtils.h"
 #include "scripting/ScriptingErrors.h"
 
 // ReSharper disable once CppUnusedIncludeDirective
@@ -73,34 +74,36 @@ namespace
 {
 	struct RuntimeStubState
 	{
-			int                                  outputBatchDepth     = 0;
-			int                                  miniWindowBatchDepth = 0;
-			int                                  savePluginStateCalls = 0;
-			unsigned short                       noteStyle            = 0;
-			int                                  noteTextColour       = 0;
-			long                                 noteColourFore       = 0xFFFFFF;
-			long                                 noteColourBack       = 0;
-			bool                                 notesInRgb           = false;
-			QStringList                          outputLines;
-			QList<bool>                          outputNewLines;
-			QStringList                          windowNames;
-			QHash<QString, QHash<int, QVariant>> windowInfo;
-			QHash<QString, QStringList>          hotspotIds;
-			QHash<int, int>                      soundStatusByBuffer;
-			QVector<WorldRuntime::LineEntry>     lineEntries;
-			QString                              startupDirectory;
-			QMap<QString, QString>               worldAttributes;
-			QString                              logFileName;
-			QString                              worldFilePath;
-			QString                              defaultWorldDirectory;
-			QString                              defaultLogDirectory;
-			QString                              pluginsDirectory;
-			QString                              translatorFile;
-			QString                              firstSpecialFontPath;
-			QString                              preferencesDatabaseName;
-			QString                              fileBrowsingDirectory;
-			QString                              stateFilesDirectory;
-			QList<WorldRuntime::Plugin>          plugins;
+			int                                           outputBatchDepth     = 0;
+			int                                           miniWindowBatchDepth = 0;
+			int                                           savePluginStateCalls = 0;
+			unsigned short                                noteStyle            = 0;
+			int                                           noteTextColour       = 0;
+			long                                          noteColourFore       = 0xFFFFFF;
+			long                                          noteColourBack       = 0;
+			bool                                          notesInRgb           = false;
+			QStringList                                   outputLines;
+			QList<bool>                                   outputNewLines;
+			QStringList                                   windowNames;
+			QHash<QString, QHash<int, QVariant>>          windowInfo;
+			QHash<QString, QStringList>                   hotspotIds;
+			QHash<int, int>                               soundStatusByBuffer;
+			QVector<WorldRuntime::LineEntry>              lineEntries;
+			QString                                       startupDirectory;
+			QMap<QString, QString>                        worldAttributes;
+			QString                                       logFileName;
+			QString                                       worldFilePath;
+			QString                                       defaultWorldDirectory;
+			QString                                       defaultLogDirectory;
+			QString                                       pluginsDirectory;
+			QString                                       translatorFile;
+			QString                                       firstSpecialFontPath;
+			QString                                       preferencesDatabaseName;
+			QString                                       fileBrowsingDirectory;
+			QString                                       stateFilesDirectory;
+			QList<WorldRuntime::Plugin>                   plugins;
+			QList<WorldRuntime::Variable>                 variables;
+			QSharedPointer<LuaCallbackMiniWindowSnapshot> variableDispatchSnapshotCache;
 			int                nextAcceleratorCommand = WorldRuntime::kAcceleratorFirstCommand;
 			QHash<qint64, int> acceleratorKeyToCommand;
 			QHash<int, WorldRuntime::AcceleratorEntry> acceleratorEntries;
@@ -161,6 +164,19 @@ namespace
 			return 0;
 		constexpr qsizetype kMaxInt = std::numeric_limits<int>::max();
 		return size > kMaxInt ? std::numeric_limits<int>::max() : static_cast<int>(size);
+	}
+
+	QSharedPointer<const LuaCallbackMiniWindowSnapshot>
+	captureVariableDispatchSnapshotForTest(const WorldRuntime &runtime)
+	{
+		RuntimeStubState &state = runtimeStubState(&runtime);
+		if (state.variableDispatchSnapshotCache)
+			return state.variableDispatchSnapshotCache;
+		auto snapshot                       = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+		snapshot->worldVariablesSnapshot    = runtime.variableSnapshot();
+		snapshot->hasWorldVariablesSnapshot = true;
+		state.variableDispatchSnapshotCache = snapshot;
+		return snapshot;
 	}
 } // namespace
 
@@ -332,6 +348,100 @@ long WorldRuntime::customColourBackground(int index) const
 {
 	Q_UNUSED(index);
 	return 0;
+}
+
+const QList<WorldRuntime::Variable> &WorldRuntime::variables() const
+{
+	return runtimeStubState(this).variables;
+}
+
+bool WorldRuntime::findVariable(const QString &name, QString &value) const
+{
+	for (const Variable &variable : runtimeStubState(this).variables)
+	{
+		const QString variableName = variable.attributes.value(QStringLiteral("name"));
+		if (variableName.compare(name, Qt::CaseInsensitive) == 0)
+		{
+			value = variable.content;
+			return true;
+		}
+	}
+	return false;
+}
+
+QStringList WorldRuntime::variableList() const
+{
+	QStringList names;
+	for (const Variable &variable : runtimeStubState(this).variables)
+	{
+		const QString name = variable.attributes.value(QStringLiteral("name"));
+		if (!name.isEmpty())
+			names.push_back(name);
+	}
+	return names;
+}
+
+QMap<QString, QString> WorldRuntime::variableSnapshot() const
+{
+	QMap<QString, QString> snapshot;
+	for (const Variable &variable : runtimeStubState(this).variables)
+	{
+		const QString name = variable.attributes.value(QStringLiteral("name"));
+		if (!name.isEmpty())
+			snapshot.insert(name, variable.content);
+	}
+	return snapshot;
+}
+
+void WorldRuntime::invalidateLuaCallbackDispatchSnapshot() const
+{
+	runtimeStubState(this).variableDispatchSnapshotCache.clear();
+}
+
+void WorldRuntime::setVariable(const QString &name, const QString &value)
+{
+	if (name.isEmpty())
+		return;
+
+	RuntimeStubState &state = runtimeStubState(this);
+	for (Variable &variable : state.variables)
+	{
+		const QString variableName = variable.attributes.value(QStringLiteral("name"));
+		if (variableName.compare(name, Qt::CaseInsensitive) == 0)
+		{
+			variable.content = value;
+			invalidateLuaCallbackDispatchSnapshot();
+			return;
+		}
+	}
+
+	Variable variable;
+	variable.attributes.insert(QStringLiteral("name"), name);
+	variable.content = value;
+	state.variables.push_back(variable);
+	invalidateLuaCallbackDispatchSnapshot();
+}
+
+void WorldRuntime::setVariables(const QList<Variable> &variables)
+{
+	runtimeStubState(this).variables = variables;
+	invalidateLuaCallbackDispatchSnapshot();
+}
+
+int WorldRuntime::deleteVariable(const QString &name)
+{
+	RuntimeStubState &state = runtimeStubState(this);
+	for (int i = 0; i < state.variables.size(); ++i)
+	{
+		const QString variableName = state.variables.at(i).attributes.value(QStringLiteral("name"));
+		if (variableName.compare(name, Qt::CaseInsensitive) == 0)
+		{
+			state.variables.removeAt(i);
+			invalidateLuaCallbackDispatchSnapshot();
+			return eOK;
+		}
+	}
+	return eVariableNotFound;
 }
 
 void WorldRuntime::setNoteColourBack(long value)
@@ -528,6 +638,20 @@ QList<WorldRuntime::Plugin> &WorldRuntime::pluginsMutable()
 	return runtimeStubState(this).plugins;
 }
 
+bool WorldRuntime::isPluginInstalled(const QString &pluginId) const
+{
+	if (QMudNativePluginRegistry::isBlacklistedId(pluginId))
+		return false;
+	if (!QMudNativePluginRegistry::resolveShimIdOrName(pluginId).isEmpty())
+		return true;
+	for (const Plugin &plugin : runtimeStubState(this).plugins)
+	{
+		if (plugin.attributes.value(QStringLiteral("id")).compare(pluginId, Qt::CaseInsensitive) == 0)
+			return true;
+	}
+	return false;
+}
+
 QVariant WorldRuntime::pluginInfo(const QString &pluginId, const int infoType) const
 {
 	if (const QString shimId = QMudNativePluginRegistry::resolveShimIdOrName(pluginId); !shimId.isEmpty())
@@ -577,6 +701,38 @@ QVariant WorldRuntime::pluginInfo(const QString &pluginId, const int infoType) c
 		}
 	}
 	return {};
+}
+
+bool WorldRuntime::findPluginVariable(const QString &pluginId, const QString &name, QString &value) const
+{
+	for (const Plugin &plugin : runtimeStubState(this).plugins)
+	{
+		if (plugin.attributes.value(QStringLiteral("id")).compare(pluginId, Qt::CaseInsensitive) != 0)
+			continue;
+		for (auto it = plugin.variables.constBegin(); it != plugin.variables.constEnd(); ++it)
+		{
+			if (it.key().compare(name, Qt::CaseInsensitive) == 0)
+			{
+				value = it.value();
+				return true;
+			}
+		}
+		return false;
+	}
+	return false;
+}
+
+bool WorldRuntime::pluginVariableSnapshot(const QString &pluginId, QMap<QString, QString> &values) const
+{
+	values.clear();
+	for (const Plugin &plugin : runtimeStubState(this).plugins)
+	{
+		if (plugin.attributes.value(QStringLiteral("id")).compare(pluginId, Qt::CaseInsensitive) != 0)
+			continue;
+		values = plugin.variables;
+		return true;
+	}
+	return false;
 }
 
 QStringList WorldRuntime::pluginIdList() const
@@ -637,11 +793,6 @@ bool WorldRuntime::suppressScriptErrorOutputToWorld() const
 {
 	return false;
 }
-
-bool WorldRuntime::forceScriptErrorOutputToWorld() const
-{
-	return false;
-}
 // NOLINTEND(readability-convert-member-functions-to-static,readability-make-member-function-const,readability-non-const-parameter)
 
 QColor WorldView::parseColor(const QString &value)
@@ -685,6 +836,8 @@ namespace
 			void colourTellIgnoresTrailingLuaGsubReturnAndKeepsFollowingNote();
 			void executeScriptNoteUsesRuntimeNoteColour();
 			void selfPluginInfoMetadataFallsThroughToRuntime();
+			void emptyPluginVariableIdReadsWorldVariables();
+			void deleteVariableInvalidatesCallbackVariableSnapshot();
 			void nativeShimDiscoveryIsAvailableWithoutShadowPlugin();
 			void nativeLuaAudioSharedRuntimeStateCoversDirectAndCallPlugin();
 			void blacklistedPluginsAreHiddenFromPluginApis();
@@ -1485,18 +1638,18 @@ void tst_LuaCallbackEngine::worldLuaFileApisUseRuntimeHomeAcrossThreadAffinity()
 	WorldRuntime runtime;
 	QThread     *mainThread = QThread::currentThread();
 	const auto   cleanup    = qScopeGuard(
-        [&]()
-        {
-            if (runtime.thread() == &worker)
-            {
-                const bool moved = QMetaObject::invokeMethod(
-                    &runtime, [&runtime, mainThread]() { runtime.moveToThread(mainThread); },
-                    Qt::BlockingQueuedConnection);
-                QVERIFY(moved);
-            }
-            worker.quit();
-            worker.wait();
-        });
+	    [&]()
+	    {
+		    if (runtime.thread() == &worker)
+		    {
+			    const bool moved = QMetaObject::invokeMethod(
+			        &runtime, [&runtime, mainThread]() { runtime.moveToThread(mainThread); },
+			        Qt::BlockingQueuedConnection);
+			    QVERIFY(moved);
+		    }
+		    worker.quit();
+		    worker.wait();
+	    });
 	worker.start();
 	QVERIFY(worker.isRunning());
 	runtimeStubState(&runtime).startupDirectory = root.absolutePath();
@@ -1663,7 +1816,7 @@ local values = {
 path_summary = table.concat(values, "|")
 path_no_backslashes = not path_summary:find("\\", 1, true)
 getinfo_56 = tostring(GetInfo(56))
-getinfo_56_ok = #getinfo_56 > 0 and not getinfo_56:find("\\", 1, true)
+getinfo_56_ok = #getinfo_56 > 0 and getinfo_56:sub(-1) == "/" and not getinfo_56:find("\\", 1, true)
 local info = utils.info()
 utils_info_summary = tostring(info.app_directory) .. "|" .. tostring(info.current_directory)
 utils_info_ok = utils_info_summary == "./|./"
@@ -1696,8 +1849,11 @@ utils_info_ok = utils_info_summary == "./|./"
 	        QStringLiteral("worlds/plugins/state/"),
 	    }
 	        .join(QLatin1Char('|'));
+	const QString expectedGetInfo56 =
+	    QMudPluginPathUtils::normalizeSeparators(root.absolutePath()) + QLatin1Char('/');
 	QCOMPARE(luaGlobalString(engine.luaState(), "path_summary"), expected);
 	QVERIFY(luaGlobalBoolean(engine.luaState(), "path_no_backslashes"));
+	QCOMPARE(luaGlobalString(engine.luaState(), "getinfo_56"), expectedGetInfo56);
 	QVERIFY(luaGlobalBoolean(engine.luaState(), "getinfo_56_ok"));
 	QCOMPARE(luaGlobalString(engine.luaState(), "utils_info_summary"), QStringLiteral("./|./"));
 	QVERIFY(luaGlobalBoolean(engine.luaState(), "utils_info_ok"));
@@ -2159,6 +2315,75 @@ void tst_LuaCallbackEngine::selfPluginInfoMetadataFallsThroughToRuntime()
 	         QStringLiteral("Plugin Name|Runtime Author|Runtime Description|Runtime Script|lua|"
 	                        "worlds/plugins/runtime_plugin.xml|Plugin.Id|Runtime Purpose|/tmp/plugin/"));
 	teardownWorkerEngine(executor, engine);
+}
+
+void tst_LuaCallbackEngine::emptyPluginVariableIdReadsWorldVariables()
+{
+	WorldRuntime runtime;
+	runtime.setVariable(QStringLiteral("hour_offset"), QStringLiteral("1"));
+	runtime.setVariable(QStringLiteral("MixedCaseMode"), QStringLiteral("active"));
+
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
+function OnPluginEnable()
+  local hour_offset = GetPluginVariable("", "hour_offset")
+  local mixed_case_mode = GetPluginVariable("", "mixedcasemode")
+  empty_plugin_variable_ok = hour_offset == "1"
+  empty_plugin_variable_case_ok = mixed_case_mode == "active"
+
+  local variables = GetPluginVariableList("")
+  empty_plugin_variable_list_ok = variables ~= nil and
+                                  variables.hour_offset == "1" and
+                                  variables.MixedCaseMode == "active"
+  empty_plugin_variable_status = table.concat({
+    tostring(hour_offset),
+    tostring(mixed_case_mode),
+    tostring(variables ~= nil),
+    variables ~= nil and tostring(variables.hour_offset) or "no-table",
+    variables ~= nil and tostring(variables.MixedCaseMode) or "no-table"
+  }, "|")
+  return empty_plugin_variable_ok and
+         empty_plugin_variable_case_ok and
+         empty_plugin_variable_list_ok
+end
+)lua"),
+	                       &runtime);
+
+	LuaBatchDispatchRequest request;
+	request.engines               = {engine};
+	request.kind                  = LuaBatchDispatchKind::NoArgs;
+	request.functionName          = QStringLiteral("OnPluginEnable");
+	request.miniWindowSnapshotArg = captureVariableDispatchSnapshotForTest(runtime);
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	QVERIFY(result.boolResultValid);
+	QVERIFY2(result.boolResult,
+	         qPrintable(luaGlobalString(engine->luaState(), "empty_plugin_variable_status")));
+	QVERIFY(luaGlobalBoolean(engine->luaState(), "empty_plugin_variable_ok"));
+	QVERIFY(luaGlobalBoolean(engine->luaState(), "empty_plugin_variable_case_ok"));
+	QVERIFY(luaGlobalBoolean(engine->luaState(), "empty_plugin_variable_list_ok"));
+	teardownWorkerEngine(executor, engine);
+}
+
+void tst_LuaCallbackEngine::deleteVariableInvalidatesCallbackVariableSnapshot()
+{
+	WorldRuntime runtime;
+	runtime.setVariable(QStringLiteral("stale"), QStringLiteral("present"));
+
+	const QSharedPointer<const LuaCallbackMiniWindowSnapshot> before =
+	    captureVariableDispatchSnapshotForTest(runtime);
+	QVERIFY(before);
+	QVERIFY(before->hasWorldVariablesSnapshot);
+	QCOMPARE(before->worldVariablesSnapshot.value(QStringLiteral("stale")), QStringLiteral("present"));
+
+	QCOMPARE(runtime.deleteVariable(QStringLiteral("stale")), eOK);
+
+	const QSharedPointer<const LuaCallbackMiniWindowSnapshot> after =
+	    captureVariableDispatchSnapshotForTest(runtime);
+	QVERIFY(after);
+	QVERIFY(after->hasWorldVariablesSnapshot);
+	QVERIFY(!after->worldVariablesSnapshot.contains(QStringLiteral("stale")));
 }
 
 void tst_LuaCallbackEngine::nativeShimDiscoveryIsAvailableWithoutShadowPlugin()
