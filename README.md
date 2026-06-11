@@ -1,6 +1,6 @@
 # QMud RS Fork
 
-This is my fork of QMud, with my own bug fixes (which I will continue to share with upstream in PRs) and the CthuluMUD references removed.
+This is my fork of QMud, with my own bug fixes (which I will continue to share with upstream in PRs) and the CthuluMUD references removed. QMud is basically MUSHclient with High DPI support and a non-glitchy zMUD style splitter window, which is a potent combination.
 
 [![Pipelines](https://github.com/Nodens-/QMud/actions/workflows/pipelines.yml/badge.svg)](https://github.com/Nodens-/QMud/actions/workflows/pipelines.yml)
 [![codecov](https://codecov.io/gh/Nodens-/QMud/branch/main/graph/badge.svg)](https://codecov.io/gh/Nodens-/QMud)
