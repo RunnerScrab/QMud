@@ -3807,9 +3807,12 @@ void WorldCommandProcessor::sendMsg(const QString &text, const bool echo, const 
 	if (m_noEcho)
 		bEcho = false;
 
+	// normalize endlines so dialog text splits into individual lines
+	strText.replace(kEndLine, QStringLiteral("\n"));
+
 	// strip trailing endline - that would trigger an extra blank line
-	if (strText.endsWith(kEndLine))
-		strText.chop(kEndLine.size());
+	if (strText.endsWith(QLatin1Char('\n')))
+		strText.chop(1);
 
 	// fix up German umlauts
 	if (m_translateGerman)
@@ -3817,7 +3820,7 @@ void WorldCommandProcessor::sendMsg(const QString &text, const bool echo, const 
 
 	// to make sure each individual line ends up on the output window marked as user
 	// input (and in the right color) break up the string into individual lines
-	QStringList strList = strText.split(kEndLine);
+	QStringList strList = strText.split(QLatin1Char('\n'));
 
 	// if list is empty, make sure we send at least one empty line
 	if (strList.isEmpty())
@@ -4176,7 +4179,9 @@ void WorldCommandProcessor::updateQueuedCommandsStatusLine()
 			break;
 		}
 
-		const QString direction = item.mid(1).trimmed();
+		// keep the status bar single line even if an entry has embedded newlines
+		QString direction = item.mid(1).trimmed();
+		direction.replace(QLatin1Char('\n'), QLatin1Char(' '));
 		if (direction.isEmpty())
 			continue;
 
