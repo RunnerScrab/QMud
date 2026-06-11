@@ -557,6 +557,18 @@ qmud_add_qtest(tst_WorldSocket_KeepAlive
         TIMEOUT
         20)
 
+qmud_add_qtest(tst_WorldRuntime_PluginLifecycle
+        GUI
+        SOURCES
+        integration/tst_WorldRuntime_PluginLifecycle.cpp
+        LIBRARIES
+        qmud_app_core
+        Qt6::Network
+        LABELS
+        integration
+        TIMEOUT
+        120)
+
 qmud_add_qtest(tst_WorldDocument_Load
         SOURCES
         integration/tst_WorldDocument_Load.cpp

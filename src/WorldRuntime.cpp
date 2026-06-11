@@ -24864,6 +24864,7 @@ void WorldRuntime::maybeRunDeferredWorldConnectHandlers()
 	}
 	if (m_pluginInstallDeferred || m_pluginInstallInProgress || hasPendingPluginInstallWork())
 		return;
+	m_deferredWorldConnectHandlersPending = false;
 	fireWorldConnectHandlers();
 }
 
