@@ -59,6 +59,9 @@ Do **NOT** use the issue tracker for general support requests.
 - You can also contribute with funding as funds are needed for code signing certificate, Apple registration etc.
   in order to bring QMud to the Apple Store/avoid issues with Windows SmartScreen/WDAC.
 
+NOTICE: While contributions/PRs are very welcome, if you open a PR, you are expected to UNDERSTAND the code you're
+touching AND be able to make requested changes after review. "Vibe coding" is NOT welcome.
+
 [![Support on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20this%20project-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/nodens)
 
 ## Supported platforms
