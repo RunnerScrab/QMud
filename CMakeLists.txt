@@ -260,6 +260,7 @@ set(QMUD_HEADERS
         MainWindowHost.h
         helpers/MainWindowHostResolver.h
         Version.h
+        ForkVersion.h
         MainFrame.h
         helpers/MainFrameActionUtils.h
         helpers/MainFrameMdiUtils.h

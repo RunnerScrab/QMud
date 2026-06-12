@@ -2,13 +2,11 @@
 
 This is my fork of QMud, with my own bug fixes (which I will continue to share with upstream in PRs) and the CthuluMUD references removed. QMud is basically MUSHclient with High DPI support and a non-glitchy zMUD style splitter window, which is a potent combination.
 
-[![Pipelines](https://github.com/Nodens-/QMud/actions/workflows/pipelines.yml/badge.svg)](https://github.com/Nodens-/QMud/actions/workflows/pipelines.yml)
-[![codecov](https://codecov.io/gh/Nodens-/QMud/branch/main/graph/badge.svg)](https://codecov.io/gh/Nodens-/QMud)
-[![Downloads](https://img.shields.io/github/downloads/Nodens-/QMud/total)](https://github.com/Nodens-/QMud/releases)
+[![Downloads](https://img.shields.io/github/downloads/RunnerScrab/QMud/total)](https://github.com/RunnerScrab/QMud/releases)
 [![Website](https://img.shields.io/website?url=https%3A%2F%2Fqmud.dev)](https://qmud.dev)
-[![Issues](https://img.shields.io/github/issues/Nodens-/QMud)](https://github.com/Nodens-/QMud/issues)
-[![PRs](https://img.shields.io/github/issues-pr/Nodens-/QMud)](https://github.com/Nodens-/QMud/pulls)
-[![License](https://img.shields.io/github/license/Nodens-/QMud)](https://github.com/Nodens-/QMud/blob/main/LICENSE.md)
+[![Issues](https://img.shields.io/github/issues/RunnerScrab/QMud)](https://github.com/RunnerScrab/QMud/issues)
+[![PRs](https://img.shields.io/github/issues-pr/RunnerScrab/QMud)](https://github.com/RunnerScrab/QMud/pulls)
+[![License](https://img.shields.io/github/license/RunnerScrab/QMud)](https://github.com/RunnerScrab/QMud/blob/main/LICENSE.md)
 [![Support on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20this%20project-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/nodens)
 
 QMud is a Qt 6 port and continuation of the

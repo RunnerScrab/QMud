@@ -28,6 +28,7 @@
 #include "ReloadUtils.h"
 #include "SqliteCompat.h"
 #include "UpdateCheckUtils.h"
+#include "ForkVersion.h"
 #include "Version.h"
 #include "WorldChildWindow.h"
 #include "WorldDocument.h"
@@ -13648,6 +13649,9 @@ void AppController::handleAppAbout()
 
 	QLabel version(QStringLiteral("Version %1").arg(QString::fromLatin1(kVersionString)), &dialog);
 	textLayout->addWidget(&version);
+
+	QLabel forkVersion(QStringLiteral("RS Fork %1").arg(QString::fromLatin1(kForkVersionString)), &dialog);
+	textLayout->addWidget(&forkVersion);
 
 	QLabel copyright(QStringLiteral("Copyright (C) 2026 Panagiotis Kalogiratos\n"), &dialog);
 	textLayout->addWidget(&copyright);
