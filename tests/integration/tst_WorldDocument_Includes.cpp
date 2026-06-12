@@ -227,6 +227,90 @@ end
 			QVERIFY(doc.errorString().contains(QStringLiteral("already loaded")));
 		}
 
+		void virtualNativePluginIncludeCreatesShimEntry()
+		{
+			QMudTest::ScopedTempDir tempDir;
+			QVERIFY(tempDir.isValid());
+
+			const QString worldPath = QDir(tempDir.path()).filePath(QStringLiteral("main.xml"));
+			QVERIFY(writeTextFile(worldPath, QStringLiteral(R"(<?xml version="1.0" encoding="UTF-8"?>
+<qmud>
+  <world id="aaaaaaaaaaaaaaaaaaaaaaaa" name="Main"/>
+  <include name="./qmud:native/MushReader" plugin="y" enabled="n"/>
+</qmud>)")));
+
+			WorldDocument doc;
+			QVERIFY(doc.loadFromFile(worldPath));
+			QVERIFY(doc.expandIncludes(worldPath, tempDir.path(), tempDir.path(), QString()));
+
+			QCOMPARE(doc.plugins().size(), 1);
+			const WorldDocument::Plugin plugin = doc.plugins().front();
+			QCOMPARE(plugin.attributes.value(QStringLiteral("id")),
+			         QStringLiteral("925cdd0331023d9f0b8f05a7"));
+			QCOMPARE(plugin.attributes.value(QStringLiteral("name")), QStringLiteral("MushReader"));
+			QCOMPARE(plugin.attributes.value(QStringLiteral("source")),
+			         QStringLiteral("qmud:native/MushReader"));
+			QCOMPARE(plugin.attributes.value(QStringLiteral("directory")), QStringLiteral("qmud:native/"));
+			QCOMPARE(plugin.attributes.value(QStringLiteral("enabled")), QStringLiteral("n"));
+			QVERIFY(plugin.script.isEmpty());
+			QVERIFY(plugin.triggers.isEmpty());
+			QVERIFY(plugin.aliases.isEmpty());
+			QVERIFY(plugin.timers.isEmpty());
+			QVERIFY(plugin.variables.isEmpty());
+		}
+
+		void virtualNativeLuaAudioIncludeCreatesShimEntry()
+		{
+			QMudTest::ScopedTempDir tempDir;
+			QVERIFY(tempDir.isValid());
+
+			const QString worldPath = QDir(tempDir.path()).filePath(QStringLiteral("main.xml"));
+			QVERIFY(writeTextFile(worldPath, QStringLiteral(R"(<?xml version="1.0" encoding="UTF-8"?>
+<qmud>
+  <world id="aaaaaaaaaaaaaaaaaaaaaaaa" name="Main"/>
+  <include name="./qmud:native/LuaAudio" plugin="y" enabled="y"/>
+</qmud>)")));
+
+			WorldDocument doc;
+			QVERIFY(doc.loadFromFile(worldPath));
+			QVERIFY(doc.expandIncludes(worldPath, tempDir.path(), tempDir.path(), QString()));
+
+			QCOMPARE(doc.plugins().size(), 1);
+			const WorldDocument::Plugin plugin = doc.plugins().front();
+			QCOMPARE(plugin.attributes.value(QStringLiteral("id")),
+			         QStringLiteral("aedf0cb0be5bf045860d54b7"));
+			QCOMPARE(plugin.attributes.value(QStringLiteral("name")), QStringLiteral("LuaAudio"));
+			QCOMPARE(plugin.attributes.value(QStringLiteral("source")),
+			         QStringLiteral("qmud:native/LuaAudio"));
+			QCOMPARE(plugin.attributes.value(QStringLiteral("directory")), QStringLiteral("qmud:native/"));
+			QCOMPARE(plugin.attributes.value(QStringLiteral("enabled")), QStringLiteral("y"));
+			QVERIFY(plugin.script.isEmpty());
+			QVERIFY(plugin.triggers.isEmpty());
+			QVERIFY(plugin.aliases.isEmpty());
+			QVERIFY(plugin.timers.isEmpty());
+			QVERIFY(plugin.variables.isEmpty());
+		}
+
+		void unknownVirtualNativePluginIncludeDoesNotResolveAsFile()
+		{
+			QMudTest::ScopedTempDir tempDir;
+			QVERIFY(tempDir.isValid());
+
+			const QString worldPath = QDir(tempDir.path()).filePath(QStringLiteral("main.xml"));
+			QVERIFY(writeTextFile(worldPath, QStringLiteral(R"(<?xml version="1.0" encoding="UTF-8"?>
+<qmud>
+  <world id="aaaaaaaaaaaaaaaaaaaaaaaa" name="Main"/>
+  <include name="qmud:native/UnknownShim" plugin="y"/>
+</qmud>)")));
+
+			WorldDocument doc;
+			QVERIFY(doc.loadFromFile(worldPath));
+			QVERIFY(!doc.expandIncludes(worldPath, tempDir.path(), tempDir.path(), QString()));
+			QCOMPARE(doc.errorString(),
+			         QStringLiteral("Unknown native plugin include \"qmud:native/UnknownShim\""));
+			QVERIFY(doc.plugins().isEmpty());
+		}
+
 		void includeMergeFlagsControlDuplicateTriggerHandling()
 		{
 			QMudTest::ScopedTempDir tempDir;

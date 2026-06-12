@@ -61,6 +61,24 @@ class tst_OutputWrapUtils : public QObject
 			QCOMPARE(text, QStringLiteral("alpha beta \ngamma\n"));
 		}
 
+		void exactWrapColumnDoesNotWrap()
+		{
+			QString text = QStringLiteral("1234567890");
+
+			QMudOutputWrapUtils::wrapPlainLineForColumn(text, 10, false);
+
+			QCOMPARE(text, QStringLiteral("1234567890"));
+		}
+
+		void onePastWrapColumnWraps()
+		{
+			QString text = QStringLiteral("12345678901");
+
+			QMudOutputWrapUtils::wrapPlainLineForColumn(text, 10, false);
+
+			QCOMPARE(text, QStringLiteral("1234567890\n1"));
+		}
+
 		void explicitNewlineAlsoStartsFreshWrapSegment()
 		{
 			QString text = QStringLiteral("alpha\nbeta gamma delta");

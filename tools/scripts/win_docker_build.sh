@@ -10,6 +10,7 @@ QMUD_WINDOCKER_MINGW_PREFIX=${QMUD_WINDOCKER_MINGW_PREFIX:-/usr/x86_64-w64-mingw
 QMUD_WINDOCKER_MINGW_TRIPLET=${QMUD_WINDOCKER_MINGW_TRIPLET:-x86_64-w64-mingw32}
 QMUD_WINDOCKER_LUA_PREFIX=${QMUD_WINDOCKER_LUA_PREFIX:-/opt/qmud/windows-deps/lua}
 QMUD_WINDOCKER_LUA_MODULES_PREFIX=${QMUD_WINDOCKER_LUA_MODULES_PREFIX:-/opt/qmud/windows-deps/lua-modules}
+QMUD_WINDOCKER_NVDA_CONTROLLER_URL=${QMUD_WINDOCKER_NVDA_CONTROLLER_URL:-}
 
 rm -f "$BUILD_DIR/CMakeCache.txt"
 rm -rf "$BUILD_DIR/CMakeFiles"
@@ -259,6 +260,74 @@ collect_dll_closure() {
   rm -f "$queue_file" "$seen_file"
 }
 
+download_url() {
+  url="$1"
+  output="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$output"
+    return
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -q -O "$output" "$url"
+    return
+  fi
+  echo "Error: curl or wget is required to download $url." >&2
+  exit 1
+}
+
+stage_nvda_controller_client() {
+  destination="$STAGE_DIR/lua/native/windows-x86_64"
+  mkdir -p "$destination"
+
+  controller_url="$QMUD_WINDOCKER_NVDA_CONTROLLER_URL"
+  if [ -z "$controller_url" ]; then
+    index_file="$BUILD_DIR/nvda-controller-stable-index.html"
+    download_url "https://download.nvaccess.org/releases/stable/" "$index_file"
+    controller_href="$(
+      sed -n 's/.*href="\([^"]*controllerClient\.zip\)".*/\1/p' "$index_file" |
+        sort -V |
+        tail -n 1
+    )"
+    if [ -z "$controller_href" ]; then
+      echo "Error: could not find an NVDA controllerClient zip in the stable release index." >&2
+      exit 1
+    fi
+    case "$controller_href" in
+      https://* | http://*)
+        controller_url="$controller_href"
+        ;;
+      *)
+        controller_url="https://download.nvaccess.org/releases/stable/$controller_href"
+        ;;
+    esac
+  fi
+
+  archive="$BUILD_DIR/nvda-controllerClient.zip"
+  extract_dir="$BUILD_DIR/nvda-controllerClient"
+  rm -rf "$extract_dir"
+  mkdir -p "$extract_dir"
+  download_url "$controller_url" "$archive"
+  cmake -E chdir "$extract_dir" cmake -E tar xf "$archive"
+
+  dll_path="$(
+    find "$extract_dir" -type f \( \
+      -path '*/x64/nvdaControllerClient.dll' -o \
+      -iname 'nvdaControllerClient64.dll' \
+    \) | sort | head -n 1
+  )"
+  if [ -z "$dll_path" ]; then
+    echo "Error: NVDA controllerClient archive does not contain an x64 controller DLL." >&2
+    exit 1
+  fi
+  cp -f "$dll_path" "$destination/$(basename "$dll_path")"
+
+  license_path="$(find "$extract_dir" -type f -iname 'license.txt' | sort | head -n 1)"
+  if [ -n "$license_path" ]; then
+    mkdir -p "$STAGE_DIR/docs/licenses"
+    cp -f "$license_path" "$STAGE_DIR/docs/licenses/NVDA_client_LICENSE.txt"
+  fi
+}
+
 copy_qt_plugin() {
   relative_path="$1"
   required="$2"
@@ -337,6 +406,8 @@ mkdir -p \
   "$STAGE_DIR/lua/native/macos-arm64" \
   "$STAGE_DIR/lua/native/macos-x86_64" \
   "$STAGE_DIR/lua/native/windows-x86_64"
+
+stage_nvda_controller_client
 
 if [ ! -f "$BUILD_DIR/socket/core.dll" ]; then
   echo "Error: expected generated LuaSocket core module at $BUILD_DIR/socket/core.dll, but it was not found." >&2

@@ -9200,6 +9200,23 @@ QRect WorldView::outputTextRectangleUnreserved() const
 	return m_outputSplitter->geometry();
 }
 
+QRect WorldView::outputTextViewportRectangle() const
+{
+	QRect rect = outputTextViewportRectangleUnreserved();
+	if (m_runtime && hasConfiguredTextRectangle(m_runtime->textRectangle()))
+		return rect;
+	if (m_wrapMarginReservationPixels > 0)
+		rect.adjust(0, 0, -qMin(m_wrapMarginReservationPixels, qMax(0, rect.width() - 1)), 0);
+	return rect;
+}
+
+QRect WorldView::outputTextViewportRectangleUnreserved() const
+{
+	if (!m_outputStack || !m_output || !m_output->viewport())
+		return outputTextRectangleUnreserved();
+	return {m_output->viewport()->mapTo(m_outputStack, QPoint(0, 0)), m_output->viewport()->size()};
+}
+
 QFont WorldView::outputFont() const
 {
 	if (!m_output)

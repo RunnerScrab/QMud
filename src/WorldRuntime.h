@@ -292,6 +292,8 @@ class WorldRuntime : public QObject
 				bool                                  saveState{false};
 				bool                                  savingStateNow{false};
 				bool                                  installPending{false};
+				bool                                  nativeShim{false};
+				QString                               nativeShimMarker;
 				int                                   sequence{5000};
 				double                                version{0.0};
 				double                                requiredVersion{0.0};
@@ -1240,6 +1242,10 @@ class WorldRuntime : public QObject
 		 * @return Requested metadata value.
 		 */
 		[[nodiscard]] QVariant    pluginInfo(const QString &pluginId, int infoType) const;
+		/**
+		 * @brief Invalidates plugin metadata caches after native shim runtime state changes.
+		 */
+		void                      notifyNativePluginStateChanged();
 		/**
 		 * @brief Lists installed plugin ids in current order.
 		 * @return Plugin id list.
@@ -3385,6 +3391,21 @@ class WorldRuntime : public QObject
 		 */
 		int playSound(int buffer, const QString &fileName, bool loop, double volume, double pan);
 		/**
+		 * @brief Plays sound file in a buffer slot without firing plugin sound callbacks.
+		 *
+		 * Only native compatibility shims that implement `OnPluginPlaySound` replacement behavior should
+		 * use this API. Normal MUSHclient `Sound` behavior must use `playSound()` so plugins can intercept it.
+		 *
+		 * @param buffer Sound buffer slot index.
+		 * @param fileName Sound file path.
+		 * @param loop Loop playback when `true`.
+		 * @param volume Playback volume.
+		 * @param pan Stereo pan value.
+		 * @return API status code.
+		 */
+		int playSoundBypassingPluginCallbacks(int buffer, const QString &fileName, bool loop, double volume,
+		                                      double pan);
+		/**
 		 * @brief Plays sound from memory bytes.
 		 * @param buffer Sound buffer slot index.
 		 * @param data Encoded audio bytes.
@@ -3400,6 +3421,17 @@ class WorldRuntime : public QObject
 		 * @return API status code.
 		 */
 		int stopSound(int buffer);
+		/**
+		 * @brief Stops playback in a buffer slot without firing plugin sound callbacks.
+		 *
+		 * Only native compatibility shims that implement `OnPluginPlaySound` replacement behavior should
+		 * use this API. Normal MUSHclient `StopSound` behavior must use `stopSound()` so plugins can
+		 * intercept stop-all requests.
+		 *
+		 * @param buffer Sound buffer slot index.
+		 * @return API status code.
+		 */
+		int stopSoundBypassingPluginCallbacks(int buffer);
 		/**
 		 * @brief Returns playback status for buffer slot.
 		 * @param buffer Sound buffer slot index.
@@ -4404,19 +4436,6 @@ class WorldRuntime : public QObject
 		 * @return `true` when script errors are suppressed from world output.
 		 */
 		[[nodiscard]] bool    suppressScriptErrorOutputToWorld() const;
-		/**
-		 * @brief Returns whether startup/install callbacks force script errors to world output.
-		 * @return `true` when startup/install callbacks should always show script errors in world output.
-		 */
-		[[nodiscard]] bool    forceScriptErrorOutputToWorld() const;
-		/**
-		 * @brief Increments forced script-error output depth.
-		 */
-		void                  pushForceScriptErrorOutputToWorld();
-		/**
-		 * @brief Decrements forced script-error output depth.
-		 */
-		void                  popForceScriptErrorOutputToWorld();
 		/**
 		 * @brief Returns draw-output notification count.
 		 * @return Output-window redraw count.
@@ -5655,7 +5674,6 @@ class WorldRuntime : public QObject
 		bool                                            m_inCancelSoundPluginCallback{false};
 		bool                                            m_inScreendrawCallback{false};
 		bool                                            m_inDrawOutputWindowCallback{false};
-		int                                             m_forceScriptErrorOutputDepth{0};
 		int                                             m_suppressWorldOutputResizedCallbacks{0};
 		bool                                            m_pluginInstallDeferred{false};
 		bool                                            m_pluginInstallInProgress{false};

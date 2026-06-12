@@ -9,11 +9,9 @@
 #ifndef QMUD_WORLDCOMMANDPROCESSORUTILS_H
 #define QMUD_WORLDCOMMANDPROCESSORUTILS_H
 
-#include <QScopeGuard>
 // ReSharper disable once CppUnusedIncludeDirective
 #include <QString>
 #include <QStringList>
-#include <utility>
 
 namespace QMudCommandPattern
 {
@@ -129,43 +127,5 @@ namespace QMudTriggerSound
 	 */
 	bool shouldPlayTriggerSound(bool pluginScoped, bool worldTriggerSoundsEnabled);
 } // namespace QMudTriggerSound
-
-namespace QMudScriptErrorRouting
-{
-	/**
-	 * @brief Returns whether script errors should be forced to world output.
-	 * @param hasRuntime `true` when a world runtime is available.
-	 * @param hasPluginScript `true` when the script belongs to a plugin rule/context.
-	 * @return `true` when errors should be forced to world output.
-	 */
-	[[nodiscard]] bool shouldForceWorldErrorOutput(bool hasRuntime, bool hasPluginScript);
-
-	/**
-	 * @brief Executes script body while forcing world-script error output when needed.
-	 * @tparam ExecuteFn Script body callable.
-	 * @tparam PushFn Callable that enables forced world output.
-	 * @tparam PopFn Callable that disables forced world output.
-	 * @param hasRuntime `true` when a world runtime is available.
-	 * @param hasPluginScript `true` when script belongs to plugin context.
-	 * @param execute Script body callable.
-	 * @param pushForce Callable to enable forced output.
-	 * @param popForce Callable to disable forced output.
-	 */
-	template <typename ExecuteFn, typename PushFn, typename PopFn>
-	void executeWithWorldErrorRouting(const bool hasRuntime, const bool hasPluginScript, ExecuteFn &&execute,
-	                                  PushFn &&pushForce, PopFn &&popForce)
-	{
-		const bool forceWorldErrorOutput = shouldForceWorldErrorOutput(hasRuntime, hasPluginScript);
-		if (forceWorldErrorOutput)
-			std::forward<PushFn>(pushForce)();
-		[[maybe_unused]] const auto popForceGuard = qScopeGuard(
-		    [&]
-		    {
-			    if (forceWorldErrorOutput)
-				    std::forward<PopFn>(popForce)();
-		    });
-		std::forward<ExecuteFn>(execute)();
-	}
-} // namespace QMudScriptErrorRouting
 
 #endif // QMUD_WORLDCOMMANDPROCESSORUTILS_H

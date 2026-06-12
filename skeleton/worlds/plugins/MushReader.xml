@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE muclient>
+
+<muclient>
+    <plugin
+            name="MushReader"
+            author="Panagiotis Kalogiratos (Nodens)"
+            id="925cdd0331023d9f0b8f05a7"
+            language="Lua"
+            purpose="Native screen-reader compatibility shim"
+            date_written="2026-06-06 00:00:00"
+            requires="11.00"
+            version="11.00"
+    >
+        <description trim="y">
+            <![CDATA[
+QMud native compatibility shim - Legacy XML ignored.
+
+Loading this plugin activates QMud's native MushReader compatibility shim. The original MushReader Lua and DLL code is not loaded or executed; QMud provides the supported MushReader APIs natively.
+]]>
+        </description>
+    </plugin>
+</muclient>

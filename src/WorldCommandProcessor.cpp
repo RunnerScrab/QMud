@@ -15,6 +15,7 @@
 #include "HyperlinkActionUtils.h"
 #include "MainWindowHost.h"
 #include "MainWindowHostResolver.h"
+#include "NativePluginRegistry.h"
 #include "SpeedwalkParser.h"
 #include "TimerSchedulingUtils.h"
 #include "TraceDispatchUtils.h"
@@ -60,11 +61,6 @@ constexpr int kStyleUnderline = 0x0002;
 constexpr int kStyleBlink = BLINK;
 #else
 constexpr int kStyleBlink = 0x0004;
-#endif
-#ifdef INVERSE
-constexpr int kStyleInverse = INVERSE;
-#else
-constexpr int kStyleInverse = 0x0008;
 #endif
 
 namespace
@@ -419,19 +415,32 @@ namespace
 			if (span.length <= 0)
 				continue;
 			LuaStyleRun run;
-			run.text       = line.mid(pos, span.length);
-			run.textColour = toRgbNumber(span.fore);
-			run.backColour = toRgbNumber(span.back);
+			run.text    = line.mid(pos, span.length);
+			QColor fore = span.fore.isValid() ? span.fore : defaultFore;
+			QColor back = span.back.isValid() ? span.back : defaultBack;
+			if (span.inverse)
+				qSwap(fore, back);
+			run.textColour = toRgbNumber(fore);
+			run.backColour = toRgbNumber(back);
 			int style      = 0;
 			if (span.bold)
 				style |= kStyleHilite;
 			if (span.underline)
 				style |= kStyleUnderline;
-			if (span.blink)
+			if (span.blink || span.italic)
 				style |= kStyleBlink;
-			if (span.inverse)
-				style |= kStyleInverse;
 			run.style = style;
+			if (!runs.isEmpty())
+			{
+				LuaStyleRun &previous = runs.last();
+				if (previous.textColour == run.textColour && previous.backColour == run.backColour &&
+				    previous.style == run.style)
+				{
+					previous.text += run.text;
+					pos += span.length;
+					continue;
+				}
+			}
 			runs.push_back(run);
 			pos += span.length;
 		}
@@ -2166,6 +2175,11 @@ bool WorldCommandProcessor::evaluateCommand(const QString &input)
 
 	if (matchedAliases.isEmpty())
 	{
+		if (QMudNativePluginRegistry::handleMushReaderCommand(m_runtime, line))
+			return false;
+		if (QMudNativePluginRegistry::handleLuaAudioCommand(m_runtime, line))
+			return false;
+
 		auto quitMacroText = QStringLiteral("quit");
 		for (const auto &[attributes, children] : m_runtime->macros())
 		{
@@ -3693,16 +3707,14 @@ void WorldCommandProcessor::dispatchScriptSend(
 		return;
 
 	QSharedPointer<LuaCallbackEngine> luaRef;
-	LuaCallbackEngine                *lua         = nullptr;
-	bool                              pluginScope = false;
+	LuaCallbackEngine                *lua = nullptr;
 	if (!pluginId.isEmpty())
 	{
 		if (const WorldRuntime::Plugin *plugin = m_runtime->pluginForId(pluginId);
 		    plugin && pluginHasValidId(*plugin) && plugin->enabled && !plugin->installPending)
 		{
-			luaRef      = plugin->lua;
-			lua         = luaRef.data();
-			pluginScope = true;
+			luaRef = plugin->lua;
+			lua    = luaRef.data();
 		}
 	}
 	else
@@ -3745,28 +3757,17 @@ void WorldCommandProcessor::dispatchScriptSend(
 	QPointer<WorldRuntime> executionRuntime = m_runtime;
 	if (!executionRuntime)
 		return;
-	const bool forceWorldErrorOutput =
-	    QMudScriptErrorRouting::shouldForceWorldErrorOutput(executionRuntime != nullptr, pluginScope);
-	if (forceWorldErrorOutput)
-		executionRuntime->pushForceScriptErrorOutputToWorld();
 	if (hasTriggerContext)
 	{
 		static_cast<void>(executionRuntime->dispatchLuaExecuteScript(
 		    luaRef, text, description, styleRuns, hasTriggerContext, replaceMatchedLineOutput,
 		    triggerMatchedLineBufferIndex, triggerMatchedLineAbsoluteNumber));
-		if (forceWorldErrorOutput && executionRuntime)
-			executionRuntime->popForceScriptErrorOutputToWorld();
 		return;
 	}
 
-	executionRuntime->dispatchLuaExecuteScriptAsync(
-	    luaRef, text, description, styleRuns, hasTriggerContext, replaceMatchedLineOutput,
-	    triggerMatchedLineBufferIndex, triggerMatchedLineAbsoluteNumber,
-	    [executionRuntime, forceWorldErrorOutput](bool)
-	    {
-		    if (forceWorldErrorOutput && executionRuntime)
-			    executionRuntime->popForceScriptErrorOutputToWorld();
-	    });
+	executionRuntime->dispatchLuaExecuteScriptAsync(luaRef, text, description, styleRuns, hasTriggerContext,
+	                                                replaceMatchedLineOutput, triggerMatchedLineBufferIndex,
+	                                                triggerMatchedLineAbsoluteNumber);
 }
 
 void WorldCommandProcessor::sendMsg(const QString &text, const bool echo, const bool queueIt, bool logIt)

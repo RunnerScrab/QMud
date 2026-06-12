@@ -11,16 +11,21 @@
 #include "LuaExecutor.h"
 #include "LuaExecutorWorker.h"
 #include "LuaSupport.h"
+#include "NativePluginRegistry.h"
 #include "TelnetProcessor.h"
 #include "WorldRuntime.h"
 #include "WorldView.h"
 #include "helpers/LuaExecutionUtils.h"
+#include "helpers/PluginPathUtils.h"
+#include "scripting/ScriptingErrors.h"
 
 // ReSharper disable once CppUnusedIncludeDirective
 #include <QDir>
 #include <QFile>
 #include <QMetaObject>
 #include <QScopeGuard>
+// ReSharper disable once CppUnusedIncludeDirective
+#include <QTemporaryDir>
 #include <QThread>
 #include <QtTest/QTest>
 
@@ -69,33 +74,39 @@ namespace
 {
 	struct RuntimeStubState
 	{
-			int                                  outputBatchDepth     = 0;
-			int                                  miniWindowBatchDepth = 0;
-			int                                  savePluginStateCalls = 0;
-			unsigned short                       noteStyle            = 0;
-			int                                  noteTextColour       = 0;
-			long                                 noteColourFore       = 0xFFFFFF;
-			long                                 noteColourBack       = 0;
-			bool                                 notesInRgb           = false;
-			QStringList                          outputLines;
-			QList<bool>                          outputNewLines;
-			QStringList                          windowNames;
-			QHash<QString, QHash<int, QVariant>> windowInfo;
-			QHash<QString, QStringList>          hotspotIds;
-			QVector<WorldRuntime::LineEntry>     lineEntries;
-			QString                              startupDirectory;
-			QMap<QString, QString>               worldAttributes;
-			QString                              logFileName;
-			QString                              worldFilePath;
-			QString                              defaultWorldDirectory;
-			QString                              defaultLogDirectory;
-			QString                              pluginsDirectory;
-			QString                              translatorFile;
-			QString                              firstSpecialFontPath;
-			QString                              preferencesDatabaseName;
-			QString                              fileBrowsingDirectory;
-			QString                              stateFilesDirectory;
-			QList<WorldRuntime::Plugin>          plugins;
+			int                                           outputBatchDepth     = 0;
+			int                                           miniWindowBatchDepth = 0;
+			int                                           savePluginStateCalls = 0;
+			unsigned short                                noteStyle            = 0;
+			int                                           noteTextColour       = 0;
+			long                                          noteColourFore       = 0xFFFFFF;
+			long                                          noteColourBack       = 0;
+			bool                                          notesInRgb           = false;
+			QStringList                                   outputLines;
+			QList<bool>                                   outputNewLines;
+			QStringList                                   windowNames;
+			QHash<QString, QHash<int, QVariant>>          windowInfo;
+			QHash<QString, QStringList>                   hotspotIds;
+			QHash<int, int>                               soundStatusByBuffer;
+			QVector<WorldRuntime::LineEntry>              lineEntries;
+			QString                                       startupDirectory;
+			QMap<QString, QString>                        worldAttributes;
+			QString                                       logFileName;
+			QString                                       worldFilePath;
+			QString                                       defaultWorldDirectory;
+			QString                                       defaultLogDirectory;
+			QString                                       pluginsDirectory;
+			QString                                       translatorFile;
+			QString                                       firstSpecialFontPath;
+			QString                                       preferencesDatabaseName;
+			QString                                       fileBrowsingDirectory;
+			QString                                       stateFilesDirectory;
+			QList<WorldRuntime::Plugin>                   plugins;
+			QList<WorldRuntime::Variable>                 variables;
+			QSharedPointer<LuaCallbackMiniWindowSnapshot> variableDispatchSnapshotCache;
+			int                nextAcceleratorCommand = WorldRuntime::kAcceleratorFirstCommand;
+			QHash<qint64, int> acceleratorKeyToCommand;
+			QHash<int, WorldRuntime::AcceleratorEntry> acceleratorEntries;
 	};
 
 	QHash<const WorldRuntime *, RuntimeStubState> &runtimeStubStates()
@@ -154,6 +165,19 @@ namespace
 		constexpr qsizetype kMaxInt = std::numeric_limits<int>::max();
 		return size > kMaxInt ? std::numeric_limits<int>::max() : static_cast<int>(size);
 	}
+
+	QSharedPointer<const LuaCallbackMiniWindowSnapshot>
+	captureVariableDispatchSnapshotForTest(const WorldRuntime &runtime)
+	{
+		RuntimeStubState &state = runtimeStubState(&runtime);
+		if (state.variableDispatchSnapshotCache)
+			return state.variableDispatchSnapshotCache;
+		auto snapshot                       = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+		snapshot->worldVariablesSnapshot    = runtime.variableSnapshot();
+		snapshot->hasWorldVariablesSnapshot = true;
+		state.variableDispatchSnapshotCache = snapshot;
+		return snapshot;
+	}
 } // namespace
 
 WorldRuntime::WorldRuntime(QObject *parent) : QObject(parent)
@@ -163,7 +187,12 @@ WorldRuntime::WorldRuntime(QObject *parent) : QObject(parent)
 
 WorldRuntime::~WorldRuntime()
 {
+	QMudNativePluginRegistry::discardRuntimeState(this);
 	runtimeStubStates().remove(this);
+}
+
+void WorldRuntime::notifyNativePluginStateChanged()
+{
 }
 
 void WorldRuntime::addScriptTime(qint64 nanos)
@@ -321,6 +350,100 @@ long WorldRuntime::customColourBackground(int index) const
 	return 0;
 }
 
+const QList<WorldRuntime::Variable> &WorldRuntime::variables() const
+{
+	return runtimeStubState(this).variables;
+}
+
+bool WorldRuntime::findVariable(const QString &name, QString &value) const
+{
+	for (const Variable &variable : runtimeStubState(this).variables)
+	{
+		const QString variableName = variable.attributes.value(QStringLiteral("name"));
+		if (variableName.compare(name, Qt::CaseInsensitive) == 0)
+		{
+			value = variable.content;
+			return true;
+		}
+	}
+	return false;
+}
+
+QStringList WorldRuntime::variableList() const
+{
+	QStringList names;
+	for (const Variable &variable : runtimeStubState(this).variables)
+	{
+		const QString name = variable.attributes.value(QStringLiteral("name"));
+		if (!name.isEmpty())
+			names.push_back(name);
+	}
+	return names;
+}
+
+QMap<QString, QString> WorldRuntime::variableSnapshot() const
+{
+	QMap<QString, QString> snapshot;
+	for (const Variable &variable : runtimeStubState(this).variables)
+	{
+		const QString name = variable.attributes.value(QStringLiteral("name"));
+		if (!name.isEmpty())
+			snapshot.insert(name, variable.content);
+	}
+	return snapshot;
+}
+
+void WorldRuntime::invalidateLuaCallbackDispatchSnapshot() const
+{
+	runtimeStubState(this).variableDispatchSnapshotCache.clear();
+}
+
+void WorldRuntime::setVariable(const QString &name, const QString &value)
+{
+	if (name.isEmpty())
+		return;
+
+	RuntimeStubState &state = runtimeStubState(this);
+	for (Variable &variable : state.variables)
+	{
+		const QString variableName = variable.attributes.value(QStringLiteral("name"));
+		if (variableName.compare(name, Qt::CaseInsensitive) == 0)
+		{
+			variable.content = value;
+			invalidateLuaCallbackDispatchSnapshot();
+			return;
+		}
+	}
+
+	Variable variable;
+	variable.attributes.insert(QStringLiteral("name"), name);
+	variable.content = value;
+	state.variables.push_back(variable);
+	invalidateLuaCallbackDispatchSnapshot();
+}
+
+void WorldRuntime::setVariables(const QList<Variable> &variables)
+{
+	runtimeStubState(this).variables = variables;
+	invalidateLuaCallbackDispatchSnapshot();
+}
+
+int WorldRuntime::deleteVariable(const QString &name)
+{
+	RuntimeStubState &state = runtimeStubState(this);
+	for (int i = 0; i < state.variables.size(); ++i)
+	{
+		const QString variableName = state.variables.at(i).attributes.value(QStringLiteral("name"));
+		if (variableName.compare(name, Qt::CaseInsensitive) == 0)
+		{
+			state.variables.removeAt(i);
+			invalidateLuaCallbackDispatchSnapshot();
+			return eOK;
+		}
+	}
+	return eVariableNotFound;
+}
+
 void WorldRuntime::setNoteColourBack(long value)
 {
 	runtimeStubState(this).noteColourBack = value & 0x00FFFFFF;
@@ -463,6 +586,48 @@ QStringList WorldRuntime::windowHotspotList(const QString &name) const
 	return runtimeStubState(this).hotspotIds.value(name);
 }
 
+int WorldRuntime::playSound(const int buffer, const QString &fileName, const bool loop, double, double)
+{
+	return playSoundBypassingPluginCallbacks(buffer, fileName, loop, 0.0, 0.0);
+}
+
+int WorldRuntime::playSoundBypassingPluginCallbacks(const int buffer, const QString &fileName,
+                                                    const bool loop, double, double)
+{
+	if (fileName.isEmpty())
+	{
+		if (!runtimeStubState(this).soundStatusByBuffer.contains(buffer))
+			return eBadParameter;
+		runtimeStubState(this).soundStatusByBuffer.insert(buffer, loop ? 2 : 1);
+		return eOK;
+	}
+	const int targetBuffer = buffer > 0 ? buffer : 1;
+	runtimeStubState(this).soundStatusByBuffer.insert(targetBuffer, loop ? 2 : 1);
+	return eOK;
+}
+
+int WorldRuntime::stopSound(const int buffer)
+{
+	return stopSoundBypassingPluginCallbacks(buffer);
+}
+
+int WorldRuntime::stopSoundBypassingPluginCallbacks(const int buffer)
+{
+	RuntimeStubState &state = runtimeStubState(this);
+	if (buffer == 0)
+		state.soundStatusByBuffer.clear();
+	else
+		state.soundStatusByBuffer.remove(buffer);
+	return eOK;
+}
+
+int WorldRuntime::soundStatus(const int buffer) const
+{
+	if (buffer < 1 || buffer > WorldRuntime::kMaxSoundBuffers)
+		return -1;
+	return runtimeStubState(this).soundStatusByBuffer.value(buffer, -2);
+}
+
 const QList<WorldRuntime::Plugin> &WorldRuntime::plugins() const
 {
 	return runtimeStubState(this).plugins;
@@ -473,8 +638,40 @@ QList<WorldRuntime::Plugin> &WorldRuntime::pluginsMutable()
 	return runtimeStubState(this).plugins;
 }
 
+bool WorldRuntime::isPluginInstalled(const QString &pluginId) const
+{
+	if (QMudNativePluginRegistry::isBlacklistedId(pluginId))
+		return false;
+	if (!QMudNativePluginRegistry::resolveShimIdOrName(pluginId).isEmpty())
+		return true;
+	for (const Plugin &plugin : runtimeStubState(this).plugins)
+	{
+		if (plugin.attributes.value(QStringLiteral("id")).compare(pluginId, Qt::CaseInsensitive) == 0)
+			return true;
+	}
+	return false;
+}
+
 QVariant WorldRuntime::pluginInfo(const QString &pluginId, const int infoType) const
 {
+	if (const QString shimId = QMudNativePluginRegistry::resolveShimIdOrName(pluginId); !shimId.isEmpty())
+	{
+		int               visibleIndex = 0;
+		const QStringList ids          = pluginIdList();
+		for (int i = 0; i < ids.size(); ++i)
+		{
+			if (ids.at(i).compare(shimId, Qt::CaseInsensitive) == 0)
+			{
+				visibleIndex = i + 1;
+				break;
+			}
+		}
+		const bool enabled =
+		    shimId.compare(QMudNativePluginRegistry::mushReaderPluginId(), Qt::CaseInsensitive) == 0
+		        ? QMudNativePluginRegistry::isMushReaderPassiveSpeechEnabled(this)
+		        : true;
+		return QMudNativePluginRegistry::pluginInfo(shimId, infoType, visibleIndex, enabled);
+	}
 	for (const Plugin &plugin : runtimeStubState(this).plugins)
 	{
 		if (plugin.attributes.value(QStringLiteral("id")).compare(pluginId, Qt::CaseInsensitive) != 0)
@@ -506,12 +703,82 @@ QVariant WorldRuntime::pluginInfo(const QString &pluginId, const int infoType) c
 	return {};
 }
 
+bool WorldRuntime::findPluginVariable(const QString &pluginId, const QString &name, QString &value) const
+{
+	for (const Plugin &plugin : runtimeStubState(this).plugins)
+	{
+		if (plugin.attributes.value(QStringLiteral("id")).compare(pluginId, Qt::CaseInsensitive) != 0)
+			continue;
+		for (auto it = plugin.variables.constBegin(); it != plugin.variables.constEnd(); ++it)
+		{
+			if (it.key().compare(name, Qt::CaseInsensitive) == 0)
+			{
+				value = it.value();
+				return true;
+			}
+		}
+		return false;
+	}
+	return false;
+}
+
+bool WorldRuntime::pluginVariableSnapshot(const QString &pluginId, QMap<QString, QString> &values) const
+{
+	values.clear();
+	for (const Plugin &plugin : runtimeStubState(this).plugins)
+	{
+		if (plugin.attributes.value(QStringLiteral("id")).compare(pluginId, Qt::CaseInsensitive) != 0)
+			continue;
+		values = plugin.variables;
+		return true;
+	}
+	return false;
+}
+
 QStringList WorldRuntime::pluginIdList() const
 {
 	QStringList ids;
 	for (const Plugin &plugin : runtimeStubState(this).plugins)
-		ids.push_back(plugin.attributes.value(QStringLiteral("id")));
+	{
+		const QString id = plugin.attributes.value(QStringLiteral("id"));
+		if (!id.isEmpty() && !QMudNativePluginRegistry::isBlacklistedId(id))
+			ids.push_back(id);
+	}
+	for (const QString &shimId :
+	     {QMudNativePluginRegistry::mushReaderPluginId(), QMudNativePluginRegistry::luaAudioPluginId()})
+	{
+		if (!ids.contains(shimId, Qt::CaseInsensitive))
+			ids.push_back(shimId);
+	}
 	return ids;
+}
+
+int WorldRuntime::allocateAcceleratorCommand()
+{
+	RuntimeStubState &state = runtimeStubState(this);
+	return state.nextAcceleratorCommand++;
+}
+
+void WorldRuntime::registerAccelerator(const qint64 key, const int commandId, const AcceleratorEntry &entry)
+{
+	RuntimeStubState &state = runtimeStubState(this);
+	state.acceleratorKeyToCommand.insert(key, commandId);
+	state.acceleratorEntries.insert(commandId, entry);
+}
+
+void WorldRuntime::removeAccelerator(const qint64 key)
+{
+	RuntimeStubState &state = runtimeStubState(this);
+	const auto        it    = state.acceleratorKeyToCommand.constFind(key);
+	if (it == state.acceleratorKeyToCommand.constEnd())
+		return;
+	state.acceleratorEntries.remove(it.value());
+	state.acceleratorKeyToCommand.remove(key);
+}
+
+int WorldRuntime::acceleratorCommandForKey(const qint64 key) const
+{
+	return runtimeStubState(this).acceleratorKeyToCommand.value(key, -1);
 }
 
 QVariant WorldRuntime::windowHotspotInfo(const QString &name, const QString &hotspotId, int infoType) const
@@ -523,11 +790,6 @@ QVariant WorldRuntime::windowHotspotInfo(const QString &name, const QString &hot
 }
 
 bool WorldRuntime::suppressScriptErrorOutputToWorld() const
-{
-	return false;
-}
-
-bool WorldRuntime::forceScriptErrorOutputToWorld() const
 {
 	return false;
 }
@@ -574,6 +836,11 @@ namespace
 			void colourTellIgnoresTrailingLuaGsubReturnAndKeepsFollowingNote();
 			void executeScriptNoteUsesRuntimeNoteColour();
 			void selfPluginInfoMetadataFallsThroughToRuntime();
+			void emptyPluginVariableIdReadsWorldVariables();
+			void deleteVariableInvalidatesCallbackVariableSnapshot();
+			void nativeShimDiscoveryIsAvailableWithoutShadowPlugin();
+			void nativeLuaAudioSharedRuntimeStateCoversDirectAndCallPlugin();
+			void blacklistedPluginsAreHiddenFromPluginApis();
 			void triggerAnchoredColourOutputKeepsNativePromptText();
 			void stringsAndWildcardsDispatchSuppliesSnapshotForCallbackReads();
 			void callbackSnapshotSuppliesGetInfoAndMiniWindowReads();
@@ -1549,7 +1816,7 @@ local values = {
 path_summary = table.concat(values, "|")
 path_no_backslashes = not path_summary:find("\\", 1, true)
 getinfo_56 = tostring(GetInfo(56))
-getinfo_56_ok = #getinfo_56 > 0 and not getinfo_56:find("\\", 1, true)
+getinfo_56_ok = #getinfo_56 > 0 and getinfo_56:sub(-1) == "/" and not getinfo_56:find("\\", 1, true)
 local info = utils.info()
 utils_info_summary = tostring(info.app_directory) .. "|" .. tostring(info.current_directory)
 utils_info_ok = utils_info_summary == "./|./"
@@ -1582,8 +1849,11 @@ utils_info_ok = utils_info_summary == "./|./"
 	        QStringLiteral("worlds/plugins/state/"),
 	    }
 	        .join(QLatin1Char('|'));
+	const QString expectedGetInfo56 =
+	    QMudPluginPathUtils::normalizeSeparators(root.absolutePath()) + QLatin1Char('/');
 	QCOMPARE(luaGlobalString(engine.luaState(), "path_summary"), expected);
 	QVERIFY(luaGlobalBoolean(engine.luaState(), "path_no_backslashes"));
+	QCOMPARE(luaGlobalString(engine.luaState(), "getinfo_56"), expectedGetInfo56);
 	QVERIFY(luaGlobalBoolean(engine.luaState(), "getinfo_56_ok"));
 	QCOMPARE(luaGlobalString(engine.luaState(), "utils_info_summary"), QStringLiteral("./|./"));
 	QVERIFY(luaGlobalBoolean(engine.luaState(), "utils_info_ok"));
@@ -2044,6 +2314,346 @@ void tst_LuaCallbackEngine::selfPluginInfoMetadataFallsThroughToRuntime()
 	QCOMPARE(result.stringResult,
 	         QStringLiteral("Plugin Name|Runtime Author|Runtime Description|Runtime Script|lua|"
 	                        "worlds/plugins/runtime_plugin.xml|Plugin.Id|Runtime Purpose|/tmp/plugin/"));
+	teardownWorkerEngine(executor, engine);
+}
+
+void tst_LuaCallbackEngine::emptyPluginVariableIdReadsWorldVariables()
+{
+	WorldRuntime runtime;
+	runtime.setVariable(QStringLiteral("hour_offset"), QStringLiteral("1"));
+	runtime.setVariable(QStringLiteral("MixedCaseMode"), QStringLiteral("active"));
+
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
+function OnPluginEnable()
+  local hour_offset = GetPluginVariable("", "hour_offset")
+  local mixed_case_mode = GetPluginVariable("", "mixedcasemode")
+  empty_plugin_variable_ok = hour_offset == "1"
+  empty_plugin_variable_case_ok = mixed_case_mode == "active"
+
+  local variables = GetPluginVariableList("")
+  empty_plugin_variable_list_ok = variables ~= nil and
+                                  variables.hour_offset == "1" and
+                                  variables.MixedCaseMode == "active"
+  empty_plugin_variable_status = table.concat({
+    tostring(hour_offset),
+    tostring(mixed_case_mode),
+    tostring(variables ~= nil),
+    variables ~= nil and tostring(variables.hour_offset) or "no-table",
+    variables ~= nil and tostring(variables.MixedCaseMode) or "no-table"
+  }, "|")
+  return empty_plugin_variable_ok and
+         empty_plugin_variable_case_ok and
+         empty_plugin_variable_list_ok
+end
+)lua"),
+	                       &runtime);
+
+	LuaBatchDispatchRequest request;
+	request.engines               = {engine};
+	request.kind                  = LuaBatchDispatchKind::NoArgs;
+	request.functionName          = QStringLiteral("OnPluginEnable");
+	request.miniWindowSnapshotArg = captureVariableDispatchSnapshotForTest(runtime);
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	QVERIFY(result.boolResultValid);
+	QVERIFY2(result.boolResult,
+	         qPrintable(luaGlobalString(engine->luaState(), "empty_plugin_variable_status")));
+	QVERIFY(luaGlobalBoolean(engine->luaState(), "empty_plugin_variable_ok"));
+	QVERIFY(luaGlobalBoolean(engine->luaState(), "empty_plugin_variable_case_ok"));
+	QVERIFY(luaGlobalBoolean(engine->luaState(), "empty_plugin_variable_list_ok"));
+	teardownWorkerEngine(executor, engine);
+}
+
+void tst_LuaCallbackEngine::deleteVariableInvalidatesCallbackVariableSnapshot()
+{
+	WorldRuntime runtime;
+	runtime.setVariable(QStringLiteral("stale"), QStringLiteral("present"));
+
+	const QSharedPointer<const LuaCallbackMiniWindowSnapshot> before =
+	    captureVariableDispatchSnapshotForTest(runtime);
+	QVERIFY(before);
+	QVERIFY(before->hasWorldVariablesSnapshot);
+	QCOMPARE(before->worldVariablesSnapshot.value(QStringLiteral("stale")), QStringLiteral("present"));
+
+	QCOMPARE(runtime.deleteVariable(QStringLiteral("stale")), eOK);
+
+	const QSharedPointer<const LuaCallbackMiniWindowSnapshot> after =
+	    captureVariableDispatchSnapshotForTest(runtime);
+	QVERIFY(after);
+	QVERIFY(after->hasWorldVariablesSnapshot);
+	QVERIFY(!after->worldVariablesSnapshot.contains(QStringLiteral("stale")));
+}
+
+void tst_LuaCallbackEngine::nativeShimDiscoveryIsAvailableWithoutShadowPlugin()
+{
+	WorldRuntime  runtime;
+	QTemporaryDir soundRoot;
+	QVERIFY(soundRoot.isValid());
+	QVERIFY(QDir(soundRoot.path()).mkpath(QStringLiteral("sounds")));
+	QFile soundFile(QDir(soundRoot.path()).filePath(QStringLiteral("sounds/coin.wav")));
+	QVERIFY(soundFile.open(QIODevice::WriteOnly));
+	soundFile.write("RIFF");
+	soundFile.close();
+	runtimeStubState(&runtime).startupDirectory = soundRoot.path();
+	runtimeStubState(&runtime).soundStatusByBuffer.insert(9, 1);
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	const QString     shimId = QMudNativePluginRegistry::mushReaderPluginId();
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
+	function OnPluginEnable()
+	  local id = "925cdd0331023d9f0b8f05a7"
+	  local audio_id = "aedf0cb0be5bf045860d54b7"
+	  audio.volume(75)
+	  local delay_id = audio.playDelay("coin.wav", 10)
+	  local delayed_playing = audio.isPlaying(delay_id)
+	  audio.free()
+	  shim_info = table.concat({
+	    GetPluginInfo(id, 1) or "",
+	    tostring(GetPluginInfo(id, 17) or false),
+	    GetPluginInfo(audio_id, 1) or "",
+	    tostring(GetPluginInfo(audio_id, 17) or false),
+	    string.format("%.0f", audio.getVolume()),
+	    tostring(delay_id),
+	    tostring(delayed_playing)
+	  }, "|")
+	end
+	function shim_info_status(value)
+	  return shim_info
+	end
+	)lua"),
+	                       &runtime);
+
+	auto snapshot = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+	snapshot->soundStatusByBuffer.insert(1, -2);
+	snapshot->soundStatusByBuffer.insert(9, 1);
+
+	LuaBatchDispatchRequest request;
+	request.engines               = {engine};
+	request.kind                  = LuaBatchDispatchKind::NoArgs;
+	request.functionName          = QStringLiteral("OnPluginEnable");
+	request.miniWindowSnapshotArg = snapshot;
+	dispatchWorkerAndWait(executor, request);
+
+	request.kind                  = LuaBatchDispatchKind::StringInOut;
+	request.functionName          = QStringLiteral("shim_info_status");
+	request.stringArg             = QStringLiteral("ignored");
+	request.miniWindowSnapshotArg = {};
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	QCOMPARE(result.stringResult, QStringLiteral("MushReader|false|LuaAudio|true|100|1|false"));
+	QCOMPARE(runtimeStubState(&runtime).soundStatusByBuffer.value(9), 1);
+	QVERIFY(runtime.pluginIdList().contains(shimId, Qt::CaseInsensitive));
+	QVERIFY(
+	    runtime.pluginIdList().contains(QMudNativePluginRegistry::luaAudioPluginId(), Qt::CaseInsensitive));
+	QCOMPARE(QMudNativePluginRegistry::pluginSupports(shimId, QStringLiteral("say")), eOK);
+	QCOMPARE(QMudNativePluginRegistry::pluginSupports(shimId, QStringLiteral("interrupt")), eOK);
+	QCOMPARE(QMudNativePluginRegistry::pluginSupports(shimId, QStringLiteral("stop")), eOK);
+	QCOMPARE(QMudNativePluginRegistry::pluginSupports(shimId, QStringLiteral("missing")), eNoSuchRoutine);
+	teardownWorkerEngine(executor, engine);
+}
+
+void tst_LuaCallbackEngine::nativeLuaAudioSharedRuntimeStateCoversDirectAndCallPlugin()
+{
+	WorldRuntime  runtime;
+	QTemporaryDir soundRoot;
+	QVERIFY(soundRoot.isValid());
+	QVERIFY(QDir(soundRoot.path()).mkpath(QStringLiteral("sounds")));
+	QFile soundFile(QDir(soundRoot.path()).filePath(QStringLiteral("sounds/coin.wav")));
+	QVERIFY(soundFile.open(QIODevice::WriteOnly));
+	soundFile.write("RIFF");
+	soundFile.close();
+	runtimeStubState(&runtime).startupDirectory = soundRoot.path();
+
+	const QMudNativePluginRegistry::NativeCallResult nativeDelayed = QMudNativePluginRegistry::callRoutine(
+	    &runtime, QMudNativePluginRegistry::luaAudioPluginId(), QStringLiteral("playDelay"),
+	    {QStringLiteral("coin.wav"), 10.0, 0.0, 100.0});
+	QCOMPARE(nativeDelayed.errorCode, eOK);
+	QCOMPARE(nativeDelayed.returnValues.size(), 1);
+	QCOMPARE(nativeDelayed.returnValues.constFirst().toInt(), 1);
+
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
+	function OnPluginEnable()
+	  audio.volume(75)
+	  local delay_id = audio.playDelay("coin.wav", 10)
+	  audio.volume(25, delay_id)
+	  local delayed_volume = audio.getVolume(delay_id)
+	  audio.free()
+	  lua_audio_shared_info = table.concat({
+	    tostring(delay_id),
+	    string.format("%.0f", delayed_volume),
+	    string.format("%.0f", audio.getVolume())
+	  }, "|")
+	end
+	function lua_audio_shared_status(value)
+	  return lua_audio_shared_info
+	end
+	)lua"),
+	                       &runtime);
+
+	auto snapshot = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+	snapshot->soundStatusByBuffer.insert(1, -2);
+	snapshot->soundStatusByBuffer.insert(2, -2);
+
+	LuaBatchDispatchRequest request;
+	request.engines               = {engine};
+	request.kind                  = LuaBatchDispatchKind::NoArgs;
+	request.functionName          = QStringLiteral("OnPluginEnable");
+	request.miniWindowSnapshotArg = snapshot;
+	dispatchWorkerAndWait(executor, request);
+
+	request.kind                  = LuaBatchDispatchKind::StringInOut;
+	request.functionName          = QStringLiteral("lua_audio_shared_status");
+	request.stringArg             = QStringLiteral("ignored");
+	request.miniWindowSnapshotArg = {};
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	QCOMPARE(result.stringResult, QStringLiteral("2|25|100"));
+	QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+
+	teardownWorkerEngine(executor, engine);
+	QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+
+	auto pendingEngine = QSharedPointer<LuaCallbackEngine>::create();
+	initializeWorkerEngine(executor, pendingEngine, QStringLiteral(R"lua(
+	function OnPluginEnable()
+	  audio.playDelay("coin.wav", 10)
+	end
+	)lua"),
+	                       &runtime);
+	auto pendingSnapshot = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+	pendingSnapshot->soundStatusByBuffer.insert(1, -2);
+	request.engines               = {pendingEngine};
+	request.kind                  = LuaBatchDispatchKind::NoArgs;
+	request.functionName          = QStringLiteral("OnPluginEnable");
+	request.miniWindowSnapshotArg = pendingSnapshot;
+	dispatchWorkerAndWait(executor, request);
+	QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).size(), 1);
+
+	teardownWorkerEngine(executor, pendingEngine);
+	QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+
+	auto loopEngine = QSharedPointer<LuaCallbackEngine>::create();
+	initializeWorkerEngine(executor, loopEngine, QStringLiteral(R"lua(
+	function OnPluginEnable()
+	end
+	)lua"),
+	                       &runtime);
+	QMudNativePluginRegistry::LuaAudioRuntimeBufferState loopState;
+	loopState.volume   = 100.0;
+	loopState.loop     = true;
+	loopState.ownerKey = loopEngine.data();
+	QMudNativePluginRegistry::luaAudioMarkRuntimeBuffer(&runtime, 1, loopState);
+	QCOMPARE(runtime.playSound(1, QStringLiteral("coin.wav"), true, 0.0, 0.0), eOK);
+	QCOMPARE(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).size(), 1);
+	QCOMPARE(runtimeStubState(&runtime).soundStatusByBuffer.value(1), 2);
+
+	teardownWorkerEngine(executor, loopEngine);
+	QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+	QCOMPARE(runtimeStubState(&runtime).soundStatusByBuffer.value(1, -2), -2);
+
+	auto timedEngine = QSharedPointer<LuaCallbackEngine>::create();
+	initializeWorkerEngine(executor, timedEngine, QStringLiteral(R"lua(
+	function OnPluginEnable()
+	  timed_id = 1
+	  fade_id = 2
+	  audio.slideVol(40, timed_id, 0.02)
+	  audio.slidePan(7, timed_id, 0.02)
+	  audio.slidePitch(5, timed_id, 0.02)
+	  audio.fadeout(fade_id, 0.02)
+	  timed_before = audio.getVolume(timed_id)
+	end
+	function timed_audio_status(value)
+	  return table.concat({
+	    tostring(timed_id),
+	    tostring(fade_id),
+	    string.format("%.0f", timed_before),
+	    string.format("%.0f", audio.getVolume(timed_id)),
+	    tostring(audio.isPlaying(fade_id))
+	  }, "|")
+	end
+	)lua"),
+	                       &runtime);
+	QMudNativePluginRegistry::LuaAudioRuntimeBufferState timedState;
+	timedState.volume   = 100.0;
+	timedState.ownerKey = timedEngine.data();
+	QMudNativePluginRegistry::luaAudioMarkRuntimeBuffer(&runtime, 1, timedState);
+	QMudNativePluginRegistry::LuaAudioRuntimeBufferState fadeState;
+	fadeState.volume   = 100.0;
+	fadeState.ownerKey = timedEngine.data();
+	QMudNativePluginRegistry::luaAudioMarkRuntimeBuffer(&runtime, 2, fadeState);
+	runtimeStubState(&runtime).soundStatusByBuffer.insert(1, 1);
+	runtimeStubState(&runtime).soundStatusByBuffer.insert(2, 1);
+	auto timedSnapshot = QSharedPointer<LuaCallbackMiniWindowSnapshot>::create();
+	timedSnapshot->soundStatusByBuffer.insert(1, 1);
+	timedSnapshot->soundStatusByBuffer.insert(2, 1);
+	request.engines               = {timedEngine};
+	request.kind                  = LuaBatchDispatchKind::NoArgs;
+	request.functionName          = QStringLiteral("OnPluginEnable");
+	request.miniWindowSnapshotArg = timedSnapshot;
+	dispatchWorkerAndWait(executor, request);
+
+	QTest::qWait(60);
+	request.kind                  = LuaBatchDispatchKind::StringInOut;
+	request.functionName          = QStringLiteral("timed_audio_status");
+	request.stringArg             = QStringLiteral("ignored");
+	request.miniWindowSnapshotArg = {};
+	dispatchWorkerAndWait(executor, request, result);
+	QCOMPARE(result.stringResult, QStringLiteral("1|2|100|40|false"));
+	QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeBufferState(&runtime, 1, timedState));
+	QCOMPARE(timedState.volume, 40.0);
+	QCOMPARE(timedState.pan, 7.0);
+	QCOMPARE(timedState.pitch, 5.0);
+	QCOMPARE(runtimeStubState(&runtime).soundStatusByBuffer.value(2, -2), -2);
+	teardownWorkerEngine(executor, timedEngine);
+	QVERIFY(QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(&runtime).isEmpty());
+}
+
+void tst_LuaCallbackEngine::blacklistedPluginsAreHiddenFromPluginApis()
+{
+	WorldRuntime      runtime;
+	auto              engine = QSharedPointer<LuaCallbackEngine>::create();
+	LuaExecutorWorker executor;
+	const QString     blacklistedId = QStringLiteral("bb6a05ed7534b5db1ed40511");
+	const QStringList blacklistedIds{blacklistedId, QStringLiteral("b8e6dac1ee7fe8e3de931fb7"),
+	                                 QStringLiteral("8238deec7c06bade8ebc3819")};
+	for (const QString &id : blacklistedIds)
+		QVERIFY(QMudNativePluginRegistry::isBlacklistedId(id));
+
+	WorldRuntime::Plugin plugin;
+	plugin.attributes.insert(QStringLiteral("id"), blacklistedId);
+	plugin.attributes.insert(QStringLiteral("name"), QStringLiteral("Automatic Backup"));
+	plugin.enabled = true;
+	runtimeStubState(&runtime).plugins.push_back(plugin);
+
+	initializeWorkerEngine(executor, engine, QStringLiteral(R"lua(
+	function OnPluginEnable()
+	  local id = "bb6a05ed7534b5db1ed40511"
+	  blacklist_status = tostring(GetPluginInfo(id, 1) == nil)
+	end
+	function blacklist_status_value(value)
+	  return blacklist_status
+	end
+	)lua"),
+	                       &runtime);
+
+	LuaBatchDispatchRequest request;
+	request.engines      = {engine};
+	request.kind         = LuaBatchDispatchKind::NoArgs;
+	request.functionName = QStringLiteral("OnPluginEnable");
+	dispatchWorkerAndWait(executor, request);
+
+	request.kind         = LuaBatchDispatchKind::StringInOut;
+	request.functionName = QStringLiteral("blacklist_status_value");
+	request.stringArg    = QStringLiteral("ignored");
+	LuaBatchDispatchResult result;
+	dispatchWorkerAndWait(executor, request, result);
+	QCOMPARE(result.stringResult, QStringLiteral("true"));
+	QVERIFY(!runtime.pluginIdList().contains(blacklistedId, Qt::CaseInsensitive));
+	QCOMPARE(QMudNativePluginRegistry::pluginSupports(blacklistedId, QStringLiteral("say")), eNoSuchPlugin);
 	teardownWorkerEngine(executor, engine);
 }
 

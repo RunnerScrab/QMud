@@ -851,15 +851,25 @@ class WorldView : public QWidget
 		 */
 		[[nodiscard]] bool                        outputScrollBarWanted() const;
 		/**
-		 * @brief Returns output text viewport rectangle.
-		 * @return Output text viewport rectangle.
+		 * @brief Returns output text layout rectangle.
+		 * @return Output text layout rectangle.
 		 */
 		[[nodiscard]] QRect                       outputTextRectangle() const;
 		/**
-		 * @brief Returns unreserved output text viewport rectangle.
+		 * @brief Returns unreserved output text layout rectangle.
 		 * @return Output text rectangle before right-reservation adjustments.
 		 */
 		[[nodiscard]] QRect                       outputTextRectangleUnreserved() const;
+		/**
+		 * @brief Returns legacy-visible output text viewport rectangle.
+		 * @return Primary output viewport rectangle in output-stack coordinates.
+		 */
+		[[nodiscard]] QRect                       outputTextViewportRectangle() const;
+		/**
+		 * @brief Returns unreserved legacy-visible output text viewport rectangle.
+		 * @return Primary output viewport rectangle before right-reservation adjustments.
+		 */
+		[[nodiscard]] QRect                       outputTextViewportRectangleUnreserved() const;
 
 	private:
 		friend class WorldOutputCanvas;

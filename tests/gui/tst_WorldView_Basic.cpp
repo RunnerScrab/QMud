@@ -1880,6 +1880,37 @@ class tst_WorldView_Basic : public QObject
 			resetTestState();
 		}
 
+		void textViewportRectangleExcludesOutputScrollbar()
+		{
+			resetTestState();
+
+			WorldView view;
+			view.resize(900, 640);
+			view.show();
+			view.setRuntimeObserver(fakeRuntimePointer());
+			for (int i = 0; i < 300; ++i)
+				view.appendOutputText(QStringLiteral("scrollbar-primer-%1").arg(i), true);
+			QCoreApplication::processEvents();
+
+			QTextBrowser *browser = findVisibleOutputBrowser(view);
+			QVERIFY(browser);
+			browser->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
+			QCoreApplication::processEvents();
+			QSplitter *const outputSplitter = findOutputSplitter(view);
+			QVERIFY(outputSplitter);
+			QWidget *const outputStack = outputSplitter->parentWidget();
+			QVERIFY(outputStack);
+			QTRY_VERIFY(browser->verticalScrollBar()->isVisible());
+
+			const QRect viewportRect(browser->viewport()->mapTo(outputStack, QPoint(0, 0)),
+			                         browser->viewport()->size());
+			QCOMPARE(view.outputTextViewportRectangleUnreserved(), viewportRect);
+			QVERIFY(view.outputTextViewportRectangleUnreserved().width() <
+			        view.outputTextRectangleUnreserved().width());
+
+			resetTestState();
+		}
+
 		void collapsedScrollbackSplitterHandleIsHidden()
 		{
 			WorldView view;
@@ -3548,7 +3579,7 @@ class tst_WorldView_Basic : public QObject
 
 			appendFakeRuntimeOutputText(view,
 			                            QStringLiteral("one two three four five six seven eight nine ten "
-			                                           "eleven twelve thirteen fourteen"),
+			                                           "eleven twelve thirteen fourteen!"),
 			                            {}, true, true);
 			QCoreApplication::processEvents();
 			nativeCanvas->update();

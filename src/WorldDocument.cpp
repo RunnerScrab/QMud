@@ -8,6 +8,7 @@
 
 #include "WorldDocument.h"
 
+#include "NativePluginRegistry.h"
 #include "Version.h"
 
 #include <QDir>
@@ -15,6 +16,28 @@
 #include <QFileInfo>
 #include <QXmlStreamReader>
 #include <algorithm>
+
+static bool makeVirtualNativePlugin(const QString &rawName, WorldDocument::Plugin &plugin)
+{
+	QMudNativePluginRegistry::NativePluginMetadata metadata;
+	if (!QMudNativePluginRegistry::metadataForNativeSource(rawName, metadata))
+		return false;
+
+	plugin.attributes.insert(QStringLiteral("id"), metadata.id);
+	plugin.attributes.insert(QStringLiteral("name"), metadata.name);
+	plugin.attributes.insert(QStringLiteral("author"), metadata.author);
+	plugin.attributes.insert(QStringLiteral("purpose"), metadata.purpose);
+	plugin.attributes.insert(QStringLiteral("language"), metadata.language);
+	plugin.attributes.insert(QStringLiteral("source"), metadata.source);
+	plugin.attributes.insert(QStringLiteral("directory"), metadata.directory);
+	plugin.description = QMudNativePluginRegistry::nativeShimMarkerText();
+	return true;
+}
+
+static bool isVirtualNativePluginInclude(const QString &rawName)
+{
+	return !QMudNativePluginRegistry::normalizeNativeSource(rawName).isEmpty();
+}
 
 static bool isPortableRootSegment(const QString &segment)
 {
@@ -449,7 +472,7 @@ bool WorldDocument::loadFromFileWithPolicy(const QString &fileName, PluginPolicy
 				}
 
 				// General attributes are on the <world> element.
-				// Multi-line alpha options are child elements (eg. <notes>...</notes>).
+				// Multi-line alpha options are child elements (e.g. <notes>...</notes>).
 				while (!reader.atEnd())
 				{
 					reader.readNext();
@@ -606,7 +629,7 @@ bool WorldDocument::loadFromFileWithPolicy(const QString &fileName, PluginPolicy
 			else if (name == QLatin1String("colours"))
 			{
 				sawContent = true;
-				// Collect colour elements by group.
+				// Collect color elements by group.
 				while (!reader.atEnd())
 				{
 					reader.readNext();
@@ -1138,9 +1161,37 @@ bool WorldDocument::expandIncludesPass(const QString &worldFilePath, const QStri
 
 		const QString pluginFlag = include.attributes.value(QStringLiteral("plugin")).toLower();
 		const bool    isPlugin   = (pluginFlag == QStringLiteral("y") || pluginFlag == QStringLiteral("1") ||
-                               pluginFlag == QStringLiteral("true"));
+		                            pluginFlag == QStringLiteral("true"));
 		if (isPlugin != wantPlugins)
 			continue;
+		if (isPlugin)
+		{
+			if (isVirtualNativePluginInclude(rawName))
+			{
+				Plugin nativePlugin;
+				if (!makeVirtualNativePlugin(rawName, nativePlugin))
+				{
+					m_errorString = QStringLiteral("Unknown native plugin include \"%1\"").arg(rawName);
+					return false;
+				}
+				const QString includeEnabled = include.attributes.value(QStringLiteral("enabled")).trimmed();
+				if (!includeEnabled.isEmpty())
+					nativePlugin.attributes.insert(QStringLiteral("enabled"), includeEnabled);
+				const QString newPluginId =
+				    nativePlugin.attributes.value(QStringLiteral("id")).trimmed().toLower();
+				const QString newPluginName = nativePlugin.attributes.value(QStringLiteral("name")).trimmed();
+				if (!newPluginId.isEmpty() && m_loadedPluginIds.contains(newPluginId))
+				{
+					const QString existingName = m_loadedPluginIds.value(newPluginId);
+					m_errorString = QStringLiteral("The plugin '%1' is already loaded.").arg(existingName);
+					return false;
+				}
+				m_plugins.push_back(nativePlugin);
+				if (!newPluginId.isEmpty())
+					m_loadedPluginIds.insert(newPluginId, newPluginName);
+				continue;
+			}
+		}
 
 		const QString resolved =
 		    resolveIncludePath(rawName, worldFilePath, pluginsDir, programDir, currentPluginDir, wantPlugins);
@@ -1353,7 +1404,7 @@ QString WorldDocument::resolveIncludePath(const QString &rawName, const QString 
 		nativeName = nativeName.mid(1);
 	}
 
-	// Repair legacy malformed absolute-like portable paths (eg. "/worlds/...").
+	// Repair legacy malformed absolute-like portable paths (e.g. "/worlds/...").
 	if (nativeName.startsWith(QLatin1Char('/')))
 	{
 		QString candidate = nativeName;
@@ -1368,7 +1419,7 @@ QString WorldDocument::resolveIncludePath(const QString &rawName, const QString 
 	}
 
 	// Convert legacy absolute Windows paths that point into portable roots
-	// (eg. "C:/Games/.../worlds/foo.xml") to portable-root paths.
+	// (e.g. "C:/Games/.../worlds/foo.xml") to portable-root paths.
 	if (const bool isDrivePath =
 	        nativeName.size() >= 2 && nativeName.at(1) == QLatin1Char(':') && nativeName.at(0).isLetter();
 	    isDrivePath)
@@ -1413,15 +1464,15 @@ QString WorldDocument::resolveIncludePath(const QString &rawName, const QString 
 
 	const QString explicitRelativeLower      = explicitRelativeWithoutCurrentDir.toLower();
 	const bool    explicitStartsPortableRoot = explicitRelativeLower == QStringLiteral("worlds") ||
-	                                        explicitRelativeLower.startsWith(QStringLiteral("worlds/")) ||
-	                                        explicitRelativeLower == QStringLiteral("logs") ||
-	                                        explicitRelativeLower.startsWith(QStringLiteral("logs/"));
+	                                           explicitRelativeLower.startsWith(QStringLiteral("worlds/")) ||
+	                                           explicitRelativeLower == QStringLiteral("logs") ||
+	                                           explicitRelativeLower.startsWith(QStringLiteral("logs/"));
 
 	const QString normalizedLower    = nativeName.toLower();
 	const bool    startsPortableRoot = normalizedLower == QStringLiteral("worlds") ||
-	                                normalizedLower.startsWith(QStringLiteral("worlds/")) ||
-	                                normalizedLower == QStringLiteral("logs") ||
-	                                normalizedLower.startsWith(QStringLiteral("logs/"));
+	                                   normalizedLower.startsWith(QStringLiteral("worlds/")) ||
+	                                   normalizedLower == QStringLiteral("logs") ||
+	                                   normalizedLower.startsWith(QStringLiteral("logs/"));
 
 	if (isExplicitRelative)
 	{

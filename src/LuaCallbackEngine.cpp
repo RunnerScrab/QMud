@@ -25,6 +25,7 @@
 #include "MainFrame.h"
 #include "MainWindowHost.h"
 #include "MainWindowHostResolver.h"
+#include "NativePluginRegistry.h"
 #include "SpeedwalkParser.h"
 #include "SqliteCompat.h"
 #include "StringUtils.h"
@@ -97,6 +98,7 @@
 #include <QTextStream>
 #include <QThread>
 #include <QTimeZone>
+#include <QTimer>
 #include <QToolBar>
 #include <QUrl>
 #include <QUuid>
@@ -121,6 +123,7 @@
 #include <ranges>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 #ifdef Q_OS_WIN
 #include <winnls.h>
 #ifndef VER_PLATFORM_WIN32_NT
@@ -6126,19 +6129,18 @@ namespace
 		const auto it = window->fonts.constFind(fontId);
 		if (it == window->fonts.constEnd())
 			return false;
-		width = qMax(0, it.value().metrics.horizontalAdvance(text));
+		width = MiniWindowUtils::textWidth(*window, fontId, text);
 		return true;
 	}
 
-	int drawCallbackMiniWindowShadowTextForApi(const LuaCallbackEngine *engine, const QString &windowName,
-	                                           const QString &fontId, const QString &text, const int left,
-	                                           const int top, const int right, const int bottom,
-	                                           const long colour)
+	int previewCallbackMiniWindowShadowTextForApi(const LuaCallbackEngine *engine, const QString &windowName,
+	                                              const QString &fontId, const QString &text, const int left,
+	                                              const int top, const int right, const int bottom)
 	{
 		MiniWindow *window = callbackMiniWindowShadow(engine, windowName);
 		if (!window)
 			return eNoSuchWindow;
-		const int width = MiniWindowUtils::text(*window, fontId, text, left, top, right, bottom, colour);
+		const int width = MiniWindowUtils::textPreviewWidth(*window, fontId, text, left, top, right, bottom);
 		if (width >= 0)
 			cacheCallbackMiniWindowTextWidth(engine, windowName, fontId, text, width);
 		return width;
@@ -9781,6 +9783,7 @@ LuaCallbackEngine::~LuaCallbackEngine()
 		       static_cast<void *>(m_executionThread), static_cast<void *>(QThread::currentThread()));
 	}
 #endif
+	QMudNativePluginRegistry::luaAudioStopRuntimeOwner(m_worldRuntime, this);
 }
 
 void LuaCallbackEngine::bindOrAssertExecutionThread(const char *context) const
@@ -9849,6 +9852,7 @@ bool LuaCallbackEngine::loadScript()
 void LuaCallbackEngine::resetState()
 {
 	bindOrAssertExecutionThread("LuaCallbackEngine::resetState");
+	QMudNativePluginRegistry::luaAudioStopRuntimeOwner(m_worldRuntime, this);
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	for (const std::shared_ptr<LuaSuspendedCallback> &suspended : std::as_const(m_suspendedCallbacks))
 	{
@@ -9873,6 +9877,8 @@ void LuaCallbackEngine::resetState()
 void LuaCallbackEngine::setWorldRuntime(WorldRuntime *runtime)
 {
 	bindOrAssertExecutionThread("LuaCallbackEngine::setWorldRuntime");
+	if (m_worldRuntime && m_worldRuntime != runtime)
+		QMudNativePluginRegistry::luaAudioStopRuntimeOwner(m_worldRuntime, this);
 	m_worldRuntime                  = runtime;
 	m_worldBindingsReady            = false;
 	m_reportedRuntimeThreadMismatch = false;
@@ -11700,7 +11706,7 @@ static int luaAdjustColour(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushnumber(L, 0);
+		lua_pushinteger(L, 0);
 		return 1;
 	}
 	const long colour = luaL_checkinteger(L, 1);
@@ -16436,7 +16442,7 @@ static int luaEnableGroup(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushnumber(L, 0);
+		lua_pushinteger(L, 0);
 		return 1;
 	}
 	const QString groupName = QString::fromUtf8(luaL_checkstring(L, 1));
@@ -17891,7 +17897,7 @@ static int luaGetMapColour(lua_State *L)
 	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
 	if (!runtime)
 	{
-		lua_pushnumber(L, 0);
+		lua_pushinteger(L, 0);
 		return 1;
 	}
 	const long value = luaL_checkinteger(L, 1);
@@ -20605,6 +20611,570 @@ static int luaStopSound(lua_State *L)
 	return 1;
 }
 
+static int normalizeLuaAudioBuffer(lua_State *L, const int index, const int fallback = 0)
+{
+	if (lua_gettop(L) < index || lua_isnil(L, index))
+		return fallback;
+	return static_cast<int>(luaL_checkinteger(L, index));
+}
+
+static double clampLuaAudioVolume(const double value)
+{
+	return qBound(0.0, value, 100.0);
+}
+
+static double luaAudioVolumeToQmudVolume(const double volume)
+{
+	return clampLuaAudioVolume(volume) - 100.0;
+}
+
+static bool luaAudioFileExists(const WorldRuntime *runtime, const QString &fileName)
+{
+	if (!runtime || fileName.isEmpty())
+		return false;
+	const QString relative = QMudPluginPathUtils::legacyPathRelativeToQmudHome(fileName);
+	QStringList   candidates;
+	if (!relative.isEmpty() && !relative.startsWith(QStringLiteral("sounds/"), Qt::CaseInsensitive))
+		candidates.push_back(QStringLiteral("sounds/%1").arg(relative));
+	candidates.push_back(fileName);
+	for (const QString &candidate : candidates)
+	{
+		QString normalizedCandidate;
+		QString error;
+		if (!QMudPluginPathUtils::resolveInsideQmudHome(runtime->startupDirectory(), candidate,
+		                                                &normalizedCandidate, &error))
+			continue;
+		if (QFileInfo::exists(normalizedCandidate))
+			return true;
+	}
+	return false;
+}
+
+static int luaAudioSoundStatus(const LuaCallbackEngine *engine, WorldRuntime *runtime, const int buffer)
+{
+	int status = -3;
+	if (!resolveSoundStatusForApi(engine, runtime, buffer, status))
+		return -3;
+	return status;
+}
+
+static int allocateLuaAudioBuffer(const LuaCallbackEngine *engine, WorldRuntime *runtime)
+{
+	return QMudNativePluginRegistry::luaAudioReserveRuntimeBuffer(
+	    runtime,
+	    [engine, runtime](const int buffer) { return luaAudioSoundStatus(engine, runtime, buffer); });
+}
+
+static void cacheLuaAudioPlaybackState(const LuaCallbackEngine *engine, const int buffer, const bool loop,
+                                       const double volume, const double pan)
+{
+	if (buffer < 1 || buffer > WorldRuntime::kMaxSoundBuffers)
+		return;
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+	bufferState.volume   = clampLuaAudioVolume(volume);
+	bufferState.pan      = pan;
+	bufferState.pitch    = QMudNativePluginRegistry::luaAudioRuntimeMasterState(runtime).pitch;
+	bufferState.loop     = loop;
+	bufferState.ownerKey = engine;
+	QMudNativePluginRegistry::luaAudioMarkRuntimeBuffer(runtime, buffer, bufferState);
+	cacheCallbackSoundStatus(engine, buffer, loop ? 2 : 1);
+}
+
+static int playLuaAudioBuffer(const LuaCallbackEngine *engine, WorldRuntime *runtime, const int buffer,
+                              const QString &fileName, const bool loop, const double volume, const double pan,
+                              const int delayMs)
+{
+	if (!runtime || buffer < 1 || buffer > WorldRuntime::kMaxSoundBuffers || fileName.isEmpty() ||
+	    !luaAudioFileExists(runtime, fileName))
+	{
+		QMudNativePluginRegistry::luaAudioReleaseRuntimeBuffer(runtime, buffer);
+		return 0;
+	}
+
+	if (delayMs > 0)
+	{
+		QPointer<WorldRuntime> runtimeGuard(runtime);
+		auto                   cancelToken = std::make_shared<std::atomic_bool>(false);
+		QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+		bufferState.volume        = clampLuaAudioVolume(volume);
+		bufferState.pan           = pan;
+		bufferState.pitch         = QMudNativePluginRegistry::luaAudioRuntimeMasterState(runtime).pitch;
+		bufferState.loop          = loop;
+		bufferState.ownerKey      = engine;
+		bufferState.pendingCancel = cancelToken;
+		QMudNativePluginRegistry::luaAudioMarkRuntimeBuffer(runtime, buffer, bufferState);
+		QMudNativePluginRegistry::LuaAudioRuntimeBufferState pendingState;
+		if (!QMudNativePluginRegistry::luaAudioRuntimeBufferState(runtime, buffer, pendingState))
+		{
+			QMudNativePluginRegistry::luaAudioReleaseRuntimeBuffer(runtime, buffer);
+			return 0;
+		}
+		const quint64 generation = pendingState.generation;
+		QTimer::singleShot(delayMs, runtime,
+		                   [runtimeGuard, cancelToken, buffer, fileName, generation]
+		                   {
+			                   if (!runtimeGuard)
+				                   return;
+			                   QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+			                   if (!QMudNativePluginRegistry::luaAudioConsumeRuntimeBufferPendingPlay(
+			                           runtimeGuard, buffer, generation, cancelToken, bufferState))
+				                   return;
+			                   const int status = runtimeGuard->playSoundBypassingPluginCallbacks(
+			                       buffer, fileName, bufferState.loop,
+			                       luaAudioVolumeToQmudVolume(bufferState.volume), bufferState.pan);
+			                   if (status != eOK)
+				                   QMudNativePluginRegistry::luaAudioReleaseRuntimeBufferIfGeneration(
+				                       runtimeGuard, buffer, generation);
+		                   });
+		return buffer;
+	}
+
+	const double qmudVolume = luaAudioVolumeToQmudVolume(volume);
+	const auto   play       = [buffer, fileName, loop, qmudVolume, pan](WorldRuntime &targetRuntime) -> int
+	{ return targetRuntime.playSoundBypassingPluginCallbacks(buffer, fileName, loop, qmudVolume, pan); };
+
+	cacheLuaAudioPlaybackState(engine, buffer, loop, volume, pan);
+	int result = eCannotPlaySound;
+	if (activeCallbackContextConst(engine))
+	{
+#ifdef QMUD_ENABLE_QSOUND
+		if (callbackScopeSyncBridgeForbidden())
+		{
+			enqueueRuntimeThreadDeferredMutationNoResult(engine, runtime, [play](WorldRuntime &targetRuntime)
+			                                             { static_cast<void>(play(targetRuntime)); });
+			return buffer;
+		}
+		result = runOnRuntimeThreadDeferredMutation(engine, runtime, play, eCannotPlaySound);
+#else
+		result = eCannotPlaySound;
+#endif
+	}
+	else
+	{
+		result = runOnRuntimeThreadDeferredMutation(engine, runtime, play, eCannotPlaySound);
+	}
+
+	if (result != eOK)
+	{
+		QMudNativePluginRegistry::luaAudioReleaseRuntimeBuffer(runtime, buffer);
+		cacheCallbackSoundStatus(engine, buffer, -2);
+		return 0;
+	}
+	return buffer;
+}
+
+static int luaAudioPlay(lua_State *L)
+{
+	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	if (!runtime)
+	{
+		lua_pushinteger(L, 0);
+		return 1;
+	}
+
+	const QString fileName = QString::fromUtf8(luaL_checkstring(L, 1));
+	const bool    loop     = optBool(L, 2, false);
+	const auto    master   = QMudNativePluginRegistry::luaAudioRuntimeMasterState(runtime);
+	const double  pan      = luaL_optnumber(L, 3, master.pan);
+	const double  volume   = luaL_optnumber(L, 4, master.volume);
+	const int     buffer   = allocateLuaAudioBuffer(engine, runtime);
+	lua_pushinteger(L, playLuaAudioBuffer(engine, runtime, buffer, fileName, loop, volume, pan, 0));
+	return 1;
+}
+
+static int luaAudioPlayDelay(lua_State *L)
+{
+	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	if (!runtime)
+	{
+		lua_pushinteger(L, 0);
+		return 1;
+	}
+
+	const QString fileName = QString::fromUtf8(luaL_checkstring(L, 1));
+	const double  seconds  = luaL_optnumber(L, 2, 0.0);
+	const auto    master   = QMudNativePluginRegistry::luaAudioRuntimeMasterState(runtime);
+	const double  pan      = luaL_optnumber(L, 3, master.pan);
+	const double  volume   = luaL_optnumber(L, 4, master.volume);
+	const int     delay    = qMax(0, qRound(seconds * 1000.0));
+	const int     buffer   = allocateLuaAudioBuffer(engine, runtime);
+	lua_pushinteger(L, playLuaAudioBuffer(engine, runtime, buffer, fileName, false, volume, pan, delay));
+	return 1;
+}
+
+static int luaAudioPlayDelayLooped(lua_State *L)
+{
+	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	if (!runtime)
+	{
+		lua_pushinteger(L, 0);
+		return 1;
+	}
+
+	const QString fileName = QString::fromUtf8(luaL_checkstring(L, 1));
+	const double  seconds  = luaL_optnumber(L, 2, 0.0);
+	const auto    master   = QMudNativePluginRegistry::luaAudioRuntimeMasterState(runtime);
+	const double  pan      = luaL_optnumber(L, 3, master.pan);
+	const double  volume   = luaL_optnumber(L, 4, master.volume);
+	const int     delay    = qMax(0, qRound(seconds * 1000.0));
+	const int     buffer   = allocateLuaAudioBuffer(engine, runtime);
+	lua_pushinteger(L, playLuaAudioBuffer(engine, runtime, buffer, fileName, true, volume, pan, delay));
+	return 1;
+}
+
+static int luaAudioStop(lua_State *L)
+{
+	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const int     buffer  = normalizeLuaAudioBuffer(L, 1, 0);
+	if (!runtime || buffer < 0 || buffer > WorldRuntime::kMaxSoundBuffers)
+		return 0;
+
+	QList<int> buffersToStop;
+	if (buffer == 0)
+		buffersToStop = QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(runtime);
+	else
+	{
+		QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+		if (QMudNativePluginRegistry::luaAudioRuntimeBufferState(runtime, buffer, bufferState))
+			buffersToStop.push_back(buffer);
+	}
+	if (buffersToStop.isEmpty())
+		return 0;
+
+	const auto stop = [buffersToStop](WorldRuntime &targetRuntime) -> int
+	{
+		for (const int ownedBuffer : buffersToStop)
+			static_cast<void>(targetRuntime.stopSoundBypassingPluginCallbacks(ownedBuffer));
+		return eOK;
+	};
+	if (activeCallbackContextConst(engine))
+	{
+		enqueueRuntimeThreadDeferredMutationNoResult(engine, runtime, [stop](WorldRuntime &targetRuntime)
+		                                             { static_cast<void>(stop(targetRuntime)); });
+	}
+	else
+	{
+		static_cast<void>(runOnRuntimeThreadDeferredMutation(engine, runtime, stop, eCannotPlaySound));
+	}
+
+	QMudNativePluginRegistry::luaAudioReleaseRuntimeBuffers(runtime, buffersToStop);
+	for (const int ownedBuffer : buffersToStop)
+		cacheCallbackSoundStatus(engine, ownedBuffer, -2);
+	return 0;
+}
+
+static int luaAudioIsPlaying(lua_State *L)
+{
+	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const int     buffer  = normalizeLuaAudioBuffer(L, 1, 0);
+	QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+	const int                                            status =
+	    (buffer > 0 && QMudNativePluginRegistry::luaAudioRuntimeBufferState(runtime, buffer, bufferState))
+	        ? luaAudioSoundStatus(engine, runtime, buffer)
+	        : -3;
+	lua_pushboolean(L, status == 1 || status == 2);
+	return 1;
+}
+
+static int luaAudioGetVolume(lua_State *L)
+{
+	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const int     buffer  = normalizeLuaAudioBuffer(L, 1, 0);
+	QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+	if (buffer > 0 && QMudNativePluginRegistry::luaAudioRuntimeBufferState(runtime, buffer, bufferState))
+		lua_pushnumber(L, bufferState.volume);
+	else
+		lua_pushnumber(L, QMudNativePluginRegistry::luaAudioRuntimeMasterState(runtime).volume);
+	return 1;
+}
+
+static int luaAudioVolume(lua_State *L)
+{
+	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	if (lua_gettop(L) == 0 || lua_isnil(L, 1))
+		return luaAudioGetVolume(L);
+
+	const double                                         volume = clampLuaAudioVolume(luaL_checknumber(L, 1));
+	const int                                            buffer = normalizeLuaAudioBuffer(L, 2, 0);
+	QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+	const bool                                           hasBuffer =
+	    buffer > 0 && QMudNativePluginRegistry::luaAudioRuntimeBufferState(runtime, buffer, bufferState);
+	if (hasBuffer)
+	{
+		bufferState.volume = volume;
+		QMudNativePluginRegistry::luaAudioMarkRuntimeBuffer(runtime, buffer, bufferState);
+	}
+	else if (runtime && buffer <= 0)
+	{
+		QMudNativePluginRegistry::luaAudioSetRuntimeMasterVolume(runtime, volume);
+	}
+	if (runtime && hasBuffer)
+	{
+		const int status = luaAudioSoundStatus(engine, runtime, buffer);
+		if (status == 1 || status == 2)
+		{
+			const auto update = [buffer, bufferState](WorldRuntime &targetRuntime) -> int
+			{
+				return targetRuntime.playSoundBypassingPluginCallbacks(
+				    buffer, QString(), bufferState.loop, luaAudioVolumeToQmudVolume(bufferState.volume),
+				    bufferState.pan);
+			};
+			if (activeCallbackContextConst(engine))
+				enqueueRuntimeThreadDeferredMutationNoResult(engine, runtime,
+				                                             [update](WorldRuntime &targetRuntime)
+				                                             { static_cast<void>(update(targetRuntime)); });
+			else
+				static_cast<void>(
+				    runOnRuntimeThreadDeferredMutation(engine, runtime, update, eCannotPlaySound));
+		}
+	}
+	lua_pushnumber(L, volume);
+	return 1;
+}
+
+static int luaAudioPan(lua_State *L)
+{
+	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const double  pan     = luaL_checknumber(L, 1);
+	const int     buffer  = normalizeLuaAudioBuffer(L, 2, 0);
+	QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+	if (buffer > 0 && QMudNativePluginRegistry::luaAudioRuntimeBufferState(runtime, buffer, bufferState))
+	{
+		bufferState.pan = pan;
+		QMudNativePluginRegistry::luaAudioMarkRuntimeBuffer(runtime, buffer, bufferState);
+	}
+	else if (runtime && buffer <= 0)
+	{
+		QMudNativePluginRegistry::luaAudioSetRuntimeMasterPan(runtime, pan);
+	}
+	lua_pushnumber(L, pan);
+	return 1;
+}
+
+static int luaAudioPitch(lua_State *L)
+{
+	const auto   *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const double  pitch   = luaL_checknumber(L, 1);
+	const int     buffer  = normalizeLuaAudioBuffer(L, 2, 0);
+	QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+	if (buffer > 0 && QMudNativePluginRegistry::luaAudioRuntimeBufferState(runtime, buffer, bufferState))
+	{
+		bufferState.pitch = pitch;
+		QMudNativePluginRegistry::luaAudioMarkRuntimeBuffer(runtime, buffer, bufferState);
+	}
+	else if (runtime && buffer <= 0)
+	{
+		QMudNativePluginRegistry::luaAudioSetRuntimeMasterPitch(runtime, pitch);
+	}
+	lua_pushnumber(L, pitch);
+	return 1;
+}
+
+static bool scheduleLuaAudioDelayedStateUpdate(
+    WorldRuntime *runtime, const int buffer, const int delayMs,
+    const std::function<void(WorldRuntime &, QMudNativePluginRegistry::LuaAudioRuntimeBufferState &)> &update)
+{
+	if (!runtime || buffer < 1 || buffer > WorldRuntime::kMaxSoundBuffers || delayMs <= 0 || !update)
+		return false;
+	auto    cancelToken = std::make_shared<std::atomic_bool>(false);
+	quint64 generation  = 0;
+	if (!QMudNativePluginRegistry::luaAudioTrackRuntimeBufferPendingOperation(runtime, buffer, cancelToken,
+	                                                                          &generation))
+		return false;
+	QPointer<WorldRuntime> runtimeGuard(runtime);
+	QTimer::singleShot(delayMs, runtime,
+	                   [runtimeGuard, cancelToken, buffer, generation, update]
+	                   {
+		                   if (!runtimeGuard)
+			                   return;
+		                   QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+		                   if (!QMudNativePluginRegistry::luaAudioConsumeRuntimeBufferPendingOperation(
+		                           runtimeGuard, buffer, generation, cancelToken, bufferState))
+			                   return;
+		                   update(*runtimeGuard, bufferState);
+		                   QMudNativePluginRegistry::luaAudioMarkRuntimeBuffer(runtimeGuard, buffer,
+		                                                                       bufferState);
+	                   });
+	return true;
+}
+
+static void scheduleLuaAudioDelayedStop(WorldRuntime *runtime, const int buffer, const int delayMs)
+{
+	if (!runtime || buffer < 0 || buffer > WorldRuntime::kMaxSoundBuffers || delayMs <= 0)
+		return;
+	const QList<int> buffersToStop =
+	    buffer == 0 ? QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(runtime) : QList<int>{buffer};
+	for (const int ownedBuffer : buffersToStop)
+	{
+		QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+		if (!QMudNativePluginRegistry::luaAudioRuntimeBufferState(runtime, ownedBuffer, bufferState))
+			continue;
+		auto    cancelToken = std::make_shared<std::atomic_bool>(false);
+		quint64 generation  = 0;
+		if (!QMudNativePluginRegistry::luaAudioTrackRuntimeBufferPendingOperation(runtime, ownedBuffer,
+		                                                                          cancelToken, &generation))
+			continue;
+		QPointer<WorldRuntime> runtimeGuard(runtime);
+		QTimer::singleShot(
+		    delayMs, runtime,
+		    [runtimeGuard, cancelToken, ownedBuffer, generation]
+		    {
+			    if (!runtimeGuard)
+				    return;
+			    QMudNativePluginRegistry::LuaAudioRuntimeBufferState bufferState;
+			    if (!QMudNativePluginRegistry::luaAudioConsumeRuntimeBufferPendingOperation(
+			            runtimeGuard, ownedBuffer, generation, cancelToken, bufferState))
+				    return;
+			    static_cast<void>(runtimeGuard->stopSoundBypassingPluginCallbacks(ownedBuffer));
+			    QMudNativePluginRegistry::luaAudioReleaseRuntimeBufferIfGeneration(runtimeGuard, ownedBuffer,
+			                                                                       generation);
+		    });
+	}
+}
+
+static int luaAudioSlideVolume(lua_State *L)
+{
+	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const double  volume  = clampLuaAudioVolume(luaL_checknumber(L, 1));
+	const int     buffer  = normalizeLuaAudioBuffer(L, 2, 0);
+	const int     delay   = qMax(0, qRound(luaL_optnumber(L, 3, 0.0) * 1000.0));
+	if (delay <= 0 || buffer <= 0)
+		return luaAudioVolume(L);
+	static_cast<void>(scheduleLuaAudioDelayedStateUpdate(
+	    runtime, buffer, delay,
+	    [buffer, volume](WorldRuntime                                         &targetRuntime,
+	                     QMudNativePluginRegistry::LuaAudioRuntimeBufferState &bufferState)
+	    {
+		    bufferState.volume = volume;
+		    const int status   = targetRuntime.soundStatus(buffer);
+		    if (status == 1 || status == 2)
+		    {
+			    static_cast<void>(targetRuntime.playSoundBypassingPluginCallbacks(
+			        buffer, QString(), bufferState.loop, luaAudioVolumeToQmudVolume(bufferState.volume),
+			        bufferState.pan));
+		    }
+	    }));
+	lua_pushnumber(L, volume);
+	return 1;
+}
+
+static int luaAudioSlidePan(lua_State *L)
+{
+	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const double  pan     = luaL_checknumber(L, 1);
+	const int     buffer  = normalizeLuaAudioBuffer(L, 2, 0);
+	const int     delay   = qMax(0, qRound(luaL_optnumber(L, 3, 0.0) * 1000.0));
+	if (delay <= 0 || buffer <= 0)
+		return luaAudioPan(L);
+	static_cast<void>(scheduleLuaAudioDelayedStateUpdate(
+	    runtime, buffer, delay,
+	    [pan](WorldRuntime &, QMudNativePluginRegistry::LuaAudioRuntimeBufferState &bufferState)
+	    { bufferState.pan = pan; }));
+	lua_pushnumber(L, pan);
+	return 1;
+}
+
+static int luaAudioSlidePitch(lua_State *L)
+{
+	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const double  pitch   = luaL_checknumber(L, 1);
+	const int     buffer  = normalizeLuaAudioBuffer(L, 2, 0);
+	const int     delay   = qMax(0, qRound(luaL_optnumber(L, 3, 0.0) * 1000.0));
+	if (delay <= 0 || buffer <= 0)
+		return luaAudioPitch(L);
+	static_cast<void>(scheduleLuaAudioDelayedStateUpdate(
+	    runtime, buffer, delay,
+	    [pitch](WorldRuntime &, QMudNativePluginRegistry::LuaAudioRuntimeBufferState &bufferState)
+	    { bufferState.pitch = pitch; }));
+	lua_pushnumber(L, pitch);
+	return 1;
+}
+
+static int luaAudioFadeOut(lua_State *L)
+{
+	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime *runtime = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const int     buffer  = normalizeLuaAudioBuffer(L, 1, 0);
+	const int     delay   = qMax(0, qRound(luaL_optnumber(L, 2, 0.0) * 1000.0));
+	if (delay <= 0)
+		return luaAudioStop(L);
+	scheduleLuaAudioDelayedStop(runtime, buffer, delay);
+	lua_pushinteger(L, 0);
+	return 1;
+}
+
+static int luaAudioFree(lua_State *L)
+{
+	auto            *engine        = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
+	WorldRuntime    *runtime       = engine ? engine->worldRuntimeForBridgedCall() : nullptr;
+	const QList<int> buffersToStop = QMudNativePluginRegistry::luaAudioRuntimeOwnedBuffers(runtime);
+	if (runtime)
+	{
+		const auto stop = [buffersToStop](WorldRuntime &targetRuntime) -> int
+		{
+			for (const int buffer : buffersToStop)
+				static_cast<void>(targetRuntime.stopSoundBypassingPluginCallbacks(buffer));
+			return eOK;
+		};
+		if (activeCallbackContextConst(engine))
+			enqueueRuntimeThreadDeferredMutationNoResult(engine, runtime, [stop](WorldRuntime &targetRuntime)
+			                                             { static_cast<void>(stop(targetRuntime)); });
+		else
+			static_cast<void>(runOnRuntimeThreadDeferredMutation(engine, runtime, stop, eCannotPlaySound));
+	}
+	QMudNativePluginRegistry::luaAudioReleaseRuntimeBuffers(runtime, buffersToStop);
+	QMudNativePluginRegistry::luaAudioSetRuntimeMasterVolume(runtime, 100.0);
+	QMudNativePluginRegistry::luaAudioSetRuntimeMasterPan(runtime, 0.0);
+	QMudNativePluginRegistry::luaAudioSetRuntimeMasterPitch(runtime, 0.0);
+	for (const int buffer : buffersToStop)
+		cacheCallbackSoundStatus(engine, buffer, -2);
+	lua_pushinteger(L, 0);
+	return 1;
+}
+
+static void registerAudioLibrary(lua_State *L, LuaCallbackEngine *engine)
+{
+	lua_newtable(L);
+	const LuaBindingEntry entries[] = {
+	    {"play",            luaAudioPlay           },
+	    {"playDelay",       luaAudioPlayDelay      },
+	    {"playDelayLooped", luaAudioPlayDelayLooped},
+	    {"stop",            luaAudioStop           },
+	    {"isPlaying",       luaAudioIsPlaying      },
+	    {"getVolume",       luaAudioGetVolume      },
+	    {"volume",          luaAudioVolume         },
+	    {"pan",             luaAudioPan            },
+	    {"pitch",           luaAudioPitch          },
+	    {"freq",            luaAudioPitch          },
+	    {"slideVol",        luaAudioSlideVolume    },
+	    {"slidePan",        luaAudioSlidePan       },
+	    {"slidePitch",      luaAudioSlidePitch     },
+	    {"fadeout",         luaAudioFadeOut        },
+	    {"free",            luaAudioFree           },
+	    {nullptr,           nullptr                },
+	};
+	for (const LuaBindingEntry *entry = entries; entry->name != nullptr; ++entry)
+	{
+		lua_pushlightuserdata(L, engine);
+		lua_pushcclosure(L, entry->function, 1);
+		lua_setfield(L, -2, entry->name);
+	}
+	lua_setglobal(L, "audio");
+}
+
 static int luaPushCommand(lua_State *L)
 {
 	auto         *engine  = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
@@ -23192,6 +23762,17 @@ static QString qmudHomeRelativePathForGetInfo(const LuaCallbackEngine *engine, c
 	return QMudPluginPathUtils::qmudHomeRelativePath(qmudHomeForLuaFileApi(engine), path, trailingSlash);
 }
 
+static QString qmudHomeDirectoryForGetInfo56(const LuaCallbackEngine *engine)
+{
+	QString root = qmudHomeForLuaFileApi(engine);
+	if (root.trimmed().isEmpty())
+		root = QCoreApplication::applicationDirPath();
+	root = QMudPluginPathUtils::normalizeSeparators(root);
+	if (!root.endsWith(QLatin1Char('/')))
+		root += QLatin1Char('/');
+	return root;
+}
+
 static void pushLuaString(lua_State *L, const QString &value)
 {
 	const QByteArray bytes = value.toLocal8Bit();
@@ -23434,7 +24015,7 @@ static int luaGetInfo(lua_State *L)
 		return 1;
 	}
 	case 56:
-		pushLuaString(L, QMudPluginPathUtils::normalizeSeparators(QCoreApplication::applicationFilePath()));
+		pushLuaString(L, qmudHomeDirectoryForGetInfo56(engine));
 		return 1;
 	case 57:
 	{
@@ -25173,8 +25754,7 @@ static void reportLuaError(const LuaCallbackEngine &engine, const QString &messa
 				if (bool parsedKeyword = false; parseBooleanKeywordValue(flag, parsedKeyword))
 					toOutput = parsedKeyword;
 			}
-			if ((toOutput || targetRuntime.forceScriptErrorOutputToWorld()) &&
-			    !targetRuntime.suppressScriptErrorOutputToWorld())
+			if (toOutput && !targetRuntime.suppressScriptErrorOutputToWorld())
 			{
 				targetRuntime.outputText(message, true, true);
 				return true;
@@ -25200,94 +25780,6 @@ static void reportLuaError(const LuaCallbackEngine &engine, const QString &messa
 			return;
 	}
 	qWarning() << message;
-}
-
-static int luaReportRequireFailure(lua_State *L)
-{
-	const auto *engine = static_cast<LuaCallbackEngine *>(lua_touserdata(L, lua_upvalueindex(1)));
-	if (!engine)
-		return 0;
-
-	WorldRuntime *runtime = engine->worldRuntimeForBridgedCall();
-	if (!runtime)
-		return 0;
-
-	const QString module  = QString::fromUtf8(luaL_optstring(L, 1, ""));
-	const QString details = QString::fromUtf8(luaL_optstring(L, 2, ""));
-	if (activeCallbackContextConst(engine) && callbackScopeSyncBridgeForbidden())
-	{
-		enqueueRuntimeThreadDeferredMutationNoResult(
-		    engine, runtime,
-		    [module, details](WorldRuntime &targetRuntime)
-		    {
-			    if (!targetRuntime.forceScriptErrorOutputToWorld())
-				    return;
-			    const QString message =
-			        module.isEmpty()
-			            ? QStringLiteral("Lua require failed: %1")
-			                  .arg(details.isEmpty() ? QStringLiteral("unknown") : details)
-			            : QStringLiteral("Lua require failed for module '%1': %2")
-			                  .arg(module, details.isEmpty() ? QStringLiteral("unknown") : details);
-
-			    const QString logFlag =
-			        targetRuntime.worldAttributeValue(QStringLiteral("log_script_errors"));
-			    bool logErrors = isEnabledValue(logFlag);
-			    if (!logErrors)
-			    {
-				    if (bool parsedKeyword = false; parseBooleanKeywordValue(logFlag, parsedKeyword))
-					    logErrors = parsedKeyword;
-			    }
-			    if (logErrors)
-			    {
-				    QString       logDir     = targetRuntime.defaultLogDirectory();
-				    const QString startupDir = targetRuntime.startupDirectory();
-				    if (logDir.isEmpty())
-					    logDir = startupDir;
-				    else if (QDir::isRelativePath(logDir) && !startupDir.isEmpty())
-					    logDir = QDir(startupDir).filePath(logDir);
-
-				    QDir dir(logDir.isEmpty() ? QDir::currentPath() : logDir);
-				    if (!dir.exists())
-					    dir.mkpath(QStringLiteral("."));
-				    QFile file(dir.filePath(QStringLiteral("script_error_log.txt")));
-				    if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
-				    {
-					    QTextStream out(&file);
-					    out << "\n--- Scripting error on "
-					        << QDateTime::currentDateTime().toString(
-					               QStringLiteral("dddd, MMMM d, yyyy, h:mm AP"))
-					        << " ---\n";
-					    out << message << "\n";
-				    }
-			    }
-
-			    const QString flag =
-			        targetRuntime.worldAttributeValue(QStringLiteral("script_errors_to_output_window"));
-			    bool toOutput = isEnabledValue(flag);
-			    if (!toOutput)
-			    {
-				    if (bool parsedKeyword = false; parseBooleanKeywordValue(flag, parsedKeyword))
-					    toOutput = parsedKeyword;
-			    }
-			    if ((toOutput || targetRuntime.forceScriptErrorOutputToWorld()) &&
-			        !targetRuntime.suppressScriptErrorOutputToWorld())
-			    {
-				    targetRuntime.outputText(message, true, true);
-			    }
-		    });
-		return 0;
-	}
-	if (!runOnRuntimeThread(
-	        runtime, [&]() -> bool { return runtime->forceScriptErrorOutputToWorld(); }, false))
-		return 0;
-
-	const QString message = module.isEmpty()
-	                            ? QStringLiteral("Lua require failed: %1")
-	                                  .arg(details.isEmpty() ? QStringLiteral("unknown") : details)
-	                            : QStringLiteral("Lua require failed for module '%1': %2")
-	                                  .arg(module, details.isEmpty() ? QStringLiteral("unknown") : details);
-	reportLuaError(*engine, message);
-	return 0;
 }
 
 static bool optBool(lua_State *L, const int index, const bool defaultValue)
@@ -32564,6 +33056,10 @@ static int queryPluginSupportsForCallback(const LuaCallbackEngine *engine, World
 {
 	if (!runtime || pluginId.trimmed().isEmpty() || scriptName.trimmed().isEmpty())
 		return fallbackCode;
+	if (QMudNativePluginRegistry::isBlacklistedId(pluginId))
+		return eNoSuchPlugin;
+	if (const QString shimId = QMudNativePluginRegistry::resolveShimIdOrName(pluginId); !shimId.isEmpty())
+		return QMudNativePluginRegistry::pluginSupports(shimId, scriptName);
 	int cachedStatus = fallbackCode;
 	if (tryResolveCallbackPluginSupportStatusFromCache(engine, pluginId, scriptName, cachedStatus))
 		return cachedStatus;
@@ -32614,6 +33110,8 @@ static void cacheCallbackPluginIdListAfterUnload(const LuaCallbackEngine *engine
 {
 	QStringList ids = resolvePluginIdListForApi(engine, runtime);
 	ids.removeIf([&pluginId](const QString &id) { return id.compare(pluginId, Qt::CaseInsensitive) == 0; });
+	if (QMudNativePluginRegistry::isShimId(pluginId) && !ids.contains(pluginId, Qt::CaseInsensitive))
+		ids.push_back(pluginId.trimmed().toLower());
 	cacheCallbackPluginIdList(engine, ids);
 }
 
@@ -32622,9 +33120,32 @@ static QVariant resolvePluginInfoValueForApi(const LuaCallbackEngine *engine, Wo
 {
 	if (!engine || !runtime || pluginId.trimmed().isEmpty())
 		return {};
-	const QString selfPluginId = engine->pluginId().trimmed();
-	const bool    targetsSelfPlugin =
-	    !selfPluginId.isEmpty() && pluginId.trimmed().compare(selfPluginId, Qt::CaseInsensitive) == 0;
+	if (QMudNativePluginRegistry::isBlacklistedId(pluginId))
+		return {};
+	const QString shimId            = QMudNativePluginRegistry::resolveShimIdOrName(pluginId);
+	const QString effectivePluginId = shimId.isEmpty() ? pluginId : shimId;
+	if (!shimId.isEmpty() && infoType == 17 &&
+	    shimId.compare(QMudNativePluginRegistry::luaAudioPluginId(), Qt::CaseInsensitive) == 0)
+	{
+		return true;
+	}
+	if (!shimId.isEmpty() && infoType != 17)
+	{
+		int               visibleIndex = 0;
+		const QStringList ids          = resolvePluginIdListForApi(engine, runtime);
+		for (int i = 0; i < ids.size(); ++i)
+		{
+			if (ids.at(i).compare(shimId, Qt::CaseInsensitive) == 0)
+			{
+				visibleIndex = i + 1;
+				break;
+			}
+		}
+		return QMudNativePluginRegistry::pluginInfo(shimId, infoType, visibleIndex);
+	}
+	const QString selfPluginId      = engine->pluginId().trimmed();
+	const bool    targetsSelfPlugin = !selfPluginId.isEmpty() && effectivePluginId.trimmed().compare(
+	                                                                 selfPluginId, Qt::CaseInsensitive) == 0;
 	if (targetsSelfPlugin)
 	{
 		if (infoType == 1)
@@ -32641,11 +33162,11 @@ static QVariant resolvePluginInfoValueForApi(const LuaCallbackEngine *engine, Wo
 	const bool needsThreadBridge   = runtime->thread() && QThread::currentThread() != runtime->thread();
 	// Keep CallPlugin caller context local to the target Lua engine thread.
 	// This avoids runtime-thread state mutation for infoType=23 in threaded mode.
-	if (infoType == 23 && pluginId.compare(engine->pluginId(), Qt::CaseInsensitive) == 0)
+	if (infoType == 23 && effectivePluginId.compare(engine->pluginId(), Qt::CaseInsensitive) == 0)
 		return engine->currentCallingPluginId();
 	QVariant value;
 	bool     cacheHit = false;
-	if (tryResolveCallbackPluginInfoValueFromCache(engine, pluginId, infoType, value, cacheHit))
+	if (tryResolveCallbackPluginInfoValueFromCache(engine, effectivePluginId, infoType, value, cacheHit))
 		return value;
 	if (cacheHit)
 		return {};
@@ -32653,7 +33174,8 @@ static QVariant resolvePluginInfoValueForApi(const LuaCallbackEngine *engine, Wo
 	    (callbackNoFlushRuntimeReadBridgeForbidden(engine, inCallback) || syncBridgeForbidden))
 	{
 		bool hasValue = false;
-		if (tryBackfillCallbackPluginInfoValueFromDispatch(engine, pluginId, infoType, value, hasValue))
+		if (tryBackfillCallbackPluginInfoValueFromDispatch(engine, effectivePluginId, infoType, value,
+		                                                   hasValue))
 			return hasValue ? value : QVariant{};
 		return {};
 	}
@@ -32661,7 +33183,7 @@ static QVariant resolvePluginInfoValueForApi(const LuaCallbackEngine *engine, Wo
 	                                       runtime,
 	                                       [&]() -> bool
 	                                       {
-		                                       value = runtime->pluginInfo(pluginId, infoType);
+		                                       value = runtime->pluginInfo(effectivePluginId, infoType);
 		                                       return true;
 	                                       },
 	                                       false)
@@ -32669,13 +33191,13 @@ static QVariant resolvePluginInfoValueForApi(const LuaCallbackEngine *engine, Wo
 	                                       runtime,
 	                                       [&]() -> bool
 	                                       {
-		                                       value = runtime->pluginInfo(pluginId, infoType);
+		                                       value = runtime->pluginInfo(effectivePluginId, infoType);
 		                                       return true;
 	                                       },
 	                                       false);
 	if (!resolved)
 		return {};
-	cacheCallbackPluginInfoValue(engine, pluginId, infoType, value, value.isValid());
+	cacheCallbackPluginInfoValue(engine, effectivePluginId, infoType, value, value.isValid());
 	return value;
 }
 
@@ -32684,6 +33206,10 @@ static bool resolvePluginInstalledForApi(const LuaCallbackEngine *engine, WorldR
 {
 	if (!engine || !runtime || pluginId.trimmed().isEmpty())
 		return false;
+	if (QMudNativePluginRegistry::isBlacklistedId(pluginId))
+		return false;
+	if (!QMudNativePluginRegistry::resolveShimIdOrName(pluginId).isEmpty())
+		return true;
 	const bool inCallback          = activeCallbackContextConst(engine) != nullptr;
 	const bool syncBridgeForbidden = callbackScopeSyncBridgeForbidden();
 	const bool needsThreadBridge   = runtime->thread() && QThread::currentThread() != runtime->thread();
@@ -32726,6 +33252,8 @@ static QString resolvePluginIdOrNameForLifecycleApi(const LuaCallbackEngine *eng
 		return {};
 	const QString key = pluginIdOrName.trimmed();
 	if (key.isEmpty())
+		return {};
+	if (QMudNativePluginRegistry::isBlacklistedId(key))
 		return {};
 	const bool inCallback          = activeCallbackContextConst(engine) != nullptr;
 	const bool syncBridgeForbidden = callbackScopeSyncBridgeForbidden();
@@ -39779,12 +40307,7 @@ static int luaGetPluginVariable(lua_State *L)
 		return 1;
 	}
 	const QString pluginId = QString::fromUtf8(luaL_checkstring(L, 1));
-	if (pluginId.isEmpty())
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const QString name = QString::fromUtf8(luaL_checkstring(L, 2));
+	const QString name     = QString::fromUtf8(luaL_checkstring(L, 2));
 	QString       value;
 	bool          pluginAvailable = false;
 	if (!resolveVariableValueForApi(engine, runtime, pluginId, name, value, pluginAvailable))
@@ -40172,7 +40695,8 @@ static int luaUnloadPlugin(lua_State *L)
 			lua_pushnumber(L, eBadParameter);
 			return 1;
 		}
-		cacheCallbackPluginInstalled(engine, resolvedPluginId, false);
+		cacheCallbackPluginInstalled(engine, resolvedPluginId,
+		                             QMudNativePluginRegistry::isShimId(resolvedPluginId));
 		cacheCallbackPluginIdListAfterUnload(engine, runtime, resolvedPluginId);
 		QList<WorldRuntime::Trigger> emptyTriggers;
 		QList<WorldRuntime::Alias>   emptyAliases;
@@ -40328,6 +40852,8 @@ static int luaCallPlugin(lua_State *L)
 		                      : reason);
 		return 2;
 	}
+	if (const QString shimId = QMudNativePluginRegistry::resolveShimIdOrName(pluginId); !shimId.isEmpty())
+		return runtime->callPluginLua(shimId, routine, L, 1, engine->pluginId());
 #ifdef QMUD_ENABLE_LUA_SCRIPTING
 	const auto pushCodeAndMessage = [L](const int code, const QString &message)
 	{
@@ -41826,8 +42352,8 @@ static int luaWindowText(lua_State *L)
 			return 1;
 		}
 
-		const int result = drawCallbackMiniWindowShadowTextForApi(engine, name, fontId, text, left, top,
-		                                                          right, bottom, colour);
+		const int result =
+		    previewCallbackMiniWindowShadowTextForApi(engine, name, fontId, text, left, top, right, bottom);
 		if (result < 0)
 		{
 			lua_pushnumber(L, result);
@@ -44032,7 +44558,7 @@ static int luaTestGetInfo(lua_State *L)
 	const int     infoType = static_cast<int>(luaL_checkinteger(L, 1));
 	if (infoType == 56)
 	{
-		pushLuaString(L, QMudPluginPathUtils::normalizeSeparators(QCoreApplication::applicationFilePath()));
+		pushLuaString(L, qmudHomeDirectoryForGetInfo56(engine));
 		return 1;
 	}
 	if (!runtime)
@@ -44365,28 +44891,31 @@ void LuaCallbackEngine::registerWorldBindings()
 		lua_setglobal(m_state, name);
 	};
 	static const LuaBindingEntry kMinimalWorldBindings[] = {
-	    {"ColourNote",           luaColourNote           },
-	    {"ColourTell",           luaColourTell           },
-	    {"GetInfo",              luaTestGetInfo          },
-	    {"GetPluginID",          luaGetPluginID          },
-	    {"GetPluginInfo",        luaGetPluginInfo        },
-	    {"GetPluginName",        luaGetPluginName        },
-	    {"Note",	             luaNote                 },
-	    {"SaveState",            luaTestSaveState        },
-	    {"Tell",	             luaTell                 },
-	    {"TestYieldModalNumber", luaTestYieldModalNumber },
-	    {"TestYieldModalString", luaTestYieldModalString },
-	    {"WindowAddHotspot",     luaTestWindowAddHotspot },
-	    {"WindowCreate",         luaTestWindowCreate     },
-	    {"WindowHotspotList",    luaTestWindowHotspotList},
-	    {"WindowInfo",           luaTestWindowInfo       },
-	    {"WindowList",           luaTestWindowList       },
-	    {"WindowPosition",       luaTestWindowPosition   },
-	    {"WindowResize",         luaTestWindowResize     },
-	    {nullptr,                nullptr                 },
+	    {"ColourNote",            luaColourNote           },
+	    {"ColourTell",            luaColourTell           },
+	    {"GetInfo",               luaTestGetInfo          },
+	    {"GetPluginID",           luaGetPluginID          },
+	    {"GetPluginInfo",         luaGetPluginInfo        },
+	    {"GetPluginName",         luaGetPluginName        },
+	    {"GetPluginVariable",     luaGetPluginVariable    },
+	    {"GetPluginVariableList", luaGetPluginVariableList},
+	    {"Note",	              luaNote                 },
+	    {"SaveState",             luaTestSaveState        },
+	    {"Tell",	              luaTell                 },
+	    {"TestYieldModalNumber",  luaTestYieldModalNumber },
+	    {"TestYieldModalString",  luaTestYieldModalString },
+	    {"WindowAddHotspot",      luaTestWindowAddHotspot },
+	    {"WindowCreate",          luaTestWindowCreate     },
+	    {"WindowHotspotList",     luaTestWindowHotspotList},
+	    {"WindowInfo",            luaTestWindowInfo       },
+	    {"WindowList",            luaTestWindowList       },
+	    {"WindowPosition",        luaTestWindowPosition   },
+	    {"WindowResize",          luaTestWindowResize     },
+	    {nullptr,                 nullptr                 },
 	};
 	for (const LuaBindingEntry *entry = kMinimalWorldBindings; entry->name != nullptr; ++entry)
 		registerWorldFn(entry->name, entry->function);
+	registerAudioLibrary(m_state, this);
 	lua_newtable(m_state);
 	lua_pushlightuserdata(m_state, this);
 	lua_pushcclosure(m_state, luaUtilsInfo, 1);
@@ -44417,6 +44946,7 @@ void LuaCallbackEngine::registerWorldBindings()
 	registerLpegLibrary(m_state);
 	registerSocketLibraries(m_state);
 	registerProgressLibrary(m_state, this);
+	registerAudioLibrary(m_state, this);
 
 	QSet<QString> registered;
 	lua_newtable(m_state);
@@ -44874,10 +45404,6 @@ void LuaCallbackEngine::registerWorldBindings()
 	};
 	for (const auto &[name, function] : kWorldBindings)
 		registerWorldFn(name, function);
-
-	lua_pushlightuserdata(m_state, this);
-	lua_pushcclosure(m_state, luaReportRequireFailure, 1);
-	lua_setglobal(m_state, "__qmud_report_require_failure");
 
 	for (const char *name : kWorldLibNames)
 	{

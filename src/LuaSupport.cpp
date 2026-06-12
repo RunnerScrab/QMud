@@ -16,7 +16,9 @@
 // ReSharper disable once CppUnusedIncludeDirective
 #include <QStringList>
 
+#include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <unordered_map>
@@ -421,6 +423,79 @@ void qmudLogLua51CompatState(lua_State *L, const char *context)
 	        << "unpack=" << hasUnpack;
 }
 
+static lua_Integer lua51IntegerFromNumber(lua_State *L, const int index)
+{
+	int         isInteger = 0;
+	lua_Integer integer   = lua_tointegerx(L, index, &isInteger);
+	if (isInteger)
+		return integer;
+
+	const lua_Number value = luaL_checknumber(L, index);
+	if (!std::isfinite(static_cast<double>(value)))
+		return luaL_error(L, "bad argument #%d (number has no integer representation)", index);
+	const lua_Number truncated = std::trunc(value);
+	const auto       bounded   = static_cast<long double>(truncated);
+	constexpr auto   minValue  = static_cast<long double>(std::numeric_limits<lua_Integer>::min());
+	constexpr auto   maxValue  = static_cast<long double>(std::numeric_limits<lua_Integer>::max());
+	if (bounded < minValue || bounded > maxValue)
+		return luaL_error(L, "bad argument #%d (number has no integer representation)", index);
+	return static_cast<lua_Integer>(truncated);
+}
+
+static lua_Integer lua51StringRelativePosition(const lua_Integer position, const lua_Integer length)
+{
+	if (position >= 0)
+		return position;
+	if (position < -length)
+		return 0;
+	return length + position + 1;
+}
+
+static int lua51StringSub(lua_State *L)
+{
+	size_t         rawLength = 0;
+	const char    *bytes     = luaL_checklstring(L, 1, &rawLength);
+	constexpr auto maxLength = static_cast<size_t>(std::numeric_limits<lua_Integer>::max());
+	if (rawLength > maxLength)
+		return luaL_error(L, "string length exceeds Lua integer range");
+	const auto  length = static_cast<lua_Integer>(rawLength);
+
+	lua_Integer start = lua51StringRelativePosition(lua51IntegerFromNumber(L, 2), length);
+	lua_Integer end   = lua51StringRelativePosition(
+	    lua_isnoneornil(L, 3) ? static_cast<lua_Integer>(-1) : lua51IntegerFromNumber(L, 3), length);
+	if (start < 1)
+		start = 1;
+	if (end > length)
+		end = length;
+	if (start <= end)
+		lua_pushlstring(L, bytes + start - 1, static_cast<size_t>(end - start + 1));
+	else
+		lua_pushliteral(L, "");
+	return 1;
+}
+
+static void installLua51StringSubCompat(lua_State *L)
+{
+	lua_getglobal(L, LUA_STRLIBNAME);
+	if (!lua_istable(L, -1))
+	{
+		lua_pop(L, 1);
+		return;
+	}
+
+	lua_getglobal(L, "__qmud_string_sub_compat_wrapped");
+	const bool alreadyInstalled = lua_toboolean(L, -1) != 0;
+	lua_pop(L, 1);
+	if (!alreadyInstalled)
+	{
+		lua_pushcfunction(L, lua51StringSub);
+		lua_setfield(L, -2, "sub");
+		lua_pushboolean(L, true);
+		lua_setglobal(L, "__qmud_string_sub_compat_wrapped");
+	}
+	lua_pop(L, 1);
+}
+
 void QMudLuaSupport::applyLua51Compat(lua_State *L)
 {
 	if (!L)
@@ -634,10 +709,6 @@ if require and not rawget(_G, "__qmud_require_compat_wrapped") then
   function require(name)
     local ok, mod_or_err = pcall(_require, name)
     if not ok then
-      local hook = rawget(_G, "__qmud_report_require_failure")
-      if type(hook) == "function" then
-        pcall(hook, tostring(name), tostring(mod_or_err))
-      end
       error(mod_or_err, 2)
     end
     local mod = mod_or_err
@@ -801,6 +872,7 @@ end
 		qWarning() << "Lua 5.1 compat init failed:" << (err ? err : "unknown");
 		lua_pop(L, 1);
 	}
+	installLua51StringSubCompat(L);
 }
 
 bool QMudLuaSupport::callLuaNamedProcedureWithString(lua_State *L, const QString &functionName,

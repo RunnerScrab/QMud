@@ -35,6 +35,7 @@ namespace MiniWindowUtils
 	[[nodiscard]] int    validatePenStyle(long penStyle, int penWidth);
 	[[nodiscard]] int    validateBrushStyle(long brushStyle);
 	[[nodiscard]] int    bytesPerLine(int width, int bitsPerPixel);
+	[[nodiscard]] int    textWidth(const MiniWindow &window, const QString &fontId, const QString &text);
 	[[nodiscard]] int textPreviewWidth(const MiniWindow &window, const QString &fontId, const QString &text,
 	                                   int left, int top, int right, int bottom);
 	[[nodiscard]] QVariant fontInfo(const MiniWindow &window, const QString &fontId, int infoType);

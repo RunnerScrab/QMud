@@ -269,10 +269,9 @@ void QMudOutputWrapUtils::wrapPlainLineForColumn(QString &text, const int wrapCo
 	     graphemeStart = graphemeEnd, graphemeEnd = boundary.toNextBoundary())
 	{
 		const QStringView grapheme = textView.sliced(graphemeStart, graphemeEnd - graphemeStart);
-		wrappedText.append(grapheme);
-
 		if (isSingleCharGrapheme(grapheme, QLatin1Char('\n')))
 		{
+			wrappedText.append(grapheme);
 			column             = 0;
 			lineStart          = safeQSizeToInt(wrappedText.size());
 			lastSpace          = -1;
@@ -280,38 +279,38 @@ void QMudOutputWrapUtils::wrapPlainLineForColumn(QString &text, const int wrapCo
 			continue;
 		}
 
+		const int graphemeWidth = graphemeColumnWidthForWrap(grapheme);
+		if (lineHasVisibleChar && graphemeWidth > 0 && column + graphemeWidth > wrapColumn)
+		{
+			int insertPos = safeQSizeToInt(wrappedText.size());
+			if (lastSpace >= lineStart)
+			{
+				insertPos = indentParas ? lastSpace : lastSpace + 1;
+
+				bool onlyWhitespace = true;
+				for (int j = lineStart, size = safeQSizeToInt(wrappedText.size()); j < insertPos && j < size;
+				     ++j)
+				{
+					if (!wrappedText.at(j).isSpace())
+					{
+						onlyWhitespace = false;
+						break;
+					}
+				}
+				if (onlyWhitespace)
+					insertPos = safeQSizeToInt(wrappedText.size());
+			}
+
+			wrappedText.insert(insertPos, QLatin1Char('\n'));
+			recomputeLineState();
+		}
+
+		wrappedText.append(grapheme);
 		if (isSingleCharGrapheme(grapheme, QLatin1Char(' ')))
 			lastSpace = safeQSizeToInt(wrappedText.size()) - 1;
 		if (!isWhitespaceGrapheme(grapheme))
 			lineHasVisibleChar = true;
-
-		column += graphemeColumnWidthForWrap(grapheme);
-		if (column < wrapColumn)
-			continue;
-
-		if (!lineHasVisibleChar)
-			continue;
-
-		int insertPos = safeQSizeToInt(wrappedText.size());
-		if (lastSpace >= lineStart)
-		{
-			insertPos = indentParas ? lastSpace : lastSpace + 1;
-
-			bool onlyWhitespace = true;
-			for (int j = lineStart, size = safeQSizeToInt(wrappedText.size()); j < insertPos && j < size; ++j)
-			{
-				if (!wrappedText.at(j).isSpace())
-				{
-					onlyWhitespace = false;
-					break;
-				}
-			}
-			if (onlyWhitespace)
-				insertPos = safeQSizeToInt(wrappedText.size());
-		}
-
-		wrappedText.insert(insertPos, QLatin1Char('\n'));
-		recomputeLineState();
+		column += graphemeWidth;
 	}
 
 	text = wrappedText;
@@ -396,14 +395,14 @@ void QMudOutputWrapUtils::wrapStyledLineForColumn(QString &text, QVector<WorldRu
 	for (qsizetype graphemeStart = 0, graphemeEnd = boundary.toNextBoundary(); graphemeEnd != kNoBoundary;
 	     graphemeStart = graphemeEnd, graphemeEnd = boundary.toNextBoundary())
 	{
-		const QStringView grapheme = textView.sliced(graphemeStart, graphemeEnd - graphemeStart);
-		wrappedText.append(grapheme);
-		for (qsizetype i = graphemeStart; i < graphemeEnd; ++i)
-			wrappedStyles.push_back(expandedStyles.value(boundedQSizeToInt(i)));
-		const WorldRuntime::StyleSpan style = expandedStyles.value(boundedQSizeToInt(graphemeEnd - 1));
+		const QStringView             grapheme = textView.sliced(graphemeStart, graphemeEnd - graphemeStart);
+		const WorldRuntime::StyleSpan style    = expandedStyles.value(boundedQSizeToInt(graphemeEnd - 1));
 
 		if (isSingleCharGrapheme(grapheme, QLatin1Char('\n')))
 		{
+			wrappedText.append(grapheme);
+			for (qsizetype i = graphemeStart; i < graphemeEnd; ++i)
+				wrappedStyles.push_back(expandedStyles.value(boundedQSizeToInt(i)));
 			column             = 0;
 			lineStart          = safeQSizeToInt(wrappedText.size());
 			lastSpace          = -1;
@@ -411,41 +410,44 @@ void QMudOutputWrapUtils::wrapStyledLineForColumn(QString &text, QVector<WorldRu
 			continue;
 		}
 
+		const int graphemeWidth = graphemeColumnWidthForWrap(grapheme);
+		if (lineHasVisibleChar && graphemeWidth > 0 && column + graphemeWidth > wrapColumn)
+		{
+			int insertPos = safeQSizeToInt(wrappedText.size());
+			if (lastSpace >= lineStart)
+			{
+				insertPos = indentParas ? lastSpace : lastSpace + 1;
+
+				bool onlyWhitespace = true;
+				for (int j = lineStart, size = safeQSizeToInt(wrappedText.size()); j < insertPos && j < size;
+				     ++j)
+				{
+					if (!wrappedText.at(j).isSpace())
+					{
+						onlyWhitespace = false;
+						break;
+					}
+				}
+				if (onlyWhitespace)
+					insertPos = safeQSizeToInt(wrappedText.size());
+			}
+
+			const WorldRuntime::StyleSpan newlineStyle = insertPos > 0 && insertPos - 1 < wrappedStyles.size()
+			                                                 ? wrappedStyles.at(insertPos - 1)
+			                                                 : style;
+			wrappedText.insert(insertPos, QLatin1Char('\n'));
+			wrappedStyles.insert(insertPos, newlineStyle);
+			recomputeLineState();
+		}
+
+		wrappedText.append(grapheme);
+		for (qsizetype i = graphemeStart; i < graphemeEnd; ++i)
+			wrappedStyles.push_back(expandedStyles.value(boundedQSizeToInt(i)));
 		if (isSingleCharGrapheme(grapheme, QLatin1Char(' ')))
 			lastSpace = safeQSizeToInt(wrappedText.size()) - 1;
 		if (!isWhitespaceGrapheme(grapheme))
 			lineHasVisibleChar = true;
-
-		column += graphemeColumnWidthForWrap(grapheme);
-		if (column < wrapColumn)
-			continue;
-
-		if (!lineHasVisibleChar)
-			continue;
-
-		int insertPos = safeQSizeToInt(wrappedText.size());
-		if (lastSpace >= lineStart)
-		{
-			insertPos = indentParas ? lastSpace : lastSpace + 1;
-
-			bool onlyWhitespace = true;
-			for (int j = lineStart, size = safeQSizeToInt(wrappedText.size()); j < insertPos && j < size; ++j)
-			{
-				if (!wrappedText.at(j).isSpace())
-				{
-					onlyWhitespace = false;
-					break;
-				}
-			}
-			if (onlyWhitespace)
-				insertPos = safeQSizeToInt(wrappedText.size());
-		}
-
-		const WorldRuntime::StyleSpan newlineStyle =
-		    insertPos > 0 && insertPos - 1 < wrappedStyles.size() ? wrappedStyles.at(insertPos - 1) : style;
-		wrappedText.insert(insertPos, QLatin1Char('\n'));
-		wrappedStyles.insert(insertPos, newlineStyle);
-		recomputeLineState();
+		column += graphemeWidth;
 	}
 
 	QVector<WorldRuntime::StyleSpan> rebuilt;

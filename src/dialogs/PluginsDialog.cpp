@@ -14,6 +14,8 @@
 #include "scripting/ScriptingErrors.h"
 
 #include <QAbstractItemView>
+#include <QBrush>
+#include <QColor>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -25,6 +27,7 @@
 #include <QSettings>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QVector>
 #include <algorithm>
 #include <limits>
 #include <memory>
@@ -225,7 +228,7 @@ PluginsDialog::PluginsDialog(WorldRuntime *runtime, MainWindow *main, QWidget *p
 		clampColumnsToViewport(m_table);
 		const int  sortColumn = settings.value(QStringLiteral("SortColumn"), kColumnName).toInt();
 		const auto sortOrder  = static_cast<Qt::SortOrder>(
-            settings.value(QStringLiteral("SortOrder"), Qt::AscendingOrder).toInt());
+		    settings.value(QStringLiteral("SortOrder"), Qt::AscendingOrder).toInt());
 		if (sortColumn >= 0)
 			m_table->sortByColumn(sortColumn, sortOrder);
 		settings.endGroup();
@@ -249,28 +252,45 @@ void PluginsDialog::reloadList() const
 	if (!m_runtime)
 		return;
 
-	const QList<WorldRuntime::Plugin> &plugins     = m_runtime->plugins();
-	const int                          pluginCount = plugins.size() > std::numeric_limits<int>::max()
-	                                                     ? std::numeric_limits<int>::max()
-	                                                     : static_cast<int>(plugins.size());
+	const QList<WorldRuntime::Plugin> &plugins    = m_runtime->plugins();
+	const QStringList                  visibleIds = m_runtime->pluginIdList();
+	QVector<int>                       visiblePluginRows;
+	visiblePluginRows.reserve(plugins.size());
+	for (int pluginIndex = 0; pluginIndex < plugins.size(); ++pluginIndex)
+	{
+		const QString pluginId = plugins.at(pluginIndex).attributes.value(QStringLiteral("id"));
+		if (!pluginId.isEmpty() && !visibleIds.contains(pluginId, Qt::CaseInsensitive))
+			continue;
+		visiblePluginRows.push_back(pluginIndex);
+	}
+	constexpr qsizetype maxPluginRows = static_cast<qsizetype>(std::numeric_limits<int>::max());
+	const int           pluginCount   = visiblePluginRows.size() > maxPluginRows
+	                                        ? std::numeric_limits<int>::max()
+	                                        : static_cast<int>(visiblePluginRows.size());
 	m_table->setRowCount(pluginCount);
 
 	for (int row = 0; row < pluginCount; ++row)
 	{
-		const WorldRuntime::Plugin &plugin   = plugins.at(row);
+		const WorldRuntime::Plugin &plugin   = plugins.at(visiblePluginRows.at(row));
 		const QString               pluginId = plugin.attributes.value(QStringLiteral("id"));
 		const QString               name     = plugin.attributes.value(QStringLiteral("name"));
-		const QString               purpose  = plugin.attributes.value(QStringLiteral("purpose"));
-		const QString               author   = plugin.attributes.value(QStringLiteral("author"));
-		const QString               file     = plugin.source;
-		const QString               enabled  = plugin.enabled ? QStringLiteral("Yes") : QStringLiteral("No");
-		const QString               version  = QString::number(plugin.version, 'f', 2);
+		const QString               purpose =
+		    plugin.nativeShim ? plugin.nativeShimMarker : plugin.attributes.value(QStringLiteral("purpose"));
+		const QString author  = plugin.attributes.value(QStringLiteral("author"));
+		const QString file    = plugin.source;
+		const QString enabled = plugin.enabled ? QStringLiteral("Yes") : QStringLiteral("No");
+		const QString version = QString::number(plugin.version, 'f', 2);
 
-		auto                        addItem = [&](const int column, const QString &text)
+		auto          addItem = [&](const int column, const QString &text)
 		{
 			auto item = std::make_unique<QTableWidgetItem>(text);
 			item->setData(Qt::UserRole, pluginId);
 			item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+			if (plugin.nativeShim)
+			{
+				item->setForeground(QBrush(QColor(0, 120, 48)));
+				item->setBackground(QBrush(QColor(223, 245, 229)));
+			}
 			m_table->setItem(row, column, item.release());
 		};
 
@@ -281,12 +301,22 @@ void PluginsDialog::reloadList() const
 		purposeItem->setData(Qt::UserRole, pluginId);
 		purposeItem->setFlags(purposeItem->flags() & ~Qt::ItemIsEditable);
 		purposeItem->setToolTip(purpose);
+		if (plugin.nativeShim)
+		{
+			purposeItem->setForeground(QBrush(QColor(0, 120, 48)));
+			purposeItem->setBackground(QBrush(QColor(223, 245, 229)));
+		}
 		m_table->setItem(row, kColumnPurpose, purposeItem.release());
 
 		auto fileItem = std::make_unique<QTableWidgetItem>(file);
 		fileItem->setData(Qt::UserRole, pluginId);
 		fileItem->setFlags(fileItem->flags() & ~Qt::ItemIsEditable);
 		fileItem->setToolTip(file);
+		if (plugin.nativeShim)
+		{
+			fileItem->setForeground(QBrush(QColor(0, 120, 48)));
+			fileItem->setBackground(QBrush(QColor(223, 245, 229)));
+		}
 		m_table->setItem(row, kColumnFile, fileItem.release());
 
 		addItem(kColumnEnabled, enabled);

@@ -65,6 +65,14 @@ namespace
 		plugin.version = 1.0;
 		return plugin;
 	}
+
+	bool isBlacklistedPluginIdForDialogTest(const QString &pluginId)
+	{
+		const QString id = pluginId.trimmed().toLower();
+		return id == QStringLiteral("bb6a05ed7534b5db1ed40511") ||
+		       id == QStringLiteral("b8e6dac1ee7fe8e3de931fb7") ||
+		       id == QStringLiteral("8238deec7c06bade8ebc3819");
+	}
 } // namespace
 
 // NOLINTBEGIN(readability-convert-member-functions-to-static,readability-make-member-function-const)
@@ -123,6 +131,19 @@ const QList<WorldRuntime::Plugin> &WorldRuntime::plugins() const
 QList<WorldRuntime::Plugin> &WorldRuntime::pluginsMutable()
 {
 	return stateFor(this).plugins;
+}
+
+QStringList WorldRuntime::pluginIdList() const
+{
+	QStringList ids;
+	for (const Plugin &plugin : stateFor(this).plugins)
+	{
+		const QString id = plugin.attributes.value(QStringLiteral("id"));
+		if (id.isEmpty() || isBlacklistedPluginIdForDialogTest(id) || ids.contains(id, Qt::CaseInsensitive))
+			continue;
+		ids.push_back(id);
+	}
+	return ids;
 }
 
 bool WorldRuntime::loadPluginFile(const QString &, QString *, bool)
@@ -229,6 +250,25 @@ class tst_Dialog_Plugins : public QObject
 			QVERIFY(enableButton->isEnabled());
 			QVERIFY(disableButton->isEnabled());
 			QVERIFY(reloadButton->isEnabled());
+		}
+
+		void blacklistedPluginsAreHiddenFromTable()
+		{
+			WorldRuntime runtime;
+			runtime.pluginsMutable().push_back(
+			    makePlugin(QStringLiteral("bb6a05ed7534b5db1ed40511"), QStringLiteral("Automatic Backup")));
+			runtime.pluginsMutable().push_back(
+			    makePlugin(QStringLiteral("visible"), QStringLiteral("Visible")));
+
+			PluginsDialog dialog(&runtime, nullptr);
+			dialog.show();
+
+			auto *table = dialog.findChild<QTableWidget *>();
+			QVERIFY(table);
+			QCOMPARE(table->rowCount(), 1);
+			QVERIFY(table->item(0, 0));
+			QCOMPARE(table->item(0, 0)->text(), QStringLiteral("Visible"));
+			QCOMPARE(table->item(0, 0)->data(Qt::UserRole).toString(), QStringLiteral("visible"));
 		}
 
 		void enableDisableAndReloadActOnSelectedPlugin()
