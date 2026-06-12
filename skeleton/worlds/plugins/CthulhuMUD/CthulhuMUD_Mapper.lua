@@ -77,7 +77,7 @@ Date:   24th January 2020
 
 --]]
 
-CTHULHUMUD_MAPPER_LUA_VERSION = 4.0 -- version must agree with plugin version
+CTHULHUMUD_MAPPER_LUA_VERSION = 4.1 -- version must agree with plugin version
 
 -- The probability (in the range 0.0 to 1.0) that a line has to meet to be considered a certain line type.
 -- The higher, the stricter the requirement.
@@ -292,12 +292,12 @@ local function db_rooms_load ()
   end
 end
 
-local function db_room_upsert (uid, room)
+local function db_room_upsert (uid, room, force)
   if not uid or not room then return end
   uid = tostring(uid):upper()
   db_open ()
 
-  if not room._dirty then
+  if not force and not room._dirty then
     return true
   end
 
@@ -321,6 +321,28 @@ local function db_room_upsert (uid, room)
   end
   if ok then
     room._dirty = nil
+  end
+  return ok
+end
+
+local function db_room_mark_dirty (uid)
+  if not uid or not rooms or not rooms[uid] then
+    return false
+  end
+
+  rooms[uid]._dirty = true
+  return db_room_upsert (uid, rooms[uid])
+end
+
+local function db_room_delete (uid)
+  if not uid then return false end
+  uid = tostring(uid):upper()
+  _pending_room_writes[uid] = nil
+  db_open ()
+  local rc, err = _db:exec ("DELETE FROM rooms WHERE uid = " .. fixsql(uid))
+  local ok, _, busy = dbcheck (rc, err)
+  if busy then
+    return false
   end
   return ok
 end
@@ -711,7 +733,7 @@ local function db_rooms_replace_all ()
   if busy then
     -- fall back to deferred writes; don't block UI
     for uid, room in pairs (rooms or {}) do
-      db_room_upsert (uid, room)
+      db_room_upsert (uid, room, true)
     end
     return
   end
@@ -2769,6 +2791,7 @@ function process_new_room ()
         uid = utils.tohex (utils.md5 (string.format ("%0.9f/%0.9f/%0.9f/%d",
                                 math.random (), math.random (), math.random (), os.time ()))):sub (1, 25)
         rooms [from_room].exits [get_last_direction_moved ()] = uid
+        db_room_mark_dirty (from_room)
         INFO (string.format ("Adding new room with random UID (%s) leading %s from %s", fixuid (uid), get_last_direction_moved (), fixuid (from_room)))
         duplicate = current_room_hash
         create_unique_room = false
@@ -3104,6 +3127,7 @@ function fix_up_exit ()
     WARNING ("Declining to set the exit " .. last_direction_moved .. " from this room to be itself")
   else
     room.exits [last_direction_moved] = current_room
+    db_room_mark_dirty (from_room)
     INFO ("Exit from " .. fixuid (from_room) .. " in the direction " .. last_direction_moved .. " is now " .. fixuid (current_room))
   end -- if
 
@@ -3112,9 +3136,11 @@ function fix_up_exit ()
   if inverse and current_room then
     if duplicates [rooms [current_room].exits [inverse]] then
       rooms [current_room].exits [inverse] = '0'
+      db_room_mark_dirty (current_room)
     end -- if
     if rooms [current_room].exits [inverse] == '0' then
       rooms [current_room].exits [inverse] = from_room
+      db_room_mark_dirty (current_room)
       INFO ("Added inverse direction from " .. fixuid (current_room) .. " in the direction " .. inverse .. " to be " .. fixuid (from_room))
     end -- if
   end -- of having an inverse
@@ -3768,6 +3794,7 @@ function mapper_delete (name, line, wildcards)
 
   mapper_show (delete_uid)
   rooms [delete_uid] = nil  -- delete it
+  db_room_delete (delete_uid)
   mapper.mapprint ("Room", delete_uid, "deleted.")
 
   -- remove any exit references to this room
@@ -3777,6 +3804,7 @@ function mapper_delete (name, line, wildcards)
         mapper.mapprint (string.format ("Setting exit %s from room %s to be unknown",
                           dest, fixuid (uid)))
         room.exits [dir] = '0'
+        db_room_mark_dirty (uid)
       end -- if that exit pointed to the deleted room
     end -- for each exit
   end -- for each room
@@ -4425,7 +4453,7 @@ function mapper_import (name, line, wildcards)
   for uid, room in pairs (in_rooms) do
     local U = tostring(uid):upper()
     rooms[U] = room
-    db_room_upsert (U, room)
+    db_room_upsert (U, room, true)
   end
 
   -- restore nomap
@@ -4580,6 +4608,7 @@ function room_edit_bookmark (room, uid)
     else
       mapper.mapprint ("Note for room", uid, "deleted. Was previously:", notes)
       rooms [uid].notes = nil
+      db_room_mark_dirty (uid)
       return
     end -- if
   end -- if
@@ -4595,6 +4624,7 @@ function room_edit_bookmark (room, uid)
    end -- if
 
    rooms [uid].notes = newnotes
+   db_room_mark_dirty (uid)
 
 end -- room_edit_bookmark
 
@@ -4624,6 +4654,7 @@ function room_edit_area (room, uid)
    mapper.mapprint ("Area name for room", uid, "changed to:", newarea)
 
    rooms [uid].area = newarea
+   db_room_mark_dirty (uid)
 
 end -- room_edit_area
 
@@ -4671,6 +4702,7 @@ local available =  {
 
   -- update in-memory table
   rooms [uid].exits [chosen_exit] = nil
+  db_room_mark_dirty (uid)
 
   local current_room = get_current_room_ ("room_delete_exit")
 
@@ -4740,6 +4772,7 @@ function room_connect_exit  (room, uid, dir)
   end -- if
 
   room.exits [dir] = dest_uid
+  db_room_mark_dirty (uid)
 
   INFO (string.format ("Exit %s from %s now connects to %s",
       dir:upper (), fixuid (uid), fixuid (dest_uid)))
@@ -4747,6 +4780,7 @@ function room_connect_exit  (room, uid, dir)
   local inverse = inverse_direction [dir]
   if inverse then
     rooms [dest_uid].exits [inverse] = uid
+    db_room_mark_dirty (dest_uid)
     INFO ("Added inverse direction from " .. fixuid (dest_uid) .. " in the direction " .. inverse .. " to be " .. fixuid (uid))
   end -- of having an inverse
 
@@ -4924,6 +4958,7 @@ function mark_duplicate_room (name, line, wildcards)
 
   if rooms [current_room_hash] then
     rooms [current_room_hash] = nil  -- delete it
+    db_room_delete (current_room_hash)
     mapper.mapprint ("Room", current_room_hash, "deleted.")
   end -- if
 
@@ -4958,6 +4993,7 @@ function mapper_integrity (name, line, wildcards)
                 fixuid (uid), dir, fixuid (dest), fixuid (dest), inverse, fixuid (dest_room.exits [inverse])))
             if repair then
               dest_room.exits [inverse] = uid
+              db_room_mark_dirty (dest)
               p (string.format ("Changed %s exit %s to be %s", fixuid (dest), inverse, fixuid (uid)))
             end -- repair
           end -- if
@@ -5228,6 +5264,7 @@ end -- set_area_name
 function set_current_area_name (name)
   if uid and name and rooms [uid] then
     rooms [uid].area = name
+    db_room_mark_dirty (uid)
 	mapper.draw (uid)
   end -- if
 end -- set_area_name
@@ -5382,6 +5419,6 @@ function set_room_extras (uid, extras)
 
   -- move the rooms table into our rooms table
   rooms [uid].extras = t.extras
+  db_room_mark_dirty (uid)
   return true
 end -- set_room_extras
-

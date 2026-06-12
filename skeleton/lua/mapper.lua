@@ -2,7 +2,7 @@
 
 --[[
 
-Author: Nick Gammon
+Author: Nick Gammon, Panagiotis Kalogiratos (Nodens)
 Date:   11th March 2010
 Amended: 15th August 2010
 Amended: 2nd October 2010
@@ -13,6 +13,7 @@ Amended: 18th November 2010 to add more timing and count of times called
 Amended: 26th November 2010 to check timers are enabled when speedwalking.
 Amended: 11th November 2014 to allow for detecting mouse-overs of rooms
 Amended: 1st February 2020 to fix bug in drawing configuration sub-window
+Amended: 6th June 2026 to allow drawing multiple unexplored rooms.
 
 Generic MUD mapper.
 
@@ -71,7 +72,7 @@ Room info should include:
 
 module (..., package.seeall)
 
-VERSION = 2.7   -- for querying by plugins
+VERSION = 3.0   -- for querying by plugins
 
 require "movewindow"
 require "copytable"
@@ -508,6 +509,21 @@ local function add_another_room (uid, path, x, y)
   return {uid=uid, path=path, x = x, y = y}
 end  -- add_another_room
 
+local function draw_unknown_exit_marker (from_uid, dir, x, y)
+  local coords = string.format ("%i,%i", math.floor (x), math.floor (y))
+  if drawn_coords [coords] and drawn_coords [coords] ~= "0" then
+    return false
+  end -- if another real room is already there
+
+  drawn_coords [coords] = string.format ("0:%s:%s", tostring (from_uid), tostring (dir))
+
+  WindowCircleOp (win, miniwin.circle_rectangle,
+                  x - HALF_ROOM, y - HALF_ROOM, x + HALF_ROOM, y + HALF_ROOM,
+                  config.UNKNOWN_ROOM_COLOUR.colour, miniwin.pen_dot, 1,
+                  -1, miniwin.brush_null)
+  return true
+end -- draw_unknown_exit_marker
+
 local function draw_room (uid, path, x, y)
 
   local coords = string.format ("%i,%i", math.floor (x), math.floor (y))
@@ -587,71 +603,76 @@ local function draw_room (uid, path, x, y)
       local linetype = miniwin.pen_solid -- unbroken
       local linewidth = 1 -- not recent
 
-      -- try to cache room
-      if not rooms [exit_uid] then
-        rooms [exit_uid] = get_room (exit_uid)
-      end -- if
-
-      if rooms [exit_uid].unknown then
-        linetype = miniwin.pen_dot -- dots
-      end -- if
-
       local next_x = x + exit_info.at [1] * (ROOM_SIZE + DISTANCE_TO_NEXT_ROOM)
       local next_y = y + exit_info.at [2] * (ROOM_SIZE + DISTANCE_TO_NEXT_ROOM)
 
       local next_coords = string.format ("%i,%i", math.floor (next_x), math.floor (next_y))
 
-      -- remember if a zone exit (first one only)
-      if show_area_exits and room.area ~= rooms [exit_uid].area then
-        area_exits [ rooms [exit_uid].area ] = area_exits [ rooms [exit_uid].area ] or {x = x, y = y}
-      end -- if
-
-      -- if another room (not where this one leads to) is already there, only draw "stub" lines
-      if drawn_coords [next_coords] and drawn_coords [next_coords] ~= exit_uid then
-        exit_info = stub_exit_info
-      elseif exit_uid == uid then
-
-        -- here if room leads back to itself
-        exit_info = stub_exit_info
-        linetype = miniwin.pen_dash -- dash
-
+      if exit_uid == "0" then
+        linetype = miniwin.pen_dot
+        draw_unknown_exit_marker (uid, dir, next_x, next_y)
       else
-        if (not show_other_areas and rooms [exit_uid].area ~= current_area) or
-           (not show_up_down and (dir == "u" or dir == "d")) then
-            exit_info = stub_exit_info    -- don't show other areas
-        else
-          -- if we are scheduled to draw the room already, only draw a stub this time
-          if plan_to_draw [exit_uid] and plan_to_draw [exit_uid] ~= next_coords then
-            -- here if room already going to be drawn
-            exit_info = stub_exit_info
-            linetype = miniwin.pen_dash -- dash
-          else
-            -- remember to draw room next iteration
-            local new_path = copytable.deep (path)
-            table.insert (new_path, { dir = dir, uid = exit_uid })
-            table.insert (rooms_to_be_drawn, add_another_room (exit_uid, new_path, next_x, next_y))
-            drawn_coords [next_coords] = exit_uid
-            plan_to_draw [exit_uid] = next_coords
+        -- try to cache room
+        if not rooms [exit_uid] then
+          rooms [exit_uid] = get_room (exit_uid)
+        end -- if
 
-            -- if exit room known
-            if not rooms [exit_uid].unknown then
-              local exit_time = last_visited [exit_uid] or 0
-              local this_time = last_visited [uid] or 0
-              local now = os.time ()
-              if exit_time > (now - config.LAST_VISIT_TIME.time) and
-                 this_time > (now - config.LAST_VISIT_TIME.time) then
-                 linewidth = 2
+        if rooms [exit_uid].unknown then
+          linetype = miniwin.pen_dot -- dots
+        end -- if
+
+        -- remember if a zone exit (first one only)
+        if show_area_exits and room.area ~= rooms [exit_uid].area then
+          area_exits [ rooms [exit_uid].area ] = area_exits [ rooms [exit_uid].area ] or {x = x, y = y}
+        end -- if
+
+        -- if another room (not where this one leads to) is already there, only draw "stub" lines
+        if drawn_coords [next_coords] and drawn_coords [next_coords] ~= exit_uid then
+          exit_info = stub_exit_info
+        elseif exit_uid == uid then
+
+          -- here if room leads back to itself
+          exit_info = stub_exit_info
+          linetype = miniwin.pen_dash -- dash
+
+        else
+          if (not show_other_areas and rooms [exit_uid].area ~= current_area) or
+             (not show_up_down and (dir == "u" or dir == "d")) then
+              exit_info = stub_exit_info    -- don't show other areas
+          else
+            -- if we are scheduled to draw the room already, only draw a stub this time
+            if plan_to_draw [exit_uid] and plan_to_draw [exit_uid] ~= next_coords then
+              -- here if room already going to be drawn
+              exit_info = stub_exit_info
+              linetype = miniwin.pen_dash -- dash
+            else
+              -- remember to draw room next iteration
+              local new_path = copytable.deep (path)
+              table.insert (new_path, { dir = dir, uid = exit_uid })
+              table.insert (rooms_to_be_drawn, add_another_room (exit_uid, new_path, next_x, next_y))
+              drawn_coords [next_coords] = exit_uid
+              plan_to_draw [exit_uid] = next_coords
+
+              -- if exit room known
+              if not rooms [exit_uid].unknown then
+                local exit_time = last_visited [exit_uid] or 0
+                local this_time = last_visited [uid] or 0
+                local now = os.time ()
+                if exit_time > (now - config.LAST_VISIT_TIME.time) and
+                   this_time > (now - config.LAST_VISIT_TIME.time) then
+                   linewidth = 2
+                end -- if
               end -- if
             end -- if
           end -- if
         end -- if
-      end -- if drawn on this spot
+      end -- if unknown exit
 
       WindowLine (win, x + exit_info.x1, y + exit_info.y1, x + exit_info.x2, y + exit_info.y2, exit_line_colour, linetype, linewidth)
 
       -- one-way exit?
 
-      if not rooms [exit_uid].unknown then
+      if exit_uid ~= "0" and not rooms [exit_uid].unknown then
         local dest = rooms [exit_uid]
         -- if inverse direction doesn't point back to us, this is one-way
         if dest.exits [inverse_direction [dir]] ~= uid then
@@ -1630,5 +1651,4 @@ function zoom_map (flags, hotspot_id)
     zoom_in ()
   end -- if
 end -- zoom_map
-
 

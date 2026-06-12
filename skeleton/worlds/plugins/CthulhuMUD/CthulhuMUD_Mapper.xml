@@ -10,9 +10,9 @@
    purpose="AI interface to mapper to learn descriptions etc. Based on Nick Gammon's Learning_Mapper"
    save_state="y"
    date_written="2022-11-17 11:29:22"
-   date_modified="2026-01-31 05:30:00"
+   date_modified="2026-06-12 13:47:00"
    requires="10.00"
-   version="4.0"
+   version="4.1"
    >
 <description trim="y">
 <![CDATA[
