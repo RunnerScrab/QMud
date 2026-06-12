@@ -6,6 +6,8 @@
  * Role: Integration coverage for WorldRuntime plugin lifecycle callback ordering.
  */
 
+#include "NativePluginRegistry.h"
+#include "WorldDocument.h"
 #include "WorldRuntime.h"
 #include "WorldView.h"
 
@@ -43,6 +45,21 @@ namespace
 	}
 
 	/**
+	 * @brief Reads a whole text fixture file.
+	 * @param path Source file path.
+	 * @param text Receives file text on success.
+	 * @return `true` when the file was read.
+	 */
+	bool readTextFile(const QString &path, QString &text)
+	{
+		QFile file(path);
+		if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+			return false;
+		text = QString::fromUtf8(file.readAll());
+		return true;
+	}
+
+	/**
 	 * @brief Reads a plugin variable from the runtime.
 	 * @param runtime Runtime to inspect.
 	 * @param name Plugin variable name.
@@ -65,6 +82,64 @@ class tst_WorldRuntime_PluginLifecycle : public QObject
 		Q_OBJECT
 
 	private slots:
+		static void nativeShimPluginSourceSurvivesWorldSaveReload()
+		{
+			QTemporaryDir tempDir;
+			QVERIFY(tempDir.isValid());
+
+			const QString worldsDir  = QDir(tempDir.path()).filePath(QStringLiteral("worlds"));
+			const QString pluginsDir = QDir(worldsDir).filePath(QStringLiteral("plugins"));
+			const QString stateDir   = QDir(tempDir.path()).filePath(QStringLiteral("state"));
+			QVERIFY(QDir().mkpath(pluginsDir));
+			QVERIFY(QDir().mkpath(stateDir));
+
+			const QString worldPath = QDir(worldsDir).filePath(QStringLiteral("native_source.qdl"));
+			QVERIFY(writeTextFile(worldPath, QStringLiteral(R"xml(<?xml version="1.0" encoding="UTF-8"?>
+<qmud>
+  <world id="aaaaaaaaaaaaaaaaaaaaaaaa" name="Native Source"/>
+  <include name="worlds/plugins/qmud:native/MushReader" plugin="y" enabled="y"/>
+</qmud>
+)xml")));
+
+			WorldDocument doc;
+			QVERIFY2(doc.loadFromFile(worldPath), qPrintable(doc.errorString()));
+			QVERIFY2(doc.expandIncludes(worldPath, pluginsDir, tempDir.path(), stateDir),
+			         qPrintable(doc.errorString()));
+			QCOMPARE(doc.plugins().size(), 1);
+			QCOMPARE(doc.plugins().constFirst().attributes.value(QStringLiteral("id")),
+			         QMudNativePluginRegistry::mushReaderPluginId());
+			QCOMPARE(doc.plugins().constFirst().attributes.value(QStringLiteral("source")),
+			         QStringLiteral("qmud:native/MushReader"));
+
+			WorldRuntime runtime;
+			runtime.setStartupDirectory(tempDir.path());
+			runtime.setPluginsDirectory(QStringLiteral("worlds/plugins"));
+			runtime.setStateFilesDirectory(stateDir);
+			runtime.applyFromDocument(doc);
+			QCOMPARE(runtime.includes().size(), 1);
+			QCOMPARE(runtime.includes().constFirst().attributes.value(QStringLiteral("name")),
+			         QStringLiteral("qmud:native/MushReader"));
+			runtime.setWorldFileModified(true);
+
+			const QString savedPath = QDir(worldsDir).filePath(QStringLiteral("native_source_saved.qdl"));
+			QString       saveError;
+			QVERIFY2(runtime.saveWorldFile(savedPath, &saveError), qPrintable(saveError));
+			QVERIFY(!runtime.worldFileModified());
+
+			QString savedText;
+			QVERIFY(readTextFile(savedPath, savedText));
+			QVERIFY(savedText.contains(QStringLiteral("name=\"qmud:native/MushReader\"")));
+			QVERIFY(!savedText.contains(QStringLiteral("worlds/plugins/qmud:native/MushReader")));
+
+			WorldDocument reloaded;
+			QVERIFY2(reloaded.loadFromFile(savedPath), qPrintable(reloaded.errorString()));
+			QVERIFY2(reloaded.expandIncludes(savedPath, pluginsDir, tempDir.path(), stateDir),
+			         qPrintable(reloaded.errorString()));
+			QCOMPARE(reloaded.plugins().size(), 1);
+			QCOMPARE(reloaded.plugins().constFirst().attributes.value(QStringLiteral("id")),
+			         QMudNativePluginRegistry::mushReaderPluginId());
+		}
+
 		static void deferredWorldConnectHandlersRunOnceAfterPluginInstallCompletes()
 		{
 			QTemporaryDir tempDir;

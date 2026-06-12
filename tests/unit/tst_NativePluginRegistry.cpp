@@ -306,6 +306,31 @@ class tst_NativePluginRegistry : public QObject
 			QCOMPARE(
 			    QMudNativePluginRegistry::pluginSupports(audioShimId, QStringLiteral("plugin_update_url")),
 			    eOK);
+
+			QCOMPARE(
+			    QMudNativePluginRegistry::normalizeNativeSource(QStringLiteral("qmud:native/MushReader")),
+			    QStringLiteral("qmud:native/MushReader"));
+			QCOMPARE(
+			    QMudNativePluginRegistry::normalizeNativeSource(QStringLiteral("./qmud:native/LuaAudio")),
+			    QStringLiteral("qmud:native/LuaAudio"));
+			QCOMPARE(
+			    QMudNativePluginRegistry::normalizeNativeSource(QStringLiteral(R"(qmud:native\MushReader)")),
+			    QStringLiteral("qmud:native/MushReader"));
+			QCOMPARE(QMudNativePluginRegistry::normalizeNativeSource(
+			             QStringLiteral("worlds/plugins/qmud:native/MushReader")),
+			         QStringLiteral("qmud:native/MushReader"));
+			QCOMPARE(
+			    QMudNativePluginRegistry::normalizeNativeSource(QStringLiteral("QMUD:NATIVE/mushreader")),
+			    QStringLiteral("qmud:native/MushReader"));
+			QCOMPARE(QMudNativePluginRegistry::normalizeNativeSource(QStringLiteral("MushReader.xml")),
+			         QString());
+
+			QMudNativePluginRegistry::NativePluginMetadata sourceMetadata;
+			QVERIFY(QMudNativePluginRegistry::metadataForNativeSource(
+			    QStringLiteral("worlds/plugins/qmud:native/MushReader"), sourceMetadata));
+			QCOMPARE(sourceMetadata.id, shimId);
+			QVERIFY(!QMudNativePluginRegistry::metadataForNativeSource(
+			    QStringLiteral("qmud:native/UnknownShim"), sourceMetadata));
 		}
 
 		void callPluginRoutesToNativeSpeech()

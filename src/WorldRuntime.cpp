@@ -7911,6 +7911,13 @@ bool WorldRuntime::writeSaveSnapshot(const SaveSnapshot &snapshot, QString *erro
 		for (auto &entry : entries)
 			normalizePathAttributes(entry.attributes);
 	};
+	const auto normalizeNativePluginSourceForStorage = [](const QString &source) -> QString
+	{
+		QMudNativePluginRegistry::NativePluginMetadata metadata;
+		if (!QMudNativePluginRegistry::metadataForNativeSource(source, metadata))
+			return {};
+		return metadata.source;
+	};
 
 	normalizePathAttributes(normalizedSnapshot.worldAttributes);
 	normalizeEntryPathAttributes(normalizedSnapshot.triggers);
@@ -7927,6 +7934,12 @@ bool WorldRuntime::writeSaveSnapshot(const SaveSnapshot &snapshot, QString *erro
 		QString includeName = includeEntry.attributes.value(QStringLiteral("name")).trimmed();
 		if (includeName.isEmpty())
 			continue;
+		if (const QString nativeSource = normalizeNativePluginSourceForStorage(includeName);
+		    !nativeSource.isEmpty())
+		{
+			includeEntry.attributes.insert(QStringLiteral("name"), nativeSource);
+			continue;
+		}
 		const QString normalizedInclude = normalizePathForStorage(includeName);
 		const bool    hasPortableRoot   = !extractPortableRootRelativePath(normalizedInclude).isEmpty();
 		if (!isAbsolutePathLike(normalizedInclude) && !hasPortableRoot && !worldDir.isEmpty())
@@ -7941,25 +7954,40 @@ bool WorldRuntime::writeSaveSnapshot(const SaveSnapshot &snapshot, QString *erro
 		QString source = plugin.source.trimmed();
 		if (!source.isEmpty())
 		{
-			const QString normalizedSource = normalizePathForStorage(source);
-			const bool    hasPortableRoot  = !extractPortableRootRelativePath(normalizedSource).isEmpty();
-			if (!isAbsolutePathLike(normalizedSource) && !hasPortableRoot && !pluginsDir.isEmpty())
-				source = QDir(pluginsDir).filePath(normalizedSource);
-			plugin.source = canonicalizePathForStorage(source, workingDir);
+			if (const QString nativeSource = normalizeNativePluginSourceForStorage(source);
+			    !nativeSource.isEmpty())
+			{
+				plugin.source = nativeSource;
+			}
+			else
+			{
+				const QString normalizedSource = normalizePathForStorage(source);
+				const bool    hasPortableRoot  = !extractPortableRootRelativePath(normalizedSource).isEmpty();
+				if (!isAbsolutePathLike(normalizedSource) && !hasPortableRoot && !pluginsDir.isEmpty())
+					source = QDir(pluginsDir).filePath(normalizedSource);
+				plugin.source = canonicalizePathForStorage(source, workingDir);
+			}
 		}
 
 		if (const QString sourceAttr = plugin.attributes.value(QStringLiteral("source")).trimmed();
 		    !sourceAttr.isEmpty())
 		{
-			QString rewrittenSource = sourceAttr;
-			if (const QString normalizedSource = normalizePathForStorage(sourceAttr);
-			    !isAbsolutePathLike(normalizedSource) &&
-			    extractPortableRootRelativePath(normalizedSource).isEmpty() && !pluginsDir.isEmpty())
+			QString       rewrittenSource = sourceAttr;
+			const QString nativeSource    = normalizeNativePluginSourceForStorage(sourceAttr);
+			if (!nativeSource.isEmpty())
+			{
+				rewrittenSource = nativeSource;
+			}
+			else if (const QString normalizedSource = normalizePathForStorage(sourceAttr);
+			         !isAbsolutePathLike(normalizedSource) &&
+			         extractPortableRootRelativePath(normalizedSource).isEmpty() && !pluginsDir.isEmpty())
 			{
 				rewrittenSource = QDir(pluginsDir).filePath(normalizedSource);
 			}
 			plugin.attributes.insert(QStringLiteral("source"),
-			                         canonicalizePathForStorage(rewrittenSource, workingDir));
+			                         !nativeSource.isEmpty()
+			                             ? rewrittenSource
+			                             : canonicalizePathForStorage(rewrittenSource, workingDir));
 		}
 	}
 
@@ -17400,7 +17428,16 @@ void WorldRuntime::applyFromDocument(const WorldDocument &doc)
 	{
 		Include ri;
 		ri.attributes = i.attributes;
-		if (!isEnabledFlag(ri.attributes.value(QStringLiteral("plugin"))))
+		if (isEnabledFlag(ri.attributes.value(QStringLiteral("plugin"))))
+		{
+			QMudNativePluginRegistry::NativePluginMetadata metadata;
+			if (QMudNativePluginRegistry::metadataForNativeSource(ri.attributes.value(QStringLiteral("name")),
+			                                                      metadata))
+			{
+				ri.attributes.insert(QStringLiteral("name"), metadata.source);
+			}
+		}
+		else
 		{
 			const QString includeName =
 			    normalizePathForStorage(ri.attributes.value(QStringLiteral("name")).trimmed());

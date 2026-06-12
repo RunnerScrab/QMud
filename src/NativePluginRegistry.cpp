@@ -8,6 +8,7 @@
 
 #include "NativePluginRegistry.h"
 
+#include <QDir>
 #ifndef QMUD_NATIVEPLUGINREGISTRY_METADATA_ONLY
 #include "AcceleratorUtils.h"
 #include "TtsEngine.h"
@@ -19,7 +20,6 @@
 
 #ifndef QMUD_NATIVEPLUGINREGISTRY_METADATA_ONLY
 #include <QCoreApplication>
-#include <QDir>
 #include <QFile>
 #include <QLibrary>
 #include <QMutex>
@@ -82,6 +82,26 @@ namespace
 	QString qmudNativeSourceName(const QString &name)
 	{
 		return QStringLiteral("qmud:native/%1").arg(name);
+	}
+
+	QString normalizeNativeSourceSyntax(QString source)
+	{
+		source.replace(QLatin1Char('\\'), QLatin1Char('/'));
+		source = QDir::cleanPath(source.trimmed());
+		while (source.startsWith(QStringLiteral("./")))
+			source.remove(0, 2);
+
+		const QStringList segments = source.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+		for (qsizetype i = 0; i + 1 < segments.size(); ++i)
+		{
+			if (segments.at(i).compare(QStringLiteral("qmud:native"), Qt::CaseInsensitive) != 0)
+				continue;
+			const QString nativeName = segments.at(i + 1).trimmed();
+			if (nativeName.isEmpty())
+				return {};
+			return qmudNativeSourceName(nativeName);
+		}
+		return {};
 	}
 
 	QMudNativePluginRegistry::NativePluginMetadata mushReaderMetadata()
@@ -1306,6 +1326,31 @@ namespace QMudNativePluginRegistry
 			}
 		}
 		return false;
+	}
+
+	QString normalizeNativeSource(const QString &source)
+	{
+		const QString normalizedSource = normalizeNativeSourceSyntax(source);
+		if (normalizedSource.isEmpty())
+			return {};
+		const QString nativeName = normalizedSource.mid(QStringLiteral("qmud:native/").size()).trimmed();
+		if (nativeName.isEmpty())
+			return {};
+		NativePluginMetadata metadata;
+		if (metadataForNativeName(nativeName, metadata))
+			return metadata.source;
+		return normalizedSource;
+	}
+
+	bool metadataForNativeSource(const QString &source, NativePluginMetadata &metadata)
+	{
+		const QString normalizedSource = normalizeNativeSourceSyntax(source);
+		if (normalizedSource.isEmpty())
+			return false;
+		const QString nativeName = normalizedSource.mid(QStringLiteral("qmud:native/").size()).trimmed();
+		if (nativeName.isEmpty())
+			return false;
+		return metadataForNativeName(nativeName, metadata);
 	}
 
 	QStringList supportedRoutines(const QString &pluginId)

@@ -138,6 +138,19 @@ namespace QMudNativePluginRegistry
 	 */
 	[[nodiscard]] bool    metadataForNativeName(const QString &nativeName, NativePluginMetadata &metadata);
 	/**
+	 * @brief Normalizes a virtual native plugin source token without resolving filesystem paths.
+	 * @param source Source/include token to normalize.
+	 * @return Canonical `qmud:native/<Name>` source, or empty when the token is not virtual-native syntax.
+	 */
+	[[nodiscard]] QString normalizeNativeSource(const QString &source);
+	/**
+	 * @brief Returns native shim metadata by virtual source token.
+	 * @param source Source/include token such as `qmud:native/MushReader`.
+	 * @param metadata Output metadata.
+	 * @return `true` when the source names a registered native shim.
+	 */
+	[[nodiscard]] bool    metadataForNativeSource(const QString &source, NativePluginMetadata &metadata);
+	/**
 	 * @brief Lists native routines exposed by a shim.
 	 * @param pluginId Shim id.
 	 * @return Routine names in stable order.

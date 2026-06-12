@@ -17,26 +17,10 @@
 #include <QXmlStreamReader>
 #include <algorithm>
 
-static constexpr auto kNativePluginIncludePrefix = "qmud:native/";
-
-static QString        normalizeVirtualNativePluginInclude(QString name)
-{
-	name.replace(QLatin1Char('\\'), QLatin1Char('/'));
-	name = QDir::cleanPath(name.trimmed());
-	while (name.startsWith(QStringLiteral("./")))
-		name.remove(0, 2);
-	return name;
-}
-
 static bool makeVirtualNativePlugin(const QString &rawName, WorldDocument::Plugin &plugin)
 {
-	const QString name = normalizeVirtualNativePluginInclude(rawName);
-	if (!name.startsWith(QLatin1String(kNativePluginIncludePrefix), Qt::CaseInsensitive))
-		return false;
-
-	const QString nativeName = name.mid(QString::fromLatin1(kNativePluginIncludePrefix).size());
 	QMudNativePluginRegistry::NativePluginMetadata metadata;
-	if (!QMudNativePluginRegistry::metadataForNativeName(nativeName, metadata))
+	if (!QMudNativePluginRegistry::metadataForNativeSource(rawName, metadata))
 		return false;
 
 	plugin.attributes.insert(QStringLiteral("id"), metadata.id);
@@ -52,8 +36,7 @@ static bool makeVirtualNativePlugin(const QString &rawName, WorldDocument::Plugi
 
 static bool isVirtualNativePluginInclude(const QString &rawName)
 {
-	return normalizeVirtualNativePluginInclude(rawName).startsWith(QLatin1String(kNativePluginIncludePrefix),
-	                                                               Qt::CaseInsensitive);
+	return !QMudNativePluginRegistry::normalizeNativeSource(rawName).isEmpty();
 }
 
 static bool isPortableRootSegment(const QString &segment)
