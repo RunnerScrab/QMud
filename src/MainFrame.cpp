@@ -677,8 +677,6 @@ void MainWindow::buildMenus()
 	addActionToMenu(helpMenu, QStringLiteral("BugReports"), QStringLiteral("&Bug Reports..."));
 	addActionToMenu(helpMenu, QStringLiteral("DocumentationWebPage"),
 	                QStringLiteral("&Documentation Web Page..."));
-	addActionToMenu(helpMenu, QStringLiteral("HelpForum"), QStringLiteral("&Discord...\tShift+Ctrl+Alt+F"),
-	                QKeySequence(QStringLiteral("Shift+Ctrl+Alt+F")));
 	addActionToMenu(helpMenu, QStringLiteral("FunctionsList"),
 	                QStringLiteral("Functions &List...\tShift+Ctrl+Alt+L"),
 	                QKeySequence(QStringLiteral("Shift+Ctrl+Alt+L")));

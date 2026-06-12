@@ -329,7 +329,6 @@ enum class ResourceId : int
 	FilePlugins                            = 32983,
 	FilePluginwizard                       = 32984,
 	GameDomappercomment                    = 32985,
-	HelpForum                              = 32986,
 	HelpFunctionswebpage                   = 32987,
 	ViewInfobar                            = 32988,
 	ConvertConverthtmlspecial              = 32989,

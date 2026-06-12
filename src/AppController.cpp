@@ -203,7 +203,8 @@ namespace
 	constexpr char   kReloadLogTag[]             = "[ReloadQMud]";
 	constexpr char   kWorldSessionStateSuffix[]  = ".qws";
 	constexpr char   kWorldSessionStateDir[]     = "worlds/state";
-	constexpr char   kUpdateLatestReleaseUrl[] = "https://api.github.com/repos/Nodens-/QMud/releases/latest";
+	constexpr char   kUpdateLatestReleaseUrl[] =
+	    "https://api.github.com/repos/RunnerScrab/QMud/releases/latest";
 
 	class WorldRuntimeReloadOps final : public ReloadSocketRecoveryOps,
 	                                    public ReloadReconnectOps,
@@ -1911,7 +1912,7 @@ static const struct
     {"AppendToLogFiles",                0                       },
     {"AutoConnectWorlds",               1                       },
     {"AutoExpandConfig",                1                       },
-    {"AutoCheckForUpdates",             1                       },
+    {"AutoCheckForUpdates",             0                       },
     {"BackupOnUpgrades",                1                       },
     {"FlatToolbars",                    1                       },
     {"AutoLogWorld",                    0                       },
@@ -5959,7 +5960,7 @@ void AppController::handleUpdateCheckResponse(const bool manual, const QByteArra
 		return;
 	}
 
-	const QString currentVersion = versionCore(m_version);
+	const QString currentVersion = versionCore(QString::fromLatin1(kForkVersionString));
 	const QString skipVersion =
 	    versionCore(getGlobalOption(QStringLiteral("SkipUpdateNotificationVersion")).toString());
 
@@ -10990,14 +10991,6 @@ void AppController::onCommandTriggered(const QString &cmdName)
 		if (const auto url = QString::fromLatin1(DOCUMENTATION_PAGE); !QDesktopServices::openUrl(QUrl(url)))
 			QMessageBox::warning(m_mainWindow, QStringLiteral("Documentation"),
 			                     QStringLiteral("Unable to open the documentation web page: %1").arg(url));
-	}
-	else if (cmdName == QStringLiteral("HelpForum"))
-	{
-		if (!m_mainWindow)
-			return;
-		if (const auto url = QString::fromLatin1(QMUD_FORUM_URL); !QDesktopServices::openUrl(QUrl(url)))
-			QMessageBox::warning(m_mainWindow, QStringLiteral("Help Forum"),
-			                     QStringLiteral("Unable to open the QMud forum web page: %1").arg(url));
 	}
 	else if (cmdName == QStringLiteral("FunctionsList") || cmdName == QStringLiteral("FunctionsWebPage"))
 	{

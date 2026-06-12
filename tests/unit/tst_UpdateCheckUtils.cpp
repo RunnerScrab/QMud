@@ -141,6 +141,31 @@ class tst_UpdateCheckUtils : public QObject
 		}
 
 		/**
+		 * @brief Verifies RS Fork rs-v tags parse and compare against fork versions.
+		 */
+		void evaluateLatestReleasePayloadHandlesRsForkTags()
+		{
+			QCOMPARE(QMudUpdateCheck::versionCore(QStringLiteral("rs-v0.2.0")), QStringLiteral("0.2.0"));
+			QCOMPARE(QMudUpdateCheck::compareVersions(QStringLiteral("rs-v0.3.0"), QStringLiteral("rs-v0.2.0")),
+			         1);
+
+			QJsonArray assets;
+			assets.push_back(makeAsset(QStringLiteral("QMud-dev-x86_64.AppImage"),
+			                           QStringLiteral("https://example.invalid/qmud.appimage"),
+			                           QStringLiteral("sha256:%1").arg(sampleSha256())));
+			const QByteArray payload =
+			    makeLatestReleasePayload(QStringLiteral("rs-v0.3.0"), assets, QStringLiteral("fork fixes"));
+
+			const auto       result = QMudUpdateCheck::evaluateLatestReleasePayload(
+                payload, QStringLiteral("rs-v0.2.0"), QString(),
+                QMudUpdateCheck::InstallTarget::LinuxAppImage);
+
+			QCOMPARE(result.status, QMudUpdateCheck::ReleaseEvaluationStatus::UpdateAvailable);
+			QCOMPARE(result.releaseVersion, QStringLiteral("0.3.0"));
+			QCOMPARE(result.asset.name, QStringLiteral("QMud-dev-x86_64.AppImage"));
+		}
+
+		/**
 		 * @brief Verifies skipped-version marker is set when release equals stored skip version.
 		 */
 		void evaluateLatestReleasePayloadSkippedVersion()

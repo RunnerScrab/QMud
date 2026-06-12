@@ -376,7 +376,7 @@ void WorldChildWindow::bindRuntime(WorldRuntime *worldRuntime, const RuntimeBind
 					    m_view->appendNoteText(QStringLiteral("For assistance with connection problems see:"),
 					                           true);
 				    }
-				    const QString           forumLink = QString::fromLatin1(FORUM_URL);
+				    const QString           forumLink = QString::fromLatin1(DOCUMENTATION_PAGE);
 				    WorldRuntime::StyleSpan linkSpan;
 				    const QString linkText = QStringLiteral("How to resolve network connection problems");
 				    const auto    boundedLinkSize =
