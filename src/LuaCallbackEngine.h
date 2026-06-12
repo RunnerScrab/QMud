@@ -16,6 +16,7 @@
 #include <QByteArray>
 // ReSharper disable once CppUnusedIncludeDirective
 #include <QHash>
+#include <QMutex>
 #include <QSet>
 #include <QSharedPointer>
 #include <QString>
@@ -120,6 +121,16 @@ class LuaCallbackEngine
 		 * @return Plugin display name.
 		 */
 		[[nodiscard]] QString pluginName() const;
+		/**
+		 * @brief Returns bound plugin id without binding execution-thread affinity.
+		 * @return Plugin id readable from any thread.
+		 */
+		[[nodiscard]] QString pluginIdForDiagnostics() const;
+		/**
+		 * @brief Returns bound plugin display name without binding execution-thread affinity.
+		 * @return Plugin display name readable from any thread.
+		 */
+		[[nodiscard]] QString pluginNameForDiagnostics() const;
 		/**
 		 * @brief Returns bound plugin directory (legacy type-20 GetPluginInfo value).
 		 * @return Plugin directory with trailing separator when known.
@@ -603,6 +614,9 @@ class LuaCallbackEngine
 		QString                                                      m_pluginId;
 		QString                                                      m_pluginName;
 		QString                                                      m_pluginDirectory;
+		mutable QMutex                                               m_pluginInfoMutex;
+		QString                                                      m_pluginIdShared;
+		QString                                                      m_pluginNameShared;
 		QVector<QString>                                             m_callingPluginIdStack;
 		QVector<QSharedPointer<const LuaCallbackMiniWindowSnapshot>> m_dispatchMiniWindowSnapshotStack;
 		int                                                          m_scriptExecutionDepth{0};

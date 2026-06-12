@@ -2358,11 +2358,13 @@ end
 	LuaBatchDispatchResult result;
 	dispatchWorkerAndWait(executor, request, result);
 	QVERIFY(result.boolResultValid);
+	engine->clearExecutionThreadAffinity();
 	QVERIFY2(result.boolResult,
 	         qPrintable(luaGlobalString(engine->luaState(), "empty_plugin_variable_status")));
 	QVERIFY(luaGlobalBoolean(engine->luaState(), "empty_plugin_variable_ok"));
 	QVERIFY(luaGlobalBoolean(engine->luaState(), "empty_plugin_variable_case_ok"));
 	QVERIFY(luaGlobalBoolean(engine->luaState(), "empty_plugin_variable_list_ok"));
+	engine->clearExecutionThreadAffinity();
 	teardownWorkerEngine(executor, engine);
 }
 

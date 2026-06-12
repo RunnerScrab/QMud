@@ -10018,8 +10018,13 @@ lua_State *LuaCallbackEngine::luaState() const
 void LuaCallbackEngine::setPluginInfo(const QString &id, const QString &name, const QString &directory)
 {
 	bindOrAssertExecutionThread("LuaCallbackEngine::setPluginInfo");
-	m_pluginId                  = id;
-	m_pluginName                = name;
+	m_pluginId   = id;
+	m_pluginName = name;
+	{
+		const QMutexLocker locker(&m_pluginInfoMutex);
+		m_pluginIdShared   = id;
+		m_pluginNameShared = name;
+	}
 	QString normalizedDirectory = directory;
 	if (!normalizedDirectory.isEmpty() && !normalizedDirectory.endsWith('/') &&
 	    !normalizedDirectory.endsWith('\\'))
@@ -10040,6 +10045,18 @@ QString LuaCallbackEngine::pluginName() const
 {
 	bindOrAssertExecutionThread("LuaCallbackEngine::pluginName");
 	return m_pluginName;
+}
+
+QString LuaCallbackEngine::pluginIdForDiagnostics() const
+{
+	const QMutexLocker locker(&m_pluginInfoMutex);
+	return m_pluginIdShared;
+}
+
+QString LuaCallbackEngine::pluginNameForDiagnostics() const
+{
+	const QMutexLocker locker(&m_pluginInfoMutex);
+	return m_pluginNameShared;
 }
 
 QString LuaCallbackEngine::pluginDirectory() const

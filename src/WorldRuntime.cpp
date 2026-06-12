@@ -568,8 +568,8 @@ namespace
 	{
 		if (!engine)
 			return QStringLiteral("<null>");
-		const QString id   = engine->pluginId().trimmed();
-		const QString name = engine->pluginName().trimmed();
+		const QString id   = engine->pluginIdForDiagnostics().trimmed();
+		const QString name = engine->pluginNameForDiagnostics().trimmed();
 		if (name.isEmpty())
 			return id;
 		return QStringLiteral("%1/%2").arg(id, name);
@@ -588,7 +588,7 @@ namespace
 	{
 		return std::ranges::any_of(
 		    engines, [](const QSharedPointer<LuaCallbackEngine> &engine)
-		    { return engine && qmudMmStartupDiagIsWatchedPluginId(engine->pluginId()); });
+		    { return engine && qmudMmStartupDiagIsWatchedPluginId(engine->pluginIdForDiagnostics()); });
 	}
 
 	bool qmudMmStartupDiagRequestHasWatchedEngine(const LuaBatchDispatchRequest &request)
@@ -609,7 +609,7 @@ namespace
 			return true;
 		return std::ranges::any_of(
 		    recipients, [](const QSharedPointer<LuaCallbackEngine> &engine)
-		    { return engine && qmudMmStartupDiagIsWatchedPluginId(engine->pluginId()); });
+		    { return engine && qmudMmStartupDiagIsWatchedPluginId(engine->pluginIdForDiagnostics()); });
 	}
 
 	QString qmudMmStartupDiagResultLabel(const LuaBatchDispatchResult &result)
