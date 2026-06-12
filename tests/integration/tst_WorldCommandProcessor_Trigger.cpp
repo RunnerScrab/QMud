@@ -33,6 +33,21 @@ namespace
 		trigger.children.insert(QStringLiteral("send"), QStringLiteral("%1|%2|%3|%4"));
 		return trigger;
 	}
+
+	/**
+	 * @brief Creates a trigger that sends matched input to script.
+	 * @return Trigger configured for script send-target coverage.
+	 */
+	WorldRuntime::Trigger makeScriptTrigger()
+	{
+		WorldRuntime::Trigger trigger;
+		trigger.attributes.insert(QStringLiteral("enabled"), QStringLiteral("y"));
+		trigger.attributes.insert(QStringLiteral("match"), QStringLiteral("*"));
+		trigger.attributes.insert(QStringLiteral("send_to"), QString::number(eSendToScript));
+		trigger.attributes.insert(QStringLiteral("sequence"), QStringLiteral("100"));
+		trigger.children.insert(QStringLiteral("send"), QStringLiteral("return true"));
+		return trigger;
+	}
 } // namespace
 
 /**
@@ -100,6 +115,82 @@ class tst_WorldCommandProcessor_Trigger : public QObject
 			QCOMPARE(captured,
 			         QStringLiteral("Multi Line: |1|Trigger |Expires on Sat Jul  4 18:08:48 2026."));
 			QCOMPARE(runtime.triggers().constFirst().matched, 1);
+		}
+
+		static void triggerStyleRunsUseMushclientPaneStyleProjection()
+		{
+			WorldRuntime runtime;
+			runtime.setWorldAttribute(QStringLiteral("enable_triggers"), QStringLiteral("y"));
+			runtime.setWorldAttribute(QStringLiteral("enable_trigger_sounds"), QStringLiteral("n"));
+			runtime.setWorldAttribute(QStringLiteral("script_language"), QStringLiteral("Lua"));
+			runtime.triggersMutable().push_back(makeScriptTrigger());
+
+			WorldCommandProcessor processor;
+			processor.setRuntime(&runtime);
+
+			bool                 sawScriptSend = false;
+			QVector<LuaStyleRun> capturedRuns;
+			QObject::connect(&processor, &WorldCommandProcessor::sendToScriptRequested, &processor,
+			                 [&](const QString &, const QString &, const QString &,
+			                     const QVector<LuaStyleRun> *styleRuns, bool, bool, int, qint64)
+			                 {
+				                 sawScriptSend = true;
+				                 if (styleRuns)
+					                 capturedRuns = *styleRuns;
+			                 });
+
+			WorldRuntime::StyleSpan implicitDefault;
+			implicitDefault.length = 3;
+
+			WorldRuntime::StyleSpan explicitDefault;
+			explicitDefault.length     = 3;
+			explicitDefault.fore       = QColor(QStringLiteral("#c0c0c0"));
+			explicitDefault.back       = QColor(QStringLiteral("#000000"));
+			explicitDefault.actionType = WorldRuntime::ActionSend;
+			explicitDefault.action     = QStringLiteral("look");
+			explicitDefault.hint       = QStringLiteral("Look");
+			explicitDefault.startTag   = true;
+
+			WorldRuntime::StyleSpan inverseEquivalent;
+			inverseEquivalent.length  = 3;
+			inverseEquivalent.fore    = QColor(QStringLiteral("#000000"));
+			inverseEquivalent.back    = QColor(QStringLiteral("#c0c0c0"));
+			inverseEquivalent.inverse = true;
+
+			WorldRuntime::StyleSpan italicSplit = explicitDefault;
+			italicSplit.length                  = 3;
+			italicSplit.actionType              = WorldRuntime::ActionNone;
+			italicSplit.action.clear();
+			italicSplit.hint.clear();
+			italicSplit.startTag = false;
+			italicSplit.italic   = true;
+
+			WorldRuntime::StyleSpan visibleSplit = explicitDefault;
+			visibleSplit.length                  = 3;
+			visibleSplit.fore                    = QColor(QStringLiteral("#ff0000"));
+			visibleSplit.actionType              = WorldRuntime::ActionNone;
+			visibleSplit.action.clear();
+			visibleSplit.hint.clear();
+			visibleSplit.startTag = false;
+
+			processor.onIncomingStyledLineReceived(
+			    QStringLiteral("aaabbbcccdddfff"),
+			    {implicitDefault, explicitDefault, inverseEquivalent, italicSplit, visibleSplit});
+
+			QVERIFY(sawScriptSend);
+			QCOMPARE(capturedRuns.size(), 3);
+			QCOMPARE(capturedRuns.at(0).text, QStringLiteral("aaabbbccc"));
+			QCOMPARE(capturedRuns.at(0).textColour, 0xc0c0c0);
+			QCOMPARE(capturedRuns.at(0).backColour, 0x000000);
+			QCOMPARE(capturedRuns.at(0).style, 0);
+			QCOMPARE(capturedRuns.at(1).text, QStringLiteral("ddd"));
+			QCOMPARE(capturedRuns.at(1).textColour, 0xc0c0c0);
+			QCOMPARE(capturedRuns.at(1).backColour, 0x000000);
+			QCOMPARE(capturedRuns.at(1).style, 0x0004);
+			QCOMPARE(capturedRuns.at(2).text, QStringLiteral("fff"));
+			QCOMPARE(capturedRuns.at(2).textColour, 0x0000ff);
+			QCOMPARE(capturedRuns.at(2).backColour, 0x000000);
+			QCOMPARE(capturedRuns.at(2).style, 0);
 		}
 };
 

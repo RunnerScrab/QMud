@@ -1371,6 +1371,29 @@ class tst_LuaExecution : public QObject
 			        result.error.contains(QStringLiteral("bad argument"), Qt::CaseInsensitive));
 		}
 
+		void stringSubCoercesFractionalIndicesLikeLua51()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			const auto result =
+			    evaluateLuaToString(state.get(), QByteArrayLiteral("return (\"abcdef\"):sub(2.9, 4.2)"));
+			QVERIFY2(result.ok, qPrintable(result.error));
+			QCOMPARE(result.value, QStringLiteral("bcd"));
+		}
+
+		void stringSubStillErrorsForNonNumericIndices()
+		{
+			LuaStateOwner state = makeCompatLuaState();
+			QVERIFY(state);
+
+			const auto result =
+			    evaluateLuaToString(state.get(), QByteArrayLiteral("return string.sub(\"abcdef\", {})"));
+			QVERIFY(!result.ok);
+			QVERIFY(result.error.contains(QStringLiteral("number expected"), Qt::CaseInsensitive) ||
+			        result.error.contains(QStringLiteral("bad argument"), Qt::CaseInsensitive));
+		}
+
 		void applyLua51CompatIsIdempotent()
 		{
 			LuaStateOwner state(QMudLuaSupport::makeLuaState());
@@ -1384,11 +1407,13 @@ class tst_LuaExecution : public QObject
 			    QByteArrayLiteral(
 			        "local a = tostring(rawget(_G, \"__qmud_require_compat_wrapped\") == true)\n"
 			        "local b = tostring(rawget(_G, \"__qmud_string_format_compat_wrapped\") == true)\n"
-			        "local c = tostring(rawget(_G, \"__qmud_string_gsub_compat_wrapped\") == true)\n"
+			        "local c = tostring(rawget(_G, \"__qmud_string_sub_compat_wrapped\") == true)\n"
+			        "local d = tostring(rawget(_G, \"__qmud_string_gsub_compat_wrapped\") == true)\n"
+			        "local e = tostring(debug.getinfo(string.sub, \"S\").what == \"C\")\n"
 			        "local s = string.gsub(\"[x]\", \"%[x%]\", \"%[ok%]\")\n"
-			        "return a .. \":\" .. b .. \":\" .. c .. \":\" .. s"));
+			        "return a .. \":\" .. b .. \":\" .. c .. \":\" .. d .. \":\" .. e .. \":\" .. s"));
 			QVERIFY2(result.ok, qPrintable(result.error));
-			QCOMPARE(result.value, QStringLiteral("true:true:true:[ok]"));
+			QCOMPARE(result.value, QStringLiteral("true:true:true:true:true:[ok]"));
 		}
 
 		void stringGsubLenientReplacementMatchesMushclientBehaviour()

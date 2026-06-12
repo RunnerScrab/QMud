@@ -62,11 +62,6 @@ constexpr int kStyleBlink = BLINK;
 #else
 constexpr int kStyleBlink = 0x0004;
 #endif
-#ifdef INVERSE
-constexpr int kStyleInverse = INVERSE;
-#else
-constexpr int kStyleInverse = 0x0008;
-#endif
 
 namespace
 {
@@ -420,19 +415,32 @@ namespace
 			if (span.length <= 0)
 				continue;
 			LuaStyleRun run;
-			run.text       = line.mid(pos, span.length);
-			run.textColour = toRgbNumber(span.fore);
-			run.backColour = toRgbNumber(span.back);
+			run.text    = line.mid(pos, span.length);
+			QColor fore = span.fore.isValid() ? span.fore : defaultFore;
+			QColor back = span.back.isValid() ? span.back : defaultBack;
+			if (span.inverse)
+				qSwap(fore, back);
+			run.textColour = toRgbNumber(fore);
+			run.backColour = toRgbNumber(back);
 			int style      = 0;
 			if (span.bold)
 				style |= kStyleHilite;
 			if (span.underline)
 				style |= kStyleUnderline;
-			if (span.blink)
+			if (span.blink || span.italic)
 				style |= kStyleBlink;
-			if (span.inverse)
-				style |= kStyleInverse;
 			run.style = style;
+			if (!runs.isEmpty())
+			{
+				LuaStyleRun &previous = runs.last();
+				if (previous.textColour == run.textColour && previous.backColour == run.backColour &&
+				    previous.style == run.style)
+				{
+					previous.text += run.text;
+					pos += span.length;
+					continue;
+				}
+			}
 			runs.push_back(run);
 			pos += span.length;
 		}
