@@ -2,6 +2,11 @@
 
 This is my fork of QMud, with my own bug fixes (which I will continue to share with upstream in PRs) and the CthuluMUD references removed. QMud is basically MUSHclient with High DPI support and a non-glitchy zMUD style splitter window, which is a potent combination.
 
+If you find issues while using the fork, **please open issues on this fork, not on the upstream project.** If I determine that the issue is from the upstream project, I will try to fix the bug here and offer the patch to the upstream. I don't want the upstream maintainer to deal with problems I make, because he did not volunteer to do that nor should he be expected to.
+
+
+
+
 [![Downloads](https://img.shields.io/github/downloads/RunnerScrab/QMud/total)](https://github.com/RunnerScrab/QMud/releases)
 [![Website](https://img.shields.io/website?url=https%3A%2F%2Fqmud.dev)](https://qmud.dev)
 [![Issues](https://img.shields.io/github/issues/RunnerScrab/QMud)](https://github.com/RunnerScrab/QMud/issues)
