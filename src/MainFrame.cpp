@@ -3287,7 +3287,6 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 
         if (view)
         {
-            //view->scrollOutputToEnd();
             this->onStatusFreezeDoubleClick();
         }
 
