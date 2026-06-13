@@ -91,6 +91,16 @@ class tst_TimeFormatUtils : public QObject
 			    TimeFormatUtils::formatWorldTime(time, QStringLiteral("%q %Y"), {}, false, nullptr);
 			QCOMPARE(unknown, QStringLiteral("%q 2026"));
 		}
+
+		void formatWorldTimeTwoDigitYear()
+		{
+			const QDateTime time = QDateTime::fromString(QStringLiteral("2026-03-04T05:06:07"), Qt::ISODate);
+			QVERIFY(time.isValid());
+
+			const QString formatted =
+			    TimeFormatUtils::formatWorldTime(time, QStringLiteral("%y-%m-%d"), {}, false, nullptr);
+			QCOMPARE(formatted, QStringLiteral("26-03-04"));
+		}
 		// NOLINTEND(readability-convert-member-functions-to-static)
 };
 
