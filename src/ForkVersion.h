@@ -9,6 +9,6 @@
 #define QMUD_FORKVERSION_H
 
 // RS Fork release identifier independent of the upstream version
-inline constexpr char kForkVersionString[] = "rs-v0.2.1";
+inline constexpr char kForkVersionString[] = "rs-v0.2.3";
 
 #endif // QMUD_FORKVERSION_H
