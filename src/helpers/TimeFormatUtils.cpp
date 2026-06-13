@@ -87,6 +87,9 @@ namespace
 			case 'Y':
 				token = QStringLiteral("yyyy");
 				break;
+			case 'y':
+				token = QStringLiteral("yy");
+				break;
 			case 'H':
 				token = noPad ? QStringLiteral("H") : QStringLiteral("HH");
 				break;
