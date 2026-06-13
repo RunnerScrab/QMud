@@ -60,7 +60,7 @@ copy_lib() {
       return 0
       ;;
     ld-musl*.so*|\
-    libwayland-*.so*|libxkbcommon*.so*|libxcb*.so*|libX11*.so*|libXau.so*|libXdmcp.so*|libXext.so*|libXrender.so*|libSM.so*|libICE.so*|\
+    libwayland-*.so*|libxcb.so*|libX11*.so*|libXau.so*|libXdmcp.so*|libXext.so*|libXrender.so*|libSM.so*|libICE.so*|\
     libEGL.so*|libGLX.so*|libOpenGL.so*|libGLdispatch.so*|libdrm.so*|libgbm.so*|\
     libdbus-1.so*|libglib-2.0.so*|libgobject-2.0.so*|libgmodule-2.0.so*|libgio-2.0.so*|\
     libsystemd.so*|libmount.so*|libblkid.so*|libcap.so*)
@@ -203,6 +203,11 @@ if has_command patchelf; then
 
   find "$APP_LIB_DIR" -maxdepth 1 -type f -name '*.so*' | while IFS= read -r lib_path; do
     ensure_runpath "$lib_path" "$APP_LIB_RUNPATH"
+  done
+
+  APP_PLUGIN_RUNPATH="\$ORIGIN/../../lib:\$ORIGIN/../../lib64"
+  find "$APP_PLUGIN_DIR" -type f -name '*.so*' | while IFS= read -r plugin_path; do
+    ensure_runpath "$plugin_path" "$APP_PLUGIN_RUNPATH"
   done
 else
   echo "error: patchelf is required for AppImage RUNPATH patching" >&2
