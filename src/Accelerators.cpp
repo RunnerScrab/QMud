@@ -110,7 +110,6 @@ const CommandIdMapping kCommandIdMappingTable[] = {
     {resourceIdValue(ResourceId::DisplayFind),                            "Find"                        },
     {resourceIdValue(ResourceId::DisplayFindagain),                       "FindAgain"                   },
     {resourceIdValue(ResourceId::EditFliptonotepad),                      "FlipToNotepad"               },
-    {resourceIdValue(ResourceId::HelpForum),                              "Forum"                       },
     {resourceIdValue(ResourceId::DisplayFreezeoutput),                    "FreezeOutput"                },
     {resourceIdValue(ResourceId::ViewFullscreenmode),                     "FullScreenMode"              },
     {resourceIdValue(ResourceId::GameFunctionslist),                      "FunctionList"                },

@@ -77,7 +77,7 @@
     {"paste_commented_softcode", false}, {"paste_delay", 0, 0, 100000},
     {"paste_delay_per_lines", 1, 1, 100000}, {"paste_echo", false}, {"play_sounds_in_background", false},
     {"pixel_offset", 1, 0, 20, OPT_UPDATE_VIEWS | OPT_FIX_INPUT_WRAP},
-    {"port", 8889, 1, USHRT_MAX, OPT_PLUGIN_CANNOT_WRITE},
+    {"port", 4000, 1, USHRT_MAX, OPT_PLUGIN_CANNOT_WRITE},
     {"proxy_port", 1080, 0, USHRT_MAX, OPT_PLUGIN_CANNOT_WRITE},
     {"proxy_type", eProxyServerNone, eProxyServerNone, eProxyServerLast - 1, OPT_PLUGIN_CANNOT_WRITE},
     {"tls_encryption", false, 0, 0, OPT_PLUGIN_CANNOT_WRITE},

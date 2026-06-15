@@ -11,9 +11,7 @@
 
 inline constexpr char MY_WEB_PAGE[]        = "https://qmud.dev";
 inline constexpr char MUD_LIST[]           = "https://qmud.dev/muds";
-inline constexpr char BUG_REPORT_PAGE[]    = "https://github.com/Nodens-/QMud/issues";
-inline constexpr char FORUM_URL[]          = "https://discord.gg/secxwnTJCq";
-inline constexpr char QMUD_FORUM_URL[]     = "https://discord.gg/secxwnTJCq";
+inline constexpr char BUG_REPORT_PAGE[]    = "https://github.com/RunnerScrab/QMud/issues";
 inline constexpr char QMUD_FUNCTIONS_URL[] = "https://qmud.dev/documentation?panel=lua&sub=api";
 inline constexpr char DOCUMENTATION_PAGE[] = "https://qmud.dev/documentation?panel=general";
 inline constexpr char REGEXP_PAGE[]        = "https://qmud.dev/documentation?panel=general&topic=regexp";

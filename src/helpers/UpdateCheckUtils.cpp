@@ -66,6 +66,8 @@ namespace QMudUpdateCheck
 	QString versionCore(QString text)
 	{
 		text = text.trimmed();
+		if (text.startsWith(QStringLiteral("rs-"), Qt::CaseInsensitive))
+			text.remove(0, 3);
 		if (text.startsWith(QLatin1Char('v'), Qt::CaseInsensitive))
 			text.remove(0, 1);
 

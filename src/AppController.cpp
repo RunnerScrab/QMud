@@ -29,6 +29,7 @@
 #include "ReloadUtils.h"
 #include "SqliteCompat.h"
 #include "UpdateCheckUtils.h"
+#include "ForkVersion.h"
 #include "Version.h"
 #include "WorldChildWindow.h"
 #include "WorldDocument.h"
@@ -224,7 +225,8 @@ namespace
 	constexpr char   kReloadLogTag[]             = "[ReloadQMud]";
 	constexpr char   kWorldSessionStateSuffix[]  = ".qws";
 	constexpr char   kWorldSessionStateDir[]     = "worlds/state";
-	constexpr char   kUpdateLatestReleaseUrl[] = "https://api.github.com/repos/Nodens-/QMud/releases/latest";
+	constexpr char   kUpdateLatestReleaseUrl[] =
+	    "https://api.github.com/repos/RunnerScrab/QMud/releases/latest";
 
 	class WorldRuntimeReloadOps final : public ReloadSocketRecoveryOps,
 	                                    public ReloadReconnectOps,
@@ -1927,7 +1929,7 @@ static const struct
     {"AppendToLogFiles",                0                       },
     {"AutoConnectWorlds",               1                       },
     {"AutoExpandConfig",                1                       },
-    {"AutoCheckForUpdates",             1                       },
+    {"AutoCheckForUpdates",             0                       },
     {"BackupOnUpgrades",                1                       },
     {"FlatToolbars",                    1                       },
     {"AutoLogWorld",                    0                       },
@@ -5141,7 +5143,6 @@ void AppController::emitStartupBanner(WorldRuntime *runtime)
 
 	constexpr QRgb bannerFore = qRgb(0, 170, 255);
 	constexpr QRgb bannerBack = qRgb(0, 0, 0);
-	constexpr QRgb linkFore   = qRgb(0, 255, 255);
 
 	auto           emitStyledNote = [runtime](const QString &text, const bool newLine)
 	{
@@ -5155,20 +5156,6 @@ void AppController::emitStartupBanner(WorldRuntime *runtime)
 		span.fore    = QColor::fromRgb(bannerFore);
 		span.back    = QColor::fromRgb(bannerBack);
 		span.changed = true;
-		runtime->outputStyledText(text, {span}, true, newLine);
-	};
-
-	auto emitStyledLink = [runtime](const QString &url, const QString &text, const bool newLine)
-	{
-		WorldRuntime::StyleSpan span;
-		span.length     = static_cast<int>(text.size());
-		span.fore       = QColor::fromRgb(linkFore);
-		span.back       = QColor::fromRgb(bannerBack);
-		span.underline  = true;
-		span.changed    = true;
-		span.actionType = WorldRuntime::ActionHyperlink;
-		span.action     = url;
-		span.hint       = text;
 		runtime->outputStyledText(text, {span}, true, newLine);
 	};
 
@@ -5188,11 +5175,6 @@ void AppController::emitStartupBanner(WorldRuntime *runtime)
 	                   .arg(QStringLiteral(LUA_RELEASE), QStringLiteral(QT_VERSION_STR),
 	                        QString::fromLatin1(zlibVersion())),
 	               true);
-	emitStyledNote(QString(), true);
-	emitStyledNote(QStringLiteral("For information and assistance about QMud visit the CthulhuMUD Discord: "),
-	               false);
-	emitStyledLink(QStringLiteral("https://discord.gg/secxwnTJCq"),
-	               QStringLiteral("https://discord.gg/secxwnTJCq"), true);
 	emitStyledNote(QString(), true);
 }
 
@@ -5570,7 +5552,7 @@ void AppController::handleUpdateCheckResponse(const bool manual, const QByteArra
 		return;
 	}
 
-	const QString currentVersion = m_version;
+	const QString currentVersion = versionCore(QString::fromLatin1(kForkVersionString));
 	const QString skipVersion =
 	    versionCore(getGlobalOption(QStringLiteral("SkipUpdateNotificationVersion")).toString());
 
@@ -5694,7 +5676,7 @@ void AppController::showUpdateAvailableDialog(const QString &currentVersion, con
 	if (!current.isEmpty() && !target.isEmpty())
 	{
 		const QString compareUrl =
-		    QStringLiteral("https://github.com/Nodens-/QMud/compare/v%1...v%2").arg(current, target);
+		    QStringLiteral("https://github.com/RunnerScrab/QMud/compare/v%1...v%2").arg(current, target);
 		fullChangelogLink->setText(QStringLiteral("Full Changelog from v%1: <a href=\"%2\">%2</a>")
 		                               .arg(current.toHtmlEscaped(), compareUrl.toHtmlEscaped()));
 	}
@@ -10601,14 +10583,6 @@ void AppController::onCommandTriggered(const QString &cmdName)
 			QMessageBox::warning(m_mainWindow, QStringLiteral("Documentation"),
 			                     QStringLiteral("Unable to open the documentation web page: %1").arg(url));
 	}
-	else if (cmdName == QStringLiteral("HelpForum"))
-	{
-		if (!m_mainWindow)
-			return;
-		if (const auto url = QString::fromLatin1(QMUD_FORUM_URL); !QDesktopServices::openUrl(QUrl(url)))
-			QMessageBox::warning(m_mainWindow, QStringLiteral("Help Forum"),
-			                     QStringLiteral("Unable to open the QMud forum web page: %1").arg(url));
-	}
 	else if (cmdName == QStringLiteral("FunctionsList") || cmdName == QStringLiteral("FunctionsWebPage"))
 	{
 		if (!m_mainWindow)
@@ -13249,14 +13223,12 @@ void AppController::handleAppAbout()
 	QLabel version(QStringLiteral("Version %1").arg(QString::fromLatin1(kVersionString)), &dialog);
 	textLayout->addWidget(&version);
 
+	QLabel forkVersion(QStringLiteral("RS Fork %1").arg(QString::fromLatin1(kForkVersionString)), &dialog);
+	textLayout->addWidget(&forkVersion);
+
 	QLabel copyright(QStringLiteral("Copyright (C) 2026 Panagiotis Kalogiratos\n"), &dialog);
 	textLayout->addWidget(&copyright);
 
-	QLabel support(QStringLiteral("Support (CthulhuMUD Discord): <a href=\"%1\">%1</a>")
-	                   .arg(QStringLiteral("https://discord.gg/secxwnTJCq")),
-	               &dialog);
-	support.setOpenExternalLinks(true);
-	textLayout->addWidget(&support);
 	QLabel disclaimer(
 	    QStringLiteral(
 	        "See License Agreement and GPL v3 for limitation of liability for use of this program."),
