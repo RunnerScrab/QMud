@@ -87,6 +87,10 @@ class tst_TimeFormatUtils : public QObject
 			    time, QStringLiteral("%#d-%#m-%Y %#H:%#M:%#S %#I"), {}, false, nullptr);
 			QCOMPARE(noPad, QStringLiteral("4-3-2026 5:6:7 5"));
 
+			const QString twoDigitYear =
+			    TimeFormatUtils::formatWorldTime(time, QStringLiteral("%y-%m-%d"), {}, false, nullptr);
+			QCOMPARE(twoDigitYear, QStringLiteral("26-03-04"));
+
 			const QString unknown =
 			    TimeFormatUtils::formatWorldTime(time, QStringLiteral("%q %Y"), {}, false, nullptr);
 			QCOMPARE(unknown, QStringLiteral("%q 2026"));
