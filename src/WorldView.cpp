@@ -2486,11 +2486,16 @@ void WorldView::syncNativeOutputScrollBarsFromLayout(const QVector<NativeOutputR
 	if (!primaryTextRect.isEmpty())
 		panes.push_back({primaryTextRect, m_output});
 
+	// Bottom pane height, used to clamp the top pane's scroll in split scrollback
+	int splitLivePaneHeight = 0;
 	if (m_scrollbackSplitActive && m_liveOutput && m_liveOutput->isVisible())
 	{
 		const QRect liveTextRect = nativeOutputPaneRect(m_liveOutput);
 		if (!liveTextRect.isEmpty())
+		{
 			panes.push_back({liveTextRect, m_liveOutput});
+			splitLivePaneHeight = qMax(0, liveTextRect.height());
+		}
 	}
 
 	if (panes.isEmpty())
@@ -2536,6 +2541,12 @@ void WorldView::syncNativeOutputScrollBarsFromLayout(const QVector<NativeOutputR
 
 			const int  pageStep          = qMax(1, pane.textRect.height());
 			const int  maxScroll         = qMax(0, contentHeight - pageStep);
+
+			// Cap the top pane at the split by clamping the value
+			const int  valueCeiling =
+			    (m_scrollbackSplitActive && pane.view == m_output && splitLivePaneHeight > 0)
+			        ? qMax(0, maxScroll - splitLivePaneHeight)
+			        : maxScroll;
 			const int  oldValue          = bar->value();
 			const int  oldMax            = bar->maximum();
 			const bool wasAtEnd          = oldValue >= oldMax;
@@ -2654,6 +2665,7 @@ void WorldView::syncNativeOutputScrollBarsFromLayout(const QVector<NativeOutputR
 				m_nativeSplitTopHeadTrimAdjustedRevision = m_nativeRenderLineCacheRevision;
 			}
 
+			targetValue                      = qMin(targetValue, valueCeiling);
 			const bool needsSingleStepUpdate = bar->singleStep() != lineStep;
 			const bool needsPageStepUpdate   = bar->pageStep() != pageStep;
 			const bool needsRangeUpdate      = bar->minimum() != 0 || bar->maximum() != maxScroll;
@@ -8592,7 +8604,15 @@ bool WorldView::isAtBufferEnd() const
 	QScrollBar *const bar = m_output->verticalScrollBar();
 	if (!bar)
 		return true;
-	return bar->value() >= bar->maximum();
+	// While split, the top pane's end is the cut at the bottom pane's top edge
+	int ceiling = bar->maximum();
+	if (m_scrollbackSplitActive && m_liveOutput)
+	{
+		const int liveHeight = nativeOutputPaneRect(m_liveOutput).height();
+		if (liveHeight > 0)
+			ceiling = qMax(0, ceiling - liveHeight);
+	}
+	return bar->value() >= ceiling;
 }
 
 void WorldView::selectOutputLine(int zeroBasedLine) const
